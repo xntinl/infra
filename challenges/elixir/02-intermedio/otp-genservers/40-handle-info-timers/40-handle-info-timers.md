@@ -418,6 +418,100 @@ single node.
 
 - Si el handler del timer tarda más que el intervalo del timer, ¿qué ocurre? ¿Cómo lo detectás y mitigás?
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule TimerGs.SendAfter do
+    @moduledoc """
+    Heartbeat implemented with `Process.send_after/3` and self-rescheduling.
+    This is the idiomatic OTP pattern for per-process periodic work.
+    """
+
+    use GenServer
+
+    defmodule State do
+      @moduledoc false
+      defstruct [:interval, :notify_to, :ticks, :timer_ref]
+    end
+
+    # ── Public API ──────────────────────────────────────────────────────────
+
+    @spec start_link(keyword()) :: GenServer.on_start()
+    def start_link(opts) do
+      {init_opts, gen_opts} = Keyword.split(opts, [:interval, :notify_to])
+      GenServer.start_link(__MODULE__, init_opts, gen_opts)
+    end
+
+    @doc "Number of ticks this process has handled since start."
+    @spec ticks(GenServer.server()) :: non_neg_integer()
+    def ticks(server), do: GenServer.call(server, :ticks)
+
+    # ── Callbacks ───────────────────────────────────────────────────────────
+
+    @impl true
+    def init(opts) do
+      interval = Keyword.fetch!(opts, :interval)
+      notify_to = Keyword.get(opts, :notify_to)
+
+      state = %State{
+        interval: interval,
+        notify_to: notify_to,
+        ticks: 0
+      }
+
+      {:ok, schedule(state)}
+    end
+
+    @impl true
+    def handle_info(:tick, %State{ticks: ticks, notify_to: notify_to} = state) do
+      if notify_to, do: send(notify_to, {:tick, ticks + 1})
+      {:noreply, schedule(%{state | ticks: ticks + 1})}
+    end
+
+    def handle_info(_other, state), do: {:noreply, state}
+
+    @impl true
+    def handle_call(:ticks, _from, %State{ticks: ticks} = state) do
+      {:reply, ticks, state}
+    end
+
+    @impl true
+    def terminate(_reason, %State{timer_ref: ref}) do
+      # Cancelling is cheap and deterministic here.
+      if is_reference(ref), do: Process.cancel_timer(ref)
+      :ok
+    end
+
+    # ── Helpers ─────────────────────────────────────────────────────────────
+
+    defp schedule(%State{interval: interval} = state) do
+      ref = Process.send_after(self(), :tick, interval)
+      %{state | timer_ref: ref}
+    end
+  end
+
+  def main do
+    {:ok, pid} = TimerGs.SendAfter.start_link(interval: 50, notify_to: self())
+  
+    assert_receive {:tick, 1}, 300
+    assert_receive {:tick, 2}, 300
+  
+    count = TimerGs.SendAfter.ticks(pid)
+    IO.puts("Ticks counted: #{count}")
+  
+    GenServer.stop(pid)
+    IO.puts("✓ TimerGs demonstrated successfully")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Process.send_after/4` — Elixir stdlib](https://hexdocs.pm/elixir/Process.html#send_after/4)

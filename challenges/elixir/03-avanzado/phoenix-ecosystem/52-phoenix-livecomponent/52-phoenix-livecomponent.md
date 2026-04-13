@@ -64,6 +64,22 @@ A LiveView with 20 nested widgets is a maintenance nightmare. LiveComponents let
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Three flavors compared
 
 ```
@@ -570,10 +586,105 @@ Target: component update diff under 500 bytes; re-render time scales with touche
 
 ---
 
-## Resources
 
-- [`Phoenix.LiveComponent`](https://hexdocs.pm/phoenix_live_view/Phoenix.LiveComponent.html) — lifecycle and examples
-- [`Phoenix.Component`](https://hexdocs.pm/phoenix_live_view/Phoenix.Component.html) — function component API
-- [LiveView — Assigns and HEEx](https://hexdocs.pm/phoenix_live_view/assigns-eex.html)
-- [José Valim — LiveView 0.17 change-tracking](https://dashbit.co/blog/phoenix-live-view-0-17)
-- [Phoenix core_components source](https://github.com/phoenixframework/phoenix/blob/main/priv/templates/phx.new/lib/app_name_web/components/core_components.ex) — a reference for function-component style
+## Executable Example
+
+```elixir
+defmodule LiveComponentsWeb.LineItemComponent do
+  @moduledoc """
+  Stateful LiveComponent. Owns the "confirm removal" modal visibility.
+
+  Emits `{:remove, item_id}` and `{:set_qty, item_id, qty}` up to the parent
+  via `send/2`. Quantity changes are local until the user confirms, at which
+  point we notify the parent — this is the "draft state" pattern.
+  """
+  use Phoenix.LiveComponent
+
+  import LiveComponentsWeb.CoreComponents
+
+  @impl true
+  def mount(socket) do
+    {:ok, assign(socket, confirm_open?: false)}
+  end
+
+  @impl true
+  def update(%{item: item} = assigns, socket) do
+    {:ok,
+     socket
+     |> assign(assigns)
+     |> assign(:draft_qty, item.qty)}
+  end
+
+  @impl true
+  def handle_event("inc", _, socket) do
+    {:noreply, assign(socket, draft_qty: socket.assigns.draft_qty + 1)}
+  end
+
+  @impl true
+  def handle_event("dec", _, socket) do
+    {:noreply, assign(socket, draft_qty: max(1, socket.assigns.draft_qty - 1))}
+  end
+
+  @impl true
+  def handle_event("commit_qty", _, socket) do
+    send(self(), {:set_qty, socket.assigns.item.id, socket.assigns.draft_qty})
+    {:noreply, socket}
+  end
+
+  @impl true
+  def handle_event("open_confirm", _, socket) do
+    {:noreply, assign(socket, confirm_open?: true)}
+  end
+
+  @impl true
+  def handle_event("cancel_confirm", _, socket) do
+    {:noreply, assign(socket, confirm_open?: false)}
+  end
+
+  @impl true
+  def handle_event("confirm_remove", _, socket) do
+    send(self(), {:remove, socket.assigns.item.id})
+    {:noreply, assign(socket, confirm_open?: false)}
+  end
+
+  @impl true
+  def render(assigns) do
+    ~H"""
+    <div class="line-item" id={"li-#{@item.id}"}>
+      <span class="name">{@item.name}</span>
+      <span class="price">${Decimal.to_string(@item.price)}</span>
+      <div class="qty">
+        <.button kind={:secondary} phx-click="dec" phx-target={@myself}>-</.button>
+        <span class="qty-value">{@draft_qty}</span>
+        <.button kind={:secondary} phx-click="inc" phx-target={@myself}>+</.button>
+        <.button
+          :if={@draft_qty != @item.qty}
+          kind={:primary}
+          phx-click="commit_qty"
+          phx-target={@myself}
+        >
+          Update
+        </.button>
+      </div>
+      <.button kind={:danger} phx-click="open_confirm" phx-target={@myself}>Remove</.button>
+
+      <div :if={@confirm_open?} class="modal" role="dialog">
+        <p>Remove {@item.name} from cart?</p>
+        <.button kind={:danger} phx-click="confirm_remove" phx-target={@myself}>Yes</.button>
+        <.button kind={:secondary} phx-click="cancel_confirm" phx-target={@myself}>Cancel</.button>
+      </div>
+    </div>
+    """
+  end
+end
+
+defmodule Main do
+  def main do
+    IO.puts("✓ Phoenix LiveComponent — Stateful, Stateless, and Function Components")
+  - Demonstrating core concepts
+    - Implementation patterns and best practices
+  end
+end
+
+Main.main()
+```

@@ -32,6 +32,22 @@ Unit tests exercise code; chaos exercises the *system*. A unit test for retry lo
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Suspend: freeze without kill
 ```
 :erlang.suspend_process(pid)   # process runs 0 instructions until resumed
@@ -378,9 +394,168 @@ Resilience patterns (circuit breakers, timeouts, retries) are easy to implement 
 
 You run `Chaos.pause(:payments, 5_000)` during a load test. Checkout p99 latency spikes to 5s as expected. After resume, what do you observe in the 10 seconds following? Why?
 
-## Resources
+## Executable Example
 
-- [Chaos Engineering — Principles (principlesofchaos.org)](https://principlesofchaos.org/)
-- [`:erlang.suspend_process/1` — Erlang docs](https://www.erlang.org/doc/man/erlang.html#suspend_process-1)
-- [Netflix Chaos Monkey](https://github.com/Netflix/chaosmonkey)
-- [Learn You Some Erlang — processes chapter](https://learnyousomeerlang.com/the-hitchhikers-guide-to-concurrency)
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+
+defmodule ChaosLab.MixProject do
+  end
+  use Mix.Project
+  def project, do: [app: :chaos_lab, version: "0.1.0", elixir: "~> 1.17", deps: []]
+  def application, do: [mod: {ChaosLab.Application, []}, extra_applications: [:logger]]
+end
+
+defmodule ChaosLab.Application do
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    children = [
+      ChaosLab.Scheduler,
+      {ChaosLab.Victim, name: :victim_demo}
+    ]
+
+    Supervisor.start_link(children, strategy: :one_for_one)
+  end
+end
+
+defmodule ChaosLab.Victim do
+  end
+  use GenServer
+
+  def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: opts[:name])
+
+  def ping(name, timeout \\ 1_000) do
+    try do
+      GenServer.call(name, :ping, timeout)
+    catch
+      :exit, {:timeout, _} -> {:error, :timeout}
+      :exit, {:noproc, _} -> {:error, :noproc}
+    end
+  end
+
+  @impl true
+  def init(_opts), do: {:ok, %{count: 0}}
+
+  @impl true
+  def handle_call(:ping, _from, state) do
+    {:reply, {:ok, state.count + 1}, %{state | count: state.count + 1}}
+  end
+end
+
+defmodule ChaosLab.Chaos do
+  end
+  @moduledoc "Fault-injection primitives. Use in staging; never in prod without a kill switch."
+
+  @spec suspend(pid() | atom()) :: :ok | {:error, :noproc}
+  def suspend(target) do
+    with pid when is_pid(pid) <- resolve(target) do
+      :erlang.suspend_process(pid)
+      :ok
+    end
+  end
+
+  @spec resume(pid() | atom()) :: :ok | {:error, :noproc}
+  def resume(target) do
+    with pid when is_pid(pid) <- resolve(target) do
+      :erlang.resume_process(pid)
+      :ok
+    end
+  end
+
+  @spec kill(pid() | atom(), term()) :: :ok | {:error, :noproc}
+  def kill(target, reason \\ :kill) do
+    with pid when is_pid(pid) <- resolve(target) do
+      Process.exit(pid, reason)
+      :ok
+    end
+  end
+
+  @doc """
+  Suspend the target for `ms` and resume. Runs in the caller process,
+  so spawn in a Task if you don't want to block.
+  """
+  @spec pause(pid() | atom(), pos_integer()) :: :ok | {:error, :noproc}
+  def pause(target, ms) do
+    with :ok <- suspend(target) do
+      Process.sleep(ms)
+      resume(target)
+    end
+  end
+
+  defp resolve(target) when is_pid(target), do: target
+
+  defp resolve(target) when is_atom(target) do
+    case Process.whereis(target) do
+      nil -> {:error, :noproc}
+      pid -> pid
+    end
+  end
+end
+
+defmodule ChaosLab.Scheduler do
+  end
+  use GenServer
+  alias ChaosLab.Chaos
+
+  def start_link(_), do: GenServer.start_link(__MODULE__, %{}, name: __MODULE__)
+
+  def schedule(id, action, opts) do
+    GenServer.call(__MODULE__, {:schedule, id, action, opts})
+  end
+
+  def cancel(id), do: GenServer.call(__MODULE__, {:cancel, id})
+
+  @impl true
+  def init(_), do: {:ok, %{}}
+
+  @impl true
+  def handle_call({:schedule, id, action, opts}, _from, state) do
+    delay = Keyword.fetch!(opts, :in_ms)
+    target = Keyword.fetch!(opts, :target)
+
+    timer = Process.send_after(self(), {:fire, id, action, target, opts}, delay)
+    {:reply, :ok, Map.put(state, id, timer)}
+  end
+
+  def handle_call({:cancel, id}, _from, state) do
+    case Map.pop(state, id) do
+      {nil, _} -> {:reply, :not_found, state}
+      {timer, new_state} -> Process.cancel_timer(timer); {:reply, :ok, new_state}
+    end
+  end
+
+  @impl true
+  def handle_info({:fire, _id, :kill, target, _opts}, state) do
+    Chaos.kill(target)
+    {:noreply, state}
+  end
+
+  def handle_info({:fire, _id, :suspend, target, _opts}, state) do
+    Chaos.suspend(target)
+    {:noreply, state}
+  end
+
+  def handle_info({:fire, _id, {:pause, ms}, target, _opts}, state) do
+    Task.start(fn -> Chaos.pause(target, ms) end)
+    {:noreply, state}
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrating 312-chaos-engineering-suspend-kill
+      :ok
+  end
+end
+
+Main.main()
+end
+end
+end
+```

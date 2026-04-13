@@ -374,6 +374,125 @@ logic around," use a function or a fun.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule MacroBasics do
+    @moduledoc """
+    A small tour of quote/unquote and defmacro.
+
+    The macros here are deliberately trivial — the point is to see the AST
+    transformation, not to build anything production-worthy.
+    """
+
+    @doc """
+    Returns the AST of an expression without evaluating it.
+
+    This is a macro because it needs the *unevaluated* form of its argument —
+    a regular function would receive the already-computed value.
+    """
+    defmacro ast_of(expr) do
+      # `expr` is already AST here. We quote it *inside another quote* so that
+      # at the call site we get back a literal representation of that AST.
+      quoted = Macro.escape(expr)
+      quote do: unquote(quoted)
+    end
+
+    @doc """
+    Logs the source form of an expression alongside its value.
+
+    Example:
+
+        iex> MacroBasics.debug(1 + 2 * 3)
+        [debug] 1 + 2 * 3 = 7
+        7
+    """
+    defmacro debug(expr) do
+      # Macro.to_string turns AST back into source — very useful for error
+      # messages and logging macros. Notice we use it at *expansion time*,
+      # so the string is baked into the compiled output.
+      source = Macro.to_string(expr)
+
+      quote do
+        value = unquote(expr)
+        IO.puts("[debug] " <> unquote(source) <> " = " <> inspect(value))
+        value
+      end
+    end
+
+    @doc """
+    `times(n, do: block)` — run `block` `n` times.
+
+    Demonstrates a macro that wraps a block (`do: ...`) and splices it into
+    a generated loop. Because the block is AST, it is *re-evaluated* on every
+    iteration — exactly what you'd expect from a language construct.
+    """
+    defmacro times(n, do: block) do
+      quote do
+        Enum.each(1..unquote(n), fn _ -> unquote(block) end)
+      end
+    end
+
+    @doc """
+    Defines a constant function at compile time.
+
+    `defconst greeting, "hello"` expands into `def greeting, do: "hello"`.
+    A first taste of code-generating macros.
+    """
+    defmacro defconst(name, value) do
+      quote do
+        def unquote(name)(), do: unquote(value)
+      end
+    end
+  end
+
+  def main do
+    require MacroBasics
+  
+    IO.puts("=== MacroBasics Demo ===\n")
+  
+    # Demo 1: ast_of/1 - returns AST without evaluating
+    IO.puts("1. ast_of(1 + 2):")
+    ast = MacroBasics.ast_of(1 + 2)
+    IO.puts("   Result: #{inspect(ast)}")
+    assert match?({:+, _, [1, 2]}, ast)
+  
+    # Demo 2: debug/1 - logs source and value
+    IO.puts("\n2. debug(1 + 2 * 3):")
+    result = MacroBasics.debug(1 + 2 * 3)
+    IO.puts("   Returned: #{result}")
+    assert result == 7
+  
+    # Demo 3: times/2 - run block n times
+    IO.puts("\n3. times(3, do: IO.write(\"*\")):")
+    MacroBasics.times(3, do: IO.write("*"))
+    IO.puts("\n   (printed 3 asterisks)")
+  
+    # Demo 4: defconst/2 - define compile-time constants
+    defmodule MyConsts do
+      require MacroBasics
+      MacroBasics.defconst(:pi, 3.14159)
+      MacroBasics.defconst(:answer, 42)
+    end
+  
+    IO.puts("\n4. defconst - generated constants:")
+    IO.puts("   pi() = #{MyConsts.pi()}")
+    IO.puts("   answer() = #{MyConsts.answer()}")
+    assert MyConsts.pi() == 3.14159
+    assert MyConsts.answer() == 42
+  
+    IO.puts("\n✓ All MacroBasics demos completed!")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Kernel.SpecialForms.quote/2`](https://hexdocs.pm/elixir/Kernel.SpecialForms.html#quote/2) — the compiler primitive, exhaustively documented

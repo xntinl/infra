@@ -50,6 +50,22 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. The Finch layering
 
 ```
@@ -621,12 +637,35 @@ you have any concurrency at all.
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
+## Executable Example
 
-- [Finch hexdocs](https://hexdocs.pm/finch/Finch.html) — pool configuration reference
-- [Req hexdocs](https://hexdocs.pm/req/Req.html) — middleware catalog and examples
-- [Mint hexdocs](https://hexdocs.pm/mint/Mint.html) — stateless HTTP client underneath
-- [NimblePool hexdocs](https://hexdocs.pm/nimble_pool/NimblePool.html) — the pool semantics
-- [Dashbit — What's new in Finch 0.5](https://dashbit.co/blog/announcing-finch-0-5) — HTTP/2 rollout details
-- [José Valim on Mint/Finch design](https://www.youtube.com/watch?v=ZG3Ip7SLG5Y) — "The Soul of Erlang and Elixir" talk context
-- [RFC 7540 — HTTP/2](https://www.rfc-editor.org/rfc/rfc7540) — stream multiplexing semantics
+```elixir
+defp deps do
+  [
+    {:finch, "~> 0.18"},
+    {:req, "~> 0.5"},
+    {:jason, "~> 1.4"},
+    {:telemetry, "~> 1.2"},
+    {:bypass, "~> 2.1", only: :test}
+  ]
+end
+
+
+
+Finch matches the destination URL against these keys and picks the pool.
+
+### 4. Streaming vs buffered
+
+`Req.get!(url)` loads the full response into memory. For a 2GB CSV this is
+fatal. `Finch.stream/4` hands you chunks as they arrive so you can pipe them
+to disk or a parser:
+
+defmodule Main do
+  def main do
+      # Demonstrating 70-req-finch-http-clients
+      :ok
+  end
+end
+
+Main.main()
+```

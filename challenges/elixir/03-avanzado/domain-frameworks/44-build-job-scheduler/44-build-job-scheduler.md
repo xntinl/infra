@@ -59,6 +59,22 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Tick loop drift and how to avoid it
 
 A naive tick loop does:
@@ -685,21 +701,72 @@ from job duration. Measure with:
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
-
-- [Quantum source on GitHub](https://github.com/quantum-elixir/quantum-core) — the mature version of this design
-- [AWS Architecture Blog — Exponential Backoff And Jitter](https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/)
-- [Oban documentation — hexdocs.pm](https://hexdocs.pm/oban/Oban.html)
-- [`DateTime` module — hexdocs.pm](https://hexdocs.pm/elixir/DateTime.html)
-- [Fred Hébert — Stuff Goes Bad: Erlang in Anger](https://www.erlang-in-anger.com/) — chapters on long-running tasks and retries
-- [Chris Keathley — "Good and Bad Elixir"](https://keathley.io/blog/good-and-bad-elixir.html) — process design principles
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+### Step 2: `lib/job_scheduler/cron.ex`
+
+**Objective**: Precompile cron expressions into MapSets — `matches?/2` becomes O(1) per field instead of re-parsing strings on every tick.
+
+
+
+
+### Step 3: `lib/job_scheduler/backoff.ex`
+
+**Objective**: Apply full-jitter exponential backoff capped at 60s to avoid thundering-herd retries when many jobs fail simultaneously.
+
+
+
+
+### Step 4: `lib/job_scheduler/job.ex`
+
+**Objective**: Model a job as an immutable spec with enforced keys — `overlap` and `max_attempts` are first-class scheduling concerns, not ad-hoc flags.
+
+
+
+
+### Step 5: `lib/job_scheduler/runner.ex`
+
+**Objective**: Isolate each invocation in a temporary Task — crashes stay contained, retries happen in-process, telemetry brackets start/stop/exception.
+
+
+
+
+### Step 6: `lib/job_scheduler/scheduler.ex`
+
+**Objective**: Anchor the tick to the wall clock (not `:timer.send_interval/2`) so schedule drift stays bounded and overlap policy is enforced per-job.
+
+
+
+
+### Step 7: `lib/job_scheduler/application.ex`
+
+**Objective**: Start the DynamicSupervisor before the Scheduler — the scheduler depends on being able to spawn runner children when it fires its first tick.
+
+
+
+
+### Step 8: Tests
+
+
+
+
+
+
+
+
+
+
+
+### Step 9: Run
+
+**Objective**: Run `mix test` — the async scheduler test is the integration signal that supervision, Cron, and Runner compose correctly.
+
+defmodule Main do
+  def main do
+      :ok
+  end
 end
+
+Main.main()
 ```

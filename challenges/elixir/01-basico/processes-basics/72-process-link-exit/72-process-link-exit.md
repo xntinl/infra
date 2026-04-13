@@ -299,7 +299,41 @@ mix test
 
 ---
 
+## Executable Example
 
+Create `lib/link_demo.ex` and test in `iex`:
+
+```elixir
+defmodule LinkDemo do
+  def worker_normal do
+    spawn_link(fn -> IO.puts("Worker started"); Process.sleep(100); IO.puts("Worker done") end)
+  end
+
+  def worker_crash do
+    spawn_link(fn -> raise "Intentional crash" end)
+  end
+
+  def trapper do
+    Process.flag(:trap_exit, true)
+    spawn_link(fn -> raise "Child error" end)
+    receive do
+      {:EXIT, pid, reason} -> IO.inspect({:caught_exit, pid, reason})
+    after
+      1000 -> IO.puts("No exit caught")
+    end
+  end
+end
+
+# Test normal
+pid = LinkDemo.worker_normal()
+Process.sleep(200)  # Let it finish
+IO.puts("Process finished normally")
+
+# Test trapper
+LinkDemo.trapper()
+```
+
+---
 ## Key Concepts
 
 ### 1. Links Create Bidirectional Exit Notifications

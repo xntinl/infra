@@ -53,6 +53,22 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. `tp` vs `tpl` vs `tpe`
 
 Three sibling functions, three different scopes:
@@ -641,21 +657,136 @@ atomic counter rather than sending messages.
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
 
-- [`:dbg` reference — Erlang/OTP](https://www.erlang.org/doc/man/dbg.html) — full API surface
-- [Match specifications reference](https://www.erlang.org/doc/apps/erts/match_spec.html) — the grammar you must program against
-- [`:ms_transform`](https://www.erlang.org/doc/man/ms_transform.html) — `fun2ms` parse transform details
-- [Fred Hébert — tracing patterns](https://ferd.ca/) — blog posts on when to choose raw `:dbg` over wrappers
-- [`ex2ms`](https://hexdocs.pm/ex2ms/readme.html) — Elixir macro alternative to `fun2ms` for match specs
-- [`:erlang.trace/3` and friends](https://www.erlang.org/doc/man/erlang.html#trace-3) — lower layer below `:dbg`
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+defmodule DbgTpl.Tracer do
+  @moduledoc """
+  Owns a `:dbg` tracer. Exposes a typed API to arm/disarm trace patterns.
+
+  Matched call/return pairs are forwarded to a subscriber pid as
+  `{:dbg_tpl, %{...}}` messages.
+  """
+
+  use GenServer
+
+  alias DbgTpl.{CallPairing, Patterns}
+
+  # ---------------------------------------------------------------------------
+  # Public API
+  # ---------------------------------------------------------------------------
+
+  def start_link(opts \\ []), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+
+  @spec subscribe(pid()) :: :ok
+  def subscribe(pid \\ self()), do: GenServer.call(__MODULE__, {:subscribe, pid})
+
+  @doc "Arm a global trace pattern."
+  @spec arm(module(), atom(), non_neg_integer(), Patterns.match_spec()) :: :ok
+  def arm(m, f, arity, match_spec) do
+    GenServer.call(__MODULE__, {:arm, :tp, m, f, arity, match_spec})
+  end
+
+  @doc "Arm a local trace pattern (includes private / intra-module calls)."
+  @spec arm_local(module(), atom(), non_neg_integer(), Patterns.match_spec()) :: :ok
+  def arm_local(m, f, arity, match_spec) do
+    GenServer.call(__MODULE__, {:arm, :tpl, m, f, arity, match_spec})
+  end
+
+  @spec disarm_all() :: :ok
+  def disarm_all, do: GenServer.call(__MODULE__, :disarm_all)
+
+  # ---------------------------------------------------------------------------
+  # GenServer callbacks
+  # ---------------------------------------------------------------------------
+
+  @impl true
+  def init(_opts) do
+    CallPairing.init()
+    Process.flag(:trap_exit, true)
+    {:ok, %{subscribers: MapSet.new(), running: false}}
+  end
+
+  @impl true
+  def handle_call({:subscribe, pid}, _from, state) do
+    Process.monitor(pid)
+    {:reply, :ok, %{state | subscribers: MapSet.put(state.subscribers, pid)}}
+  end
+
+  def handle_call({:arm, kind, m, f, arity, ms}, _from, state) do
+    :ok = ensure_tracer_running(state.running)
+    {:ok, _} = arm_pattern(kind, m, f, arity, ms)
+    {:reply, :ok, %{state | running: true}}
+  end
+
+  def handle_call(:disarm_all, _from, state) do
+    :dbg.stop_clear()
+    :ets.delete_all_objects(:dbg_tpl_stack)
+    {:reply, :ok, %{state | running: false}}
+  end
+
+  @impl true
+  def handle_info({:dbg_msg, trace}, state) do
+    case CallPairing.handle(trace, nil) do
+      nil ->
+        :ok
+
+      event ->
+        Enum.each(state.subscribers, fn sub -> send(sub, {:dbg_tpl, event}) end)
+    end
+
+    {:noreply, state}
+  end
+
+  def handle_info({:DOWN, _ref, :process, pid, _}, state),
+    do: {:noreply, %{state | subscribers: MapSet.delete(state.subscribers, pid)}}
+
+  def handle_info(_, state), do: {:noreply, state}
+
+  @impl true
+  def terminate(_reason, _state) do
+    :dbg.stop_clear()
+    :ok
+  end
+
+  # ---------------------------------------------------------------------------
+  # Internals
+  # ---------------------------------------------------------------------------
+
+  defp ensure_tracer_running(true), do: :ok
+
+  defp ensure_tracer_running(false) do
+    parent = self()
+
+    {:ok, _} =
+      :dbg.tracer(
+        :process,
+        {fn msg, _ ->
+           send(parent, {:dbg_msg, msg})
+           []
+         end, []}
+      )
+
+    {:ok, _} = :dbg.p(:all, [:call, :timestamp])
+    :ok
+  end
+
+  defp arm_pattern(:tp, m, f, arity, ms), do: :dbg.tp({m, f, arity}, ms)
+  defp arm_pattern(:tpl, m, f, arity, ms), do: :dbg.tpl({m, f, arity}, ms)
 end
+
+defmodule Main do
+  def main do
+      IO.puts("Benchmarking initialized")
+      {elapsed_us, result} = :timer.tc(fn ->
+        Enum.reduce(1..1000, 0, &+/2)
+      end)
+      if is_number(elapsed_us) do
+        IO.puts("✓ Benchmark completed: sum(1..1000) = " <> inspect(result) <> " in " <> inspect(elapsed_us) <> "µs")
+      end
+  end
+end
+
+Main.main()
 ```

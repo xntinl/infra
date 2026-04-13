@@ -347,6 +347,96 @@ introduces test-order coupling. Use `setup` + `start_supervised!/1` instead.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule UserRepo do
+    @moduledoc """
+    A trivial in-memory user repository backed by an Agent, used purely to
+    demonstrate ExUnit setup patterns.
+    """
+
+    use Agent
+
+    @type user :: %{id: pos_integer(), name: String.t(), email: String.t()}
+
+    @spec start_link(keyword()) :: Agent.on_start()
+    def start_link(_opts \\ []) do
+      Agent.start_link(fn -> %{} end)
+    end
+
+    @spec insert(pid(), String.t(), String.t()) :: {:ok, user()}
+    def insert(repo, name, email) do
+      Agent.get_and_update(repo, fn state ->
+        id = map_size(state) + 1
+        user = %{id: id, name: name, email: email}
+        {{:ok, user}, Map.put(state, id, user)}
+      end)
+    end
+
+    @spec get(pid(), pos_integer()) :: {:ok, user()} | {:error, :not_found}
+    def get(repo, id) do
+      case Agent.get(repo, &Map.get(&1, id)) do
+        nil -> {:error, :not_found}
+        user -> {:ok, user}
+      end
+    end
+
+    @spec all(pid()) :: [user()]
+    def all(repo), do: Agent.get(repo, &Map.values/1)
+
+    @spec count(pid()) :: non_neg_integer()
+    def count(repo), do: Agent.get(repo, &map_size/1)
+  end
+
+  def main do
+    IO.puts("=== ExUnit Setup Demo ===\n")
+  
+    # Demo 1: Create and use a UserRepo
+    IO.puts("1. Basic UserRepo operations:")
+    {:ok, repo} = UserRepo.start_link()
+  
+    # Insert users
+    {:ok, user1} = UserRepo.insert(repo, "Alice", "alice@example.com")
+    {:ok, user2} = UserRepo.insert(repo, "Bob", "bob@example.com")
+    IO.puts("   Inserted: #{user1.name}, #{user2.name}")
+  
+    # Get user
+    {:ok, retrieved} = UserRepo.get(repo, user1.id)
+    IO.puts("   Retrieved user 1: #{retrieved.name}")
+    assert retrieved.email == "alice@example.com"
+  
+    # Count
+    count = UserRepo.count(repo)
+    IO.puts("   Total users: #{count}")
+    assert count == 2
+  
+    # List all
+    IO.puts("   All users:")
+    UserRepo.all(repo) |> Enum.each(fn u -> IO.puts("     - #{u.name} (#{u.email})") end)
+  
+    # Demo 2: Test isolation
+    IO.puts("\n2. Test isolation:")
+    {:ok, repo2} = UserRepo.start_link()
+    IO.puts("   New repo count: #{UserRepo.count(repo2)}")
+    assert UserRepo.count(repo2) == 0
+  
+    # Cleanup
+    Agent.stop(repo)
+    Agent.stop(repo2)
+  
+    IO.puts("\n✓ All ExUnit setup demos completed!")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`ExUnit.Callbacks`](https://hexdocs.pm/ex_unit/ExUnit.Callbacks.html)

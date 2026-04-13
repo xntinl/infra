@@ -56,6 +56,25 @@ Runtime config needs a lookup on every call and cannot validate required keys un
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Metaprogramming-specific insight:**
+Code generation is powerful and dangerous. Every macro you write is a place where intent is hidden. Use macros sparingly, only when they eliminate genuine boilerplate. If your macro is more than 10 lines, you probably need a function or data structure instead. Future maintainers will thank you.
 ### 1. The anatomy of a `use` call
 
 ```
@@ -408,11 +427,132 @@ functions (`queue/0`, `run/1`) are plain functions with normal BEAM performance.
 
 ---
 
-## Resources
 
-- [`Kernel.use/2` — hexdocs.pm](https://hexdocs.pm/elixir/Kernel.html#use/2)
-- [Oban.Worker source](https://github.com/sorentwo/oban/blob/main/lib/oban/worker.ex) — canonical `use ... opts`
-- [Phoenix.Controller source](https://github.com/phoenixframework/phoenix/blob/main/lib/phoenix/controller.ex)
-- [Ecto.Schema](https://github.com/elixir-ecto/ecto/blob/master/lib/ecto/schema.ex)
-- [*Metaprogramming Elixir* — Chris McCord](https://pragprog.com/titles/cmelixir/metaprogramming-elixir/)
-- [Dashbit blog — "mastering `use`"](https://dashbit.co/blog)
+## Executable Example
+
+```elixir
+defmodule UsePatterns.Worker do
+  @moduledoc """
+  Base behaviour + code-generating `__using__`.
+
+      use UsePatterns.Worker,
+        queue: :payments,
+        max_attempts: 5,
+        telemetry_prefix: [:payment, :worker]
+  """
+
+  @callback perform(job :: map()) :: :ok | {:error, term()}
+
+  @defaults [queue: :default, max_attempts: 3, telemetry_prefix: [:worker]]
+  @known_opts Keyword.keys(@defaults)
+
+  defmacro __using__(opts) do
+    opts = Keyword.merge(@defaults, opts)
+    validate!(opts)
+
+    queue = Keyword.fetch!(opts, :queue)
+    max_attempts = Keyword.fetch!(opts, :max_attempts)
+    telemetry_prefix = Keyword.fetch!(opts, :telemetry_prefix)
+
+    validate_telemetry_prefix!(telemetry_prefix)
+
+    quote do
+      @behaviour UsePatterns.Worker
+
+      @worker_queue unquote(queue)
+      @worker_max_attempts unquote(max_attempts)
+      @worker_telemetry_prefix unquote(telemetry_prefix)
+
+      @spec queue() :: atom()
+      def queue, do: @worker_queue
+
+      @spec max_attempts() :: pos_integer()
+      def max_attempts, do: @worker_max_attempts
+
+      @spec telemetry_prefix() :: [atom()]
+      def telemetry_prefix, do: @worker_telemetry_prefix
+
+      @spec run(map()) :: :ok | {:error, term()}
+      def run(job) do
+        event_start = @worker_telemetry_prefix ++ [:start]
+        event_stop = @worker_telemetry_prefix ++ [:stop]
+
+        :telemetry.execute(event_start, %{system_time: System.system_time()}, %{job: job})
+        start_mono = System.monotonic_time()
+
+        result = perform(job)
+
+        :telemetry.execute(
+          event_stop,
+          %{duration: System.monotonic_time() - start_mono},
+          %{job: job, result: result}
+        )
+
+        result
+      end
+    end
+  end
+
+  @doc false
+  def validate!(opts) do
+    case Keyword.keys(opts) -- @known_opts do
+      [] ->
+        :ok
+
+      extras ->
+        raise CompileError,
+          description:
+            "UsePatterns.Worker: unknown options #{inspect(extras)}. " <>
+              "Known: #{inspect(@known_opts)}"
+    end
+  end
+
+  @doc false
+  def validate_telemetry_prefix!(prefix) when is_list(prefix) do
+    if Enum.all?(prefix, &is_atom/1) do
+      :ok
+    else
+      raise CompileError,
+        description: ":telemetry_prefix must be a list of atoms, got #{inspect(prefix)}"
+    end
+  end
+
+  def validate_telemetry_prefix!(other) do
+    raise CompileError,
+      description: ":telemetry_prefix must be a list of atoms, got #{inspect(other)}"
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrate `use` patterns with options
+      defmodule ConfigDSL do
+        defmacro __using__(opts) do
+          quote bind_quoted: [opts: opts] do
+            @config opts
+
+            def get_config, do: @config
+          end
+        end
+      end
+
+      # Using ConfigDSL with options
+      defmodule MyConfig do
+        use ConfigDSL, env: :dev, timeout: 5000, debug: true
+      end
+
+      # Test
+      config = MyConfig.get_config()
+
+      IO.inspect(config, label: "✓ Config passed via use")
+
+      assert config[:env] == :dev, "Environment set"
+      assert config[:timeout] == 5000, "Timeout set"
+      assert config[:debug] == true, "Debug set"
+
+      IO.puts("✓ Use patterns: compile-time options working")
+  end
+end
+
+Main.main()
+```

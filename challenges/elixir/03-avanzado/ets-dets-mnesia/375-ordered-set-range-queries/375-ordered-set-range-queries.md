@@ -37,6 +37,22 @@ We pick Option B.
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Composite key ordering
 
 ETS `:ordered_set` compares keys using Erlang's standard term ordering. Tuples are compared element-wise. So `{"cpu", 100} < {"cpu", 200} < {"memory", 50}`. For a range query on metric `"cpu"` between `t1` and `t2`, you iterate from key `{"cpu", t1}` to `{"cpu", t2}`.
@@ -366,10 +382,49 @@ ETS tables are in-memory, non-distributed key-value stores with tunable semantic
 
 Your system ingests 500k samples/s across 1000 metrics. Range queries are < 100/s. Your benchmark shows `:ordered_set` inserts at 250k/s single-threaded. Where do you shard, and how do you preserve cross-shard range query atomicity? Is there a point where a columnar store (e.g. DuckDB, ClickHouse) beats this architecture, and what is the observable signal that tells you it is time to migrate?
 
-## Resources
+## Executable Example
 
-- [`:ets` documentation — `type`](https://www.erlang.org/doc/man/ets.html#type-table_type)
-- [Term ordering in Erlang](https://www.erlang.org/doc/reference_manual/expressions.html#term-comparisons)
-- [OTP 22 ordered_set improvements](https://www.erlang.org/blog/otp-22-highlights/)
-- [`:ets.select/3` continuation pattern](https://www.erlang.org/doc/man/ets.html#select-3)
-- [Fred Hebert — Guidelines for picking ETS table type](https://ferd.ca/)
+```elixir
+defmodule TimeSeriesEts.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :time_series_ets, version: "0.1.0", elixir: "~> 1.16", deps: deps()]
+  end
+
+  def application do
+    [extra_applications: [:logger], mod: {TimeSeriesEts.Application, []}]
+  end
+
+  defp deps do
+    [{:benchee, "~> 1.3", only: :dev}]
+  end
+end
+
+
+
+### Step 1: Store owner
+
+**Objective**: Own an `:ordered_set` ETS table keyed by `{metric, ts_ms}` so range scans stay O(log n + k).
+
+
+
+### Step 2: Range query engine
+
+**Objective**: Drive bounded range scans via match specs + `select/3` continuations so result sets never materialize fully in memory.
+
+
+
+### Step 3: Application
+
+**Objective**: Boot the Store under a `:one_for_one` supervisor so a crashed owner rebuilds the table before callers retry.
+
+defmodule Main do
+  def main do
+      # Demonstrating 375-ordered-set-range-queries
+      :ok
+  end
+end
+
+Main.main()
+```

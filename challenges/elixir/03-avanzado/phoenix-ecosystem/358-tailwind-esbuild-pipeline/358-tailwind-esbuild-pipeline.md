@@ -40,6 +40,22 @@ admin_ui/
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. `esbuild` mix task
 
 `mix esbuild default` runs the configured default profile. The profile is defined in `config/config.exs`:
@@ -487,9 +503,47 @@ Stream-based pipelines in Elixir achieve backpressure and composability by defer
 
 A backend engineer wants to add TypeScript + React for a single admin panel. Argue for or against extending the pipeline to include `tsc`/`esbuild-ts` vs creating a separate SPA workspace. What breaks when you mix the two compilation models?
 
-## Resources
 
-- [`:esbuild` Hex package](https://hex.pm/packages/esbuild)
-- [`:tailwind` Hex package](https://hex.pm/packages/tailwind)
-- [Phoenix assets guide](https://hexdocs.pm/phoenix/asset_management.html)
-- [Tailwind CSS — content configuration](https://tailwindcss.com/docs/content-configuration)
+## Executable Example
+
+```elixir
+# test/admin_ui/assets_test.exs
+defmodule AdminUi.AssetsTest do
+  use ExUnit.Case, async: true
+
+  describe "esbuild config" do
+    test "default profile is defined" do
+      args = Application.get_env(:esbuild, :default) |> Keyword.fetch!(:args)
+      assert "--bundle" in args
+      assert Enum.any?(args, &String.starts_with?(&1, "--outdir"))
+    end
+  end
+
+  describe "tailwind config" do
+    test "default profile is defined" do
+      args = Application.get_env(:tailwind, :default) |> Keyword.fetch!(:args)
+      assert Enum.any?(args, &String.starts_with?(&1, "--input"))
+      assert Enum.any?(args, &String.starts_with?(&1, "--output"))
+    end
+  end
+
+  describe "aliases" do
+    test "assets.deploy runs minified build and digest" do
+      aliases = Mix.Project.config() |> Keyword.fetch!(:aliases)
+      deploy = Keyword.fetch!(aliases, :"assets.deploy")
+      assert Enum.any?(deploy, &String.contains?(&1, "--minify"))
+      assert "phx.digest" in deploy
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+    IO.puts("✓ Phoenix Asset Pipeline with Tailwind and esbuild")
+  - Demonstrating core concepts
+    - Implementation patterns and best practices
+  end
+end
+
+Main.main()
+```

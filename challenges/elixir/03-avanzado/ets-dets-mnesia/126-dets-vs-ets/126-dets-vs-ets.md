@@ -48,6 +48,22 @@ DETS solves the one thing ETS does not — outliving the node. It is not a gener
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. What DETS actually is
 
 DETS is "ETS on disk". A DETS file holds a hash table with the same
@@ -602,12 +618,306 @@ The 25-30x gap is the DETS serialization cost.
 
 ---
 
-## Resources
+## Executable Example
 
-- [`:dets` documentation — erlang.org](https://www.erlang.org/doc/man/dets.html)
-- [`:ets` documentation — erlang.org](https://www.erlang.org/doc/man/ets.html)
-- [Erlang in Anger — Fred Hebert](https://www.erlang-in-anger.com/) — chapter "Stateful Data Stores"
-- [OTP source: dets.erl](https://github.com/erlang/otp/blob/master/lib/stdlib/src/dets.erl) — the repair logic lives here
-- [SQLite as a File Format](https://www.sqlite.org/appfileformat.html) — consider this instead
-- [Exqlite](https://hexdocs.pm/exqlite/) — idiomatic SQLite for Elixir, usually a better DETS alternative
-- [Cachex](https://github.com/whitfin/cachex) — for when you want ETS-with-persistence already solved
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+
+defmodule DetsVsEts.MixProject do
+  end
+  use Mix.Project
+
+  def project do
+    [app: :dets_vs_ets, version: "0.1.0", elixir: "~> 1.16", deps: deps()]
+  end
+
+  def application do
+    [extra_applications: [:logger], mod: {DetsVsEts.Application, []}]
+  end
+
+  defp deps, do: [{:benchee, "~> 1.3", only: :dev}]
+end
+
+defmodule DetsVsEts.Application do
+  @moduledoc false
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    File.mkdir_p!("priv/storage")
+
+    children = [
+      DetsVsEts.EtsStore,
+      DetsVsEts.DetsStore,
+      DetsVsEts.HybridStore
+    ]
+
+    Supervisor.start_link(children, strategy: :one_for_one, name: DetsVsEts.Supervisor)
+  end
+end
+
+defmodule DetsVsEts.EtsStore do
+  end
+  @moduledoc "Public ETS table owned by this GenServer."
+  use GenServer
+
+  @table :ets_kv
+
+  def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+
+  @spec put(term(), term()) :: :ok
+  def put(key, value) do
+    :ets.insert(@table, {key, value})
+    :ok
+  end
+
+  @spec get(term()) :: {:ok, term()} | :miss
+  def get(key) do
+    case :ets.lookup(@table, key) do
+      [{^key, v}] -> {:ok, v}
+      [] -> :miss
+    end
+  end
+
+  @spec delete(term()) :: :ok
+  def delete(key) do
+    :ets.delete(@table, key)
+    :ok
+  end
+
+  @impl true
+  def init(_opts) do
+    :ets.new(@table, [:named_table, :public, :set, read_concurrency: true, write_concurrency: true])
+    {:ok, %{}}
+  end
+end
+
+defmodule DetsVsEts.DetsStore do
+  end
+  @moduledoc """
+  DETS-backed KV store.
+
+  All operations serialize through the DETS server. Open on init;
+  close gracefully on terminate to avoid the auto-repair path.
+  """
+  use GenServer
+  require Logger
+
+  @table :dets_kv
+  @file ~c"priv/storage/dets_kv.dets"
+
+  def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+
+  @spec put(term(), term()) :: :ok | {:error, term()}
+  def put(key, value) do
+    case :dets.insert(@table, {key, value}) do
+      :ok -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @spec get(term()) :: {:ok, term()} | :miss
+  def get(key) do
+    case :dets.lookup(@table, key) do
+      [{^key, v}] -> {:ok, v}
+      [] -> :miss
+    end
+  end
+
+  @spec delete(term()) :: :ok
+  def delete(key) do
+    :dets.delete(@table, key)
+    :ok
+  end
+
+  @spec sync() :: :ok
+  def sync, do: :dets.sync(@table)
+
+  @impl true
+  def init(_opts) do
+    Process.flag(:trap_exit, true)
+
+    case :dets.open_file(@table, file: @file, type: :set, auto_save: 5_000) do
+      {:ok, @table} ->
+        Logger.info("DETS opened: entries=#{:dets.info(@table, :size)}")
+        {:ok, %{}}
+
+      {:error, reason} ->
+        {:stop, {:dets_open_failed, reason}}
+    end
+  end
+
+  @impl true
+  def terminate(_reason, _state) do
+    Logger.info("DETS closing cleanly")
+    :dets.close(@table)
+    :ok
+  end
+end
+
+defmodule DetsVsEts.HybridStore do
+  end
+  @moduledoc """
+  ETS for the hot path, periodic DETS snapshots for durability.
+
+  Reads go to ETS directly (public table). Writes go to ETS directly;
+  the snapshotter GenServer dumps ETS → DETS every `@snapshot_interval_ms`.
+
+  RPO = snapshot interval. RTO = dets → ets load on start.
+  """
+  use GenServer
+  require Logger
+
+  @ets :hybrid_ets
+  @dets :hybrid_dets
+  @file ~c"priv/storage/hybrid.dets"
+  @snapshot_interval_ms :timer.seconds(10)
+
+  def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+
+  @spec put(term(), term()) :: :ok
+  def put(key, value) do
+    :ets.insert(@ets, {key, value})
+    :ok
+  end
+
+  @spec get(term()) :: {:ok, term()} | :miss
+  def get(key) do
+    case :ets.lookup(@ets, key) do
+      [{^key, v}] -> {:ok, v}
+      [] -> :miss
+    end
+  end
+
+  @spec force_snapshot() :: :ok
+  def force_snapshot, do: GenServer.call(__MODULE__, :snapshot, 30_000)
+
+  @impl true
+  def init(_opts) do
+    Process.flag(:trap_exit, true)
+    :ets.new(@ets, [:named_table, :public, :set, read_concurrency: true, write_concurrency: true])
+
+    {:ok, @dets} = :dets.open_file(@dets, file: @file, type: :set)
+    rehydrate()
+
+    schedule_snapshot()
+    {:ok, %{}}
+  end
+
+  @impl true
+  def handle_info(:snapshot, state) do
+    take_snapshot()
+    schedule_snapshot()
+    {:noreply, state}
+  end
+
+  @impl true
+  def handle_call(:snapshot, _from, state) do
+    take_snapshot()
+    {:reply, :ok, state}
+  end
+
+  @impl true
+  def terminate(_reason, _state) do
+    take_snapshot()
+    :dets.close(@dets)
+    :ok
+  end
+
+  defp rehydrate do
+    :dets.to_ets(@dets, @ets)
+    size = :ets.info(@ets, :size)
+    Logger.info("HybridStore rehydrated: #{size} entries")
+  end
+
+  defp take_snapshot do
+    t0 = System.monotonic_time(:millisecond)
+    :ets.to_dets(@ets, @dets)
+    :dets.sync(@dets)
+    elapsed = System.monotonic_time(:millisecond) - t0
+    Logger.debug("HybridStore snapshot took #{elapsed}ms")
+  end
+
+  defp schedule_snapshot, do: Process.send_after(self(), :snapshot, @snapshot_interval_ms)
+end
+
+defmodule DetsVsEts.DetsStoreTest do
+  use ExUnit.Case, async: false
+
+  alias DetsVsEts.DetsStore
+
+  setup do
+    # Wipe the DETS file before each test
+    :dets.delete_all_objects(:dets_kv)
+    :ok
+  end
+
+  describe "DetsVsEts.DetsStore" do
+    test "put/get round-trip" do
+      assert :ok = DetsStore.put("k", :v)
+      assert {:ok, :v} = DetsStore.get("k")
+    end
+
+    test "sync/0 fsyncs to disk" do
+      DetsStore.put("durable", 1)
+      assert :ok = DetsStore.sync()
+    end
+
+    test "delete/1 removes the key" do
+      DetsStore.put("gone", :v)
+      DetsStore.delete("gone")
+      assert :miss = DetsStore.get("gone")
+    end
+  end
+end
+
+defmodule DetsVsEts.HybridStoreTest do
+  end
+  use ExUnit.Case, async: false
+
+  alias DetsVsEts.HybridStore
+
+  setup do
+    for {k, _} <- :ets.tab2list(:hybrid_ets), do: :ets.delete(:hybrid_ets, k)
+    HybridStore.force_snapshot()
+    :ok
+  end
+
+  describe "DetsVsEts.HybridStore" do
+    test "put/get round-trip hits the ETS table" do
+      HybridStore.put("k", :v)
+      assert {:ok, :v} = HybridStore.get("k")
+    end
+
+    test "force_snapshot/0 persists the current state" do
+      HybridStore.put("persistent", "yes")
+      HybridStore.force_snapshot()
+
+      # The value should now be in DETS — we verify indirectly by looking
+      # in the DETS table directly.
+      assert [{"persistent", "yes"}] = :dets.lookup(:hybrid_dets, "persistent")
+    end
+  end
+end
+
+
+
+
+Restart IEx. You will see Erlang log lines like:
+
+defmodule Main do
+  def main do
+      # Demonstrating 126-dets-vs-ets
+      :ok
+  end
+end
+
+Main.main()
+end
+end
+end
+```

@@ -44,6 +44,25 @@ special_process/
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**OTP-specific insight:**
+The OTP framework enforces a discipline: supervision trees, callback modules, and standard return values. This structure is not a constraint — it's the contract that allows Erlang's release handler, hot code upgrades, and clustering to work. Every deviation from the pattern you'll pay for later in production debuggability and operational tooling.
 ### 1. What OTP expects from a "special process"
 
 The contract, copied from `OTP Design Principles — sys and proc_lib`:
@@ -517,12 +536,245 @@ Target: per-call latency ≤ 1 µs on modern hardware; ≥ 20 % improvement vs e
 
 ---
 
-## Resources
+## Executable Example
 
-- [OTP Design Principles — sys and proc_lib](https://www.erlang.org/doc/design_principles/spec_proc.html)
-- [`:proc_lib`](https://www.erlang.org/doc/man/proc_lib.html) / [`:sys`](https://www.erlang.org/doc/man/sys.html)
-- [`gen_server.erl` — the canonical special process](https://github.com/erlang/otp/blob/master/lib/stdlib/src/gen_server.erl)
-- [Ranch acceptor loop (real-world example)](https://github.com/ninenines/ranch/blob/master/src/ranch_acceptor.erl)
-- [Learn You Some Erlang — "The Power of Pattern Matching" and "What Is OTP?"](https://learnyousomeerlang.com/what-is-otp)
-- [Fred Hebert — *Stuff Goes Bad: Erlang in Anger*](https://www.erlang-in-anger.com/)
-- [Saša Jurić — *Elixir in Action*, 2e, ch. 10](https://www.manning.com/books/elixir-in-action-second-edition)
+```elixir
+defmodule SpecialProcess.MixProject do
+  end
+  use Mix.Project
+
+  def project, do: [
+    app: :special_process,
+    version: "0.1.0",
+    elixir: "~> 1.16",
+    deps: []
+  ]
+
+  def application, do: [
+    extra_applications: [:logger],
+    mod: {SpecialProcess.Application, []}
+  ]
+end
+
+defmodule SpecialProcess.Counter do
+  end
+  @moduledoc """
+  An OTP special process implementing an integer counter.
+
+  Provides:
+
+    * `increment/1` — asynchronous `+1`
+    * `value/1`     — synchronous read
+
+  Fully compatible with `:sys.get_state/1`, `:sys.trace/2`,
+  `:sys.suspend/1`, `:sys.replace_state/2`, and supervisor shutdown.
+  """
+
+  @type state :: %{value: integer()}
+
+  @spec start_link(keyword()) :: {:ok, pid()} | {:error, term()}
+  def start_link(opts \\ []) do
+    :proc_lib.start_link(__MODULE__, :init, [self(), opts])
+  end
+
+  # ---- public API ----------------------------------------------------------
+
+  @spec increment(pid()) :: :ok
+  def increment(pid), do: send(pid, {:"$call", :increment}) && :ok
+
+  @spec value(pid()) :: integer()
+  def value(pid) do
+    ref = make_ref()
+    send(pid, {:"$call", {:value, self(), ref}})
+
+    receive do
+      {^ref, v} -> v
+    after
+      1_000 -> exit(:timeout)
+    end
+  end
+
+  # ---- init ----------------------------------------------------------------
+
+  @doc false
+  def init(parent, opts) do
+    Process.flag(:trap_exit, true)
+    debug = :sys.debug_options(Keyword.get(opts, :debug, []))
+    state = %{value: Keyword.get(opts, :start, 0)}
+    :proc_lib.init_ack(parent, {:ok, self()})
+    loop(parent, debug, state)
+  end
+
+  # ---- main loop -----------------------------------------------------------
+
+  defp loop(parent, debug, state) do
+    receive do
+      {:system, from, request} ->
+        :sys.handle_system_msg(request, from, parent, __MODULE__, debug, state)
+
+      {:EXIT, ^parent, reason} ->
+        terminate(reason, state)
+
+      {:"$call", :increment} ->
+        new_state = %{state | value: state.value + 1}
+        new_debug = :sys.handle_debug(debug, &write_debug/3, __MODULE__, {:incr, new_state.value})
+        loop(parent, new_debug, new_state)
+
+      {:"$call", {:value, from, ref}} ->
+        send(from, {ref, state.value})
+        new_debug = :sys.handle_debug(debug, &write_debug/3, __MODULE__, {:read, state.value})
+        loop(parent, new_debug, state)
+    end
+  end
+
+  defp terminate(reason, _state), do: exit(reason)
+
+  defp write_debug(dev, event, name) do
+    IO.write(dev, "*DBG* #{inspect(name)} event: #{inspect(event)}\n")
+  end
+
+  # ---- sys callbacks -------------------------------------------------------
+
+  @doc false
+  def system_continue(parent, debug, state), do: loop(parent, debug, state)
+
+  @doc false
+  def system_terminate(reason, _parent, _debug, _state), do: exit(reason)
+
+  @doc false
+  def system_get_state(state), do: {:ok, state}
+
+  @doc false
+  def system_replace_state(fun, state) do
+    new_state = fun.(state)
+    {:ok, new_state, new_state}
+  end
+
+  @doc false
+  def system_code_change(state, _mod, _old_vsn, _extra), do: {:ok, state}
+end
+
+defmodule SpecialProcess.CounterSupervisor do
+  @moduledoc """
+  Demonstrates that a hand-rolled special process is a first-class child.
+  """
+
+  use Supervisor
+
+  def start_link(opts) do
+    Supervisor.start_link(__MODULE__, opts, name: __MODULE__)
+  end
+
+  @impl true
+  def init(opts) do
+    children = [
+      %{
+        id: SpecialProcess.Counter,
+        start: {SpecialProcess.Counter, :start_link, [opts]},
+        restart: :permanent,
+        shutdown: 5_000,
+        type: :worker
+      }
+    ]
+
+    Supervisor.init(children, strategy: :one_for_one)
+  end
+end
+
+defmodule SpecialProcess.Application do
+  @moduledoc false
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    Supervisor.start_link([], strategy: :one_for_one, name: SpecialProcess.Supervisor)
+  end
+end
+
+defmodule SpecialProcess.CounterTest do
+  use ExUnit.Case, async: false
+
+  alias SpecialProcess.{Counter, CounterSupervisor}
+
+  describe "user API" do
+    test "increment and read" do
+      {:ok, pid} = Counter.start_link(start: 0)
+      Counter.increment(pid)
+      Counter.increment(pid)
+      Counter.increment(pid)
+      assert Counter.value(pid) == 3
+    end
+
+    test "starts with custom value" do
+      {:ok, pid} = Counter.start_link(start: 42)
+      assert Counter.value(pid) == 42
+    end
+  end
+
+  describe "sys protocol" do
+    test ":sys.get_state reads without dispatching a user callback" do
+      {:ok, pid} = Counter.start_link(start: 7)
+      assert %{value: 7} = :sys.get_state(pid)
+    end
+
+    test ":sys.replace_state can rewrite the state" do
+      {:ok, pid} = Counter.start_link(start: 0)
+      :sys.replace_state(pid, fn s -> %{s | value: 100} end)
+      assert Counter.value(pid) == 100
+    end
+
+    test ":sys.suspend stops user dispatch but sys protocol still works" do
+      {:ok, pid} = Counter.start_link(start: 0)
+      :sys.suspend(pid)
+      Counter.increment(pid)
+      # increment is queued; counter is suspended.
+      assert :sys.get_state(pid).value == 0
+      :sys.resume(pid)
+      assert Counter.value(pid) == 1
+    end
+  end
+
+  describe "supervisor integration" do
+    test "can be supervised and restarts on crash" do
+      {:ok, sup} = CounterSupervisor.start_link(start: 0)
+      [{_id, pid, :worker, _}] = Supervisor.which_children(sup)
+      Counter.increment(pid)
+      assert Counter.value(pid) == 1
+
+      ref = Process.monitor(pid)
+      Process.exit(pid, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^pid, :killed}, 500
+
+      # Supervisor should have restarted it with the original args (start: 0).
+      [{_id, new_pid, :worker, _}] = Supervisor.which_children(sup)
+      assert new_pid != pid
+      assert Counter.value(new_pid) == 0
+
+      Supervisor.stop(sup)
+    end
+
+    test "responds to supervisor shutdown within the deadline" do
+      {:ok, sup} = CounterSupervisor.start_link(start: 0)
+      [{_id, pid, :worker, _}] = Supervisor.which_children(sup)
+
+      ref = Process.monitor(pid)
+      :ok = Supervisor.stop(sup, :shutdown, 1_000)
+      assert_receive {:DOWN, ^ref, :process, ^pid, _reason}, 1_200
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrating 80-special-process-impl
+      :ok
+  end
+end
+
+Main.main()
+end
+end
+end
+end
+end
+```

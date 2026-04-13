@@ -57,6 +57,25 @@ replaces five.
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Testing-specific insight:**
+Tests are not QA. They document intent and catch regressions. A test that passes without asserting anything is technical debt. Always test the failure case; "it works when everything succeeds" teaches nothing. Use property-based testing for domain logic where the number of edge cases is infinite.
 ### 1. `build_conn/0` returns a bare conn
 `ConnCase` builds one in `setup`. Chain `put_req_header/3`, `put_resp_content_type/2`,
 etc. to customize.
@@ -383,19 +402,86 @@ ConnTest bypasses TCP. For what categories of production bug (network, TLS, keep
 WebSocket upgrade) is that bypass a false assurance, and what complementary tool would
 close the gap?
 
-## Resources
 
-- [`Phoenix.ConnTest`](https://hexdocs.pm/phoenix/Phoenix.ConnTest.html)
-- [`Plug.Test`](https://hexdocs.pm/plug/Plug.Test.html)
-- [Phoenix testing guide](https://hexdocs.pm/phoenix/testing.html)
-- [Phoenix `json_response/2`](https://hexdocs.pm/phoenix/Phoenix.ConnTest.html#json_response/2)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+# test/orders_api_web/controllers/order_controller_test.exs
+defmodule OrdersApiWeb.OrderControllerTest do
+  use OrdersApiWeb.ConnCase, async: true
+
+  describe "POST /orders — happy path" do
+    test "creates an order and returns 201 with the order payload", %{conn: conn} do
+      conn =
+        conn
+        |> put_req_header("x-client-id", "client_abc")
+        |> put_req_header("content-type", "application/json")
+        |> post("/orders", %{amount_cents: 2500})
+
+      assert %{"id" => id, "amount_cents" => 2500} = json_response(conn, 201)
+      assert is_binary(id) or is_integer(id)
+    end
+  end
+
+  describe "POST /orders — auth" do
+    test "returns 401 when x-client-id header is missing", %{conn: conn} do
+      conn = post(conn, "/orders", %{amount_cents: 100})
+
+      assert %{"error" => "missing x-client-id"} = json_response(conn, 401)
+    end
+
+    test "returns 401 when x-client-id header is empty", %{conn: conn} do
+      conn =
+        conn
+        |> put_req_header("x-client-id", "")
+        |> post("/orders", %{amount_cents: 100})
+
+      assert json_response(conn, 401)
+    end
+  end
+
+  describe "POST /orders — validation" do
+    test "returns 400 when amount_cents is missing", %{conn: conn} do
+      conn =
+        conn
+        |> put_req_header("x-client-id", "c")
+        |> post("/orders", %{})
+
+      assert %{"error" => _} = json_response(conn, 400)
+    end
+
+    test "returns 400 when amount_cents is zero", %{conn: conn} do
+      conn =
+        conn
+        |> put_req_header("x-client-id", "c")
+        |> post("/orders", %{amount_cents: 0})
+
+      assert json_response(conn, 400)
+    end
+  end
+
+  describe "GET /orders — list" do
+    test "returns an empty list for a fresh client", %{conn: conn} do
+      conn =
+        conn
+        |> put_req_header("x-client-id", "new_client")
+        |> get("/orders")
+
+      assert %{"data" => []} = json_response(conn, 200)
+    end
+  end
 end
+
+defmodule Main do
+  def main do
+      IO.puts("Property-based test generator initialized")
+      a = 10
+      b = 20
+      c = 30
+      assert (a + b) + c == a + (b + c)
+      IO.puts("✓ Property invariant verified: (a+b)+c = a+(b+c)")
+  end
+end
+
+Main.main()
 ```

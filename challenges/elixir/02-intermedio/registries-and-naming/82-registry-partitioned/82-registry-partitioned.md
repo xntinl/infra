@@ -357,6 +357,67 @@ ETS contention actually shows up (~thousands of ops/sec).
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule PartitionedReg.Bench do
+    @moduledoc """
+    A simple write-heavy benchmark: N workers, each registering `ops` keys
+    concurrently under the given registry name. Returns the wall-clock
+    microseconds taken.
+
+    Not a scientific benchmark — the goal is educational: run it on both
+    registries and watch the partitioned one pull ahead under high
+    concurrency.
+    """
+
+    @doc """
+    Runs `workers` concurrent processes, each performing `ops` registrations
+    plus lookups against `registry`. Returns the duration in microseconds.
+    """
+    @spec run(atom(), pos_integer(), pos_integer()) :: non_neg_integer()
+    def run(registry, workers, ops) do
+      parent = self()
+
+      {elapsed, _} =
+        :timer.tc(fn ->
+          tasks =
+            for w <- 1..workers do
+              Task.async(fn ->
+                for o <- 1..ops do
+                  key = {w, o}
+                  # Register self under a unique key, then look it up — the
+                  # common "addressable per-entity server" pattern.
+                  {:ok, _} = Registry.register(registry, key, nil)
+                  [{pid, _}] = Registry.lookup(registry, key)
+                  ^pid = self()
+                  :ok = Registry.unregister(registry, key)
+                end
+
+                send(parent, :done)
+              end)
+            end
+
+          Enum.each(tasks, &Task.await(&1, :infinity))
+        end)
+
+      elapsed
+    end
+  end
+
+  def main do
+    IO.puts("PartitionedReg OK")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Registry` — partitions option](https://hexdocs.pm/elixir/Registry.html#start_link/1)

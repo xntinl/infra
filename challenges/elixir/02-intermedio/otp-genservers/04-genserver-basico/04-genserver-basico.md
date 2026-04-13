@@ -319,6 +319,59 @@ you need serialized writes, a small working set, and the simplicity of
 
 - Un colega propone un GenServer para guardar una constante de configuración. ¿Qué le recomendás y por qué?
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule MyServer do
+    use GenServer
+
+    def start_link(state \\ []) do
+      GenServer.start_link(__MODULE__, state, name: __MODULE__)
+    end
+
+    def init(state) do
+      {:ok, state}
+    end
+
+    def call_example do
+      GenServer.call(__MODULE__, :example)
+    end
+
+    def cast_example do
+      GenServer.cast(__MODULE__, :example)
+    end
+
+    def handle_call(:example, _from, state) do
+      {:reply, "Success from call", state}
+    end
+
+    def handle_cast(:example, state) do
+      IO.puts("Cast received")
+      {:noreply, state}
+    end
+  end
+
+  def main do
+    {:ok, _pid} = MyServer.start_link()
+  
+    result = MyServer.call_example()
+    IO.puts("Call result: #{inspect(result)}")
+  
+    MyServer.cast_example()
+    Process.sleep(100)
+  
+    IO.puts("✓ GenServer demonstrated successfully")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`GenServer` — Elixir stdlib](https://hexdocs.pm/elixir/GenServer.html)

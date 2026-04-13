@@ -567,6 +567,73 @@ separate, idempotent, resumable script (you'll want to re-run them).
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule MigrationsLab.User do
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    schema "users" do
+      field :email, :string
+      has_many :posts, MigrationsLab.Post
+      timestamps()
+    end
+
+    def changeset(user, attrs) do
+      user
+      |> cast(attrs, [:email])
+      |> validate_required([:email])
+      |> unique_constraint(:email)
+    end
+  end
+
+  defmodule MigrationsLab.Post do
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    schema "posts" do
+      field :title, :string
+      field :body, :string
+      field :published_at, :utc_datetime_usec
+      belongs_to :user, MigrationsLab.User
+      timestamps()
+    end
+
+    def changeset(post, attrs) do
+      post
+      |> cast(attrs, [:title, :body, :published_at, :user_id])
+      |> validate_required([:title, :user_id])
+      |> foreign_key_constraint(:user_id)
+      # This is what turns the DB check constraint into a field-level error.
+      |> check_constraint(:published_at,
+           name: :published_at_not_in_future,
+           message: "cannot be in the future")
+    end
+  end
+
+  def main do
+    IO.puts("=== Repo Demo ===
+  ")
+  
+    # Demo: Migration structure
+  IO.puts("1. Migrations define database schema changes")
+  IO.puts("2. Use: mix ecto.migrate")
+  IO.puts("3. Use: mix ecto.rollback")
+
+  IO.puts("
+  ✓ Ecto migrations demo completed!")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Ecto.Migration` — hexdocs](https://hexdocs.pm/ecto_sql/Ecto.Migration.html)

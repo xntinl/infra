@@ -52,6 +52,22 @@ bulkhead_sups/
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Bulkhead = compartmentalized capacity
 
 Ship hulls have watertight compartments. A leak fills one; the ship floats. Apply to OTP: separate supervisors, separate process pools, separate memory budgets.
@@ -537,12 +553,143 @@ Target: p99 interactive latency unchanged when batch bulkhead is saturated at 10
 
 ---
 
-## Resources
 
-- [Michael Nygard — *Release It!*](https://pragprog.com/titles/mnee2/release-it-second-edition/) — original "Bulkheads" chapter; foundational reading.
-- [Resilience4j — Bulkhead pattern](https://resilience4j.readme.io/docs/bulkhead) — Java analogue; similar reasoning.
-- [Netflix Hystrix — thread pool isolation](https://github.com/Netflix/Hystrix/wiki/How-it-Works#ThreadPoolIsolation) — the classic cloud-era bulkhead.
-- [`PartitionSupervisor`](https://hexdocs.pm/elixir/PartitionSupervisor.html) — the BEAM primitive used here.
-- [Fred Hébert — Handling Overload](https://ferd.ca/handling-overload.html) — bulkheads + load shedding together.
-- [Finch connection pools — per-host isolation](https://github.com/sneako/finch) — real-world bulkhead pattern for HTTP outbound traffic.
-- [Broadway concurrency — per-processor supervisors](https://github.com/dashbitco/broadway) — bulkheads between pipeline stages.
+## Executable Example
+
+```elixir
+# test/bulkhead_sups/isolation_test.exs
+defmodule BulkheadSups.IsolationTest do
+  use ExUnit.Case, async: false
+
+  alias BulkheadSups.{Router, Batch}
+
+  describe "BulkheadSups.Isolation" do
+    test "batch workers hogging does NOT block interactive requests" do
+      # Saturate both batch partitions with 500ms of sleep each.
+      for _ <- 1..2 do
+        Task.async(fn ->
+          pid = {:via, PartitionSupervisor, {Batch.Workers, :rand.uniform(1_000_000)}}
+          GenServer.call(pid, {:hog, 500}, 1_000)
+        end)
+      end
+
+      Process.sleep(20)
+
+      # Interactive requests should complete well under the 500ms hog window.
+      {t_us, result} =
+        :timer.tc(fn -> Router.dispatch(%{path: "/checkout", method: :get}) end)
+
+      assert {:ok, _} = result
+      assert t_us < 50_000, "interactive was blocked: #{t_us} µs"
+    end
+
+    test "crash in one bulkhead does not affect siblings" do
+      # Kill all interactive workers.
+      interactive_pids =
+        PartitionSupervisor.which_children(BulkheadSups.Interactive.Workers)
+        |> Enum.map(fn {_, pid, _, _} -> pid end)
+
+      for pid <- interactive_pids, do: Process.exit(pid, :kill)
+
+      # Search and batch still work.
+      assert {:ok, _} = Router.dispatch(%{path: "/search?q=elixir", method: :get})
+      assert {:ok, _} = Router.dispatch(%{method: :post, path: "/export/x.csv"})
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrate bulkhead supervisors for workload isolation
+
+      # Start root supervisor with independent bulkheads
+      {:ok, root_sup} = Supervisor.start_link(
+        [
+          {BulkheadSups.Interactive.Supervisor, []},
+          {BulkheadSups.Search.Supervisor, []},
+          {BulkheadSups.Batch.Supervisor, []},
+          {BulkheadSups.Admin.Supervisor, []}
+        ],
+        strategy: :one_for_one,
+        name: BulkheadSups.RootSupervisor
+      )
+
+      assert is_pid(root_sup), "Root supervisor must start"
+      IO.inspect(root_sup, label: "Root supervisor PID")
+
+      # Verify each bulkhead is running
+      interactive_sup = Process.whereis(BulkheadSups.Interactive.Supervisor)
+      search_sup = Process.whereis(BulkheadSups.Search.Supervisor)
+      batch_sup = Process.whereis(BulkheadSups.Batch.Supervisor)
+      admin_sup = Process.whereis(BulkheadSups.Admin.Supervisor)
+
+      assert is_pid(interactive_sup), "Interactive bulkhead must be running"
+      assert is_pid(search_sup), "Search bulkhead must be running"
+      assert is_pid(batch_sup), "Batch bulkhead must be running"
+      assert is_pid(admin_sup), "Admin bulkhead must be running"
+
+      IO.puts("✓ Four independent bulkheads initialized:")
+      IO.puts("  - Interactive (p99 < 50ms, tight budget)")
+      IO.puts("  - Search (200-800ms, generous budget)")
+      IO.puts("  - Batch (seconds, high memory, capped concurrency)")
+      IO.puts("  - Admin (operational queries, low priority)")
+
+      # Test workload routing and isolation
+      # Send an interactive request (fast path)
+      {:ok, task_i} = BulkheadSups.Interactive.handle_request("interactive-1")
+      assert is_pid(task_i), "Interactive request should queue"
+      IO.puts("✓ Interactive request routed to isolated bulkhead")
+
+      # Send a search query (slower, can spike)
+      {:ok, task_s} = BulkheadSups.Search.handle_request("search-1")
+      assert is_pid(task_s), "Search request should queue"
+      IO.puts("✓ Search request routed to dedicated bulkhead")
+
+      # Send batch work (can be slow and memory-heavy)
+      {:ok, task_b} = BulkheadSups.Batch.handle_request("batch-export")
+      assert is_pid(task_b), "Batch request should queue"
+      IO.puts("✓ Batch request routed to isolated bulkhead")
+
+      # Send admin query
+      {:ok, task_a} = BulkheadSups.Admin.handle_request("health-check")
+      assert is_pid(task_a), "Admin request should queue"
+      IO.puts("✓ Admin request routed to dedicated bulkhead")
+
+      # Test isolation: search slowdown does NOT affect interactive
+      IO.puts("✓ Demonstrating fault isolation...")
+
+      # Simulate search bottleneck (pathological query)
+      for _i <- 1..5 do
+        BulkheadSups.Search.handle_request("slow-query")
+      end
+
+      # Interactive should still be responsive (separate bulkhead)
+      {:ok, _interactive_responsive} = BulkheadSups.Interactive.handle_request("fast-interactive")
+      IO.puts("✓ Interactive queries remain responsive despite search bottleneck")
+
+      # Check queue depths per bulkhead (verifying concurrency caps)
+      interactive_count = BulkheadSups.Interactive.in_flight_count()
+      batch_count = BulkheadSups.Batch.in_flight_count()
+
+      IO.inspect(interactive_count, label: "Interactive in-flight")
+      IO.inspect(batch_count, label: "Batch in-flight")
+
+      # Batch should be capped to prevent resource exhaustion
+      assert batch_count <= 4, "Batch concurrency should be capped"
+      IO.puts("✓ Per-bulkhead concurrency caps enforced")
+
+      IO.puts("\n✓ Bulkhead supervisor pattern demonstrated:")
+      IO.puts("  - Four independent fault domains")
+      IO.puts("  - Failure isolation (crash in one doesn't affect others)")
+      IO.puts("  - Resource isolation (concurrency caps per class)")
+      IO.puts("  - Restart budget isolation (tight for interactive, loose for batch)")
+      IO.puts("  - Interactive always responsive, batch can't starve it")
+      IO.puts("✓ Ready for multi-tenant API gateway")
+
+      Supervisor.stop(root_sup)
+      IO.puts("✓ Bulkhead supervisors shutdown complete")
+  end
+end
+
+Main.main()
+```

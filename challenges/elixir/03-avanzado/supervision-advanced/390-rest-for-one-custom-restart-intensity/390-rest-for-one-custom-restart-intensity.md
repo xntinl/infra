@@ -49,6 +49,22 @@ Rule of thumb: set `max_restarts` so that the expected transient rate is clearly
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Supervisor strategy
 Determines which children restart when one dies.
 
@@ -424,9 +440,181 @@ When your processes are peers (not a pipeline), `:one_for_one` is better — the
 
 Your supervisor is configured at `10 restarts / 60s`. Imagine a persistent upstream fault that makes `Source` crash every 6 seconds exactly. The supervisor restarts 10 times in 60 seconds — at the 10th, it exceeds intensity and the supervisor itself exits. What happens next? Trace the escalation through `IngestPipeline.Application`. Would you prefer the node to crash (`:kernel` brings it down), or to survive and retry from the top? How would you express that choice?
 
-## Resources
 
-- [`Supervisor` module docs](https://hexdocs.pm/elixir/Supervisor.html)
-- [OTP Design Principles — Supervision Principles](https://www.erlang.org/doc/design_principles/sup_princ.html)
-- [Fred Hebert — "Stuff Goes Bad: Erlang in Anger"](https://www.erlang-in-anger.com/) — chapter on restart strategies
-- [José Valim — "The Road to 2 Million WebSockets" (talk)](https://www.youtube.com/watch?v=6pYUKYiD5s8)
+## Executable Example
+
+```elixir
+defmodule IngestPipeline.SupervisorTest do
+  use ExUnit.Case, async: false
+
+  alias IngestPipeline.{Supervisor, Source, Transform, Sink}
+
+  setup do
+    start_supervised!(Supervisor)
+    # Wait for processes to fully register.
+    :ok = wait_for_registered([Source, Transform, Sink])
+    :ok
+  end
+
+  describe "rest_for_one semantics" do
+    test "Sink crash does not affect Source or Transform" do
+      src_pid = Process.whereis(Source)
+      xfm_pid = Process.whereis(Transform)
+      snk_pid = Process.whereis(Sink)
+
+      Process.flag(:trap_exit, true)
+      catch_exit(Sink.crash())
+
+      :ok = wait_until(fn ->
+        new_snk = Process.whereis(Sink)
+        is_pid(new_snk) and new_snk != snk_pid
+      end)
+
+      assert Process.whereis(Source) == src_pid
+      assert Process.whereis(Transform) == xfm_pid
+    end
+
+    test "Transform crash restarts Transform and Sink, not Source" do
+      src_pid = Process.whereis(Source)
+      xfm_pid = Process.whereis(Transform)
+      snk_pid = Process.whereis(Sink)
+
+      Process.flag(:trap_exit, true)
+      catch_exit(Transform.crash())
+
+      :ok = wait_until(fn ->
+        new_xfm = Process.whereis(Transform)
+        new_snk = Process.whereis(Sink)
+        is_pid(new_xfm) and new_xfm != xfm_pid and is_pid(new_snk) and new_snk != snk_pid
+      end)
+
+      assert Process.whereis(Source) == src_pid
+    end
+
+    test "Source crash cascades to all three" do
+      src_pid = Process.whereis(Source)
+      xfm_pid = Process.whereis(Transform)
+      snk_pid = Process.whereis(Sink)
+
+      Process.flag(:trap_exit, true)
+      catch_exit(Source.crash())
+
+      :ok = wait_until(fn ->
+        is_pid(Process.whereis(Source)) and Process.whereis(Source) != src_pid and
+          is_pid(Process.whereis(Transform)) and Process.whereis(Transform) != xfm_pid and
+          is_pid(Process.whereis(Sink)) and Process.whereis(Sink) != snk_pid
+      end)
+    end
+  end
+
+  # --- helpers ---
+
+  defp wait_for_registered(names) do
+    wait_until(fn -> Enum.all?(names, &is_pid(Process.whereis(&1))) end)
+  end
+
+  defp wait_until(fun, deadline \\ 500) do
+    start = System.monotonic_time(:millisecond)
+    do_wait(fun, start, deadline)
+  end
+
+  defp do_wait(fun, start, deadline) do
+    cond do
+      fun.() -> :ok
+      System.monotonic_time(:millisecond) - start > deadline -> flunk("condition never became true")
+      true ->
+        Process.sleep(10)
+        do_wait(fun, start, deadline)
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrate rest_for_one with custom restart intensity for ingestion pipeline
+
+      # Start the pipeline supervisor with tuned restart budget
+      {:ok, sup_pid} = Supervisor.start_link(
+        [
+          IngestPipeline.Source,
+          IngestPipeline.Transform,
+          IngestPipeline.Sink
+        ],
+        strategy: :rest_for_one,
+        max_restarts: 10,
+        max_seconds: 30,
+        name: IngestPipeline.Supervisor
+      )
+
+      assert is_pid(sup_pid), "Pipeline supervisor must start"
+      IO.inspect(sup_pid, label: "Pipeline supervisor PID")
+
+      # Verify all stages are running
+      source_pid = Process.whereis(IngestPipeline.Source)
+      transform_pid = Process.whereis(IngestPipeline.Transform)
+      sink_pid = Process.whereis(IngestPipeline.Sink)
+
+      assert is_pid(source_pid), "Source must be running"
+      assert is_pid(transform_pid), "Transform must be running"
+      assert is_pid(sink_pid), "Sink must be running"
+
+      IO.puts("✓ Ingestion pipeline initialized (Source → Transform → Sink)")
+      IO.puts("✓ Restart budget tuned: max_restarts=10, max_seconds=30 (tolerates spiky upstream)")
+
+      # Test rest_for_one behavior: Source crash restarts Transform and Sink
+      ref_source = Process.monitor(source_pid)
+      Process.exit(source_pid, :kill)
+      assert_receive {:DOWN, ^ref_source, :process, ^source_pid, _}, 500
+
+      Process.sleep(100)
+
+      # Source is restarted
+      source_new = Process.whereis(IngestPipeline.Source)
+      assert is_pid(source_new) and source_new != source_pid, "Source must be restarted"
+
+      # Transform is restarted (rest_for_one: downstream of Source)
+      transform_new = Process.whereis(IngestPipeline.Transform)
+      assert is_pid(transform_new) and transform_new != transform_pid, "Transform must be restarted"
+
+      # Sink is restarted (rest_for_one: downstream of Transform)
+      sink_new = Process.whereis(IngestPipeline.Sink)
+      assert is_pid(sink_new) and sink_new != sink_pid, "Sink must be restarted"
+
+      IO.puts("✓ rest_for_one verified: Source crash → restarts Transform and Sink")
+
+      # Test rest_for_one behavior: Sink crash does NOT restart Source or Transform
+      source_pid_2 = Process.whereis(IngestPipeline.Source)
+      transform_pid_2 = Process.whereis(IngestPipeline.Transform)
+      sink_pid_2 = Process.whereis(IngestPipeline.Sink)
+
+      ref_sink = Process.monitor(sink_pid_2)
+      Process.exit(sink_pid_2, :kill)
+      assert_receive {:DOWN, ^ref_sink, :process, ^sink_pid_2, _}, 500
+
+      Process.sleep(100)
+
+      # Sink is restarted
+      sink_new_2 = Process.whereis(IngestPipeline.Sink)
+      assert is_pid(sink_new_2) and sink_new_2 != sink_pid_2, "Sink must be restarted"
+
+      # Source and Transform are NOT restarted
+      assert Process.whereis(IngestPipeline.Source) == source_pid_2, "Source should survive Sink crash"
+      assert Process.whereis(IngestPipeline.Transform) == transform_pid_2, "Transform should survive Sink crash"
+
+      IO.puts("✓ rest_for_one verified: Sink crash → only Sink restarts")
+      IO.puts("✓ Upstream stages unaffected by downstream failures")
+
+      IO.puts("\n✓ Ingestion pipeline supervision demonstrated:")
+      IO.puts("  - Strategy: rest_for_one (encodes dataflow: Source → Transform → Sink)")
+      IO.puts("  - Custom restart budget: 10 restarts in 30 seconds (tolerates spikes)")
+      IO.puts("  - Upstream crash cascades downstream (consistency)")
+      IO.puts("  - Downstream crash isolated (efficiency)")
+      IO.puts("✓ Ready for production ingestion workloads")
+
+      Supervisor.stop(sup_pid)
+      IO.puts("✓ Pipeline supervisor shutdown complete")
+  end
+end
+
+Main.main()
+```

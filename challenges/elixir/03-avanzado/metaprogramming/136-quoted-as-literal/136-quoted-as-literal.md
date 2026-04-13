@@ -58,6 +58,25 @@ A runtime term is computed on every call and opaque to the compiler. A quoted li
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Metaprogramming-specific insight:**
+Code generation is powerful and dangerous. Every macro you write is a place where intent is hidden. Use macros sparingly, only when they eliminate genuine boilerplate. If your macro is more than 10 lines, you probably need a function or data structure instead. Future maintainers will thank you.
 ### 1. What counts as a "valid quoted expression"
 
 Legal as-is without escaping:
@@ -371,11 +390,75 @@ Expect ~5–20 ms for a 1k-entry map. Compile-time only.
 
 ---
 
-## Resources
 
-- [`Macro.escape/1` — hexdocs.pm](https://hexdocs.pm/elixir/Macro.html#escape/1)
-- [`Macro.escape/2` with `:unquote`](https://hexdocs.pm/elixir/Macro.html#escape/2)
-- [`@external_resource` docs](https://hexdocs.pm/elixir/Module.html#module-external_resource)
-- [Ecto Schema — compile-time field baking](https://github.com/elixir-ecto/ecto/blob/master/lib/ecto/schema.ex)
-- [*Metaprogramming Elixir* — ch. 5](https://pragprog.com/titles/cmelixir/metaprogramming-elixir/)
-- [`:persistent_term` docs](https://www.erlang.org/doc/man/persistent_term.html) — runtime-loaded alternative
+## Executable Example
+
+```elixir
+defmodule EscapeQuotedTest do
+  use ExUnit.Case, async: true
+
+  alias EscapeQuoted.Sample.{Catalog, Regex}
+  alias EscapeQuoted.CompileCatalog.Product
+
+  describe "compile-embedded catalog" do
+    test "catalog/0 returns the original structs" do
+      products = Catalog.catalog()
+      assert length(products) == 2
+      assert %Product{sku: "SKU-001"} = hd(products)
+    end
+
+    test "regexes survive the escape round-trip" do
+      %Product{sku_pattern: re} = hd(Catalog.catalog())
+      assert Regex.match?(re, "SKU-123")
+      refute Regex.match?(re, "BAD-ID")
+    end
+
+    test "nested tuples survive" do
+      %Product{tags: tags} = hd(Catalog.catalog())
+      assert {:color, :red} in tags
+    end
+
+    test "find/1 returns :ok or :error" do
+      assert {:ok, %Product{name: "Widget"}} = Catalog.find("SKU-001")
+      assert :error = Catalog.find("SKU-999")
+    end
+  end
+
+  describe "regex map macro" do
+    test "good_macro compiled correctly" do
+      %{re: re} = Regex.data()
+      assert Regex.match?(re, "abc")
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrate Macro.escape for embedding complex data at compile time
+      data = %{
+        name: "config",
+        pattern: ~r/\d+/,
+        nested: %{x: 1, y: 2}
+      }
+
+      # Escape the data so it can be used in generated code
+      escaped = Macro.escape(data)
+
+      IO.puts("✓ Original data:")
+      IO.inspect(data, label: "  ")
+
+      IO.puts("✓ Escaped (as quoted expression):")
+      IO.inspect(escaped, label: "  ")
+
+      # In real scenario: use escaped data in quote block
+      # quote do: unquote(escaped)
+
+      assert is_map(data), "Original is map"
+      assert is_map(escaped) or is_tuple(escaped), "Escaped representation"
+
+      IO.puts("✓ Macro.escape: complex data serialization working")
+  end
+end
+
+Main.main()
+```

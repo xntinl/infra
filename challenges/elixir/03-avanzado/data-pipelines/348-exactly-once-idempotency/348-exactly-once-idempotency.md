@@ -62,6 +62,25 @@ Alternatives:
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Pipeline-specific insight:**
+Streams are lazy; Enum is eager. Use Stream for data larger than RAM or when you're building intermediate stages. Use Enum when the collection is small or you need side effects at each step. Mixing them carelessly results in performance cliffs.
 ### 1. The commit-effect ordering
 
 There are two orders to consider:
@@ -448,19 +467,97 @@ to 30%. The idempotency check is catching all of them, so no double-charges,
 but DB CPU spikes. What operational actions do you take immediately, and
 what does a 150× duplicate rate tell you about the upstream system?
 
-## Resources
 
-- [Stripe — Idempotent Requests](https://docs.stripe.com/api/idempotent_requests)
-- [Designing Data-Intensive Applications — M. Kleppmann](https://dataintensive.net/) — chapter on exactly-once semantics
-- [SQS FIFO — deduplication](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/using-messagededuplicationid-property.html)
-- [Kafka Transactions — Confluent blog](https://www.confluent.io/blog/transactions-apache-kafka/)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+defmodule PaymentsProcessor.IdempotencyTest do
+  use ExUnit.Case, async: false
+
+  alias PaymentsProcessor.{Idempotency, Repo}
+
+  setup do
+    Repo.query!("DELETE FROM idempotency_keys", [])
+    :ok
+  end
+
+  describe "process/2" do
+    test "runs the effect on first call" do
+      key = "k1-#{:erlang.unique_integer()}"
+
+      assert {:ok, %{"charged" => true}} =
+               Idempotency.process(key, fn -> {:ok, %{"charged" => true}} end)
+    end
+
+    test "returns :duplicate without re-running the effect" do
+      key = "k2-#{:erlang.unique_integer()}"
+      counter = :atomics.new(1, [])
+
+      effect = fn ->
+        :atomics.add(counter, 1, 1)
+        {:ok, %{"charged" => true}}
+      end
+
+      assert {:ok, _} = Idempotency.process(key, effect)
+      assert {:duplicate, %{"charged" => true}} = Idempotency.process(key, effect)
+      assert :atomics.get(counter, 1) == 1
+    end
+
+    test "rolls back on effect error" do
+      key = "k3-#{:erlang.unique_integer()}"
+
+      assert {:error, :boom} =
+               Idempotency.process(key, fn -> {:error, :boom} end)
+
+      # Key was not committed — next attempt runs the effect again.
+      assert {:ok, _} = Idempotency.process(key, fn -> {:ok, %{"ok" => true}} end)
+    end
+  end
+
+  describe "concurrent calls with the same key" do
+    test "only one effect runs" do
+      key = "k4-#{:erlang.unique_integer()}"
+      counter = :atomics.new(1, [])
+
+      effect = fn ->
+        :atomics.add(counter, 1, 1)
+        Process.sleep(20)
+        {:ok, %{"n" => 1}}
+      end
+
+      tasks =
+        for _ <- 1..10 do
+          Task.async(fn -> Idempotency.process(key, effect) end)
+        end
+
+      Task.await_many(tasks, 5_000)
+
+      assert :atomics.get(counter, 1) == 1
+    end
+  end
 end
+
+defmodule Main do
+  def main do
+      # Demonstrate exactly-once processing with idempotency keys
+      events = [
+        %{id: "pay1", idempotency_key: "key_1", amount: 100},
+        %{id: "pay2", idempotency_key: "key_1", amount: 100},  # Duplicate
+        %{id: "pay3", idempotency_key: "key_2", amount: 50}
+      ]
+
+      # Dedup by idempotency_key
+      processed = Enum.uniq_by(events, & &1.idempotency_key)
+
+      IO.inspect(processed, label: "✓ Deduplicated payments")
+      IO.puts("✓ Processed #{length(processed)} unique payments from #{length(events)} events")
+
+      assert length(processed) == 2, "Expected 2 unique payments"
+      assert Enum.all?(processed, &Map.has_key?(&1, :idempotency_key)), "All have idempotency key"
+
+      IO.puts("✓ Exactly-once idempotency: duplicate detection working")
+  end
+end
+
+Main.main()
 ```

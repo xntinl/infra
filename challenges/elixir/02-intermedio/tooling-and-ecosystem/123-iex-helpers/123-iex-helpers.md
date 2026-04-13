@@ -366,6 +366,87 @@ minimal (imports, aliases, banner) and put logic in testable modules.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule IExHelpersDemo.Shell do
+    @moduledoc """
+    Helpers exposed to the IEx shell by importing this module from `.iex.exs`.
+
+    Keep these tiny — they're for convenience, not for production code paths.
+    """
+
+    @doc """
+    Prints a visual separator in the shell. Handy when running long sequences
+    of commands and you want a clear break.
+    """
+    @spec sep() :: :ok
+    def sep do
+      IO.puts("\n" <> String.duplicate("─", 60) <> "\n")
+      :ok
+    end
+
+    @doc """
+    Returns a deterministic fixture map for ad-hoc REPL experiments.
+    """
+    @spec fixture_user() :: %{name: String.t(), age: integer(), roles: [atom()]}
+    def fixture_user do
+      %{name: "Ada Lovelace", age: 36, roles: [:admin, :analyst]}
+    end
+
+    @doc """
+    Pretty-prints every process in the system, sorted by reduction count
+    (proxy for "busiest process"). Truncates to `limit` processes.
+    """
+    @spec top(pos_integer()) :: :ok
+    def top(limit \\ 10) do
+      Process.list()
+      |> Enum.map(fn pid ->
+        info = Process.info(pid, [:registered_name, :reductions, :memory, :message_queue_len])
+        {pid, info}
+      end)
+      |> Enum.filter(fn {_pid, info} -> info != nil end)
+      |> Enum.sort_by(fn {_pid, info} -> -info[:reductions] end)
+      |> Enum.take(limit)
+      |> Enum.each(fn {pid, info} ->
+        IO.puts("#{inspect(pid)}  #{inspect(info)}")
+      end)
+    end
+
+    @doc """
+    One-shot helper that times a function and prints both the elapsed µs and
+    the result. Don't use for real benchmarking — use Benchee for that.
+    """
+    @spec time((-> result)) :: result when result: term()
+    def time(fun) when is_function(fun, 0) do
+      {micros, result} = :timer.tc(fun)
+      IO.puts("elapsed: #{micros} µs")
+      result
+    end
+  end
+
+  def main do
+    IO.puts("=== IEX Demo ===
+  ")
+  
+    # Demo: IEx helpers
+  IO.puts("1. iex(1)> h(String) - get help")
+  IO.puts("2. iex(1)> s(map_size) - source location")
+  IO.puts("3. iex(1)> i(value) - inspect value")
+
+  IO.puts("
+  ✓ IEx helpers demo completed!")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`IEx.Helpers`](https://hexdocs.pm/iex/IEx.Helpers.html) — all built-in helpers

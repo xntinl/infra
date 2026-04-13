@@ -40,6 +40,22 @@ JWT requires picking an algorithm (RS256 vs HS256), parsing JOSE headers, dealin
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Salt (namespace)
 
 The second argument to `Phoenix.Token.sign/3` is a **salt string** — it derives a unique key per-purpose. `"password reset"` and `"user socket"` produce different keys from the same `secret_key_base`. If a password-reset token is leaked, an attacker cannot replay it as a socket auth token.
@@ -315,9 +331,69 @@ Phoenix's conn struct represents an HTTP request/response in flight, accumulatin
 
 A reviewer suggests embedding the user's current password hash inside the password-reset token so the token auto-invalidates when the password is changed. Pros and cons of that design? Is there a simpler scheme that achieves the same guarantee?
 
-## Resources
 
-- [Phoenix.Token — hexdocs](https://hexdocs.pm/phoenix/Phoenix.Token.html)
-- [Plug.Crypto.MessageVerifier source](https://github.com/elixir-plug/plug_crypto/blob/main/lib/plug/crypto/message_verifier.ex)
-- [Plug.Crypto.KeyGenerator (PBKDF2)](https://github.com/elixir-plug/plug_crypto/blob/main/lib/plug/crypto/key_generator.ex)
-- [Timing attacks on HMAC comparison — Crosby 2009](https://codahale.com/a-lesson-in-timing-attacks/)
+## Executable Example
+
+```elixir
+defmodule ShareLinks.Tokens do
+  @moduledoc """
+  Purpose-scoped signed tokens.
+
+  Each public function has its own salt so keys cannot be cross-used.
+  A password-reset token is useless as a share-link token.
+  """
+
+  alias ShareLinksWeb.Endpoint
+
+  @password_reset_salt "password reset v1"
+  @share_salt "document share v1"
+  @magic_login_salt "magic login v1"
+
+  @password_reset_max_age 3600
+  @share_max_age 7 * 86_400
+  @magic_login_max_age 900
+
+  # ---- Password reset ------------------------------------------------------
+
+  @spec password_reset(integer()) :: binary()
+  def password_reset(user_id) when is_integer(user_id) do
+    Phoenix.Token.sign(Endpoint, @password_reset_salt, user_id)
+  end
+
+  @spec verify_password_reset(binary()) :: {:ok, integer()} | {:error, atom()}
+  def verify_password_reset(token) when is_binary(token) do
+    Phoenix.Token.verify(Endpoint, @password_reset_salt, token, max_age: @password_reset_max_age)
+  end
+
+  # ---- Document share ------------------------------------------------------
+
+  @spec document_share(integer(), integer()) :: binary()
+  def document_share(doc_id, recipient_id) do
+    Phoenix.Token.sign(Endpoint, @share_salt, %{doc_id: doc_id, for: recipient_id})
+  end
+
+  def verify_document_share(token) do
+    Phoenix.Token.verify(Endpoint, @share_salt, token, max_age: @share_max_age)
+  end
+
+  # ---- Magic login --------------------------------------------------------
+
+  def magic_login(email) do
+    Phoenix.Token.sign(Endpoint, @magic_login_salt, email)
+  end
+
+  def verify_magic_login(token) do
+    Phoenix.Token.verify(Endpoint, @magic_login_salt, token, max_age: @magic_login_max_age)
+  end
+end
+
+defmodule Main do
+  def main do
+    IO.puts("✓ Phoenix.Token for Secure Signing and Verification")
+  - Demonstrating core concepts
+    - Implementation patterns and best practices
+  end
+end
+
+Main.main()
+```

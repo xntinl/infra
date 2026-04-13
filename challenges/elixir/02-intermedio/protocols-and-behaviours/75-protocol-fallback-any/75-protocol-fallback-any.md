@@ -303,6 +303,63 @@ better than a crash.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule Describable.Impls do
+    @moduledoc false
+
+    defimpl Describable, for: Integer do
+      # Specific impls beat the Any fallback.
+      def describe(i), do: "an integer: #{i}"
+    end
+
+    defimpl Describable, for: BitString do
+      def describe(s) when is_binary(s) do
+        "a string of length #{byte_size(s)}"
+      end
+    end
+
+    defimpl Describable, for: List do
+      def describe(list) do
+        "a list of #{length(list)} element(s)"
+      end
+    end
+
+    defimpl Describable, for: Any do
+      @moduledoc """
+      Fallback. Branches on whether the value is a struct so structs get a
+      shape-aware description, while bare values (tuples, PIDs, etc.) fall
+      through to `inspect/1`.
+      """
+
+      def describe(value) when is_struct(value) do
+        %mod{} = value
+        # Show the struct name and the field count — enough to orient a reader.
+        field_count = value |> Map.from_struct() |> map_size()
+        "a #{inspect(mod)} struct with #{field_count} field(s)"
+      end
+
+      def describe(other) do
+        # Catch-all: inspect gives a faithful, unambiguous representation.
+        "a value: #{inspect(other)}"
+      end
+    end
+  end
+
+  def main do
+    IO.puts("Describable OK")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Protocol` module — `@fallback_to_any`](https://hexdocs.pm/elixir/Protocol.html#module-fallback-to-any)

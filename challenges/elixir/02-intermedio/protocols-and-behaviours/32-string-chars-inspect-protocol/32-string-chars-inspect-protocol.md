@@ -282,6 +282,95 @@ missing impl is clearer than a garbage string.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Money do
+  @moduledoc """
+  A minimal money value with integer-cent precision and a currency code.
+
+  Demonstrates `String.Chars` (for interpolation) and `Inspect` (for
+  developer output). Not a real money type — use `ex_money` in production.
+  """
+
+  @enforce_keys [:cents, :currency]
+  defstruct [:cents, :currency]
+
+  @type t :: %__MODULE__{cents: integer(), currency: String.t()}
+
+  @doc "Build a `Money` from a decimal amount (float) and a currency code."
+  @spec new(number(), String.t()) :: t
+  def new(amount, currency) when is_number(amount) and is_binary(currency) do
+    # Round to integer cents once, at construction — avoids FP drift later.
+    %__MODULE__{cents: round(amount * 100), currency: currency}
+  end
+
+  @doc "Format as a decimal string (no currency), e.g. `12.34`."
+  @spec format_amount(t) :: String.t()
+  def format_amount(%__MODULE__{cents: c}) do
+    sign = if c < 0, do: "-", else: ""
+    abs_c = abs(c)
+    whole = div(abs_c, 100)
+    frac = rem(abs_c, 100)
+    # Pad cents to two digits so 5 cents renders as "0.05", not "0.5".
+    "#{sign}#{whole}.#{String.pad_leading(Integer.to_string(frac), 2, "0")}"
+  end
+end
+
+defimpl String.Chars, for: Money do
+  @moduledoc """
+  Human-facing: `"paid #{money}"` becomes `"paid 12.34 EUR"`.
+  """
+  def to_string(%Money{currency: cur} = m) do
+    Money.format_amount(m) <> " " <> cur
+  end
+end
+
+defimpl Inspect, for: Money do
+  @moduledoc """
+  Developer-facing: `inspect(money)` returns `#Money<12.34 EUR>`. The
+  `#Type<...>` convention signals "this is a custom inspect, not the
+  default struct dump" so readers know it's intentional.
+  """
+  import Inspect.Algebra
+
+  def inspect(%Money{currency: cur} = m, _opts) do
+    concat(["#Money<", Money.format_amount(m), " ", cur, ">"])
+  end
+end
+
+# Demonstrate String.Chars and Inspect protocols
+IO.puts("=== Money Protocol Demo ===")
+
+m1 = Money.new(12.34, "EUR")
+m2 = Money.new(5, "USD")
+m3 = Money.new(0.05, "GBP")
+
+# Test String.Chars (used by to_string/1 and interpolation)
+assert to_string(m1) == "12.34 EUR"
+assert to_string(m2) == "5.00 USD"
+assert to_string(m3) == "0.05 GBP"
+
+# Test Inspect protocol (different format for development)
+assert inspect(m1) == "#Money<12.34 EUR>"
+assert inspect(m2) == "#Money<5.00 USD>"
+
+# Verify they differ
+refute inspect(m1) == to_string(m1)
+
+# Test interpolation
+msg = "You paid #{m1} for your purchase"
+assert msg == "You paid 12.34 EUR for your purchase"
+
+IO.puts("String.Chars output: #{to_string(m1)}")
+IO.puts("Inspect output: #{inspect(m1)}")
+IO.puts("Interpolation: #{msg}")
+IO.puts("All Money protocol assertions passed!")
+```
+
+
 ## Resources
 
 - [`String.Chars` — Elixir stdlib](https://hexdocs.pm/elixir/String.Chars.html)

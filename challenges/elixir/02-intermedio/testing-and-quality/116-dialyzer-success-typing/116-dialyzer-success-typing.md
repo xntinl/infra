@@ -328,6 +328,60 @@ the codebase reaches ~5k lines or you start a library.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule Reports do
+    @moduledoc """
+    Deliberately buggy. Run `mix dialyzer` — you should see warnings for
+    each numbered issue below. Fix them one at a time, re-running Dialyzer.
+    """
+
+    # ── Issue 1: spec says non_neg_integer() but function can return nil ──
+    @spec grand_total([Billing.invoice()]) :: non_neg_integer()
+    def grand_total([]), do: nil
+    def grand_total(invoices), do: Billing.total_of(invoices)
+
+    # ── Issue 2: unreachable pattern — a string can never be an atom ──
+    @spec status_label(:draft | :sent | :paid) :: String.t()
+    def status_label(:draft), do: "Draft"
+    def status_label(:sent), do: "Sent"
+    def status_label(:paid), do: "Paid"
+    def status_label("unknown"), do: "Unknown"
+
+    # ── Issue 3: calls a function with the wrong argument type ──
+    @spec report([Billing.invoice()]) :: String.t()
+    def report(invoices) do
+      # `total_of/1` expects a list — calling it on a single invoice is wrong.
+      sum = Billing.total_of(List.first(invoices))
+      "Total: #{sum}"
+    end
+  end
+
+  def main do
+    IO.puts("=== TypeChecker Demo ===
+  ")
+  
+    # Demo: Dialyzer type checking
+  IO.puts("1. safe_divide(10, 2): #{TypeChecker.safe_divide(10, 2)}")
+  assert TypeChecker.safe_divide(10, 2) == {:ok, 5}
+
+  IO.puts("2. safe_divide(10, 0): #{inspect(TypeChecker.safe_divide(10, 0))}")
+  assert TypeChecker.safe_divide(10, 0) == {:error, :zero_division}
+
+  IO.puts("
+  ✓ Dialyzer demo completed!")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [Dialyxir](https://hexdocs.pm/dialyxir/readme.html)

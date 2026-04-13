@@ -241,9 +241,67 @@ mix test
 
 The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
 
+---
 
+## Executable Example
+
+Create a file `lib/transaction.ex` with the `Transaction` module above, then test in `iex`:
+
+```elixir
+defmodule Transaction do
+  def new(amount) when is_number(amount) and amount >= 0 do
+    %{amount: amount, status: :pending, metadata: %{}}
+  end
+
+  def approve(%{status: :pending} = tx) do
+    %{tx | status: :approved}
+  end
+
+  def approve(tx), do: tx
+
+  def add_metadata(%{metadata: meta} = tx, key, value) do
+    %{tx | metadata: Map.put(meta, key, value)}
+  end
+
+  def process(%{status: :approved, amount: amt} = tx) do
+    %{tx | status: :processed, metadata: Map.put(tx.metadata, :processed_at, DateTime.utc_now())}
+  end
+
+  def process(tx), do: tx
+
+  def fail(%{status: status} = tx, reason) when status in [:pending, :approved] do
+    %{tx | status: :failed, metadata: Map.put(tx.metadata, :error, reason)}
+  end
+
+  def fail(tx, _reason), do: tx
+
+  def status(%{status: s}), do: s
+end
+
+# Demonstrate rebinding and function composition
+tx = Transaction.new(100.0)
+IO.inspect(tx)  # %{amount: 100.0, status: :pending, metadata: %{}}
+
+tx = Transaction.add_metadata(tx, :user_id, 42)
+tx = Transaction.add_metadata(tx, :ref, "TXN-001")
+IO.inspect(tx)  # metadata now has both keys
+
+tx = Transaction.approve(tx)
+IO.inspect(tx.status)  # :approved
+
+tx = Transaction.process(tx)
+IO.inspect(tx.status)  # :processed
+IO.puts("Transaction processed at: #{inspect(tx.metadata[:processed_at])}")
+
+# Test failure path
+tx2 = Transaction.new(50.0)
+tx2 = Transaction.fail(tx2, "insufficient_funds")
+IO.inspect(tx2.status)  # :failed
+IO.inspect(tx2.metadata[:error])  # "insufficient_funds"
+```
 
 ---
+
 ## Key Concepts
 
 ### 1. Rebinding Creates a New Binding, Not Mutation

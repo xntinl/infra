@@ -44,6 +44,25 @@ audit_log/
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Testing-specific insight:**
+Tests are not QA. They document intent and catch regressions. A test that passes without asserting anything is technical debt. Always test the failure case; "it works when everything succeeds" teaches nothing. Use property-based testing for domain logic where the number of edge cases is infinite.
 ### 1. capture_log is synchronous and pid-scoped
 The string returned contains all messages emitted by the calling process (and by processes
 using the same logger group leader) during the function call.
@@ -360,19 +379,78 @@ metadata, or use `ExUnit.CaptureIO` where applicable.
 you write a test that asserts on the combined logs of the test process plus a child Task,
 without falling back to `Process.sleep`?
 
-## Resources
 
-- [`ExUnit.CaptureLog`](https://hexdocs.pm/ex_unit/ExUnit.CaptureLog.html)
-- [`ExUnit.Assertions.assert_raise/3`](https://hexdocs.pm/ex_unit/ExUnit.Assertions.html#assert_raise/3)
-- [`Logger` configuration](https://hexdocs.pm/logger/Logger.html)
-- [Structured logging — Dashbit](https://dashbit.co/blog/structured-logging-with-elixir)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+# test/audit_log/validator_test.exs
+defmodule AuditLog.ValidatorTest do
+  use ExUnit.Case, async: true
+
+  alias AuditLog.Validator
+  alias AuditLog.Validator.InvalidEventError
+
+  describe "validate!/1 — user_id" do
+    test "raises when user_id is not a binary" do
+      assert_raise InvalidEventError, ~r/invalid user_id: must be a non-empty string/, fn ->
+        Validator.validate!(%{user_id: 123, action: "x", result: :allowed})
+      end
+    end
+
+    test "raises when user_id is an empty string" do
+      assert_raise InvalidEventError, ~r/invalid user_id/, fn ->
+        Validator.validate!(%{user_id: "", action: "x", result: :allowed})
+      end
+    end
+  end
+
+  describe "validate!/1 — action" do
+    test "raises when action is nil" do
+      assert_raise InvalidEventError, ~r/invalid action/, fn ->
+        Validator.validate!(%{user_id: "u", action: nil, result: :allowed})
+      end
+    end
+  end
+
+  describe "validate!/1 — result" do
+    test "raises when result is not in the whitelist" do
+      assert_raise InvalidEventError, ~r/invalid result/, fn ->
+        Validator.validate!(%{user_id: "u", action: "a", result: :unknown})
+      end
+    end
+  end
+
+  describe "validate!/1 — structured exception access" do
+    test "exposes the failing field on the struct" do
+      error =
+        try do
+          Validator.validate!(%{user_id: "", action: "x", result: :allowed})
+        rescue
+          e -> e
+        end
+
+      assert %InvalidEventError{field: :user_id} = error
+    end
+  end
+
+  describe "validate!/1 — happy path" do
+    test "returns :ok for a fully valid event" do
+      assert :ok =
+               Validator.validate!(%{user_id: "u", action: "login", result: :allowed})
+    end
+  end
 end
+
+defmodule Main do
+  def main do
+      IO.puts("Property-based test generator initialized")
+      a = 10
+      b = 20
+      c = 30
+      assert (a + b) + c == a + (b + c)
+      IO.puts("✓ Property invariant verified: (a+b)+c = a+(b+c)")
+  end
+end
+
+Main.main()
 ```

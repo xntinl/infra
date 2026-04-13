@@ -350,6 +350,136 @@ to avoid restarting A when only B crashes.
 
 - Con 20 children, ¿`:one_for_all` sigue siendo apropiado o es momento de romper en subtrees? Justificá con una métrica concreta.
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule OneForAllDemo.Writer do
+  @moduledoc """
+  Holds an opaque "session token" that Readers expect to be valid. If the
+  Writer dies, every Reader is holding an expired token — so the whole
+  group must reset together.
+  """
+
+  use GenServer
+
+  @spec start_link(keyword()) :: GenServer.on_start()
+  def start_link(_opts), do: GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
+
+  @spec token() :: reference()
+  def token, do: GenServer.call(__MODULE__, :token)
+
+  @spec crash() :: :ok
+  def crash, do: GenServer.cast(__MODULE__, :crash)
+
+  @impl true
+  def init(:ok), do: {:ok, make_ref()}
+
+  @impl true
+  def handle_call(:token, _from, ref), do: {:reply, ref, ref}
+
+  @impl true
+  def handle_cast(:crash, _ref), do: raise("writer blew up")
+end
+
+defmodule OneForAllDemo.Reader do
+  @moduledoc """
+  Caches the Writer's token at boot. If the Writer restarts without us,
+  the cached token is stale — which is exactly why this group uses
+  :one_for_all.
+  """
+
+  use GenServer
+
+  @spec start_link(keyword()) :: GenServer.on_start()
+  def start_link(opts) do
+    name = Keyword.fetch!(opts, :name)
+    GenServer.start_link(__MODULE__, :ok, name: name)
+  end
+
+  @spec cached_token(atom()) :: reference()
+  def cached_token(name), do: GenServer.call(name, :cached_token)
+
+  @impl true
+  def init(:ok) do
+    # Fetched ONCE at boot; treated as immutable for the process's lifetime.
+    {:ok, OneForAllDemo.Writer.token()}
+  end
+
+  @impl true
+  def handle_call(:cached_token, _from, ref), do: {:reply, ref, ref}
+end
+
+defmodule OneForAllDemo.Supervisor do
+  @moduledoc """
+  Supervisor with :one_for_all strategy. Writer and Readers form a tightly-coupled group:
+  all must be in sync. If any crashes, all restart together.
+  """
+
+  use Supervisor
+
+  @spec start_link(keyword()) :: Supervisor.on_start()
+  def start_link(opts \\ []) do
+    Supervisor.start_link(__MODULE__, :ok, opts)
+  end
+
+  @impl true
+  def init(:ok) do
+    children = [
+      OneForAllDemo.Writer,
+      Supervisor.child_spec({OneForAllDemo.Reader, [name: :r1]}, id: :r1),
+      Supervisor.child_spec({OneForAllDemo.Reader, [name: :r2]}, id: :r2)
+    ]
+
+    Supervisor.init(children, strategy: :one_for_all)
+  end
+end
+
+# Demonstrate :one_for_all strategy
+IO.puts("=== OneForAll Strategy Demo ===")
+
+{:ok, _sup} = OneForAllDemo.Supervisor.start_link()
+
+# Get initial token
+old_token = OneForAllDemo.Writer.token()
+assert OneForAllDemo.Reader.cached_token(:r1) == old_token
+assert OneForAllDemo.Reader.cached_token(:r2) == old_token
+IO.puts("Initial: Writer token cached in both readers")
+
+# Crash the Writer
+old_writer = Process.whereis(OneForAllDemo.Writer)
+ref_w = Process.monitor(old_writer)
+old_r1 = Process.whereis(:r1)
+old_r2 = Process.whereis(:r2)
+
+OneForAllDemo.Writer.crash()
+
+# All three must go down
+assert_receive {:DOWN, ^ref_w, :process, ^old_writer, _}, 500
+
+# Wait for restart
+Process.sleep(100)
+
+# Verify all restarted
+new_token = OneForAllDemo.Writer.token()
+refute new_token == old_token
+
+assert OneForAllDemo.Reader.cached_token(:r1) == new_token
+assert OneForAllDemo.Reader.cached_token(:r2) == new_token
+
+# Verify new pids (all restarted)
+new_writer = Process.whereis(OneForAllDemo.Writer)
+assert new_writer != old_writer
+
+IO.puts("After Writer crash:")
+IO.puts("  Writer restarted with new token")
+IO.puts("  Both readers restarted and cached the new token")
+IO.puts("  Group is consistent again")
+IO.puts("All :one_for_all assertions passed!")
+```
+
+
 ## Resources
 
 - [`Supervisor` strategies — `:one_for_all`](https://hexdocs.pm/elixir/Supervisor.html#module-strategies)

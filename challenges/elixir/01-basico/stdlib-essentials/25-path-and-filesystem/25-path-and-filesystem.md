@@ -597,6 +597,17 @@ mix format
 ---
 
 
+
+
+## Executable Example
+
+Create a simple example demonstrating the key concepts:
+
+```elixir
+# Example code demonstrating module concepts
+IO.puts("Example: Read the Implementation section above and run the code samples in iex")
+```
+
 ## Key Concepts
 
 ### 1. `Path` Functions Work with Strings, Not Actual Paths

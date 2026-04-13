@@ -322,6 +322,127 @@ process-level stability, not domain-level retry logic.
 
 - ¿Preferís fallar rápido con `max_restarts: 1` o ser tolerante con `max_restarts: 100`? Definí en qué subtree se aplica cada uno.
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule RestartIntensityDemo.FlakyWorker do
+  @moduledoc """
+  A worker that can be made to crash on demand, to demonstrate restart intensity.
+  """
+
+  use GenServer
+
+  @spec start_link(keyword()) :: GenServer.on_start()
+  def start_link(opts) do
+    name = Keyword.fetch!(opts, :name)
+    GenServer.start_link(__MODULE__, :ok, name: name)
+  end
+
+  @spec crash(atom()) :: :ok
+  def crash(name), do: GenServer.cast(name, :crash)
+
+  @impl true
+  def init(:ok), do: {:ok, :ok}
+
+  @impl true
+  def handle_cast(:crash, _state), do: raise("worker crashed")
+end
+
+defmodule RestartIntensityDemo.Supervisor do
+  @moduledoc """
+  Supervisor with configurable restart intensity. Demonstrates how max_restarts
+  and max_seconds protect against restart loops.
+  """
+
+  use Supervisor
+
+  @spec start_link(keyword()) :: Supervisor.on_start()
+  def start_link(opts) do
+    max_restarts = Keyword.get(opts, :max_restarts, 3)
+    max_seconds = Keyword.get(opts, :max_seconds, 5)
+    Supervisor.start_link(__MODULE__, {max_restarts, max_seconds}, opts)
+  end
+
+  @impl true
+  def init({max_restarts, max_seconds}) do
+    children = [
+      {RestartIntensityDemo.FlakyWorker, [name: :flaky]}
+    ]
+
+    Supervisor.init(children,
+      strategy: :one_for_one,
+      max_restarts: max_restarts,
+      max_seconds: max_seconds
+    )
+  end
+end
+
+# Demonstrate restart intensity
+IO.puts("=== Restart Intensity Demo ===")
+
+# Start supervisor with permissive budget
+{:ok, sup} = RestartIntensityDemo.Supervisor.start_link(max_restarts: 5, max_seconds: 5)
+
+# Get initial worker
+old_pid = Process.whereis(:flaky)
+assert is_pid(old_pid)
+
+IO.puts("Supervisor started with permissive budget (5 restarts in 5 seconds)")
+IO.puts("Initial worker PID: #{inspect(old_pid)}")
+
+# Cause one crash — within budget, so supervisor keeps running
+ref = Process.monitor(old_pid)
+RestartIntensityDemo.FlakyWorker.crash(:flaky)
+assert_receive {:DOWN, ^ref, :process, ^old_pid, _}, 500
+
+Process.sleep(50)
+
+# Worker restarted, supervisor still alive
+new_pid = Process.whereis(:flaky)
+assert new_pid != nil
+assert new_pid != old_pid
+assert Process.alive?(sup)
+
+IO.puts("After first crash: worker restarted (within budget)")
+IO.puts("New worker PID: #{inspect(new_pid)}")
+IO.puts("Supervisor still running: #{Process.alive?(sup)}")
+
+# Now demonstrate exceeding the budget
+IO.puts("\nStarting new supervisor with strict budget (1 restart in 2 seconds)...")
+{:ok, strict_sup} = RestartIntensityDemo.Supervisor.start_link(max_restarts: 1, max_seconds: 2)
+ref_sup = Process.monitor(strict_sup)
+
+# First crash is OK
+pid1 = Process.whereis(:flaky)
+ref1 = Process.monitor(pid1)
+RestartIntensityDemo.FlakyWorker.crash(:flaky)
+assert_receive {:DOWN, ^ref1, :process, ^pid1, _}, 500
+
+Process.sleep(50)
+
+# Second crash within the window — this blows the budget
+pid2 = Process.whereis(:flaky)
+ref2 = Process.monitor(pid2)
+RestartIntensityDemo.FlakyWorker.crash(:flaky)
+assert_receive {:DOWN, ^ref2, :process, ^pid2, _}, 500
+
+# Supervisor should die from intensity exhaustion
+result =
+  receive do
+    {:DOWN, ^ref_sup, :process, ^strict_sup, _reason} ->
+      true
+  after
+    1000 -> false
+  end
+
+assert result == true
+IO.puts("Supervisor crashed from exceeding restart intensity (as expected)")
+IO.puts("All restart intensity assertions passed!")
+```
+
+
 ## Resources
 
 - [`Supervisor.init/2` — `:max_restarts`/`:max_seconds`](https://hexdocs.pm/elixir/Supervisor.html#init/2)

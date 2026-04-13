@@ -375,6 +375,45 @@ is pointless.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule NamingCompared do
+    @moduledoc """
+    Helpers to start the same counter via three naming strategies.
+    """
+
+    alias NamingCompared.Counter
+
+    @doc "Atom name — `Process.register/2` under the hood."
+    def start_atom(name) when is_atom(name) do
+      Counter.start_link(name: name)
+    end
+
+    @doc ":global name — cluster-wide synchronized table."
+    def start_global(name) do
+      Counter.start_link(name: {:global, name})
+    end
+
+    @doc "Registry + via tuple — local, dynamic, atom-safe."
+    def start_via(key) do
+      Counter.start_link(name: {:via, Registry, {NamingCompared.Registry, key}})
+    end
+  end
+
+  def main do
+    IO.puts("NamingCompared OK")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`:global` — Erlang/OTP docs](https://www.erlang.org/doc/man/global.html)

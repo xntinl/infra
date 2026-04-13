@@ -46,6 +46,22 @@ on crash.
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. `Port.open({:spawn_executable, ...}, [{:packet, 4}, :binary])`
 
 - `:packet, 4` — framing: 4-byte big-endian length prefix on every packet.
@@ -428,9 +444,51 @@ ml_inference) or should it be "free-first" (next available worker takes the requ
 Reason about the mailbox-vs-checkout trade-off when the subprocesses have non-uniform
 response times.
 
-## Resources
+## Executable Example
 
-- [`Port` packet protocols — Erlang erts](https://www.erlang.org/doc/man/erlang.html#open_port-2)
-- [Jason — Elixir JSON library](https://hexdocs.pm/jason/)
-- [Node.js process.stdin](https://nodejs.org/api/process.html#process_process_stdin)
-- [`renderToString` — React docs](https://react.dev/reference/react-dom/server/renderToString)
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+
+defmodule FrontendRender.MixProject do
+  end
+  use Mix.Project
+
+  def project do
+    [
+      app: :frontend_render,
+      version: "0.1.0",
+      elixir: "~> 1.17",
+      deps: [
+        {:jason, "~> 1.4"}
+      ]
+    ]
+  end
+
+  def application,
+    do: [extra_applications: [:logger], mod: {FrontendRender.Application, []}]
+end
+
+
+### Step 2: Elixir port wrapper (`lib/frontend_render/node_port.ex`)
+
+**Objective**: Correlate async requests so N concurrent callers get parallel Node.js execution without blocking.
+
+
+
+### Step 3: Supervision
+
+**Objective**: Boot Node.js interpreter so RPC framework is ready at startup.
+
+defmodule Main do
+  def main do
+      # Demonstrating 328-port-nodejs-json-framing
+      :ok
+  end
+end
+
+Main.main()
+```

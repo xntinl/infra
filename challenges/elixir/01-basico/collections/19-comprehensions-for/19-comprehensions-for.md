@@ -559,6 +559,77 @@ not warn you. Always sanity-check the product of generator sizes or use
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule GridCombo.CatalogTest do
+  use ExUnit.Case, async: true
+
+  alias GridCombo.Catalog
+
+  describe "all_variants/0" do
+    test "produces a cartesian product filtered by business rules" do
+      variants = Catalog.all_variants()
+
+      # 4 colors × 4 sizes × 3 styles = 48 raw combinations.
+      # Polo excludes sizes S and XL: removes 4 colors × 2 sizes = 8.
+      # Polo excludes white: but white polo rows were already removed above
+      # for sizes S and XL. Still need to remove white × {M, L} × polo = 2 more.
+      # Total: 48 - 8 - 2 = 38.
+      assert length(variants) == 38
+    end
+
+    test "no white polo variant exists" do
+      variants = Catalog.all_variants()
+      refute Enum.any?(variants, fn v -> v == {:white, :m, :polo} end)
+      refute Enum.any?(variants, fn v -> v == {:white, :l, :polo} end)
+    end
+
+    test "polo is only available in M and L" do
+      polo_sizes =
+        Catalog.all_variants()
+        |> Enum.filter(fn {_c, _s, style} -> style == :polo end)
+        |> Enum.map(fn {_c, size, _s} -> size end)
+        |> Enum.uniq()
+        |> Enum.sort()
+
+      assert polo_sizes == [:l, :m]
+    end
+
+    test "crew and vneck are available in all sizes and colors" do
+      crew_count =
+        Enum.count(Catalog.all_variants(), fn {_c, _s, style} -> style == :crew end)
+
+      # 4 colors × 4 sizes = 16
+      assert crew_count == 16
+    end
+  end
+
+  describe "by_style/0" do
+    test "returns a map keyed by style" do
+      grouped = Catalog.by_style()
+
+      assert Map.keys(grouped) |> Enum.sort() == [:crew, :polo, :vneck]
+    end
+
+    test "polo group has the expected count (3 colors × 2 sizes)" do
+      %{polo: polos} = Catalog.by_style()
+      assert length(polos) == 6
+    end
+  end
+
+  describe "available_colors/0" do
+    test "returns each color once even though many variants share it" do
+      colors = Catalog.available_colors()
+      assert Enum.sort(colors) == [:black, :blue, :red, :white]
+      assert length(colors) == length(Enum.uniq(colors))
+    end
+  end
+end
+```
+
 ## Resources
 
 - [Comprehensions — Elixir Getting Started](https://hexdocs.pm/elixir/comprehensions.html)

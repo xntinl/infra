@@ -47,6 +47,25 @@ reply_async_gs/
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**OTP-specific insight:**
+The OTP framework enforces a discipline: supervision trees, callback modules, and standard return values. This structure is not a constraint — it's the contract that allows Erlang's release handler, hot code upgrades, and clustering to work. Every deviation from the pattern you'll pay for later in production debuggability and operational tooling.
 ### 1. The `from` tuple is a first-class value
 
 `handle_call/3` receives `from` as its second argument. It is a tuple
@@ -485,12 +504,144 @@ Target: throughput under N concurrent I/O-bound callers ≈ N × synchronous thr
 
 ---
 
-## Resources
+## Executable Example
 
-- [`GenServer.reply/2` — HexDocs](https://hexdocs.pm/elixir/GenServer.html#reply/2)
-- [`Task.Supervisor.async_nolink/3` — HexDocs](https://hexdocs.pm/elixir/Task.Supervisor.html#async_nolink/3)
-- [José Valim — "Todo List in Elixir: Long running processes"](https://elixir-lang.org/blog/)
-- [Saša Jurić — *Elixir in Action*, 2e, §7.4 "Stopping the server"](https://www.manning.com/books/elixir-in-action-second-edition)
-- [Finch source: pool checkout uses deferred reply](https://github.com/sneako/finch)
-- [Oban source: `Oban.Pro.Worker.handle_call` returns `:noreply`](https://github.com/oban-bg/oban)
-- [Fred Hebert — *Learn You Some Erlang*, "What is OTP?"](https://learnyousomeerlang.com/what-is-otp)
+```elixir
+defmodule ReplyAsyncGs.MixProject do
+  use Mix.Project
+  def project, do: [app: :reply_async_gs, version: "0.1.0", elixir: "~> 1.16", deps: []]
+  def application, do: [extra_applications: [:logger], mod: {ReplyAsyncGs.Application, []}]
+end
+
+
+defmodule ReplyAsyncGs.Application do
+  @moduledoc false
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    children = [
+      {Task.Supervisor, name: ReplyAsyncGs.TaskSup},
+      ReplyAsyncGs.AuthBroker
+    ]
+
+    Supervisor.start_link(children, strategy: :one_for_one, name: ReplyAsyncGs.Sup)
+  end
+end
+
+
+defmodule ReplyAsyncGs.FakePartner do
+  @moduledoc """
+  Stub of the partner HTTP endpoint. Sleeps `latency_ms` then returns a result.
+  """
+
+  @spec authenticate(String.t(), non_neg_integer()) :: {:ok, map()} | {:error, atom()}
+  def authenticate(token, latency_ms) do
+    Process.sleep(latency_ms)
+
+    case token do
+      "bad_token" -> {:error, :unauthorized}
+      "boom"      -> raise "partner crashed"
+      _           -> {:ok, %{user_id: "u_" <> Integer.to_string(:erlang.phash2(token))}}
+    end
+  end
+end
+
+
+defmodule ReplyAsyncGs.AuthBroker do
+  @moduledoc """
+  GenServer that fronts partner SSO validation.
+
+  `authenticate/2` looks synchronous to the caller but internally the
+  server returns `{:noreply, state}` and offloads the slow HTTP call to a
+  task. The caller is eventually replied to via `GenServer.reply/2`.
+  """
+
+  use GenServer
+  require Logger
+
+  @type state :: %{
+          pending: %{reference() => GenServer.from()},
+          partner_latency_ms: non_neg_integer()
+        }
+
+  # --- public API -----------------------------------------------------------
+
+  def start_link(opts \ []) do
+    GenServer.start_link(__MODULE__, opts, Keyword.put_new(opts, :name, __MODULE__))
+  end
+
+  @spec authenticate(GenServer.server(), String.t(), timeout()) ::
+          {:ok, map()} | {:error, term()}
+  def authenticate(server \ __MODULE__, token, timeout \ 5_000) do
+    GenServer.call(server, {:authenticate, token}, timeout)
+  end
+
+  # --- GenServer ------------------------------------------------------------
+
+  @impl true
+  def init(opts) do
+    {:ok,
+     %{
+       pending: %{},
+       partner_latency_ms: Keyword.get(opts, :partner_latency_ms, 100)
+     }}
+  end
+
+  @impl true
+  def handle_call({:authenticate, token}, from, state) do
+    %Task{ref: ref} =
+      Task.Supervisor.async_nolink(ReplyAsyncGs.TaskSup, fn ->
+        ReplyAsyncGs.FakePartner.authenticate(token, state.partner_latency_ms)
+      end)
+
+    {:noreply, %{state | pending: Map.put(state.pending, ref, from)}}
+  end
+
+  @impl true
+  def handle_info({ref, result}, state) when is_reference(ref) do
+    # The task succeeded; tell the original caller.
+    case Map.pop(state.pending, ref) do
+      {nil, _} ->
+        # Unknown ref — most likely a late reply after caller already timed out.
+        {:noreply, state}
+
+      {from, rest} ->
+        GenServer.reply(from, result)
+        # We no longer need the task's DOWN signal.
+        Process.demonitor(ref, [:flush])
+        {:noreply, %{state | pending: rest}}
+    end
+  end
+
+  @impl true
+  def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
+    # Task crashed. Reply with an error instead of leaving the caller hanging.
+    case Map.pop(state.pending, ref) do
+      {nil, _} ->
+        {:noreply, state}
+
+      {from, rest} ->
+        Logger.warning("auth task crashed: #{inspect(reason)}")
+        GenServer.reply(from, {:error, {:task_crash, reason}})
+        {:noreply, %{state | pending: rest}}
+    end
+  end
+end
+
+
+defmodule ReplyAsyncGs.AuthBrokerTest do
+  use ExUnit.Case, async: false
+
+  alias ReplyAsyncGs.AuthBroker
+  end
+end
+
+defmodule Main do
+  def main do
+      :ok
+  end
+end
+
+Main.main()
+```

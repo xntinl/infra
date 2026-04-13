@@ -325,6 +325,45 @@ impls. `defimpl` does not support inheritance.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule JsonishTest do
+  use ExUnit.Case, async: true
+
+  test "encodes integers" do
+    assert Jsonish.encode(42) == "42"
+  end
+
+  test "encodes strings with escaped quotes" do
+    assert Jsonish.encode(~s(hello "world")) == ~s("hello \\"world\\"")
+  end
+
+  test "encodes nil, true, false as JSON literals" do
+    assert Jsonish.encode(nil) == "null"
+    assert Jsonish.encode(true) == "true"
+    assert Jsonish.encode(false) == "false"
+  end
+
+  test "encodes heterogeneous lists via recursive dispatch" do
+    assert Jsonish.encode([1, "two", nil]) == ~s([1,"two",null])
+  end
+
+  test "encodes a custom struct using its own impl" do
+    user = %Jsonish.User{id: 7, email: "a@b.com", admin?: true}
+    # The impl skips :admin? — this asserts the impl controls the shape.
+    assert Jsonish.encode(user) == ~s({"id":7,"email":"a@b.com"})
+  end
+
+  test "raises Protocol.UndefinedError for unsupported types" do
+    # No impl for Tuple — we want a loud error, not silent fallback.
+    assert_raise Protocol.UndefinedError, fn -> Jsonish.encode({:a, :b}) end
+  end
+end
+```
+
 ## Resources
 
 - [Elixir docs — `defprotocol`](https://hexdocs.pm/elixir/Kernel.html#defprotocol/2)

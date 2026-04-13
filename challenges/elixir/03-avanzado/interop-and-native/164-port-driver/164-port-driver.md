@@ -46,6 +46,22 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. The three mechanisms at a glance
 
 ```
@@ -444,11 +460,48 @@ via Port:        ~3 000 µs (3 ms — fork+exec dominates)
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
 
-- https://www.erlang.org/doc/man/erl_driver.html — Port Driver C API
-- https://www.erlang.org/doc/tutorial/c_portdriver.html — Port Driver tutorial
-- https://www.erlang.org/doc/man/erl_nif.html — NIF C API
-- https://www.erlang.org/doc/design_principles/erl_interface.html — `ei` vs `enif`
-- https://ferd.ca/a-guide-to-tracing-in-elixir.html — internals perspective
-- https://github.com/erlang/otp/tree/master/erts/emulator/drivers — real OTP driver source
+## Executable Example
+
+```elixir
+defmodule PortDriverDemo.ViaDriver do
+  @moduledoc "Uppercase via linked-in port driver."
+
+  @priv_path Path.expand("../../priv", __DIR__)
+
+  @spec upcase(binary()) :: binary()
+  def upcase(data) when is_binary(data) do
+    :ok = ensure_loaded()
+    port = Port.open({:spawn_driver, ~c"upcase_drv"}, [:binary])
+    Port.command(port, data)
+
+    result =
+      receive do
+        {^port, {:data, d}} -> d
+      after
+        1_000 -> raise "driver timeout"
+      end
+
+    Port.close(port)
+    result
+  end
+
+  defp ensure_loaded do
+    case :erl_ddll.load_driver(String.to_charlist(@priv_path), ~c"upcase_drv") do
+      :ok -> :ok
+      {:error, :already_loaded} -> :ok
+      {:error, reason} -> raise "driver load: #{inspect(reason)}"
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+    IO.puts("✓ Port Drivers vs Ports — When C Meets BEAM Without a Pipe")
+  - Port drivers vs ports
+    - C interop patterns
+  end
+end
+
+Main.main()
+```

@@ -39,6 +39,22 @@ Sharding gives you **N times the bucket count** (N × internal stripes), plus is
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Shard count heuristic
 
 A common default: `N = schedulers_online()` — one shard per scheduler. Going higher gives diminishing returns. Powers of two (16, 32, 64) also avoid modulo bias issues if you ever switch hash functions. For pure write-throughput, N = schedulers_online() works well; for mixed read-aggregate workloads you may want fewer shards (fewer lookups during aggregation).
@@ -383,10 +399,49 @@ ETS tables are in-memory, non-distributed key-value stores with tunable semantic
 
 Your benchmark shows the sharded version is 2.5× faster at 16 schedulers but only 1.2× faster at 4 schedulers. Why? Plot the expected cross-over point (schedulers where sharding starts to pay for itself) and relate it to the ETS internal stripe count. How would you verify this empirically on your production hardware before committing to the design?
 
-## Resources
+## Executable Example
 
-- [`:ets` — `write_concurrency` and lock striping](https://www.erlang.org/doc/man/ets.html)
-- [`:counters` module](https://www.erlang.org/doc/man/counters.html)
-- [OTP 23 ETS improvements — `decentralized_counters`](https://www.erlang.org/blog/otp-23-highlights/)
-- [`:erlang.phash2/2`](https://www.erlang.org/doc/man/erlang.html#phash2-2)
-- [Concurrent ETS patterns — Saša Jurić](https://www.erlang-solutions.com/blog/)
+```elixir
+defmodule WriteHeavyCounter.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :write_heavy_counter, version: "0.1.0", elixir: "~> 1.16", deps: deps()]
+  end
+
+  def application do
+    [extra_applications: [:logger], mod: {WriteHeavyCounter.Application, []}]
+  end
+
+  defp deps do
+    [{:benchee, "~> 1.3", only: :dev}]
+  end
+end
+
+
+
+### Step 1: The sharder
+
+**Objective**: Create one `:write_concurrency` ETS table per scheduler and publish the tuple via `:persistent_term` for lock-free routing.
+
+
+
+### Step 2: The counter API
+
+**Objective**: Drive increments via `update_counter/4` with a default tuple so hot keys never bounce through a GenServer.
+
+
+
+### Step 3: Application
+
+**Objective**: Supervise the Sharder so a crash rebuilds all shard tables before any writer observes a stale `:persistent_term` tuple.
+
+defmodule Main do
+  def main do
+      # Demonstrating 379-ets-shard-pattern
+      :ok
+  end
+end
+
+Main.main()
+```

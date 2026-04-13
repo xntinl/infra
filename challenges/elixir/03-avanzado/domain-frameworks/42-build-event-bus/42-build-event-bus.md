@@ -61,6 +61,22 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Why `Registry` and not a GenServer map
 
 A naive bus holds `%{topic => [pid]}` in GenServer state. Every publish becomes a
@@ -674,21 +690,69 @@ the same Registry primitive.
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
-
-- [Registry module — hexdocs.pm](https://hexdocs.pm/elixir/Registry.html)
-- [Phoenix.PubSub source on GitHub](https://github.com/phoenixframework/phoenix_pubsub)
-- [José Valim — A tour of the Elixir Registry](http://blog.plataformatec.com.br/2017/07/a-tour-of-the-elixir-registry/)
-- [Broadway back-pressure design — dashbit.co/blog](https://dashbit.co/blog/introducing-broadway)
-- [`:telemetry` conventions — hexdocs.pm](https://hexdocs.pm/telemetry/readme.html)
-- [Saša Jurić — "To spawn, or not to spawn?"](https://www.theerlangelist.com/article/spawn_or_not)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+Add in `mix.exs`:
+
+
+
+
+### Step 2: `lib/event_bus/application.ex`
+
+**Objective**: Start partitioned Registry with duplicate keys, DynamicSupervisor for subscribers, Outbox and Telemetry under supervision.
+
+
+
+
+### Step 3: `lib/event_bus/bus.ex`
+
+**Objective**: Expose a non-blocking publish API with wildcard topic matching — `Registry.dispatch/3` fans out per-subscriber without blocking the caller.
+
+
+
+
+### Step 4: `lib/event_bus/subscriber.ex`
+
+**Objective**: Wrap user handlers in a supervised GenServer — crashes stay contained; `{:error, _}` leaves the envelope in the outbox for redelivery.
+
+
+
+
+### Step 5: `lib/event_bus/outbox.ex`
+
+**Objective**: Back per-subscriber buffers with ETS plus a periodic sweep — at-least-once-local delivery without touching disk.
+
+
+
+
+### Step 6: `lib/event_bus/telemetry.ex`
+
+**Objective**: Attach a logger to publish, lag, exception, and sweep events — observability is wired at the bus boundary, not sprinkled inside handlers.
+
+
+
+
+### Step 7: Tests
+
+**Objective**: Exercise publish, wildcard matching, and at-least-once redelivery — three seams that together prove the bus composes correctly.
+
+
+
+
+
+
+
+
+
+
+### Step 8: Run it
+
+defmodule Main do
+  def main do
+      :ok
+  end
 end
+
+Main.main()
 ```

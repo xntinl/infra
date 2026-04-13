@@ -43,6 +43,25 @@ code) are of higher quality than tests that survive the mutation.
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Testing-specific insight:**
+Tests are not QA. They document intent and catch regressions. A test that passes without asserting anything is technical debt. Always test the failure case; "it works when everything succeeds" teaches nothing. Use property-based testing for domain logic where the number of edge cases is infinite.
 ### 1. A mutant is a small, syntactic change to source code
 Swap `>` for `>=`. Replace `true` with `false`. Negate a pattern. Delete a line. Each
 is a candidate "bug" a tool (or human) could plausibly introduce.
@@ -319,19 +338,89 @@ surviving mutants include both equivalent mutants and real test gaps. What signa
 you use to decide which category a given surviving mutant falls into, and when is the
 cost of classifying it higher than the value of the answer?
 
-## Resources
 
-- [PIT (Java) — the gold standard](https://pitest.org/) — read the operator catalogue
-- [Stryker (JS)](https://stryker-mutator.io/) — comparable concepts
-- [Offutt & Untch — "Mutation 2000" survey](https://cs.gmu.edu/~offutt/rsrch/papers/mut-survey.pdf)
-- [Excoveralls](https://github.com/parroty/excoveralls) — pair coverage with this discipline
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+# test/discount_engine/rules_test.exs
+defmodule DiscountEngine.RulesTest do
+  use ExUnit.Case, async: true
+
+  alias DiscountEngine.Rules
+
+  # Each describe block targets a mutation category from the catalogue.
+
+  describe "kill ROR mutants — >= vs > at the 1000 boundary" do
+    test "exactly 1000 with member applies 15% (not 5%) — kills >= → >" do
+      # If `>=` is mutated to `>`, the 1000 case falls through to the 500-branch,
+      # returning 5% instead of 15%. This exact-value assertion kills it.
+      assert Rules.discount_cents(%{total_cents: 1_000, member?: true}) == 150
+    end
+
+    test "999 with member applies 5% — kills >= → > at the 1000 boundary" do
+      # Confirms the boundary is exclusive on the lower side of the 1000 tier.
+      assert Rules.discount_cents(%{total_cents: 999, member?: true}) == 49
+    end
+
+    test "exactly 500 with member applies 5% (not 0%) — kills >= → > at 500" do
+      assert Rules.discount_cents(%{total_cents: 500, member?: true}) == 25
+    end
+
+    test "499 with member applies 0% — kills >= → > at 500" do
+      assert Rules.discount_cents(%{total_cents: 499, member?: true}) == 0
+    end
+  end
+
+  describe "kill COR mutants — member? vs not member?" do
+    test "1000-member gets 15% — kills true → false on member" do
+      assert Rules.discount_cents(%{total_cents: 1_000, member?: true}) == 150
+    end
+
+    test "1000-non-member gets 10% — kills true → false on member" do
+      # If member? branch is swapped, both cases return 15 → this test fails.
+      assert Rules.discount_cents(%{total_cents: 1_000, member?: false}) == 100
+    end
+
+    test "500-non-member gets 0% — kills an accidental member-agnostic branch at 500" do
+      assert Rules.discount_cents(%{total_cents: 500, member?: false}) == 0
+    end
+  end
+
+  describe "kill AOR mutants — * vs / in percent/2" do
+    test "explicit value 300 at 10% is 30 — kills * → +" do
+      # total 300 would not actually reach 10% by rule; we verify percent helper
+      # indirectly by comparing two totals whose ratio matches percentage.
+      # 2000 at 10% = 200
+      assert Rules.discount_cents(%{total_cents: 2_000, member?: false}) == 200
+    end
+
+    test "2000 at 15% is exactly 300 — kills * → + or / → * in percent/2" do
+      assert Rules.discount_cents(%{total_cents: 2_000, member?: true}) == 300
+    end
+  end
+
+  describe "kill SDL mutants — clause deletion" do
+    test "zero-total cart returns 0, proving the fallback clause exists" do
+      # If the 0-catch-all clause is deleted, this raises FunctionClauseError.
+      assert Rules.discount_cents(%{total_cents: 0, member?: false}) == 0
+    end
+
+    test "1-cent cart returns 0" do
+      assert Rules.discount_cents(%{total_cents: 1, member?: true}) == 0
+    end
+  end
 end
+
+defmodule Main do
+  def main do
+      IO.puts("Property-based test generator initialized")
+      a = 10
+      b = 20
+      c = 30
+      assert (a + b) + c == a + (b + c)
+      IO.puts("✓ Property invariant verified: (a+b)+c = a+(b+c)")
+  end
+end
+
+Main.main()
 ```

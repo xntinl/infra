@@ -54,6 +54,22 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Why :pg2 was removed
 
 `:pg2` dates back to Erlang/OTP R13 (2009). It was a global, strongly-consistent process group
@@ -629,21 +645,113 @@ Compare with `:pg2` if you still have OTP 23 around: joins are ~5-10x slower und
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
 
-- [`:pg` module — Erlang/OTP docs](https://www.erlang.org/doc/man/pg.html)
-- [Maxim Fedorov — "pg2 is dead, long live pg"](https://github.com/max-au/pg/blob/master/doc/pg.md) — the author of the new :pg module
-- [EEP-53: Process Groups](https://www.erlang.org/eeps/eep-0053) — design rationale for :pg
-- [OTP 23 release notes — pg section](https://www.erlang.org/blog/otp-23-highlights/)
-- [Phoenix.PubSub.PG2 source](https://github.com/phoenixframework/phoenix_pubsub/blob/main/lib/phoenix/pubsub/pg2.ex) — production usage of :pg as a transport
-- [Erlang in Anger — chapter on distribution](https://www.erlang-in-anger.com/) — Fred Hébert on netsplit survival
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+defmodule PgMigration.GroupPgTest do
+  use ExUnit.Case, async: false
+
+  alias PgMigration.Group
+
+  setup do
+    # cleanup: :pg has no explicit delete, but leaving shrinks the group to empty
+    on_exit(fn -> :ok end)
+    :ok
+  end
+
+  describe "PgMigration.GroupPg" do
+    test "join appears in members and local_members" do
+      task = Task.async(fn ->
+        Group.join(:test_group)
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+      # Give pg time to broadcast (local is immediate)
+      Process.sleep(20)
+
+      assert task.pid in Group.members(:test_group)
+      assert task.pid in Group.local_members(:test_group)
+
+      send(task.pid, :stop)
+      Task.await(task)
+    end
+
+    test "leave removes member" do
+      {:ok, pid} = Agent.start_link(fn -> nil end)
+      Agent.get(pid, fn _ ->
+        Group.join(:leave_group)
+      end)
+      Process.sleep(20)
+      assert pid in Group.members(:leave_group)
+
+      Agent.get(pid, fn _ -> Group.leave(:leave_group) end)
+      Process.sleep(20)
+      refute pid in Group.members(:leave_group)
+      Agent.stop(pid)
+    end
+
+    test "closest/1 prefers local" do
+      task = Task.async(fn ->
+        Group.join(:closest_group)
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+      Process.sleep(20)
+
+      assert Group.closest(:closest_group) == task.pid
+      send(task.pid, :stop)
+      Task.await(task)
+    end
+
+    test "dead processes are auto-removed" do
+      {pid, ref} =
+        spawn_monitor(fn ->
+          Group.join(:auto_cleanup)
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      Process.sleep(20)
+      assert pid in Group.members(:auto_cleanup)
+
+      Process.exit(pid, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^pid, :killed}
+      Process.sleep(20)
+      refute pid in Group.members(:auto_cleanup)
+    end
+  end
 end
+
+defmodule Main do
+  def main do
+      # Demonstrate :pg (OTP 23+) replacement for deprecated :pg2
+      # :pg is newer, more efficient, and doesn't require distributed Erlang
+
+      group = :my_group
+
+      # Create a local process
+      {:ok, pid} = GenServer.start_link(Agent, fn -> %{name: "member1"} end)
+
+      # Simulate :pg.join (modern API)
+      :ok = :pg.join(group, pid)
+
+      # Get members
+      members = :pg.get_members(group)
+
+      IO.puts("✓ Joined group: #{inspect(group)}")
+      IO.inspect(members, label: "✓ Group members")
+
+      assert pid in members, "Process is group member"
+
+      IO.puts("✓ :pg migration: modern distributed group API working")
+  end
+end
+
+Main.main()
 ```

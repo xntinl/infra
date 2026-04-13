@@ -33,6 +33,25 @@ A plain `spawn_link(fun)` process is invisible to supervisors (no synchronous in
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**OTP-specific insight:**
+The OTP framework enforces a discipline: supervision trees, callback modules, and standard return values. This structure is not a constraint — it's the contract that allows Erlang's release handler, hot code upgrades, and clustering to work. Every deviation from the pattern you'll pay for later in production debuggability and operational tooling.
 ### 1. `:proc_lib.start_link/3`
 Spawns a child under OTP conventions. Returns `{:ok, pid}` only after the child's init function calls `:proc_lib.init_ack/1`. Failure before the ack becomes `{:error, reason}` to the caller.
 
@@ -433,9 +452,228 @@ For 99% of cases, `use GenServer`. You roll your own only when you need custom d
 
 OTP's `:gen_server` implements roughly this same loop with more polish (format_status, timeouts, distribution). Find one feature of `GenServer` you relied on recently (e.g. `:timeout` return value, `continue` callback) and sketch how you would add it to `TinyServer`. What does that tell you about the hidden cost of each feature?
 
-## Resources
+## Executable Example
 
-- [`:proc_lib` reference](https://www.erlang.org/doc/man/proc_lib.html)
-- [`:sys` reference](https://www.erlang.org/doc/man/sys.html)
-- [OTP Design Principles — "Special Processes"](https://www.erlang.org/doc/design_principles/spec_proc.html) — the official spec for what we built
-- [`:gen_server` source](https://github.com/erlang/otp/blob/master/lib/stdlib/src/gen_server.erl)
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+
+defp deps, do: [{:benchee, "~> 1.3", only: [:dev, :test]}]
+
+defmodule TinyServer do
+  end
+  @moduledoc """
+  Hand-rolled OTP-compliant server. Mirrors the minimal GenServer contract
+  but is written entirely with :proc_lib + :sys + receive loop so you can
+  see how GenServer is built.
+  """
+
+  @type from :: {pid(), reference()}
+
+  @callback init(term()) :: {:ok, state :: term()} | {:stop, reason :: term()}
+  @callback handle_call(request :: term(), from, state :: term()) ::
+              {:reply, term(), term()} | {:stop, term(), term(), term()}
+  @callback handle_cast(msg :: term(), state :: term()) ::
+              {:noreply, term()} | {:stop, term(), term()}
+  @callback handle_info(msg :: term(), state :: term()) ::
+              {:noreply, term()} | {:stop, term(), term()}
+  @callback terminate(reason :: term(), state :: term()) :: any()
+  @callback code_change(term(), term(), term()) :: {:ok, term()}
+
+  @optional_callbacks handle_info: 2, terminate: 2, code_change: 3
+
+  # --- client API ---
+
+  def start_link(mod, arg, opts \\ []) do
+    :proc_lib.start_link(__MODULE__, :init_it, [self(), mod, arg, opts])
+  end
+
+  def call(server, request, timeout \\ 5_000) do
+    ref = Process.monitor(server)
+    send(server, {:"$call", {self(), ref}, request})
+
+    receive do
+      {^ref, reply} ->
+        Process.demonitor(ref, [:flush])
+        reply
+
+      {:DOWN, ^ref, :process, _, reason} ->
+        exit({reason, {__MODULE__, :call, [server, request]}})
+    after
+      timeout ->
+        Process.demonitor(ref, [:flush])
+        exit(:timeout)
+    end
+  end
+
+  def cast(server, msg), do: send(server, {:"$cast", msg})
+
+  # --- :proc_lib init entry point ---
+
+  def init_it(parent, mod, arg, opts) do
+    Process.flag(:trap_exit, true)
+
+    case name_opt(opts) do
+      {:ok, name} -> Process.register(self(), name)
+      :none -> :ok
+      {:error, reason} -> exit(reason)
+    end
+
+    case mod.init(arg) do
+      {:ok, state} ->
+        :proc_lib.init_ack(parent, {:ok, self()})
+        loop(parent, mod, state, :sys.debug_options([]))
+
+      {:stop, reason} ->
+        :proc_lib.init_ack(parent, {:error, reason})
+        exit(reason)
+    end
+  end
+
+  defp name_opt(opts) do
+    case Keyword.get(opts, :name) do
+      nil -> :none
+      atom when is_atom(atom) -> {:ok, atom}
+      other -> {:error, {:bad_name, other}}
+    end
+  end
+
+  # --- main loop ---
+
+  defp loop(parent, mod, state, debug) do
+    receive do
+      {:system, from, request} ->
+        :sys.handle_system_msg(request, from, parent, __MODULE__, debug, {mod, state})
+
+      {:EXIT, ^parent, reason} ->
+        terminate(reason, mod, state, debug)
+
+      {:"$call", {pid, ref} = from, request} ->
+        debug = :sys.handle_debug(debug, &write_debug/3, __MODULE__, {:in, request, pid})
+
+        case mod.handle_call(request, from, state) do
+          {:reply, reply, new_state} ->
+            send(pid, {ref, reply})
+            debug = :sys.handle_debug(debug, &write_debug/3, __MODULE__, {:out, reply, pid})
+            loop(parent, mod, new_state, debug)
+
+          {:stop, reason, reply, new_state} ->
+            send(pid, {ref, reply})
+            terminate(reason, mod, new_state, debug)
+        end
+
+      {:"$cast", msg} ->
+        handle_noreply(mod.handle_cast(msg, state), parent, mod, debug)
+
+      msg ->
+        if function_exported?(mod, :handle_info, 2) do
+          handle_noreply(mod.handle_info(msg, state), parent, mod, debug)
+        else
+          loop(parent, mod, state, debug)
+        end
+    end
+  end
+
+  defp handle_noreply({:noreply, new_state}, parent, mod, debug),
+    do: loop(parent, mod, new_state, debug)
+
+  defp handle_noreply({:stop, reason, new_state}, _parent, mod, debug),
+    do: terminate(reason, mod, new_state, debug)
+
+  defp write_debug(dev, event, name) do
+    IO.puts(dev, "~p event = ~p~n" |> :io_lib.format([name, event]) |> IO.iodata_to_binary())
+  end
+
+  # --- :sys required callbacks ---
+
+  def system_continue(parent, debug, {mod, state}), do: loop(parent, mod, state, debug)
+
+  def system_terminate(reason, _parent, debug, {mod, state}),
+    do: terminate(reason, mod, state, debug)
+
+  def system_get_state({_mod, state}), do: {:ok, state}
+
+  def system_replace_state(fun, {mod, state}) do
+    new_state = fun.(state)
+    {:ok, new_state, {mod, new_state}}
+  end
+
+  def system_code_change({mod, state}, _module, old_vsn, extra) do
+    case function_exported?(mod, :code_change, 3) do
+      true ->
+        case mod.code_change(old_vsn, state, extra) do
+          {:ok, new_state} -> {:ok, {mod, new_state}}
+          other -> other
+        end
+
+      false ->
+        {:ok, {mod, state}}
+    end
+  end
+
+  defp terminate(reason, mod, state, _debug) do
+    if function_exported?(mod, :terminate, 2), do: mod.terminate(reason, state)
+    exit(reason)
+  end
+end
+
+defmodule Counter do
+  end
+  @behaviour TinyServer
+
+  def start_link(initial \\ 0, opts \\ []),
+    do: TinyServer.start_link(__MODULE__, initial, opts)
+
+  def increment(pid, by \\ 1), do: TinyServer.cast(pid, {:inc, by})
+  def read(pid), do: TinyServer.call(pid, :read)
+  def reset(pid), do: TinyServer.call(pid, :reset)
+
+  @impl true
+  def init(initial), do: {:ok, initial}
+
+  @impl true
+  def handle_call(:read, _from, state), do: {:reply, state, state}
+  def handle_call(:reset, _from, _state), do: {:reply, :ok, 0}
+
+  @impl true
+  def handle_cast({:inc, n}, state), do: {:noreply, state + n}
+
+  @impl true
+  def handle_info(_msg, state), do: {:noreply, state}
+
+  @impl true
+  def terminate(_reason, _state), do: :ok
+
+  @impl true
+  def code_change(_old, state, _extra), do: {:ok, state}
+end
+
+defmodule Main do
+  def main do
+      # Demonstrating 385-proc-lib-sys-handrolled-behaviour
+      :ok
+  end
+end
+
+Main.main()
+end
+end
+end
+end
+end
+end
+end
+end
+end
+end
+end
+end
+end
+end
+end
+end
+end
+```

@@ -357,6 +357,47 @@ Run with `mix run bench/encode_decode.exs`.
 
 - If OTP 27's stdlib `:json` module is ~15% slower than Jason on decode but ships with Erlang, at what project size does "one less dependency" outweigh the performance gap — and does the answer change for a library you publish to hex.pm versus a closed-source service?
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule JsonCompare do
+    @moduledoc """
+    Thin facade over a configured JSON adapter. Swap implementations via
+    `config :json_compare, :adapter, JsonCompare.Adapter.Jason`.
+    """
+
+    def encode(term), do: adapter().encode(term)
+    def decode(bin), do: adapter().decode(bin)
+
+    defp adapter,
+      do: Application.get_env(:json_compare, :adapter, JsonCompare.Adapter.Jason)
+  end
+
+  def main do
+    IO.puts("=== JSON Demo ===
+  ")
+  
+    # Demo: Jason vs Poison
+  data = %{"name" => "alice", "age" => 30}
+  encoded = Jason.encode!(data)
+  IO.puts("1. Jason.encode!: #{encoded}")
+
+  decoded = Jason.decode!(encoded)
+  IO.puts("2. Jason.decode!: #{inspect(decoded)}")
+
+  IO.puts("
+  ✓ Jason demo completed!")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [Jason on HexDocs](https://hexdocs.pm/jason/Jason.html)

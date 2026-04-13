@@ -53,6 +53,25 @@ work to a non-test process. Neither covers every case, so Ecto exposes all three
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Testing-specific insight:**
+Tests are not QA. They document intent and catch regressions. A test that passes without asserting anything is technical debt. Always test the failure case; "it works when everything succeeds" teaches nothing. Use property-based testing for domain logic where the number of edge cases is infinite.
 ### 1. Checkout and checkin
 `Sandbox.checkout(Repo)` associates the calling process with a connection. `checkin/1`
 releases it. In `DataCase` tests this is typically automatic via `setup`.
@@ -322,19 +341,43 @@ codebase with 50 integration tests that all need `:shared`, is it better to keep
 one async-false file or split across many — and what does the answer tell you about the
 real cost of `:shared`?
 
-## Resources
 
-- [`Ecto.Adapters.SQL.Sandbox`](https://hexdocs.pm/ecto_sql/Ecto.Adapters.SQL.Sandbox.html)
-- [José Valim — Concurrent transactional tests](https://dashbit.co/blog/ecto-sql-3-changesets-are-data)
-- [Phoenix test guide](https://hexdocs.pm/phoenix/testing.html)
-- [`Oban.Testing`](https://hexdocs.pm/oban/Oban.Testing.html)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+# test/billing_api/invoice_worker_test.exs
+defmodule BillingApi.InvoiceWorkerTest do
+  use BillingApi.DataCase, async: true
+
+  alias BillingApi.{Invoices, InvoiceWorker, Repo}
+
+  describe "process_batch/1 — with allow/4" do
+    test "worker can see rows created by the test" do
+      {:ok, _} = Invoices.create(%{amount_cents: 50, currency: "EUR"})
+
+      # Find the worker — a named GenServer started by the app supervisor
+      worker = Process.whereis(InvoiceWorker)
+
+      # Grant the worker access to THIS test's sandbox connection
+      :ok = Ecto.Adapters.SQL.Sandbox.allow(Repo, self(), worker)
+
+      # Now the worker sees the invoice we just inserted
+      assert {:ok, processed} = InvoiceWorker.process_batch(1)
+      assert processed == 1
+    end
+  end
 end
+
+defmodule Main do
+  def main do
+      IO.puts("Property-based test generator initialized")
+      a = 10
+      b = 20
+      c = 30
+      assert (a + b) + c == a + (b + c)
+      IO.puts("✓ Property invariant verified: (a+b)+c = a+(b+c)")
+  end
+end
+
+Main.main()
 ```

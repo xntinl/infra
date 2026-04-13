@@ -59,6 +59,22 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. The `fwup` signing chain
 
 `fwup` is the low-level Erlang-Solutions tool that builds and applies Nerves firmware files. Signing uses Ed25519 by default (fast, small signatures, no parameter choice bikeshedding). You generate a key pair once:
@@ -743,22 +759,69 @@ Measure on your actual target. A raspberry pi 3B+ with a slow SD card can easily
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
-
-- [Nerves project — official docs](https://hexdocs.pm/nerves/) — A/B partition model, `Nerves.Runtime.KV`, validation flow.
-- [NervesHub architecture](https://docs.nerves-hub.org/) — deployments, delta updates, device certificates.
-- [`fwup` manual](https://github.com/fwup-home/fwup) — signing, verification, `.fw` format.
-- [Frank Hunleth — "Nerves in production"](https://www.youtube.com/watch?v=PSLUcRxozfY) — Frank is the creator of Nerves and fwup; the constraints discussed here come from his talks.
-- [Justin Schneck — "Smart Rockets with Nerves"](https://www.youtube.com/watch?v=oSE4Lc4LTyw) — co-creator of Nerves, covers OTA at fleet scale.
-- [`nerves_hub_link` source](https://github.com/nerves-hub/nerves_hub_link) — reference implementation of the `Client` behaviour, connection supervisor, fwup GenServer.
-- [Fred Hébert — "Reliable software" chapter on upgrades](https://ferd.ca/) — language-agnostic discussion of staged rollouts and rollback.
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+### Step 2: `mix.exs` — dependencies
+
+**Objective**: Pin `nerves_hub_link`, `nerves_runtime`, `shoehorn` — these deliver OTA transport, KV access, and boot-loop recovery; Mox is test-only.
+
+
+
+### Step 3: `config/target.exs` — NervesHub client
+
+**Objective**: Configure `nerves_hub_link` with heartbeat + reconnect backoff — the socket must survive flaky networks without DoSing the hub on reconnect.
+
+
+
+### Step 4: `lib/nerves_ota/application.ex`
+
+**Objective**: Branch the supervision tree on target vs host — the firmware validator only runs on-device; host keeps iteration fast during dev.
+
+
+
+### Step 5: `lib/nerves_ota/nerves_hub_client.ex`
+
+**Objective**: Implement the `NervesHubLink.Client` behaviour — delegate the `apply | reschedule | ignore` decision to a pure policy module for testability.
+
+
+
+### Step 6: `lib/nerves_ota/update_policy.ex`
+
+**Objective**: Keep the apply/reschedule/ignore rules pure — health, time, and `[force]` metadata are inputs; no IO means property-testable decisions.
+
+
+
+### Step 7: `lib/nerves_ota/health.ex`
+
+**Objective**: Gate `validate_firmware/0` behind N green health cycles — without this, a boot-looping firmware can self-mark as good and brick the device.
+
+
+
+### Step 8: `lib/nerves_ota/firmware_metadata.ex`
+
+**Objective**: Wrap `Nerves.Runtime.KV` behind a testable facade — an env-based override lets tests inject active partition, UUID, and validation state.
+
+
+
+### Step 9: Tests
+
+**Objective**: Cover the policy's branch matrix (healthy/unhealthy × in-window/out/force) — the policy IS the safety story; tests must be exhaustive.
+
+
+
+
+
+### Step 10: CI — `.github/workflows/firmware.yml`
+
+**Objective**: Build, sign, and publish firmware to NervesHub's canary deployment — unsigned firmware cannot be applied, so signing failure blocks rollout.
+
+defmodule Main do
+  def main do
+      # Demonstrating 268-nerves-ota
+      :ok
+  end
 end
+
+Main.main()
 ```

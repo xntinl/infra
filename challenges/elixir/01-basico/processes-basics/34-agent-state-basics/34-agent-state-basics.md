@@ -435,7 +435,51 @@ The Agent's process is a single mailbox — every `Agent.get/2`, `update/2`, and
 
 ---
 
+## Executable Example
 
+Create `lib/counter_service.ex` and test in `iex`:
+
+```elixir
+defmodule CounterService do
+  def start(initial \\ 0) do
+    Agent.start_link(fn -> initial end)
+  end
+
+  def increment(agent_pid) do
+    Agent.update(agent_pid, &(&1 + 1))
+  end
+
+  def decrement(agent_pid) do
+    Agent.update(agent_pid, &(&1 - 1))
+  end
+
+  def get(agent_pid) do
+    Agent.get(agent_pid, & &1)
+  end
+
+  def reset(agent_pid) do
+    Agent.update(agent_pid, fn _state -> 0 end)
+  end
+end
+
+# Test it
+{:ok, counter} = CounterService.start(0)
+
+CounterService.increment(counter)
+IO.inspect(CounterService.get(counter))  # 1
+
+CounterService.increment(counter)
+CounterService.increment(counter)
+IO.inspect(CounterService.get(counter))  # 3
+
+CounterService.decrement(counter)
+IO.inspect(CounterService.get(counter))  # 2
+
+CounterService.reset(counter)
+IO.inspect(CounterService.get(counter))  # 0
+```
+
+---
 ## Key Concepts
 
 ### 1. Agents Wrap Stateful Functions in Processes

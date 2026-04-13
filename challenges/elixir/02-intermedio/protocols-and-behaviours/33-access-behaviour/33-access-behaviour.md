@@ -297,6 +297,97 @@ objects, not for stateful or invariant-heavy types.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule User do
+  @moduledoc """
+  A small user struct that supports bracket-access (`user[:profile]`) and
+  works with `get_in`, `put_in`, and `update_in`. Implements the `Access`
+  behaviour.
+  """
+
+  @behaviour Access
+
+  @enforce_keys [:id, :profile]
+  defstruct [:id, :profile]
+
+  @type t :: %__MODULE__{id: term(), profile: map()}
+
+  @doc "Build a new user with id and a profile map."
+  @spec new(term(), map()) :: t
+  def new(id, profile) when is_map(profile), do: %__MODULE__{id: id, profile: profile}
+
+  # ── Access callbacks ───────────────────────────────────────────────────
+  #
+  # We delegate to the underlying map for storage, but restrict which keys
+  # are accessible — only declared struct fields. Attempting to fetch an
+  # unknown key returns :error, which is the documented "not present" signal.
+
+  @impl Access
+  def fetch(%__MODULE__{} = user, key) when key in [:id, :profile] do
+    {:ok, Map.fetch!(user, key)}
+  end
+
+  def fetch(%__MODULE__{}, _key), do: :error
+
+  @impl Access
+  def get_and_update(%__MODULE__{} = user, key, fun)
+      when key in [:id, :profile] and is_function(fun, 1) do
+    current = Map.fetch!(user, key)
+
+    case fun.(current) do
+      {get, new_value} ->
+        {get, Map.put(user, key, new_value)}
+
+      :pop ->
+        # Pop is allowed only for optional fields; id/profile are enforced.
+        raise ArgumentError, "cannot pop required key #{inspect(key)} from User"
+    end
+  end
+
+  @impl Access
+  def pop(%__MODULE__{}, key) do
+    raise ArgumentError, "cannot pop key #{inspect(key)} from User (all keys required)"
+  end
+end
+
+# Demonstrate Access behaviour
+IO.puts("=== Access Behaviour Demo ===")
+
+user = User.new(1, %{"name" => "Jane", "age" => 30})
+
+# Bracket access
+assert user[:id] == 1
+assert user[:profile] == %{"name" => "Jane", "age" => 30}
+assert user[:missing] == nil
+
+IO.puts("Bracket access: user[:id] = #{user[:id]}")
+
+# get_in/put_in/update_in
+assert get_in(user, [:profile, "name"]) == "Jane"
+
+updated = put_in(user, [:profile, "name"], "Janet")
+assert updated.profile["name"] == "Janet"
+assert user.profile["name"] == "Jane"
+
+IO.puts("put_in works: profile name updated to Janet")
+
+updated2 = update_in(user, [:profile, "age"], &(&1 + 1))
+assert updated2.profile["age"] == 31
+
+IO.puts("update_in works: profile age incremented to 31")
+
+# pop on required field raises
+assert_raise ArgumentError, fn -> pop_in(user, [:id]) end
+
+IO.puts("pop_in correctly raises on required field")
+IO.puts("All Access assertions passed!")
+```
+
+
 ## Resources
 
 - [`Access` behaviour — Elixir stdlib](https://hexdocs.pm/elixir/Access.html)

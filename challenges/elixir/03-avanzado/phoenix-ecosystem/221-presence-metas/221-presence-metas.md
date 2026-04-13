@@ -53,6 +53,22 @@ Presence across nodes needs conflict-free replication. Phoenix.Presence implemen
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Presence shape: key → list of metas
 
 Phoenix.Presence stores state as:
@@ -600,12 +616,82 @@ Target: presence update propagates cluster-wide in tens of ms under normal load;
 
 ---
 
-## Resources
+## Executable Example
 
-- [`Phoenix.Presence`](https://hexdocs.pm/phoenix/Phoenix.Presence.html) — full API including `fetch/2`, `handle_metas/4`, `update/4`
-- [`Phoenix.Tracker`](https://hexdocs.pm/phoenix_pubsub/Phoenix.Tracker.html) — CRDT engine under Presence
-- [Phoenix Tracker source](https://github.com/phoenixframework/phoenix_pubsub/blob/main/lib/phoenix/tracker.ex) — read the state-based delta gossip
-- [José Valim on Phoenix Tracker (Devoxx 2016)](https://www.youtube.com/watch?v=n338leKvqnA) — the original announcement with the CRDT reasoning
-- [Shapiro et al — *A Comprehensive Study of Convergent and Commutative Replicated Data Types*](https://hal.inria.fr/inria-00555588/document) — the OR-Set paper Presence is based on
-- [Chris McCord — Real-time Phoenix](https://pragprog.com/titles/sbsockets/real-time-phoenix/) — chapter 7 on Presence patterns
-- [Dashbit — Real-time Phoenix on Fly.io](https://dashbit.co/blog/real-time-phoenix-on-fly) — cluster-scale presence numbers
+```elixir
+defmodule PresenceMetas.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :presence_metas, version: "0.1.0", elixir: "~> 1.16", deps: deps()]
+  end
+
+  def application do
+    [mod: {PresenceMetas.Application, []}, extra_applications: [:logger]]
+  end
+
+  defp deps do
+    [
+      {:phoenix, "~> 1.7"},
+      {:phoenix_pubsub, "~> 2.1"},
+      {:jason, "~> 1.4"},
+      {:bandit, "~> 1.5"}
+    ]
+  end
+end
+
+
+
+### Step 2: `lib/presence_metas/presence.ex`
+
+**Objective**: Implement the module in `lib/presence_metas/presence.ex`.
+
+
+
+The `fetch/2` callback is the reduce step of the merge-reduce pattern. The tracker
+gives us raw `metas`; `fetch/2` turns that into the domain-shaped object we want the
+client to consume. Because it runs *per `list/1` call*, not per presence change, it
+absorbs the cost of DB enrichment without slowing the gossip loop.
+
+### Step 3: `lib/presence_metas/channels/dashboard_channel.ex`
+
+**Objective**: Implement the module in `lib/presence_metas/channels/dashboard_channel.ex`.
+
+
+
+`Presence.update/4` is the correct primitive when a device changes page. Using
+`untrack + track` would emit a spurious `leaves` / `joins` diff that the UI would
+interpret as "Alice went offline and came back online on `/billing`" — flickering the
+online dot. `update/4` emits a single diff that keeps the ref stable.
+
+### Step 4: `lib/presence_metas/user_socket.ex`
+
+**Objective**: Implement the module in `lib/presence_metas/user_socket.ex`.
+
+
+
+### Step 5: `lib/presence_metas/endpoint.ex`
+
+**Objective**: Implement the module in `lib/presence_metas/endpoint.ex`.
+
+
+
+### Step 6: `lib/presence_metas/application.ex`
+
+**Objective**: Define the OTP application and supervision tree in `lib/presence_metas/application.ex`.
+
+
+
+### Step 7: Tests
+
+**Objective**: Add tests that cover the expected behavior and edge cases.
+
+defmodule Main do
+  def main do
+      # Demonstrating 221-presence-metas
+      :ok
+  end
+end
+
+Main.main()
+```

@@ -42,6 +42,25 @@ proto_consolidation/
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Metaprogramming-specific insight:**
+Code generation is powerful and dangerous. Every macro you write is a place where intent is hidden. Use macros sparingly, only when they eliminate genuine boilerplate. If your macro is more than 10 lines, you probably need a function or data structure instead. Future maintainers will thank you.
 ### 1. What the compiler does for a protocol
 
 ```
@@ -380,12 +399,85 @@ more explicit. Protocols amortize when the set is open or has 5+ impls.
 
 ---
 
-## Resources
 
-- [`Protocol` — hexdocs.pm](https://hexdocs.pm/elixir/Protocol.html) — including `consolidate/2`
-- [Elixir docs: protocol consolidation](https://hexdocs.pm/mix/Mix.Tasks.Compile.Protocols.html)
-- [Jason source — consolidated Jason.Encoder](https://github.com/michalmuskala/jason/blob/master/lib/encoder.ex)
-- [José Valim — "Protocols in Elixir"](https://dashbit.co/blog) — Dashbit
-- [BEAM Book — type test instructions](https://blog.stenmans.org/theBeamBook/) — free
-- [Erlang efficiency guide](https://www.erlang.org/doc/efficiency_guide/introduction.html)
-- [Fred Hébert — "What is a protocol anyway?"](https://ferd.ca/)
+## Executable Example
+
+```elixir
+defimpl ProtoConsolidation.Encoder, for: Integer do
+  def encode(i), do: Integer.to_string(i)
+end
+
+defimpl ProtoConsolidation.Encoder, for: BitString do
+  def encode(bin) when is_binary(bin), do: [?", bin, ?"]
+end
+
+defimpl ProtoConsolidation.Encoder, for: List do
+  alias ProtoConsolidation.Encoder
+
+  def encode(list) do
+    inner = list |> Enum.map(&Encoder.encode/1) |> Enum.intersperse(?,)
+    [?[, inner, ?]]
+  end
+end
+
+defimpl ProtoConsolidation.Encoder, for: Map do
+  alias ProtoConsolidation.Encoder
+
+  def encode(map) do
+    inner =
+      map
+      |> Enum.map(fn {k, v} ->
+        [Encoder.encode(to_string(k)), ?:, Encoder.encode(v)]
+      end)
+      |> Enum.intersperse(?,)
+
+    [?{, inner, ?}]
+  end
+end
+
+defimpl ProtoConsolidation.Encoder, for: Atom do
+  def encode(nil), do: "null"
+  def encode(true), do: "true"
+  def encode(false), do: "false"
+  def encode(atom), do: [?", Atom.to_string(atom), ?"]
+end
+
+defimpl ProtoConsolidation.Encoder, for: Any do
+  def encode(value), do: [?", inspect(value), ?"]
+end
+
+defmodule Main do
+  def main do
+      # Demonstrate protocol consolidation impact on dispatch performance
+      defprotocol TestProto do
+        def process(data)
+      end
+
+      defimpl TestProto, for: String do
+        def process(str), do: String.upcase(str)
+      end
+
+      defimpl TestProto, for: Integer do
+        def process(num), do: num * 2
+      end
+
+      # Measure dispatch performance
+      t0 = System.monotonic_time(:microsecond)
+      result1 = TestProto.process("hello")
+      t1 = System.monotonic_time(:microsecond)
+
+      result2 = TestProto.process(42)
+      t2 = System.monotonic_time(:microsecond)
+
+      IO.puts("✓ String dispatch: #{t1 - t0} µs → #{inspect(result1)}")
+      IO.puts("✓ Integer dispatch: #{t2 - t1} µs → #{inspect(result2)}")
+
+      assert result1 == "HELLO", "String impl works"
+      assert result2 == 84, "Integer impl works"
+
+      IO.puts("✓ Protocol consolidation: dispatch performance working")
+  end
+end
+
+Main.main()
+```

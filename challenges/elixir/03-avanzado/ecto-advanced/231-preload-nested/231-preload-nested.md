@@ -59,6 +59,25 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Ecto-specific insight:**
+Ecto separates the query layer (building queries) from the execution layer (sending them). This separation allows for debugging, composability, and testing without a database. Never load all rows first and filter in-memory — write the filter into the query itself, or you've just built an N+1 problem.
 ### 1. Preload flavors
 
 ```
@@ -509,20 +528,212 @@ On 150 comments: naive ≈ 180 ms (151 queries), preload ≈ 12 ms (4 queries), 
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
-
-- [`Ecto.Repo.preload/3` — hexdocs](https://hexdocs.pm/ecto/Ecto.Repo.html#c:preload/3) — official with examples.
-- [`Ecto.Query.preload/3` in-query preload](https://hexdocs.pm/ecto/Ecto.Query.html#preload/3) — the join-preload form.
-- [Dashbit: "Ecto Preloads"](https://dashbit.co/blog/ecto-preloads) — canonical explanation.
-- [Absinthe Docs — DataLoader](https://hexdocs.pm/dataloader/Dataloader.html) — the GraphQL N+1 solution using Ecto preload under the hood.
-- [Ecto GitHub — `lib/ecto/repo/preloader.ex`](https://github.com/elixir-ecto/ecto/blob/master/lib/ecto/repo/preloader.ex) — read the source for deep understanding.
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+defmodule PreloadNested.Schemas.User do
+  use Ecto.Schema
+
+  schema "users" do
+    field :name, :string
+    field :email, :string
+    has_many :posts, PreloadNested.Schemas.Post
+    has_many :authored_comments, PreloadNested.Schemas.Comment
+    timestamps()
+
+defmodule PreloadNested.Schemas.Post do
+  use Ecto.Schema
+
+  schema "posts" do
+    field :title, :string
+    field :body, :string
+    field :published, :boolean, default: false
+    belongs_to :user, PreloadNested.Schemas.User
+    has_many :comments, PreloadNested.Schemas.Comment
+    has_one :cover_image, PreloadNested.Schemas.CoverImage
+    many_to_many :tags, PreloadNested.Schemas.Tag,
+      join_through: "posts_tags", on_replace: :delete
+    timestamps()
+  end
 end
+
+defmodule PreloadNested.Schemas.Comment do
+  use Ecto.Schema
+
+  schema "comments" do
+    field :body, :string
+    belongs_to :post, PreloadNested.Schemas.Post
+    belongs_to :author, PreloadNested.Schemas.User
+    timestamps()
+  end
+end
+
+defmodule PreloadNested.Schemas.Tag do
+  use Ecto.Schema
+
+  schema "tags" do
+    field :name, :string
+  end
+end
+
+defmodule PreloadNested.Schemas.CoverImage do
+  use Ecto.Schema
+
+  schema "cover_images" do
+    field :url, :string
+    belongs_to :post, PreloadNested.Schemas.Post
+  end
+end
+
+
+defmodule PreloadNested.Blog do
+  @moduledoc """
+  Post loading with different preload strategies.
+  """
+
+  import Ecto.Query
+
+  alias PreloadNested.Repo
+  alias PreloadNested.Schemas.{Comment, Post}
+
+  @doc """
+  Full post tree loaded with the typical nested preload.
+
+  Issues 5 queries regardless of N comments:
+    1. posts, 2. cover_images, 3. tags, 4. comments, 5. authors
+  """
+  @spec full_post(integer()) :: Post.t() | nil
+  def full_post(id) do
+    Post
+    |> Repo.get(id)
+    |> Repo.preload([
+      :cover_image,
+      :tags,
+      comments: [:author]
+    ])
+  end
+
+  @doc """
+  Post with only its 5 most-recent comments, authors preloaded.
+  """
+  @spec post_with_recent_comments(integer(), pos_integer()) :: Post.t() | nil
+  def post_with_recent_comments(id, limit \ 5) do
+    recent_comments =
+      from c in Comment,
+        order_by: [desc: c.inserted_at],
+        limit: ^limit
+
+    Post
+    |> Repo.get(id)
+    |> Repo.preload(comments: {recent_comments, [:author]})
+  end
+
+  @doc """
+  Posts filtered by child comment author — needs a join preload.
+
+  Single SQL query; duplicates parent rows per matching child.
+  """
+  @spec posts_commented_by(integer()) :: [Post.t()]
+  def posts_commented_by(user_id) do
+    from(p in Post,
+      join: c in assoc(p, :comments),
+      where: c.author_id == ^user_id,
+      preload: [comments: c]
+    )
+    |> Repo.all()
+    |> Enum.uniq_by(& &1.id)
+  end
+
+  @doc """
+  Dynamic preloads driven by GraphQL-style field selection.
+  """
+  @spec find(integer(), [atom()]) :: Post.t() | nil
+  def find(id, selected_fields) do
+    preloads = preloads_for(selected_fields)
+    Post |> Repo.get(id) |> Repo.preload(preloads)
+  end
+
+  defp preloads_for(fields) do
+    Enum.flat_map(fields, fn
+      :tags -> [:tags]
+      :cover -> [:cover_image]
+      :comments_with_author -> [comments: :author]
+      :author -> [:user]
+      _ -> []
+    end)
+  end
+end
+
+
+defmodule PreloadNested.Repo.Migrations.Create do
+  use Ecto.Migration
+
+  def change do
+    create table(:users) do
+      add :name, :string, null: false
+      add :email, :string, null: false
+      timestamps()
+    end
+    create unique_index(:users, [:email])
+
+    create table(:posts) do
+      add :title, :string, null: false
+      add :body, :text, null: false
+      add :published, :boolean, default: false
+      add :user_id, references(:users, on_delete: :delete_all), null: false
+      timestamps()
+    end
+    create index(:posts, [:user_id])
+
+    create table(:comments) do
+      add :body, :text, null: false
+      add :post_id, references(:posts, on_delete: :delete_all), null: false
+      add :author_id, references(:users, on_delete: :restrict), null: false
+      timestamps()
+    end
+    create index(:comments, [:post_id])
+    create index(:comments, [:author_id])
+
+    create table(:cover_images) do
+      add :url, :string, null: false
+      add :post_id, references(:posts, on_delete: :delete_all), null: false
+    end
+    create unique_index(:cover_images, [:post_id])
+
+    create table(:tags) do
+      add :name, :string, null: false
+    end
+
+    create table(:posts_tags, primary_key: false) do
+      add :post_id, references(:posts, on_delete: :delete_all), null: false
+      add :tag_id, references(:tags, on_delete: :delete_all), null: false
+    end
+    create unique_index(:posts_tags, [:post_id, :tag_id])
+  end
+end
+
+
+defmodule PreloadNested.BlogTest do
+  use ExUnit.Case, async: false
+
+  import Ecto.Query
+
+  alias PreloadNested.Repo
+  alias PreloadNested.Blog
+  alias PreloadNested.Schemas.{Comment, CoverImage, Post, Tag, User}
+
+    {:ok, post: post, commenter: commenter}
+  end
+
+
+
+end
+
+defmodule Main do
+  def main do
+      :ok
+  end
+end
+
+Main.main()
 ```

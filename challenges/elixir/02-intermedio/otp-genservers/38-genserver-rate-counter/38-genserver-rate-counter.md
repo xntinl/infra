@@ -368,6 +368,55 @@ circuit breaker reading its own recent error rate), not for observability.
 
 - Con 100k clientes activos cada uno con su rate limiter, ¿seguís con GenServers per-key o migrás a ETS/Redis? Justificá con números.
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule MyServer do
+    use GenServer
+
+    def start_link(state \\ []) do
+      GenServer.start_link(__MODULE__, state, name: __MODULE__)
+    end
+
+    def init(state) do
+      {:ok, state}
+    end
+
+    def call_example do
+      GenServer.call(__MODULE__, :example)
+    end
+
+    def cast_example do
+      GenServer.cast(__MODULE__, :example)
+    end
+
+    def handle_call(:example, _from, state) do
+      {:reply, "Success from call", state}
+    end
+
+    def handle_cast(:example, state) do
+      IO.puts("Cast received")
+      {:noreply, state}
+    end
+  end
+
+  def main do
+    IO.puts("MyServer OK")
+  end
+
+  def main do
+    IO.puts("MyServer OK")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Process.send_after/3` — Elixir stdlib](https://hexdocs.pm/elixir/Process.html#send_after/4)

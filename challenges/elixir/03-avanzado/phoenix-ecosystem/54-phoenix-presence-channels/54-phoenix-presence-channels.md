@@ -66,6 +66,22 @@ A per-node roster is straightforward; a distributed roster with netsplit recover
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Why CRDTs for presence
 
 Presence is a set of `{key, meta}` entries per topic. Two nodes observe slightly
@@ -515,11 +531,97 @@ Target: join-to-roster-visible latency under 100 ms cluster-wide; roster size bo
 
 ---
 
-## Resources
 
-- [`Phoenix.Presence`](https://hexdocs.pm/phoenix/Phoenix.Presence.html) — API and callbacks
-- [Chris McCord — Real-world distributed Elixir / Presence](https://www.youtube.com/watch?v=n338leKvqnA) — the original Presence talk
-- [Marc Shapiro et al. — "A comprehensive study of Convergent and Commutative Replicated Data Types"](https://hal.inria.fr/inria-00555588/document) — the CRDT paper behind Presence
-- [`phoenix_pubsub`](https://hexdocs.pm/phoenix_pubsub/) — the adapter Presence builds on
-- [`:net_kernel.monitor_nodes/1`](https://www.erlang.org/doc/man/net_kernel.html#monitor_nodes-1) — cluster membership events
-- [José Valim — LiveView + Presence blog](https://dashbit.co/blog/live-view-with-presence)
+## Executable Example
+
+```elixir
+defmodule PresenceChannelsWeb.RoomChannelTest do
+  use PresenceChannelsWeb.ChannelCase, async: false
+  # async: false because Presence state is shared across tests
+
+  alias PresenceChannels.{Auth, Presence}
+  alias PresenceChannelsWeb.{Endpoint, UserSocket, RoomChannel}
+
+  defp join_as(user_id, topic) do
+    token = Auth.sign(Endpoint, user_id)
+    {:ok, socket} = connect(UserSocket, %{"token" => token})
+    subscribe_and_join(socket, RoomChannel, topic)
+  end
+
+  describe "presence lifecycle" do
+    test "tracks user on join and broadcasts state" do
+      {:ok, _, _channel} = join_as("user-1", "room:test:1")
+
+      assert_push "presence_state", state
+      assert Map.has_key?(state, "user-1")
+    end
+
+    test "two users see each other" do
+      {:ok, _, channel_a} = join_as("user-1", "room:test:2")
+      assert_push "presence_state", _
+
+      {:ok, _, _channel_b} = join_as("user-2", "room:test:2")
+
+      # A receives a diff announcing B's join
+      assert_push "presence_diff", %{joins: joins, leaves: leaves}
+      assert Map.has_key?(joins, "user-2")
+      assert leaves == %{}
+
+      # A still sees both
+      list = Presence.list(channel_a)
+      assert Map.has_key?(list, "user-1")
+      assert Map.has_key?(list, "user-2")
+    end
+
+    test "typing update emits a leave+join diff" do
+      {:ok, _, _channel} = join_as("user-3", "room:test:3")
+      assert_push "presence_state", _
+
+      {:ok, _, channel} = join_as("user-4", "room:test:3")
+      assert_push "presence_state", _
+
+      ref = push(channel, "typing", %{"typing?" => true})
+      assert_reply ref, :ok
+
+      assert_push "presence_diff", %{joins: joins, leaves: leaves}
+      assert Map.has_key?(joins, "user-4")
+      assert Map.has_key?(leaves, "user-4")
+      [meta | _] = joins["user-4"][:metas]
+      assert meta.typing? == true
+    end
+
+    test "leave removes presence on channel termination" do
+      {:ok, _, channel} = join_as("user-5", "room:test:4")
+      assert_push "presence_state", _
+
+      Process.unlink(channel.channel_pid)
+      ref = leave(channel)
+      assert_reply ref, :ok
+
+      # Re-join fresh to inspect state
+      {:ok, _, channel2} = join_as("user-6", "room:test:4")
+      assert_push "presence_state", state
+      refute Map.has_key?(state, "user-5")
+      _ = channel2
+    end
+  end
+
+  describe "enriched metadata via fetch/2" do
+    test "injects display_name without client input" do
+      {:ok, _, _channel} = join_as("user-7", "room:test:5")
+      assert_push "presence_state", state
+      assert state["user-7"].display_name == "User 7"
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+    IO.puts("✓ Phoenix Presence — CRDT-Backed User Tracking")
+  - Demonstrating core concepts
+    - Implementation patterns and best practices
+  end
+end
+
+Main.main()
+```

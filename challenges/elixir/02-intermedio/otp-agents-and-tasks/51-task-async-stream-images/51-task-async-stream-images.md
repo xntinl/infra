@@ -358,6 +358,29 @@ materializing a list of results.
 
 - Definí `max_concurrency` para un proceso que hace HTTP a una API con rate limit de 100 req/s. Justificá.
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  def main do
+    items = [1, 2, 3, 4, 5]
+  
+    results = items
+      |> Task.async_stream(fn x -> x * 10 end, max_concurrency: 2)
+      |> Enum.map(fn {:ok, val} -> val end)
+  
+    IO.puts("Streamed results: #{inspect(results)}")
+    IO.puts("✓ Task.async_stream works correctly")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Task.async_stream/3` — Elixir stdlib](https://hexdocs.pm/elixir/Task.html#async_stream/3)

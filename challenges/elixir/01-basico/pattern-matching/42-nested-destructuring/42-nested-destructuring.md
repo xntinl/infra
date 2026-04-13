@@ -348,7 +348,58 @@ mix test
 
 The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
 
+---
 
+## Executable Example
+
+Create `lib/ast_analyzer.ex` and test in `iex`:
+
+```elixir
+defmodule ASTAnalyzer do
+  def extract_author_email({:ok, %{author: %{email: email}}}) when is_binary(email) do
+    {:ok, email}
+  end
+
+  def extract_author_email({:error, reason}), do: {:error, reason}
+  def extract_author_email(_), do: {:error, :invalid_structure}
+
+  def extract_user_info({:ok, %{user: %{id: id, profile: %{name: name, age: age}}} = data}) when is_integer(id) and is_binary(name) and is_integer(age) do
+    {:ok, %{id: id, name: name, age: age, full_response: data}}
+  end
+
+  def extract_user_info({:error, r}), do: {:error, r}
+  def extract_user_info(_), do: {:error, :malformed}
+
+  def analyze_author_metadata({:ok, %{author: %{email: email, location: %{city: city, country: country}}}}) when is_binary(email) and is_binary(city) and is_binary(country) do
+    {:ok, {email, city, country}}
+  end
+
+  def analyze_author_metadata(_), do: {:error, :missing_metadata}
+
+  def validate_package(%{name: name, version: version, license: %{type: license_type}}) when is_binary(name) and is_binary(version) and is_binary(license_type) do
+    :valid
+  end
+
+  def validate_package(_), do: :invalid
+end
+
+# Test it
+response = {:ok, %{author: %{email: "alice@example.com"}}}
+{:ok, email} = ASTAnalyzer.extract_author_email(response)
+IO.inspect(email)  # "alice@example.com"
+
+user_response = {:ok, %{user: %{id: 1, profile: %{name: "Bob", age: 30}}}}
+{:ok, info} = ASTAnalyzer.extract_user_info(user_response)
+IO.inspect(info.name)  # "Bob"
+
+metadata_response = {:ok, %{author: %{email: "charlie@example.com", location: %{city: "NYC", country: "USA"}}}}
+{:ok, {email, city, country}} = ASTAnalyzer.analyze_author_metadata(metadata_response)
+IO.inspect(city)  # "NYC"
+
+package = %{name: "my_pkg", version: "1.0.0", license: %{type: "MIT"}}
+:valid = ASTAnalyzer.validate_package(package)
+IO.puts("Package validation passed")
+```
 
 ---
 ## Key Concepts

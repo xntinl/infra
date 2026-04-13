@@ -54,6 +54,22 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Eventually consistent reads — the unavoidable trade-off
 
 CQRS decouples write and read models. The price is that reads lag the writes by one event-handler tick (milliseconds in practice, seconds under back-pressure). If your UI calls `Ledger.dispatch(deposit)` and immediately queries the balance, it may see the old value.
@@ -610,21 +626,340 @@ For the daily totals upsert pattern above, the `ON CONFLICT DO UPDATE SET value 
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
-
-- [commanded_ecto_projections hexdocs](https://hexdocs.pm/commanded_ecto_projections/) — the `project/3` macro and `Commanded.Projections.Ecto`
-- [Commanded — "Projections" guide](https://github.com/commanded/commanded/blob/master/guides/Read%20Model%20Projections.md) — official guide
-- [Martin Kleppmann — "Designing Data-Intensive Applications"](https://dataintensive.net/) — chapter 11 on stream processing and materialized views
-- [Chris Keathley — "Consistency in distributed systems"](https://keathley.io/blog/consistency-in-distributed-systems.html)
-- [Ecto.Multi hexdocs](https://hexdocs.pm/ecto/Ecto.Multi.html) — the transactional building block used by every projector
-- [Greg Young — "Polyglot Data"](https://www.youtube.com/watch?v=hv2dKtPq0ME) — why different read models belong in different stores
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
+defmodule CommandedProjections.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :commanded_projections, version: "0.1.0", elixir: "~> 1.16", deps: deps()]
+
+  def application do
+    [extra_applications: [:logger], mod: {CommandedProjections.Application, []}]
+
+  defp deps do
+    [
+      {:commanded, "~> 1.4"},
+      {:commanded_ecto_projections, "~> 1.4"},
+      {:ecto_sql, "~> 3.11"},
+      {:postgrex, "~> 0.17"},
+      {:jason, "~> 1.4"}
+    ]
+
+
+defmodule CommandedProjections.Repo do
+  use Ecto.Repo,
+    otp_app: :commanded_projections,
+    adapter: Ecto.Adapters.Postgres
+
+
+import Config
+
+config :commanded_projections, CommandedProjections.Repo,
+  database: "ledger_read",
+  hostname: "localhost",
+  username: "postgres",
+  password: "postgres",
+  pool_size: 10
+
+config :commanded_projections, ecto_repos: [CommandedProjections.Repo]
+
+config :commanded_projections, CommandedProjections.App,
+  event_store: [
+    adapter: Commanded.EventStore.Adapters.InMemory,
+    serializer: Commanded.Serialization.JsonSerializer
   ]
+
+
+# 001_create_account_balances.exs
+defmodule CommandedProjections.Repo.Migrations.CreateAccountBalances do
+  use Ecto.Migration
+
+  def change do
+    create table(:account_balances, primary_key: false) do
+      add :account_id, :string, primary_key: true
+      add :owner, :string, null: false
+      add :balance, :bigint, null: false, default: 0
+      add :status, :string, null: false
+      timestamps()
+
+    create table(:projection_versions, primary_key: false) do
+      add :projection_name, :string, primary_key: true
+      add :last_seen_event_number, :bigint, null: false, default: 0
+
+# 002_create_transaction_log.exs
+defmodule CommandedProjections.Repo.Migrations.CreateTransactionLog do
+  use Ecto.Migration
+
+  def change do
+    create table(:transaction_log) do
+      add :account_id, :string, null: false
+      add :kind, :string, null: false
+      add :amount, :bigint, null: false
+      add :balance_after, :bigint, null: false
+      add :occurred_at, :utc_datetime_usec, null: false
+
+    create index(:transaction_log, [:account_id, :occurred_at])
+  end
 end
+
+# 003_create_daily_totals.exs
+defmodule CommandedProjections.Repo.Migrations.CreateDailyTotals do
+  use Ecto.Migration
+
+  def change do
+    create table(:daily_totals, primary_key: false) do
+      add :account_id, :string, primary_key: true
+      add :day, :date, primary_key: true
+      add :deposits_total, :bigint, null: false, default: 0
+      add :withdrawals_total, :bigint, null: false, default: 0
+    end
+  end
+end
+
+
+defmodule CommandedProjections.Projections.AccountBalance do
+  use Ecto.Schema
+
+  @primary_key {:account_id, :string, []}
+  schema "account_balances" do
+    field :owner, :string
+    field :balance, :integer
+    field :status, :string
+    timestamps()
+  end
+end
+
+defmodule CommandedProjections.Projections.TransactionLog do
+  use Ecto.Schema
+
+  schema "transaction_log" do
+    field :account_id, :string
+    field :kind, :string
+    field :amount, :integer
+    field :balance_after, :integer
+    field :occurred_at, :utc_datetime_usec
+  end
+end
+
+defmodule CommandedProjections.Projections.DailyTotals do
+  use Ecto.Schema
+
+  @primary_key false
+  schema "daily_totals" do
+    field :account_id, :string, primary_key: true
+    field :day, :date, primary_key: true
+    field :deposits_total, :integer
+    field :withdrawals_total, :integer
+  end
+end
+
+
+# lib/commanded_projections/projectors/account_balance_projector.ex
+defmodule CommandedProjections.Projectors.AccountBalance do
+  use Commanded.Projections.Ecto,
+    application: CommandedProjections.App,
+    repo: CommandedProjections.Repo,
+    name: "account_balance_projector"
+
+  alias CommandedProjections.Projections.AccountBalance
+  alias CommandedAggregates.Events.{AccountOpened, MoneyDeposited, MoneyWithdrawn, AccountClosed}
+
+  project(%AccountOpened{} = e, _metadata, fn multi ->
+    Ecto.Multi.insert(
+      multi,
+      :account,
+      %AccountBalance{
+        account_id: e.account_id,
+        owner: e.owner,
+        balance: 0,
+        status: "open"
+      }
+    )
+  end)
+
+  project(%MoneyDeposited{} = e, _md, fn multi ->
+    Ecto.Multi.update_all(
+      multi,
+      :account,
+      from(a in AccountBalance, where: a.account_id == ^e.account_id),
+      set: [balance: e.new_balance, updated_at: DateTime.utc_now()]
+    )
+  end)
+
+  project(%MoneyWithdrawn{} = e, _md, fn multi ->
+    Ecto.Multi.update_all(
+      multi,
+      :account,
+      from(a in AccountBalance, where: a.account_id == ^e.account_id),
+      set: [balance: e.new_balance, updated_at: DateTime.utc_now()]
+    )
+  end)
+
+  project(%AccountClosed{} = e, _md, fn multi ->
+    Ecto.Multi.update_all(
+      multi,
+      :account,
+      from(a in AccountBalance, where: a.account_id == ^e.account_id),
+      set: [status: "closed", updated_at: DateTime.utc_now()]
+    )
+  end)
+
+  import Ecto.Query
+end
+
+# lib/commanded_projections/projectors/transaction_log_projector.ex
+defmodule CommandedProjections.Projectors.TransactionLog do
+  use Commanded.Projections.Ecto,
+    application: CommandedProjections.App,
+    repo: CommandedProjections.Repo,
+    name: "transaction_log_projector"
+
+  alias CommandedProjections.Projections.TransactionLog
+  alias CommandedAggregates.Events.{MoneyDeposited, MoneyWithdrawn}
+
+  project(%MoneyDeposited{} = e, _md, fn multi ->
+    Ecto.Multi.insert(multi, :tx, %TransactionLog{
+      account_id: e.account_id,
+      kind: "deposit",
+      amount: e.amount,
+      balance_after: e.new_balance,
+      occurred_at: e.deposited_at
+    })
+  end)
+
+  project(%MoneyWithdrawn{} = e, _md, fn multi ->
+    Ecto.Multi.insert(multi, :tx, %TransactionLog{
+      account_id: e.account_id,
+      kind: "withdrawal",
+      amount: e.amount,
+      balance_after: e.new_balance,
+      occurred_at: e.withdrawn_at
+    })
+  end)
+end
+
+# lib/commanded_projections/projectors/daily_totals_projector.ex
+defmodule CommandedProjections.Projectors.DailyTotals do
+  use Commanded.Projections.Ecto,
+    application: CommandedProjections.App,
+    repo: CommandedProjections.Repo,
+    name: "daily_totals_projector"
+
+  alias CommandedProjections.Projections.DailyTotals
+  alias CommandedAggregates.Events.{MoneyDeposited, MoneyWithdrawn}
+
+  project(%MoneyDeposited{} = e, _md, fn multi ->
+    upsert_totals(multi, e.account_id, DateTime.to_date(e.deposited_at),
+      deposits_delta: e.amount,
+      withdrawals_delta: 0
+    )
+  end)
+
+  project(%MoneyWithdrawn{} = e, _md, fn multi ->
+    upsert_totals(multi, e.account_id, DateTime.to_date(e.withdrawn_at),
+      deposits_delta: 0,
+      withdrawals_delta: e.amount
+    )
+  end)
+
+  defp upsert_totals(multi, account_id, day, deposits_delta: dd, withdrawals_delta: wd) do
+    row = %DailyTotals{
+      account_id: account_id,
+      day: day,
+      deposits_total: dd,
+      withdrawals_total: wd
+    }
+
+    Ecto.Multi.insert(multi, {:daily, account_id, day}, row,
+      on_conflict: [inc: [deposits_total: dd, withdrawals_total: wd]],
+      conflict_target: [:account_id, :day]
+    )
+  end
+end
+
+
+defmodule CommandedProjections.App do
+  use Commanded.Application, otp_app: :commanded_projections
+end
+
+defmodule CommandedProjections.Application do
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    children = [
+      CommandedProjections.Repo,
+      CommandedProjections.App,
+      CommandedProjections.Projectors.AccountBalance,
+      CommandedProjections.Projectors.TransactionLog,
+      CommandedProjections.Projectors.DailyTotals
+    ]
+
+    Supervisor.start_link(children, strategy: :one_for_one, name: CommandedProjections.Supervisor)
+  end
+end
+
+
+defmodule CommandedProjections.ProjectorsTest do
+  use ExUnit.Case
+
+  alias CommandedProjections.Repo
+  alias CommandedProjections.Projections.{AccountBalance, TransactionLog, DailyTotals}
+  alias CommandedAggregates.Events.{AccountOpened, MoneyDeposited, MoneyWithdrawn}
+
+    test "TransactionLog appends one row per money event" do
+      account_id = "acc-tx-" <> Integer.to_string(System.unique_integer([:positive]))
+
+      publish_events([
+        %AccountOpened{account_id: account_id, owner: "Bob", overdraft_limit: 0},
+        %MoneyDeposited{account_id: account_id, amount: 100, new_balance: 100, deposited_at: DateTime.utc_now()},
+        %MoneyWithdrawn{account_id: account_id, amount: 30, new_balance: 70, withdrawn_at: DateTime.utc_now()}
+      ])
+
+      wait_for_projection(fn ->
+        import Ecto.Query
+        Repo.aggregate(from(t in TransactionLog, where: t.account_id == ^account_id), :count)
+        |> case do
+          n when n >= 2 -> :ok
+          _ -> nil
+        end
+      end)
+    end
+  end
+
+  # ---- helpers ----
+
+  defp publish_events(events) do
+    # Test support — publish events directly to the app's event store.
+    # In production, events arrive via CommandedAggregates.App.dispatch/1.
+    for e <- events do
+      CommandedProjections.App.event_store()
+      |> elem(0)
+      |> send({:publish, e})
+    end
+
+    :ok
+  end
+
+  defp wait_for_projection(fun, attempts \ 50) do
+    case fun.() do
+      nil when attempts > 0 ->
+        Process.sleep(20)
+        wait_for_projection(fun, attempts - 1)
+
+      other ->
+        other
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+      :ok
+  end
+end
+
+Main.main()
 ```

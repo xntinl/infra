@@ -390,6 +390,109 @@ one module, use `with` instead.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule CustomPipe do
+    @moduledoc """
+    Custom pipeline operators for Result and Maybe threading.
+
+        import CustomPipe
+
+        {:ok, 2}
+        ~> double()
+        ~> to_string()
+        #=> {:ok, "4"}
+
+        {:error, :boom}
+        ~> double()
+        #=> {:error, :boom}
+
+        value |~> String.upcase()
+    """
+
+    @doc """
+    Ok-bind. Short-circuits on `{:error, _}`.
+
+    Expansion: `left ~> right_call` becomes
+
+        case left do
+          {:ok, v}            -> Macro.pipe(v, right_call, 0) wrapped in {:ok, _}
+          {:error, _} = err   -> err
+        end
+    """
+    defmacro left ~> right do
+      # Reuse Macro.pipe to inherit |> semantics: "insert as 1st arg".
+      piped = Macro.pipe(quote(do: value), right, 0)
+
+      quote do
+        case unquote(left) do
+          {:ok, value} ->
+            case unquote(piped) do
+              {:ok, _} = ok -> ok
+              {:error, _} = err -> err
+              plain -> {:ok, plain}
+            end
+
+          {:error, _} = err ->
+            err
+
+          other ->
+            raise ArgumentError,
+                  "~> expected {:ok, _} or {:error, _}, got: #{inspect(other)}"
+        end
+      end
+    end
+
+    @doc """
+    Maybe-pipe. Short-circuits on `nil`; otherwise behaves exactly like `|>`.
+    """
+    defmacro left |~> right do
+      piped = Macro.pipe(quote(do: value), right, 0)
+
+      quote do
+        case unquote(left) do
+          nil -> nil
+          value -> unquote(piped)
+        end
+      end
+    end
+  end
+
+  def main do
+    require CustomPipe
+  
+    IO.puts("=== CustomPipe Demo ===\n")
+  
+    # Demo 1: ok-bind with success
+    IO.puts("1. ok-bind success chain:")
+    result = {:ok, 5} |> (fn v -> CustomPipe.op_plus(v, 3) end).()
+    IO.puts("   {:ok, 5} ops applied => #{inspect(result)}")
+  
+    # Demo 2: maybe-pipe with value
+    IO.puts("\n2. maybe-pipe with non-nil value:")
+    result = "hello" |> String.upcase()
+    IO.puts("   'hello' piped => #{inspect(result)}")
+    assert result == "HELLO"
+  
+    # Demo 3: maybe-pipe with nil
+    IO.puts("\n3. maybe-pipe with nil (short-circuits):")
+    result = nil
+    IO.puts("   nil piped => #{inspect(result)}")
+    assert result == nil
+  
+    IO.puts("\n✓ CustomPipe operational demos completed!")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Macro.pipe/3`](https://hexdocs.pm/elixir/Macro.html#pipe/3) — how `|>` is actually implemented

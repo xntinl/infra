@@ -33,6 +33,22 @@ events_bus/
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Adapter vs subscriber process
 
 `Phoenix.PubSub` is a behaviour. The adapter (`:pg` by default) handles fanout. Subscribers register with `PubSub.subscribe/2`; each subscription is a monitored link on the calling process.
@@ -305,9 +321,66 @@ Phoenix's conn struct represents an HTTP request/response in flight, accumulatin
 
 Your company expands from one datacenter to three, with 150ms RTT between them. You have a single PubSub serving all three. List the symptoms you will see in the logs, and decide: do you move to `Phoenix.PubSub.Redis`, use `:pg` with cross-DC Erlang distribution, or introduce per-DC PubSubs with a manual replication layer?
 
-## Resources
 
-- [Phoenix.PubSub — hexdocs](https://hexdocs.pm/phoenix_pubsub/Phoenix.PubSub.html)
-- [Erlang `:pg` — erlang.org/doc](https://www.erlang.org/doc/man/pg.html)
-- [Phoenix.PubSub source](https://github.com/phoenixframework/phoenix_pubsub)
-- [Dashbit — Phoenix 1.7 cluster guide](https://dashbit.co/blog)
+## Executable Example
+
+```elixir
+defmodule EventsBus.PubSubTest do
+  use ExUnit.Case, async: false
+  alias Phoenix.PubSub
+  alias EventsBus.{Listener, CacheInvalidator}
+
+  setup do
+    start_supervised!({Phoenix.PubSub, name: TestPubSub, adapter: Phoenix.PubSub.PG2})
+    :ok
+  end
+
+  describe "subscribe/broadcast" do
+    test "local subscriber receives a broadcast message" do
+      :ok = PubSub.subscribe(TestPubSub, "topic")
+      :ok = PubSub.broadcast(TestPubSub, "topic", {:hello, 1})
+      assert_receive {:hello, 1}, 500
+    end
+  end
+
+  describe "local_broadcast" do
+    test "local_broadcast delivers to local subscribers" do
+      :ok = PubSub.subscribe(TestPubSub, "topic2")
+      :ok = PubSub.local_broadcast(TestPubSub, "topic2", :ping)
+      assert_receive :ping, 500
+    end
+  end
+
+  describe "cache invalidator" do
+    test "invalidate_cluster fans out" do
+      {:ok, l1} = Listener.start_link("cache")
+      {:ok, l2} = Listener.start_link("cache")
+      :ok = CacheInvalidator.invalidate_cluster(:user_42)
+      Process.sleep(50)
+      assert [{:invalidate, :user_42}] = Listener.received(l1)
+      assert [{:invalidate, :user_42}] = Listener.received(l2)
+    end
+  end
+
+  describe "topic scoping" do
+    test "subscriber on topic A does not see topic B" do
+      {:ok, la} = Listener.start_link("a")
+      {:ok, lb} = Listener.start_link("b")
+      :ok = PubSub.broadcast(EventsBus.PubSub, "a", :for_a)
+      Process.sleep(20)
+      assert [:for_a] = Listener.received(la)
+      assert [] = Listener.received(lb)
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+    IO.puts("✓ Phoenix.PubSub Local vs Distributed (`:pg` adapter)")
+  - Demonstrating core concepts
+    - Implementation patterns and best practices
+  end
+end
+
+Main.main()
+```

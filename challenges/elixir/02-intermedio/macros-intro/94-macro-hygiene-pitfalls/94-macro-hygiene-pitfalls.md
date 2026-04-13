@@ -400,6 +400,116 @@ application code does not. Treat `var!` as a "license required" tool.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule HygienePitfalls do
+    @moduledoc """
+    A tour of macro hygiene: what it protects you from, how to break it
+    on purpose with `var!/2`, and how to audit a macro's expansion with
+    `Macro.expand/2`.
+    """
+
+    # ── Hygienic by default ─────────────────────────────────────────────────
+
+    @doc """
+    Internally binds a variable named `result`. Hygiene ensures that a
+    caller-owned `result` is not clobbered.
+    """
+    defmacro tag(do: block) do
+      quote do
+        # `result` here belongs to the macro's context — a different
+        # variable from any `result` the caller may have bound.
+        result = unquote(block)
+        {:tagged, result}
+      end
+    end
+
+    # ── Deliberately unhygienic: var!/2 ─────────────────────────────────────
+
+    @doc """
+    Introduces a variable named `counter` **into the caller's scope**.
+
+    Using `var!/2` opts out of hygiene. This is the right tool when the
+    macro is an explicit binding construct (Ecto's `from/2` uses the same
+    mechanism to introduce the bindings it queries).
+    """
+    defmacro bind_counter(initial \\ 0) do
+      quote do
+        var!(counter) = unquote(initial)
+      end
+    end
+
+    @doc """
+    Reads and increments the caller's `counter` variable.
+
+    Pairs with `bind_counter/1` — the two macros *share* a caller-owned
+    variable. Only use this shape when the shared variable is part of your
+    DSL's documented contract.
+    """
+    defmacro inc_counter do
+      quote do
+        var!(counter) = var!(counter) + 1
+      end
+    end
+
+    # ── Expansion auditor ──────────────────────────────────────────────────
+
+    @doc """
+    Returns the fully-expanded source of an AST, as a string.
+
+    Useful during development to see what a macro actually emits —
+    including the hidden `:context` markers that drive hygiene.
+    """
+    @spec expand_source(Macro.t(), Macro.Env.t()) :: String.t()
+    def expand_source(ast, env) do
+      ast
+      |> Macro.expand(env)
+      |> Macro.to_string()
+    end
+  end
+
+  def main do
+    require HygienePitfalls
+  
+    IO.puts("=== HygienePitfalls Demo ===\n")
+  
+    # Demo 1: Hygiene by default
+    IO.puts("1. tag/1 - Hygiene protects caller's variables:")
+    result = :caller_owned
+    IO.puts("   Before macro: result = #{inspect(result)}")
+  
+    {:tagged, macro_result} = HygienePitfalls.tag do
+      :macro_owned
+    end
+    IO.puts("   After macro: result = #{inspect(result)} (unchanged!)")
+    IO.puts("   Macro returned: #{inspect({:tagged, macro_result})}")
+    assert result == :caller_owned
+    assert macro_result == :macro_owned
+  
+    # Demo 2: Breaking hygiene with var!/2
+    IO.puts("\n2. bind_counter/1 & inc_counter/0 - var!/2 breaks hygiene:")
+    HygienePitfalls.bind_counter(10)
+    IO.puts("   After bind_counter(10): counter = #{binding(do: counter)}")
+  
+    HygienePitfalls.inc_counter()
+    IO.puts("   After inc_counter(): counter = #{binding(do: counter)}")
+  
+    HygienePitfalls.inc_counter()
+    IO.puts("   After inc_counter(): counter = #{binding(do: counter)}")
+  
+    IO.puts("\n✓ HygienePitfalls demo completed!")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Kernel.SpecialForms.quote/2` — the `:context` option and hygiene](https://hexdocs.pm/elixir/Kernel.SpecialForms.html#quote/2-hygiene-in-variables)

@@ -498,6 +498,161 @@ which is equivalent and clearer.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule MdLite do
+  @moduledoc """
+  Converts a subset of Markdown to HTML using recursive list processing.
+
+  Demonstrates head/tail pattern matching, accumulator-based recursion,
+  and the difference between prepend (O(1)) and append (O(n)) on lists.
+  """
+
+  @doc """
+  Converts a markdown string to HTML.
+
+  ## Examples
+
+      iex> MdLite.to_html("# Hello")
+      "<h1>Hello</h1>"
+
+      iex> MdLite.to_html("## World")
+      "<h2>World</h2>"
+
+      iex> MdLite.to_html("- apple\\n- banana")
+      "<ul>\\n<li>apple</li>\\n<li>banana</li>\\n</ul>"
+
+  """
+  @spec to_html(String.t()) :: String.t()
+  def to_html(markdown) when is_binary(markdown) do
+    markdown
+    |> String.split("\n")
+    |> process_lines([])
+    |> Enum.reverse()
+    |> Enum.join("\n")
+  end
+
+  @doc """
+  Processes a list of markdown lines into HTML lines using head/tail recursion.
+
+  Uses an accumulator (prepend-based) for O(1) per line. The result is
+  reversed at the end — the standard pattern for building lists efficiently.
+
+  This function is public for educational purposes. In production, use to_html/1.
+  """
+  @spec process_lines([String.t()], [String.t()]) :: [String.t()]
+  def process_lines([], acc), do: acc
+
+  # Code block — consume lines until closing fence
+  def process_lines(["```" <> _lang | rest], acc) do
+    {code_lines, remaining} = consume_code_block(rest, [])
+    code_html = "<pre><code>#{Enum.join(code_lines, "\n")}</code></pre>"
+    process_lines(remaining, [code_html | acc])
+  end
+
+  # Headings — match leading # characters
+  def process_lines(["### " <> text | rest], acc) do
+    process_lines(rest, ["<h3>#{inline(text)}</h3>" | acc])
+  end
+
+  def process_lines(["## " <> text | rest], acc) do
+    process_lines(rest, ["<h2>#{inline(text)}</h2>" | acc])
+  end
+
+  def process_lines(["# " <> text | rest], acc) do
+    process_lines(rest, ["<h1>#{inline(text)}</h1>" | acc])
+  end
+
+  # Unordered list — consume consecutive "- " lines
+  def process_lines(["- " <> _ | _] = lines, acc) do
+    {list_items, remaining} = consume_list_items(lines, [])
+
+    items_html =
+      list_items
+      |> Enum.map(fn item -> "<li>#{inline(item)}</li>" end)
+      |> Enum.join("\n")
+
+    list_html = "<ul>\n#{items_html}\n</ul>"
+    process_lines(remaining, [list_html | acc])
+  end
+
+  # Empty line — skip
+  def process_lines(["" | rest], acc) do
+    process_lines(rest, acc)
+  end
+
+  # Paragraph — any other text
+  def process_lines([line | rest], acc) do
+    process_lines(rest, ["<p>#{inline(line)}</p>" | acc])
+  end
+
+  @doc """
+  Processes inline markdown formatting: bold and inline code.
+
+  ## Examples
+
+      iex> MdLite.inline("This is **bold** text")
+      "This is <strong>bold</strong> text"
+
+      iex> MdLite.inline("Use `Enum.map/2` here")
+      "Use <code>Enum.map/2</code> here"
+
+  """
+  @spec inline(String.t()) :: String.t()
+  def inline(text) do
+    text
+    |> replace_inline_code()
+    |> replace_bold()
+  end
+
+  # --- Private functions ---
+
+  @spec consume_code_block([String.t()], [String.t()]) ::
+          {[String.t()], [String.t()]}
+  defp consume_code_block([], acc), do: {Enum.reverse(acc), []}
+
+  defp consume_code_block(["```" | rest], acc) do
+    {Enum.reverse(acc), rest}
+  end
+
+  defp consume_code_block([line | rest], acc) do
+    escaped = html_escape(line)
+    consume_code_block(rest, [escaped | acc])
+  end
+
+  @spec consume_list_items([String.t()], [String.t()]) ::
+          {[String.t()], [String.t()]}
+  defp consume_list_items(["- " <> item | rest], acc) do
+    consume_list_items(rest, [item | acc])
+  end
+
+  defp consume_list_items(remaining, acc) do
+    {Enum.reverse(acc), remaining}
+  end
+
+  @spec replace_inline_code(String.t()) :: String.t()
+  defp replace_inline_code(text) do
+    Regex.replace(~r/`([^`]+)`/, text, "<code>\\1</code>")
+  end
+
+  @spec replace_bold(String.t()) :: String.t()
+  defp replace_bold(text) do
+    Regex.replace(~r/\*\*([^*]+)\*\*/, text, "<strong>\\1</strong>")
+  end
+
+  @spec html_escape(String.t()) :: String.t()
+  defp html_escape(text) do
+    text
+    |> String.replace("&", "&amp;")
+    |> String.replace("<", "&lt;")
+    |> String.replace(">", "&gt;")
+  end
+end
+```
+
 ## Resources
 
 - [Lists — Elixir Getting Started](https://elixir-lang.org/getting-started/basic-types.html#linked-lists)

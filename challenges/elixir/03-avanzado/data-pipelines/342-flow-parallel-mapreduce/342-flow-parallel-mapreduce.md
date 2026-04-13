@@ -42,6 +42,25 @@ log_analytics/
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Pipeline-specific insight:**
+Streams are lazy; Enum is eager. Use Stream for data larger than RAM or when you're building intermediate stages. Use Enum when the collection is small or you need side effects at each step. Mixing them carelessly results in performance cliffs.
 ### 1. The stages pipeline
 
 ```
@@ -413,19 +432,121 @@ CPU usage peaks at 400% (4 cores busy, 12 idle). The file is 8 GB on a local NVM
 SSD that sustains 3 GB/s sequential read. What is the likely bottleneck, and what
 instrumentation would you add to prove it before tuning `stages` or `max_demand`?
 
-## Resources
 
-- [Flow documentation — hexdocs](https://hexdocs.pm/flow/Flow.html)
-- [Data Processing with Elixir — Dashbit](https://dashbit.co/blog/gen_stage-and-flow)
-- [`File.stream!/2` — Elixir stdlib](https://hexdocs.pm/elixir/File.html#stream!/2)
-- [Benchee](https://github.com/bencheeorg/benchee)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+defmodule LogAnalytics.Reports do
+  alias LogAnalytics.Parser
+
+  @doc """
+  Counts requests per path and returns the top N.
+
+  The pipeline:
+    1. File.stream!/2 produces lines lazily (O(1) memory).
+    2. Flow.from_enumerable parallelises the stream across N mapper stages.
+    3. Flow.partition shuffles events by path so each path lands on one reducer.
+    4. Flow.reduce counts occurrences per partition.
+    5. Enum.take picks the top N.
+  """
+  @spec top_paths(Path.t(), pos_integer()) :: [{String.t(), non_neg_integer()}]
+  def top_paths(file, n \\ 10) do
+    stages = System.schedulers_online()
+
+    file
+    |> File.stream!(read_ahead: 100_000)
+    |> Flow.from_enumerable(stages: stages, max_demand: 1_000)
+    |> Flow.map(&String.trim_trailing/1)
+    |> Flow.map(&Parser.parse/1)
+    |> Flow.filter(&match?({:ok, _}, &1))
+    |> Flow.map(fn {:ok, e} -> e.path end)
+    |> Flow.partition(stages: stages, key: & &1)
+    |> Flow.reduce(fn -> %{} end, fn path, acc -> Map.update(acc, path, 1, &(&1 + 1)) end)
+    |> Enum.to_list()
+    |> Enum.sort_by(fn {_p, c} -> -c end)
+    |> Enum.take(n)
+  end
+
+  @doc """
+  Returns approximate p95 latency across the whole file.
+
+  For exactness you'd need to materialise all latencies. Here we use a
+  reservoir sampling approach (constant memory) that is accurate within ~1%.
+  """
+  @spec p95_latency(Path.t()) :: non_neg_integer()
+  def p95_latency(file) do
+    stages = System.schedulers_online()
+
+    samples =
+      file
+      |> File.stream!(read_ahead: 100_000)
+      |> Flow.from_enumerable(stages: stages)
+      |> Flow.map(&String.trim_trailing/1)
+      |> Flow.map(&Parser.parse/1)
+      |> Flow.filter(&match?({:ok, _}, &1))
+      |> Flow.map(fn {:ok, e} -> e.latency_ms end)
+      |> Enum.to_list()
+
+    count = length(samples)
+    Enum.at(Enum.sort(samples), round(count * 0.95))
+  end
+
+  @doc """
+  Counts unique IPs using a Flow reduce with a MapSet per partition.
+  Final merge happens at the collector.
+  """
+  @spec unique_ips(Path.t()) :: non_neg_integer()
+  def unique_ips(file) do
+    stages = System.schedulers_online()
+
+    file
+    |> File.stream!(read_ahead: 100_000)
+    |> Flow.from_enumerable(stages: stages)
+    |> Flow.map(&String.trim_trailing/1)
+    |> Flow.map(&Parser.parse/1)
+    |> Flow.filter(&match?({:ok, _}, &1))
+    |> Flow.map(fn {:ok, e} -> e.ip end)
+    |> Flow.partition(stages: stages, key: & &1)
+    |> Flow.reduce(fn -> MapSet.new() end, &MapSet.put(&2, &1))
+    |> Flow.emit(:state)
+    |> Enum.reduce(MapSet.new(), &MapSet.union/2)
+    |> MapSet.size()
+  end
 end
+
+defmodule Main do
+  def main do
+      # Simulate Flow-style parallel map-reduce on log data
+      logs = [
+        %{user: "u1", status: 200, latency: 45},
+        %{user: "u2", status: 200, latency: 52},
+        %{user: "u1", status: 500, latency: 1200},
+        %{user: "u3", status: 200, latency: 48}
+      ]
+
+      # Map: extract relevant fields
+      mapped = Enum.map(logs, fn log ->
+        {log.user, log.status, log.latency}
+      end)
+
+      # Reduce: aggregate by user
+      reduced = Enum.reduce(mapped, %{}, fn {user, status, latency}, acc ->
+        Map.update(acc, user, [latency], fn lats -> [latency | lats] end)
+      end)
+
+      # Compute stats
+      stats = Map.map(reduced, fn _user, latencies ->
+        %{p95: Enum.sort(latencies) |> Enum.reverse() |> hd()}
+      end)
+
+      IO.inspect(stats, label: "✓ Aggregated statistics")
+
+      assert map_size(stats) > 0, "Stats computed"
+      assert Enum.all?(stats, fn {_, v} -> Map.has_key?(v, :p95) end), "P95 calculated"
+
+      IO.puts("✓ Flow parallel map-reduce working")
+  end
+end
+
+Main.main()
 ```

@@ -372,6 +372,110 @@ proxies are for single-node, single-quota gatekeeping.
 
 - Cuando el servicio real cae, ¿el proxy debe crashear o degradar silenciosamente? Justificá en función del tipo de cliente downstream.
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule ProxyGs do
+    @moduledoc """
+    A GenServer that forwards `echo/2` requests to a `ProxyGs.Backend`
+    while enforcing a configurable per-second rate cap.
+
+    Returns `{:ok, reply}` on forwarded requests and `{:error, :rate_limited}`
+    when the cap is exceeded — the backend is not called in that case.
+    """
+
+    use GenServer
+
+    @default_cap 5
+    @window_ms 1_000
+
+    defmodule State do
+      @moduledoc false
+      @enforce_keys [:backend, :cap, :window_ms]
+      defstruct [:backend, :cap, :window_ms, timestamps: []]
+
+      @type t :: %__MODULE__{
+              backend: GenServer.server(),
+              cap: pos_integer(),
+              window_ms: pos_integer(),
+              timestamps: [integer()]
+            }
+    end
+
+    # ── Public API ──────────────────────────────────────────────────────────
+
+    @spec start_link(keyword()) :: GenServer.on_start()
+    def start_link(opts) do
+      {backend, opts} = Keyword.pop!(opts, :backend)
+      {cap, opts} = Keyword.pop(opts, :cap, @default_cap)
+      {window_ms, opts} = Keyword.pop(opts, :window_ms, @window_ms)
+      GenServer.start_link(__MODULE__, {backend, cap, window_ms}, opts)
+    end
+
+    @spec echo(GenServer.server(), term()) :: {:ok, term()} | {:error, :rate_limited}
+    def echo(proxy, term), do: GenServer.call(proxy, {:echo, term})
+
+    # ── Callbacks ───────────────────────────────────────────────────────────
+
+    @impl true
+    def init({backend, cap, window_ms}) do
+      {:ok, %State{backend: backend, cap: cap, window_ms: window_ms}}
+    end
+
+    @impl true
+    def handle_call({:echo, term}, _from, %State{} = state) do
+      now = monotonic_ms()
+      recent = prune(state.timestamps, now, state.window_ms)
+
+      if length(recent) >= state.cap do
+        {:reply, {:error, :rate_limited}, %{state | timestamps: recent}}
+      else
+        # Forward under the cap. Backend may take time — caller waits.
+        reply = ProxyGs.Backend.echo(state.backend, term)
+        {:reply, reply, %{state | timestamps: [now | recent]}}
+      end
+    end
+
+    # ── Helpers ─────────────────────────────────────────────────────────────
+
+    defp monotonic_ms, do: System.monotonic_time(:millisecond)
+
+    # Drop timestamps older than `window_ms` ago. Cheap for small caps;
+    # if cap grows, replace with a counter per bucket.
+    defp prune(timestamps, now, window_ms) do
+      threshold = now - window_ms
+      Enum.filter(timestamps, &(&1 > threshold))
+    end
+  end
+
+  defmodule ProxyGs.Backend do
+    use GenServer
+    def start_link(), do: GenServer.start_link(__MODULE__, nil)
+    def echo(pid, term), do: GenServer.call(pid, {:echo, term})
+    def init(nil), do: {:ok, 0}
+    def handle_call({:echo, term}, _from, count), do: {:reply, {:ok, term}, count + 1}
+  end
+
+  def main do
+    {:ok, backend} = ProxyGs.Backend.start_link()
+    {:ok, proxy} = ProxyGs.start_link(backend: backend, cap: 2, window_ms: 1000)
+  
+    {:ok, 1} = ProxyGs.echo(proxy, 1)
+    {:ok, 2} = ProxyGs.echo(proxy, 2)
+    {:error, :rate_limited} = ProxyGs.echo(proxy, 3)
+  
+    IO.puts("✓ ProxyGs rate limiting works correctly")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`GenServer` — Elixir stdlib](https://hexdocs.pm/elixir/GenServer.html)

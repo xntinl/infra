@@ -67,6 +67,22 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Why Postgres as a queue
 
 Oban's core insight: modern Postgres already has everything a durable queue needs.
@@ -603,22 +619,77 @@ of work per job can push ~2,500 jobs/sec.
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
-
-- [Oban — hexdocs.pm](https://hexdocs.pm/oban/Oban.html)
-- [Oban — GitHub](https://github.com/oban-bg/oban)
-- [Parker Selbert — "Reliable background jobs in Elixir and Postgres"](https://soren.blog/post/reliable-background-jobs-in-elixir-and-postgres/)
-- [PostgreSQL docs — SKIP LOCKED](https://www.postgresql.org/docs/current/sql-select.html#SQL-FOR-UPDATE-SHARE)
-- [Oban telemetry guide — hexdocs.pm](https://hexdocs.pm/oban/Oban.Telemetry.html)
-- [Dashbit — Ecto Multi & Oban](https://dashbit.co/blog/oban-recipes-part-1-unique-jobs)
-- [AWS — Exponential Backoff and Jitter](https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+In `mix.exs`:
+
+
+
+### Step 2: `config/config.exs`
+
+**Objective**: Configure Oban queues with per-queue concurrency limits and plugins for pruning to manage job lifecycle.
+
+
+
+### Step 3: Repo and migrations
+
+**Objective**: Create Ecto Repo and run Oban migrations to establish job queue table schema.
+
+
+
+
+
+Run migrations:
+
+
+
+### Step 4: `lib/oban_intro/application.ex`
+
+**Objective**: Start Repo and Oban supervisor with telemetry to boot job processing at application startup.
+
+
+
+### Step 5: Workers
+
+**Objective**: Build Oban.Worker modules with custom backoff strategies and queue-specific concurrency settings for different job types.
+
+
+
+
+
+
+
+### Step 6: Telemetry
+
+**Objective**: Implement: Telemetry.
+
+
+
+### Step 7: Tests
+
+**Objective**: Verify the implementation by running the test suite.
+
+
+
+
+
+
+
+Run tests:
+
+
+
+### Step 8: Enqueue in IEx
+
+**Objective**: Implement: Enqueue in IEx.
+
+defmodule Main do
+  def main do
+      # Demonstrating 46-oban-background-jobs
+      :ok
+  end
 end
+
+Main.main()
 ```

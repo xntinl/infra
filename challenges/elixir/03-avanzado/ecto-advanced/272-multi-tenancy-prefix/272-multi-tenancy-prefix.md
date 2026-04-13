@@ -82,6 +82,25 @@ For tens of thousands of tenants, `prefix` is the only viable choice.
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Ecto-specific insight:**
+Ecto separates the query layer (building queries) from the execution layer (sending them). This separation allows for debugging, composability, and testing without a database. Never load all rows first and filter in-memory — write the filter into the query itself, or you've just built an N+1 problem.
 ### 1. Schema qualification in Postgres
 
 Postgres resolves unqualified table names through `search_path`. With `search_path = public`,
@@ -604,19 +623,253 @@ switching the read path.
 
 ---
 
-## Resources
-
-- [Ecto `prefix` documentation](https://hexdocs.pm/ecto/multi-tenancy-with-query-prefixes.html)
-- [Ecto.Migrator — running migrations with prefix](https://hexdocs.pm/ecto_sql/Ecto.Migrator.html)
-- [Postgres — schemas and search_path](https://www.postgresql.org/docs/current/ddl-schemas.html)
-- [Triplex](https://github.com/ateliware/triplex) — battle-tested schema-per-tenant library, read the source for edge cases
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+defmodule TenantBilling.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :tenant_billing,
+      version: "0.1.0",
+      elixir: "~> 1.17",
+      deps: deps(),
+      aliases: aliases()
+    ]
+  end
+
+  def application do
+    [
+      mod: {TenantBilling.Application, []},
+      extra_applications: [:logger]
+    ]
+  end
+
+  defp deps do
+    [
+      {:ecto_sql, "~> 3.12"},
+      {:postgrex, "~> 0.19"},
+      {:benchee, "~> 1.3", only: :dev}
+    ]
+  end
+
+  defp aliases do
+    [
+      "ecto.setup": ["ecto.create", "ecto.migrate"],
+      test: ["ecto.create --quiet", "ecto.migrate --quiet", "test"]
+    ]
+  end
+end
+
+# lib/tenant_billing/repo.ex
+defmodule TenantBilling.Repo do
+  use Ecto.Repo,
+    otp_app: :tenant_billing,
+    adapter: Ecto.Adapters.Postgres
+end
+
+# lib/tenant_billing/application.ex
+defmodule TenantBilling.Application do
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    Supervisor.start_link([TenantBilling.Repo], strategy: :one_for_one)
+  end
+end
+
+# lib/tenant_billing/schemas/invoice.ex
+defmodule TenantBilling.Schemas.Invoice do
+  use Ecto.Schema
+  import Ecto.Changeset
+
+  @primary_key {:id, :binary_id, autogenerate: true}
+  @foreign_key_type :binary_id
+
+  schema "invoices" do
+    field :number, :string
+    field :status, :string, default: "draft"
+    field :total_cents, :integer, default: 0
+
+    has_many :line_items, TenantBilling.Schemas.LineItem
+
+    timestamps()
+  end
+
+  def changeset(invoice, attrs) do
+    invoice
+    |> cast(attrs, [:number, :status, :total_cents])
+    |> validate_required([:number])
+    |> validate_inclusion(:status, ~w(draft issued paid void))
+  end
+end
+
+# lib/tenant_billing/schemas/line_item.ex
+defmodule TenantBilling.Schemas.LineItem do
+  use Ecto.Schema
+  import Ecto.Changeset
+
+  @primary_key {:id, :binary_id, autogenerate: true}
+  @foreign_key_type :binary_id
+
+  schema "line_items" do
+    field :description, :string
+    field :unit_cents, :integer
+    field :quantity, :integer, default: 1
+
+    belongs_to :invoice, TenantBilling.Schemas.Invoice
+
+    timestamps()
+  end
+
+  def changeset(item, attrs) do
+    item
+    |> cast(attrs, [:description, :unit_cents, :quantity, :invoice_id])
+    |> validate_required([:description, :unit_cents, :invoice_id])
+    |> validate_number(:quantity, greater_than: 0)
+  end
+end
+
+# lib/tenant_billing/tenants.ex
+defmodule TenantBilling.Tenants do
+  @moduledoc """
+  Creates and drops per-tenant Postgres schemas. Runs tenant migrations.
+  """
+
+  alias TenantBilling.Repo
+
+  @tenant_migrations_path "priv/repo/tenant_migrations"
+
+  @doc "Creates a new tenant schema and runs all migrations inside it."
+  @spec create(String.t()) :: :ok | {:error, term()}
+  def create(tenant) when is_binary(tenant) do
+    with :ok <- validate_tenant_name(tenant),
+         {:ok, _} <- create_schema(tenant),
+         :ok <- migrate(tenant) do
+      :ok
+    end
+  end
+
+  @spec drop(String.t()) :: :ok | {:error, term()}
+  def drop(tenant) do
+    with :ok <- validate_tenant_name(tenant) do
+      Ecto.Adapters.SQL.query(Repo, ~s(DROP SCHEMA "#{tenant}" CASCADE), [])
+      |> case do
+        {:ok, _} -> :ok
+        err -> err
+      end
+    end
+  end
+
+  @spec migrate(String.t()) :: :ok
+  def migrate(tenant) do
+    Ecto.Migrator.run(Repo, @tenant_migrations_path, :up,
+      all: true,
+      prefix: tenant,
+      dynamic_repo: Repo
+    )
+
+    :ok
+  end
+
+  # A tenant name becomes a SQL identifier. Never interpolate raw user input.
+  defp validate_tenant_name(name) do
+    if Regex.match?(~r/\A[a-z][a-z0-9_]{1,62}\z/, name) do
+      :ok
+    else
+      {:error, :invalid_tenant_name}
+    end
+  end
+
+  defp create_schema(tenant) do
+    Ecto.Adapters.SQL.query(Repo, ~s(CREATE SCHEMA IF NOT EXISTS "#{tenant}"), [])
+  end
+end
+
+# priv/repo/tenant_migrations/20260101000000_create_invoices.exs
+defmodule TenantBilling.Repo.TenantMigrations.CreateInvoices do
+  use Ecto.Migration
+
+  def change do
+    create table(:invoices, primary_key: false) do
+      add :id, :binary_id, primary_key: true
+      add :number, :string, null: false
+      add :status, :string, null: false, default: "draft"
+      add :total_cents, :integer, null: false, default: 0
+      timestamps()
+    end
+
+    create unique_index(:invoices, [:number])
+
+    create table(:line_items, primary_key: false) do
+      add :id, :binary_id, primary_key: true
+      add :invoice_id, references(:invoices, type: :binary_id, on_delete: :delete_all),
+        null: false
+      add :description, :string, null: false
+      add :unit_cents, :integer, null: false
+      add :quantity, :integer, null: false, default: 1
+      timestamps()
+    end
+
+    create index(:line_items, [:invoice_id])
+  end
+end
+
+# lib/tenant_billing/invoices.ex
+defmodule TenantBilling.Invoices do
+  end
+  import Ecto.Query
+
+  alias TenantBilling.Repo
+  alias TenantBilling.Schemas.{Invoice, LineItem}
+
+  @spec create(String.t(), map()) :: {:ok, Invoice.t()} | {:error, Ecto.Changeset.t()}
+  def create(tenant, attrs) do
+    %Invoice{}
+    |> Invoice.changeset(attrs)
+    |> Ecto.Changeset.put_change(:id, Ecto.UUID.generate())
+    |> Repo.insert(prefix: tenant)
+  end
+
+  @spec add_line_item(String.t(), Invoice.t(), map()) ::
+          {:ok, LineItem.t()} | {:error, Ecto.Changeset.t()}
+  def add_line_item(tenant, %Invoice{id: invoice_id}, attrs) do
+    attrs = Map.put(attrs, :invoice_id, invoice_id)
+
+    %LineItem{}
+    |> LineItem.changeset(attrs)
+    |> Repo.insert(prefix: tenant)
+  end
+
+  @spec list(String.t(), keyword()) :: [Invoice.t()]
+  def list(tenant, opts \\ []) do
+    status = Keyword.get(opts, :status)
+
+    Invoice
+    |> maybe_filter_status(status)
+    |> Repo.all(prefix: tenant)
+  end
+
+  @spec get_with_items(String.t(), Ecto.UUID.t()) :: Invoice.t() | nil
+  def get_with_items(tenant, id) do
+    Invoice
+    |> where([i], i.id == ^id)
+    |> preload(:line_items)
+    |> Repo.one(prefix: tenant)
+  end
+
+  defp maybe_filter_status(query, nil), do: query
+  defp maybe_filter_status(query, status), do: where(query, [i], i.status == ^status)
+end
+
+defmodule Main do
+  def main do
+      # Demonstrating 272-multi-tenancy-prefix
+      :ok
+  end
+end
+
+Main.main()
 end
 ```

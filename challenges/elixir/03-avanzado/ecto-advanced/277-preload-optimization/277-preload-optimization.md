@@ -98,6 +98,25 @@ The nested `Repo.get!` re-introduces the problem.
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Ecto-specific insight:**
+Ecto separates the query layer (building queries) from the execution layer (sending them). This separation allows for debugging, composability, and testing without a database. Never load all rows first and filter in-memory — write the filter into the query itself, or you've just built an N+1 problem.
 ### 1. Preload is bounded by the query planner
 
 When you preload 50 posts with an `IN (id1, id2, ..., id50)`, Postgres must parse a 50-
@@ -524,19 +543,169 @@ given a round-trip latency of R ms and a per-row transfer cost of t ms?
 
 ---
 
-## Resources
-
-- [`Ecto.Query.preload/3`](https://hexdocs.pm/ecto/Ecto.Query.html#preload/3)
-- [Dashbit — "Ecto and preloads"](https://dashbit.co/blog)
-- [Postgres window functions](https://www.postgresql.org/docs/current/tutorial-window.html)
-- [Telemetry for Ecto](https://hexdocs.pm/ecto/Ecto.Repo.html#module-telemetry-events)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
 defp deps do
   [
-    # Add dependencies here
+    {:ecto_sql, "~> 3.12"},
+    {:postgrex, "~> 0.19"},
+    {:benchee, "~> 1.3", only: :dev}
   ]
+
+
+# lib/blog_feed/schemas/author.ex
+defmodule BlogFeed.Schemas.Author do
+  use Ecto.Schema
+
+  schema "authors" do
+    field :name, :string
+    field :verified, :boolean, default: false
+    has_many :posts, BlogFeed.Schemas.Post
+    timestamps()
+  end
 end
+
+# lib/blog_feed/schemas/post.ex
+defmodule BlogFeed.Schemas.Post do
+  use Ecto.Schema
+
+  schema "posts" do
+    field :title, :string
+    field :published_at, :utc_datetime
+    belongs_to :author, BlogFeed.Schemas.Author
+    has_many :comments, BlogFeed.Schemas.Comment
+    many_to_many :tags, BlogFeed.Schemas.Tag, join_through: "post_tags"
+    timestamps()
+  end
+end
+
+# lib/blog_feed/schemas/comment.ex
+defmodule BlogFeed.Schemas.Comment do
+  use Ecto.Schema
+
+  schema "comments" do
+    field :body, :string
+    belongs_to :post, BlogFeed.Schemas.Post
+    belongs_to :author, BlogFeed.Schemas.Author
+    timestamps()
+  end
+end
+
+# lib/blog_feed/schemas/tag.ex
+defmodule BlogFeed.Schemas.Tag do
+  use Ecto.Schema
+
+  schema "tags" do
+    field :name, :string
+    many_to_many :posts, BlogFeed.Schemas.Post, join_through: "post_tags"
+    timestamps()
+  end
+end
+
+
+# lib/blog_feed/feed.ex
+defmodule BlogFeed.Feed do
+  @moduledoc """
+  Feed loaders with explicit preload strategies.
+
+  `latest/1` is the production default: linear round-trips, no row explosion.
+  `latest_join/1` is an alternative for threads with ≤ 10 comments each.
+  """
+  import Ecto.Query
+
+  alias BlogFeed.Repo
+  alias BlogFeed.Schemas.{Comment, Post, Tag}
+
+  # ------------------------------------------------------------------------
+  # Strategy 1 — separate preloads (default)
+  # 1 query for posts
+  # 1 query for authors
+  # 1 query for comments
+  # 1 query for comment authors
+  # 1 query for tags (+ join table)
+  # = 5 queries regardless of post count
+  # ------------------------------------------------------------------------
+
+  @spec latest(non_neg_integer()) :: [Post.t()]
+  def latest(n \ 50) do
+    posts_query =
+      from p in Post,
+        order_by: [desc: p.published_at],
+        limit: ^n
+
+    comment_query = from c in Comment, order_by: [asc: c.inserted_at]
+
+    posts_query
+    |> preload([:author, comments: ^{comment_query, [:author]}, tags: []])
+    |> Repo.all()
+  end
+
+  # ------------------------------------------------------------------------
+  # Strategy 2 — join preload for filtering on associated columns
+  # ONE query. Use only when you need to filter/order by joined fields.
+  # ------------------------------------------------------------------------
+
+  @spec verified_author_feed(non_neg_integer()) :: [Post.t()]
+  def verified_author_feed(n \ 50) do
+    query =
+      from p in Post,
+        join: a in assoc(p, :author),
+        where: a.verified == true,
+        order_by: [desc: p.published_at],
+        limit: ^n,
+        preload: [author: a]
+
+    Repo.all(query)
+  end
+
+  # ------------------------------------------------------------------------
+  # Strategy 3 — custom per-parent subquery using lateral join
+  # Top-N-per-group: the last 3 comments FOR EACH post.
+  # ------------------------------------------------------------------------
+
+  @spec latest_with_top_comments(non_neg_integer(), non_neg_integer()) :: [Post.t()]
+  def latest_with_top_comments(n \ 50, top_k \ 3) do
+    posts = from(p in Post, order_by: [desc: p.published_at], limit: ^n) |> Repo.all()
+    post_ids = Enum.map(posts, & &1.id)
+
+    top_comments_sql = """
+    SELECT c.*
+    FROM comments c
+    WHERE c.post_id = ANY($1)
+      AND c.id IN (
+        SELECT id FROM (
+          SELECT id,
+                 row_number() OVER (PARTITION BY post_id ORDER BY inserted_at DESC) AS rn
+          FROM comments
+          WHERE post_id = ANY($1)
+        ) ranked
+        WHERE rn <= $2
+      )
+    """
+
+    {:ok, %{rows: rows, columns: cols}} =
+      Ecto.Adapters.SQL.query(Repo, top_comments_sql, [post_ids, top_k])
+
+    comments =
+      rows
+      |> Enum.map(fn row ->
+        Repo.load(Comment, {cols, row})
+      end)
+
+    by_post = Enum.group_by(comments, & &1.post_id)
+
+    for p <- posts do
+      %{p | comments: Map.get(by_post, p.id, [])}
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+      :ok
+  end
+end
+
+Main.main()
 ```

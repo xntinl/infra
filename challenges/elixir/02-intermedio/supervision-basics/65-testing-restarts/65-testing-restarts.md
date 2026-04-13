@@ -358,6 +358,57 @@ tree, not once per worker.
 
 - ¿Cómo distinguís en un test si un child crasheó y reinició vs nunca crasheó? Dá el código.
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule TestingRestarts.Service do
+    @moduledoc """
+    A small stateful service used to demonstrate testing restart behavior.
+    Holds a counter plus a "last reason" field so tests can verify both
+    that a restart happened and that state was properly reset.
+    """
+
+    use GenServer
+
+    @spec start_link(keyword()) :: GenServer.on_start()
+    def start_link(opts) do
+      name = Keyword.get(opts, :name, __MODULE__)
+      GenServer.start_link(__MODULE__, :ok, name: name)
+    end
+
+    @spec bump(GenServer.server()) :: :ok
+    def bump(srv \\ __MODULE__), do: GenServer.cast(srv, :bump)
+
+    @spec value(GenServer.server()) :: non_neg_integer()
+    def value(srv \\ __MODULE__), do: GenServer.call(srv, :value)
+
+    @spec crash(GenServer.server()) :: :ok
+    def crash(srv \\ __MODULE__), do: GenServer.cast(srv, :crash)
+
+    @impl true
+    def init(:ok), do: {:ok, 0}
+
+    @impl true
+    def handle_cast(:bump, n), do: {:noreply, n + 1}
+    def handle_cast(:crash, _n), do: raise("test-triggered crash")
+
+    @impl true
+    def handle_call(:value, _from, n), do: {:reply, n, n}
+  end
+
+  def main do
+    IO.puts("TestingRestarts OK")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`ExUnit.Callbacks.start_supervised!/2`](https://hexdocs.pm/ex_unit/ExUnit.Callbacks.html#start_supervised!/2)

@@ -455,18 +455,242 @@ Target: operation should complete in the low-microsecond range on modern hardwar
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
-
-- [Axon HexDocs](https://hexdocs.pm/axon/Axon.html) — layers, build, predict
-- [Axon.Loop](https://hexdocs.pm/axon/Axon.Loop.html) — trainer, metric, run
-- [Machine Learning in Elixir — Sean Moriarity](https://pragprog.com/titles/smelixir/machine-learning-in-elixir/)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
 defp deps do
   [
-    # Add dependencies here
+    {:nx,   "~> 0.7"},
+    {:axon, "~> 0.6"},
+    {:exla, "~> 0.7", only: [:dev, :prod]}
   ]
+
+
+defmodule ApiGateway.ML.FeatureExtractor do
+  @moduledoc """
+  Converts raw request metadata into a normalized 8-element feature vector.
+
+  Features (all normalized to [0, 1]):
+    0: requests_per_minute / 1000  (rate, normalized)
+    1: payload_bytes / 65536       (size, normalized)
+    2: unique_endpoints / 100      (diversity)
+    3: error_rate                  (fraction of 4xx/5xx)
+    4: hour_of_day / 24            (time pattern)
+    5: is_weekend (0.0 or 1.0)
+    6: p99_latency_ms / 10_000     (normalized)
+    7: burst_score                 (stddev of per-second counts, normalized)
+  """
+
+  @feature_count 8
+
+  @doc "Extracts and returns an Nx tensor of shape {1, 8} from a request stats map."
+  @spec extract(%{
+    requests_per_minute: number(),
+    payload_bytes: number(),
+    unique_endpoints: number(),
+    error_rate: float(),
+    hour_of_day: integer(),
+    is_weekend: boolean(),
+    p99_latency_ms: number(),
+    burst_score: number()
+  }) :: Nx.Tensor.t()
+  def extract(stats) do
+    features = [
+      min(stats.requests_per_minute / 1_000.0, 1.0),
+      min(stats.payload_bytes / 65_536.0, 1.0),
+      min(stats.unique_endpoints / 100.0, 1.0),
+      stats.error_rate,
+      stats.hour_of_day / 24.0,
+      if(stats.is_weekend, do: 1.0, else: 0.0),
+      min(stats.p99_latency_ms / 10_000.0, 1.0),
+      min(stats.burst_score, 1.0)
+    ]
+
+    Nx.tensor([features], type: :f32)
+
+  @spec feature_count() :: pos_integer()
+  def feature_count, do: @feature_count
+
+
+defmodule ApiGateway.ML.Classifier do
+  @moduledoc """
+  Neural network classifier for request patterns.
+
+  Architecture: Dense(16, relu) -> Dropout(0.3) -> Dense(8, relu) -> Dense(3, softmax)
+  Output classes: 0=normal, 1=suspicious, 2=abusive
+  """
+
+  @classes [:normal, :suspicious, :abusive]
+
+  @doc """
+  Builds and returns the model architecture. Does not initialize weights.
+  """
+  @spec build() :: Axon.t()
+  def build do
+    Axon.input("request_features", shape: {nil, 8})
+    |> Axon.dense(16, activation: :relu)
+    |> Axon.dropout(rate: 0.3)
+    |> Axon.dense(8, activation: :relu)
+    |> Axon.dense(3, activation: :softmax)
+
+  @spec classes() :: [:normal | :suspicious | :abusive]
+  def classes, do: @classes
 end
+
+
+defmodule ApiGateway.ML.Training do
+  @moduledoc """
+  Training pipeline for the request classifier.
+
+  The training data comes from labeled historical request logs.
+  Labels: 0=normal, 1=suspicious, 2=abusive (one-hot encoded).
+  """
+
+  alias ApiGateway.ML.{Classifier, FeatureExtractor}
+
+  @doc """
+  Trains the classifier on labeled examples.
+
+  `data` is a list of `{stats_map, label_integer}` tuples.
+  `label_integer` is 0, 1, or 2.
+
+  Returns `{model, model_state}`.
+  """
+  @spec train(list({map(), 0 | 1 | 2}), keyword()) :: {Axon.t(), map()}
+  def train(data, opts \ []) do
+    epochs        = Keyword.get(opts, :epochs, 20)
+    learning_rate = Keyword.get(opts, :learning_rate, 0.001)
+    batch_size    = Keyword.get(opts, :batch_size, 32)
+
+    model = Classifier.build()
+
+    # Convert data to batched tensors
+    {features_list, labels_list} =
+      data
+      |> Enum.map(fn {stats, label} ->
+        features = FeatureExtractor.extract(stats) |> Nx.squeeze(axes: [0])
+        one_hot = Nx.tensor(one_hot_encode(label, 3), type: :f32)
+        {features, one_hot}
+      end)
+      |> Enum.unzip()
+
+    # Stack all features and labels into single tensors
+    all_features = Nx.stack(features_list)
+    all_labels = Nx.stack(labels_list)
+
+    # Create batched stream for training
+    batches =
+      Stream.zip(
+        Nx.to_batched(all_features, batch_size),
+        Nx.to_batched(all_labels, batch_size)
+      )
+      |> Stream.map(fn {feat_batch, label_batch} ->
+        %{"request_features" => feat_batch, "labels" => label_batch}
+      end)
+
+    # Build training loop
+    model_state =
+      model
+      |> Axon.Loop.trainer(:categorical_cross_entropy, Polaris.Optimizers.adam(learning_rate: learning_rate))
+      |> Axon.Loop.metric(:accuracy)
+      |> Axon.Loop.run(batches, %{}, epochs: epochs, compiler: EXLA)
+
+    {model, model_state}
+  end
+
+  @doc """
+  Generates synthetic labeled training data for testing.
+  In production this comes from labeled incident logs.
+  """
+  @spec synthetic_data(pos_integer()) :: list({map(), 0 | 1 | 2})
+  def synthetic_data(n \ 1_000) do
+    Enum.map(1..n, fn _ ->
+      label = :rand.uniform(3) - 1
+
+      stats =
+        case label do
+          0 ->
+            %{
+              requests_per_minute: 10 + :rand.uniform(50),
+              payload_bytes: 100 + :rand.uniform(500),
+              unique_endpoints: 1 + :rand.uniform(10),
+              error_rate: :rand.uniform() * 0.05,
+              hour_of_day: :rand.uniform(24) - 1,
+              is_weekend: :rand.uniform(2) == 1,
+              p99_latency_ms: 50 + :rand.uniform(100),
+              burst_score: :rand.uniform() * 0.1
+            }
+
+          1 ->
+            %{
+              requests_per_minute: 200 + :rand.uniform(300),
+              payload_bytes: 100 + :rand.uniform(2000),
+              unique_endpoints: 5 + :rand.uniform(20),
+              error_rate: 0.1 + :rand.uniform() * 0.2,
+              hour_of_day: :rand.uniform(24) - 1,
+              is_weekend: :rand.uniform(2) == 1,
+              p99_latency_ms: 200 + :rand.uniform(500),
+              burst_score: 0.3 + :rand.uniform() * 0.3
+            }
+
+          2 ->
+            %{
+              requests_per_minute: 800 + :rand.uniform(200),
+              payload_bytes: 500 + :rand.uniform(10_000),
+              unique_endpoints: 1 + :rand.uniform(3),
+              error_rate: 0.4 + :rand.uniform() * 0.5,
+              hour_of_day: :rand.uniform(24) - 1,
+              is_weekend: false,
+              p99_latency_ms: 1_000 + :rand.uniform(5_000),
+              burst_score: 0.7 + :rand.uniform() * 0.3
+            }
+        end
+
+      {stats, label}
+    end)
+  end
+
+  # Converts an integer class index to a one-hot list.
+  # one_hot_encode(1, 3) => [0.0, 1.0, 0.0]
+  defp one_hot_encode(class_idx, num_classes) do
+    Enum.map(0..(num_classes - 1), fn i ->
+      if i == class_idx, do: 1.0, else: 0.0
+    end)
+  end
+end
+
+
+# test/api_gateway/ml_classifier_test.exs
+defmodule ApiGateway.ML.ClassifierTest do
+  use ExUnit.Case, async: true
+
+  alias ApiGateway.ML.{Classifier, FeatureExtractor, Training}
+
+    test "all features are in [0, 1]" do
+      stats = %{
+        requests_per_minute: 100_000,
+        payload_bytes: 999_999,
+        unique_endpoints: 99_999,
+        error_rate: 1.0,
+        hour_of_day: 23,
+        is_weekend: true,
+        p99_latency_ms: 999_999,
+        burst_score: 999_999
+      }
+      tensor = FeatureExtractor.extract(stats)
+      values = Nx.to_flat_list(tensor)
+      assert Enum.all?(values, fn v -> v >= 0.0 and v <= 1.0 end)
+    end
+  end
+  end
+  end
+end
+
+defmodule Main do
+  def main do
+      :ok
+  end
+end
+
+Main.main()
 ```

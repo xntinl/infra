@@ -449,6 +449,156 @@ at scale (thousands of ops/sec, many cores, hot keys).
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule EtsAccessModes do
+    @moduledoc """
+    Demonstrates the three ETS access modes (`:public`, `:protected`, `:private`)
+    by opening tables from a deliberately separate *owner process* and letting
+    a *client process* attempt reads and writes. The rules are enforced by the
+    runtime, so the tests boil down to "does this `:ets` call raise `:badarg`?".
+    """
+
+    @type mode :: :public | :protected | :private
+
+    @doc """
+    Spawns an owner process that opens a table with the given mode and
+    replies with the table reference. The owner stays alive until it receives
+    `:stop`, so tests can interact with it.
+    """
+    @spec start_owner(mode(), keyword()) :: {pid(), :ets.tid()}
+    def start_owner(mode, extra_opts \\ []) do
+      parent = self()
+
+      pid =
+        spawn_link(fn ->
+          t = :ets.new(:tally, [:set, mode | extra_opts])
+          send(parent, {:table, self(), t})
+          loop(t)
+        end)
+
+      receive do
+        {:table, ^pid, t} -> {pid, t}
+      after
+        1_000 -> raise "owner did not return its table"
+      end
+    end
+
+    # Owner loop: handles a couple of messages so the test can use it as an
+    # agent-of-sorts without pulling in GenServer here.
+    defp loop(t) do
+      receive do
+        {:write, from, key, value} ->
+          result =
+            try do
+              :ets.insert(t, {key, value})
+            rescue
+              e -> {:error, e}
+            end
+
+          send(from, {:write_result, result})
+          loop(t)
+
+        :stop ->
+          :ets.delete(t)
+          :ok
+      end
+    end
+
+    @doc "Asks the owner to insert a tuple on its own behalf."
+    @spec owner_write(pid(), term(), term()) :: term()
+    def owner_write(owner, key, value) do
+      send(owner, {:write, self(), key, value})
+
+      receive do
+        {:write_result, r} -> r
+      after
+        1_000 -> raise "owner did not reply"
+      end
+    end
+
+    @doc """
+    Attempts to read from a table as a non-owner. Returns `{:ok, value}`,
+    `:empty`, or `{:error, reason}` if the access mode forbids it.
+    """
+    @spec foreign_read(:ets.tid(), term()) :: {:ok, term()} | :empty | {:error, term()}
+    def foreign_read(table, key) do
+      case :ets.lookup(table, key) do
+        [{^key, v}] -> {:ok, v}
+        [] -> :empty
+      end
+    rescue
+      e -> {:error, e}
+    end
+
+    @doc """
+    Attempts to write to a table as a non-owner. Returns `:ok` or
+    `{:error, reason}` if the access mode forbids it (`:protected`, `:private`).
+    """
+    @spec foreign_write(:ets.tid(), term(), term()) :: :ok | {:error, term()}
+    def foreign_write(table, key, value) do
+      :ets.insert(table, {key, value})
+      :ok
+    rescue
+      e -> {:error, e}
+    end
+
+    @doc "Shuts down the owner process (and its table)."
+    @spec stop_owner(pid()) :: :ok
+    def stop_owner(owner) do
+      ref = Process.monitor(owner)
+      send(owner, :stop)
+
+      receive do
+        {:DOWN, ^ref, :process, ^owner, _} -> :ok
+      after
+        500 -> :ok
+      end
+    end
+  end
+
+  def main do
+    # Demo: modos de acceso ETS (:public, :protected, :private)
+  
+    # Test :public — cualquier proceso puede leer y escribir
+    {owner_pub, t_pub} = EtsAccessModes.start_owner(:public)
+    assert EtsAccessModes.foreign_write(t_pub, :k, 1) == :ok
+    assert EtsAccessModes.foreign_read(t_pub, :k) == {:ok, 1}
+    EtsAccessModes.stop_owner(owner_pub)
+    IO.puts("✓ :public — lectura y escritura permitidas para procesos ajenos")
+  
+    # Test :protected — owner escribe, todos leen
+    {owner_prot, t_prot} = EtsAccessModes.start_owner(:protected)
+    assert EtsAccessModes.owner_write(owner_prot, :k, 2) == true
+    assert EtsAccessModes.foreign_read(t_prot, :k) == {:ok, 2}
+    # Foreign write debe fallar
+    error_result = EtsAccessModes.foreign_write(t_prot, :k, 999)
+    assert match?({:error, _}, error_result)
+    EtsAccessModes.stop_owner(owner_prot)
+    IO.puts("✓ :protected — solo owner escribe, otros leen")
+  
+    # Test :private — solo owner
+    {owner_priv, t_priv} = EtsAccessModes.start_owner(:private)
+    assert EtsAccessModes.owner_write(owner_priv, :k, 3) == true
+    # Foreign read debe fallar
+    read_result = EtsAccessModes.foreign_read(t_priv, :k)
+    assert match?({:error, _}, read_result)
+    EtsAccessModes.stop_owner(owner_priv)
+    IO.puts("✓ :private — solo owner puede leer y escribir")
+  
+    IO.puts("\nEtsAccessModes: demostración de modos de acceso exitosa")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`:ets.new/2` — all options](https://www.erlang.org/doc/man/ets.html#new-2)

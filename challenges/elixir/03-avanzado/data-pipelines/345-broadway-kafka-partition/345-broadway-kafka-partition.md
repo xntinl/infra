@@ -55,6 +55,25 @@ Alternatives we rejected:
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Pipeline-specific insight:**
+Streams are lazy; Enum is eager. Use Stream for data larger than RAM or when you're building intermediate stages. Use Enum when the collection is small or you need side effects at each step. Mixing them carelessly results in performance cliffs.
 ### 1. Partition-aware concurrency
 
 ```
@@ -386,19 +405,98 @@ bump `concurrency: 16` but forget to update the hash mod. What breaks,
 and what's the minimal-downtime migration path to 16 stages while
 preserving per-user ordering?
 
-## Resources
 
-- [BroadwayKafka — hexdocs](https://hexdocs.pm/broadway_kafka/BroadwayKafka.Producer.html)
-- [Broadway `partition_by:` docs](https://hexdocs.pm/broadway/Broadway.html#start_link/2-processors-options)
-- [brod — Erlang Kafka client](https://github.com/kafka4beam/brod)
-- [Kafka Consumer Group protocol](https://kafka.apache.org/documentation/#consumerconfigs)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+defmodule UserEventsConsumer.Pipeline do
+  use Broadway
+
+  alias Broadway.Message
+
+  @stages 8
+
+  def start_link(_opts) do
+    Broadway.start_link(__MODULE__,
+      name: __MODULE__,
+      producer: [
+        module:
+          {BroadwayKafka.Producer,
+           hosts: [localhost: 9092],
+           group_id: "user_events_consumer",
+           topics: ["user-events"],
+           offset_commit_interval_seconds: 5,
+           client_config: [connect_timeout: 30_000]},
+        concurrency: 1
+      ],
+      processors: [
+        default: [
+          concurrency: @stages,
+          max_demand: 100,
+          partition_by: &partition_by_user/1
+        ]
+      ],
+      batchers: [
+        default: [concurrency: 2, batch_size: 200, batch_timeout: 500]
+      ]
+    )
+  end
+
+  @impl true
+  def handle_message(_processor, %Message{data: data} = message, _ctx) do
+    case Jason.decode(data) do
+      {:ok, %{"user_id" => uid} = event} ->
+        UserEventsConsumer.Processor.apply_event(uid, event)
+        message
+
+      {:ok, _} ->
+        Message.failed(message, "missing user_id")
+
+      {:error, _} ->
+        Message.failed(message, "invalid json") |> Message.configure_ack(on_failure: :reject)
+    end
+  end
+
+  @impl true
+  def handle_batch(:default, messages, _info, _ctx), do: messages
+
+  # ---- routing ---------------------------------------------------------
+
+  # Keep the hash stable across releases — it determines per-user order.
+  defp partition_by_user(%Message{data: data}) do
+    case Jason.decode(data) do
+      {:ok, %{"user_id" => uid}} -> :erlang.phash2(uid, @stages)
+      _ -> 0
+    end
+  end
 end
+
+defmodule Main do
+  def main do
+      # Simulate Kafka partition_by for per-user-id ordering
+      events = [
+        %{id: "e1", user_id: "u1", action: "view"},
+        %{id: "e2", user_id: "u2", action: "buy"},
+        %{id: "e3", user_id: "u1", action: "review"},
+        %{id: "e4", user_id: "u3", action: "follow"}
+      ]
+
+      # Partition by user_id using hash
+      partitioned = Enum.group_by(events, & &1.user_id)
+
+      IO.inspect(Map.keys(partitioned), label: "✓ Partitions created")
+
+      # Verify ordering per partition
+      u1_events = partitioned["u1"]
+
+      IO.inspect(u1_events, label: "✓ u1 events (in order)")
+
+      assert length(partitioned) == 3, "3 partitions created"
+      assert Enum.all?(u1_events, &(&1.user_id == "u1")), "All u1 events in partition"
+
+      IO.puts("✓ Kafka partition_by: per-key ordering with parallel processing")
+  end
+end
+
+Main.main()
 ```

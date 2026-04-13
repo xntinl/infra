@@ -352,6 +352,123 @@ throughput.
 
 - ¿Qué pasa si el consumidor tarda 10x más que el productor durante 1 minuto? Diseñá la política de rechazo y justificala.
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule BoundedBufferGs do
+    @moduledoc """
+    A fixed-capacity FIFO buffer implemented as a GenServer, backed by Erlang's
+    `:queue`. Producers get `{:error, :full}` when the buffer is at capacity,
+    which makes back-pressure explicit at the call site.
+    """
+
+    use GenServer
+
+    @default_capacity 100
+
+    defmodule State do
+      @moduledoc false
+      defstruct [:queue, :size, :capacity]
+
+      @type t :: %__MODULE__{
+              queue: :queue.queue(term()),
+              size: non_neg_integer(),
+              capacity: pos_integer()
+            }
+    end
+
+    # ── Public API ──────────────────────────────────────────────────────────
+
+    @doc """
+    Starts the buffer. Options:
+
+      * `:capacity` — positive integer, max items held (default 100).
+      * `:name` — optional process name.
+    """
+    @spec start_link(keyword()) :: GenServer.on_start()
+    def start_link(opts \\ []) do
+      {capacity, opts} = Keyword.pop(opts, :capacity, @default_capacity)
+
+      unless is_integer(capacity) and capacity > 0 do
+        raise ArgumentError, "capacity must be a positive integer, got: #{inspect(capacity)}"
+      end
+
+      GenServer.start_link(__MODULE__, capacity, opts)
+    end
+
+    @doc "Pushes an item. Returns `:ok` or `{:error, :full}`."
+    @spec push(GenServer.server(), term()) :: :ok | {:error, :full}
+    def push(server, item), do: GenServer.call(server, {:push, item})
+
+    @doc "Pops the oldest item. Returns `{:ok, item}` or `:empty`."
+    @spec pop(GenServer.server()) :: {:ok, term()} | :empty
+    def pop(server), do: GenServer.call(server, :pop)
+
+    @doc "Current number of items in the buffer."
+    @spec size(GenServer.server()) :: non_neg_integer()
+    def size(server), do: GenServer.call(server, :size)
+
+    # ── Callbacks ───────────────────────────────────────────────────────────
+
+    @impl true
+    def init(capacity) do
+      {:ok, %State{queue: :queue.new(), size: 0, capacity: capacity}}
+    end
+
+    @impl true
+    def handle_call({:push, _item}, _from, %State{size: size, capacity: capacity} = state)
+        when size >= capacity do
+      {:reply, {:error, :full}, state}
+    end
+
+    def handle_call({:push, item}, _from, %State{queue: q, size: size} = state) do
+      {:reply, :ok, %{state | queue: :queue.in(item, q), size: size + 1}}
+    end
+
+    def handle_call(:pop, _from, %State{queue: q, size: size} = state) do
+      case :queue.out(q) do
+        {{:value, item}, q2} ->
+          {:reply, {:ok, item}, %{state | queue: q2, size: size - 1}}
+
+        {:empty, _q} ->
+          {:reply, :empty, state}
+      end
+    end
+
+    def handle_call(:size, _from, %State{size: size} = state) do
+      {:reply, size, state}
+    end
+  end
+
+  def main do
+    {:ok, buf} = BoundedBufferGs.start_link(capacity: 3)
+  
+    :ok = BoundedBufferGs.push(buf, :a)
+    :ok = BoundedBufferGs.push(buf, :b)
+    :ok = BoundedBufferGs.push(buf, :c)
+    IO.puts("Pushed 3 items, size: #{BoundedBufferGs.size(buf)}")
+  
+    {:error, :full} = BoundedBufferGs.push(buf, :d)
+    IO.puts("Cannot push when full")
+  
+    {:ok, :a} = BoundedBufferGs.pop(buf)
+    IO.puts("Popped :a, size: #{BoundedBufferGs.size(buf)}")
+  
+    :ok = BoundedBufferGs.push(buf, :d)
+    IO.puts("Now can push, size: #{BoundedBufferGs.size(buf)}")
+  
+    IO.puts("✓ BoundedBufferGs works correctly")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`:queue` — Erlang stdlib](https://www.erlang.org/doc/man/queue.html)

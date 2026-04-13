@@ -379,6 +379,98 @@ Reserve `{:stop, ...}` for "this process cannot continue".
 
 - Diseñá una taxonomía de `stop reasons` para un sistema de pagos. Cuáles son `:normal`, cuáles `:shutdown`, cuáles fallan ruidoso.
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule StopReasonsGs do
+    @moduledoc """
+    A tiny worker that can be asked to stop with different reasons so we
+    can observe supervisor restart behavior for each.
+
+    Restart strategy: `:transient` — treat `:normal`/`:shutdown`/
+    `{:shutdown, _}` as clean, restart on everything else.
+    """
+
+    use GenServer, restart: :transient
+
+    require Logger
+
+    # ── Public API ──────────────────────────────────────────────────────────
+
+    @spec start_link(keyword()) :: GenServer.on_start()
+    def start_link(opts \\ []), do: GenServer.start_link(__MODULE__, :ok, opts)
+
+    @doc """
+    Cleanly stop. Supervisor will NOT restart a :transient worker for these reasons.
+
+      * `:normal`                 — the canonical "work done" exit
+      * `:shutdown`               — canonical graceful shutdown
+      * `{:shutdown, something}`  — graceful with extra context
+    """
+    @spec stop_clean(GenServer.server(), term()) :: :ok
+    def stop_clean(server, reason \\ :normal) do
+      GenServer.cast(server, {:stop_clean, reason})
+    end
+
+    @doc """
+    Stop with an abnormal reason. For a :transient worker this WILL be restarted.
+    """
+    @spec stop_crashy(GenServer.server(), term()) :: :ok
+    def stop_crashy(server, reason \\ :boom) do
+      GenServer.cast(server, {:stop_crashy, reason})
+    end
+
+    # ── Callbacks ───────────────────────────────────────────────────────────
+
+    @impl true
+    def init(:ok) do
+      Process.flag(:trap_exit, true)
+      {:ok, %{started_at: System.monotonic_time()}}
+    end
+
+    @impl true
+    def handle_cast({:stop_clean, reason}, state) do
+      {:stop, reason, state}
+    end
+
+    def handle_cast({:stop_crashy, reason}, state) do
+      # Abnormal reason — counted as a crash by the supervisor.
+      {:stop, reason, state}
+    end
+
+    @impl true
+    def terminate(reason, _state) do
+      # terminate/2 runs for ALL of the above because trap_exit is on and
+      # none of them are :kill. Branch cleanup on the reason shape.
+      case reason do
+        :normal -> Logger.debug("clean exit: :normal")
+        :shutdown -> Logger.debug("clean exit: :shutdown")
+        {:shutdown, ctx} -> Logger.debug("clean exit: shutdown ctx=#{inspect(ctx)}")
+        other -> Logger.warning("crash exit: #{inspect(other)}")
+      end
+
+      :ok
+    end
+  end
+
+  def main do
+    {:ok, pid} = StopReasonsGs.start_link()
+  
+    :ok = StopReasonsGs.stop_clean(pid, :normal)
+    Process.sleep(50)
+  
+    IO.puts("✓ StopReasonsGs works correctly")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`GenServer` callback return values](https://hexdocs.pm/elixir/GenServer.html#callbacks)

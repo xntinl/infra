@@ -349,6 +349,57 @@ tools for specific situations, not expressions of taste.
 
 - Un worker reintenta un job y si falla 3 veces, no debe reiniciar. ¿Qué restart type usás y cómo implementás el límite?
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule RestartStrategiesDemo.Worker do
+    @moduledoc """
+    Minimal worker that can exit via three paths:
+     * `finish/1` → GenServer.stop with :normal
+     * `crash/1`  → raises (abnormal exit)
+     * `shut/1`   → GenServer.stop with :shutdown
+
+    The restart strategy is set by the spec in Supervisor, not the worker
+    itself, so we can mount the same module with three different policies.
+    """
+
+    use GenServer
+
+    @spec start_link(keyword()) :: GenServer.on_start()
+    def start_link(opts) do
+      name = Keyword.fetch!(opts, :name)
+      GenServer.start_link(__MODULE__, :ok, name: name)
+    end
+
+    @spec finish(atom()) :: :ok
+    def finish(name), do: GenServer.stop(name, :normal)
+
+    @spec crash(atom()) :: :ok
+    def crash(name), do: GenServer.cast(name, :crash)
+
+    @spec shut(atom()) :: :ok
+    def shut(name), do: GenServer.stop(name, :shutdown)
+
+    @impl true
+    def init(:ok), do: {:ok, %{}}
+
+    @impl true
+    def handle_cast(:crash, _s), do: raise("boom")
+  end
+
+  def main do
+    IO.puts("RestartStrategiesDemo OK")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Supervisor` — restart values](https://hexdocs.pm/elixir/Supervisor.html#module-restart-values-restart)

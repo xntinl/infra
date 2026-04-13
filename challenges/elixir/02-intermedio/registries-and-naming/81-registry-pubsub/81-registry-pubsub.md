@@ -403,6 +403,91 @@ node, wrong for anything else.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule LocalPubsub do
+    @moduledoc """
+    A tiny local pub/sub bus backed by a `:duplicate`-keyed Registry.
+
+    Subscribers register themselves under a topic; publishers call
+    `broadcast/2`, which fans the message out to every subscriber's mailbox.
+    Subscriptions are automatically cleaned up when subscribers exit.
+    """
+
+    @registry LocalPubsub.Registry
+
+    @type topic :: String.t()
+    @type message :: term()
+
+    @doc """
+    Subscribes the calling process to `topic`. The process will receive
+    `{:pubsub, topic, message}` for every subsequent `broadcast/2`.
+
+    Optional `filter` is an arbitrary metadata term stored with the entry —
+    `broadcast/2` delivers it back so the subscriber can implement
+    server-side filtering.
+    """
+    @spec subscribe(topic(), term()) :: :ok
+    def subscribe(topic, filter \\ nil) when is_binary(topic) do
+      {:ok, _} = Registry.register(@registry, topic, filter)
+      :ok
+    end
+
+    @doc """
+    Unsubscribes the calling process from `topic`. Does nothing if the
+    caller was not subscribed.
+    """
+    @spec unsubscribe(topic()) :: :ok
+    def unsubscribe(topic) when is_binary(topic) do
+      Registry.unregister(@registry, topic)
+    end
+
+    @doc """
+    Publishes `message` to everyone subscribed to `topic`. Returns the
+    number of subscribers delivered to.
+
+    We use `dispatch/3` instead of `lookup/2` + manual iteration because
+    `dispatch/3` is partition-aware and does not materialize the full
+    subscriber list when running against a partitioned registry.
+    """
+    @spec broadcast(topic(), message()) :: non_neg_integer()
+    def broadcast(topic, message) when is_binary(topic) do
+      counter = :counters.new(1, [:atomics])
+
+      Registry.dispatch(@registry, topic, fn entries ->
+        for {pid, _filter} <- entries do
+          send(pid, {:pubsub, topic, message})
+          :counters.add(counter, 1, 1)
+        end
+      end)
+
+      :counters.get(counter, 1)
+    end
+
+    @doc """
+    Returns the current number of subscribers for `topic`. Useful for
+    debugging and for "nobody listening, skip the expensive payload" checks.
+    """
+    @spec subscribers(topic()) :: non_neg_integer()
+    def subscribers(topic) when is_binary(topic) do
+      length(Registry.lookup(@registry, topic))
+    end
+  end
+
+  def main do
+    IO.puts("LocalPubsub OK")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Registry` — duplicate keys and dispatch](https://hexdocs.pm/elixir/Registry.html#module-using-as-a-pubsub)

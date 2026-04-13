@@ -331,6 +331,89 @@ different design.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defprotocol Jsonable do
+  @moduledoc """
+  Turns a value into a compact JSON string. Dispatches on the type of the
+  first argument — add `defimpl Jsonable, for: MyType` to extend.
+  """
+
+  @doc "Encode `value` as a JSON string."
+  @spec to_json(t) :: String.t()
+  def to_json(value)
+end
+
+defmodule Jsonable.Impls do
+  @moduledoc """
+  Container module that groups all built-in `Jsonable` implementations.
+  Having them in one file keeps the wire-up visible; you could also split
+  them across files — protocol consolidation doesn't care.
+  """
+
+  defimpl Jsonable, for: Integer do
+    def to_json(i), do: Integer.to_string(i)
+  end
+
+  defimpl Jsonable, for: Float do
+    def to_json(f), do: Float.to_string(f)
+  end
+
+  defimpl Jsonable, for: Atom do
+    # nil and booleans are atoms in Elixir; JSON has dedicated literals for them.
+    def to_json(nil), do: "null"
+    def to_json(true), do: "true"
+    def to_json(false), do: "false"
+    def to_json(atom), do: ~s("#{Atom.to_string(atom)}")
+  end
+
+  defimpl Jsonable, for: BitString do
+    # BitString is the protocol name for Strings.
+    def to_json(s) when is_binary(s) do
+      # Minimal JSON escaping — production should use a real encoder.
+      escaped = s |> String.replace("\\", "\\\\") |> String.replace("\"", "\\\"")
+      ~s("#{escaped}")
+    end
+  end
+
+  defimpl Jsonable, for: List do
+    def to_json(list) do
+      "[" <> Enum.map_join(list, ",", &Jsonable.to_json/1) <> "]"
+    end
+  end
+
+  defimpl Jsonable, for: Map do
+    def to_json(map) do
+      pairs =
+        Enum.map_join(map, ",", fn {k, v} ->
+          # JSON object keys must be strings.
+          Jsonable.to_json(to_string(k)) <> ":" <> Jsonable.to_json(v)
+        end)
+
+      "{" <> pairs <> "}"
+    end
+  end
+end
+
+# Demonstrate protocol polymorphism with real assertions
+IO.puts("=== Jsonable Protocol Demo ===")
+assert Jsonable.to_json(42) == "42"
+assert Jsonable.to_json(3.14) == "3.14"
+assert Jsonable.to_json(true) == "true"
+assert Jsonable.to_json(false) == "false"
+assert Jsonable.to_json(nil) == "null"
+assert Jsonable.to_json("hello") == ~s("hello")
+assert Jsonable.to_json(:foo) == ~s("foo")
+assert Jsonable.to_json([1, "two", true]) == ~s([1,"two",true])
+assert Jsonable.to_json(%{a: 1, b: 2}) in [~s({"a":1,"b":2}), ~s({"b":2,"a":1})]
+
+IO.puts("All protocol assertions passed!")
+```
+
+
 ## Resources
 
 - [Protocols — Elixir guide](https://hexdocs.pm/elixir/protocols.html)

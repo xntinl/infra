@@ -413,6 +413,113 @@ means your TTL is too short or your keys are too sparse.
 
 - ¿Cómo testeás que el sweeper corre y evicta sin hacer `Process.sleep` en los tests?
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule TtlCacheAgent do
+    @moduledoc """
+    A process-local key/value cache where every entry has a time-to-live
+    (TTL). Expired entries are removed lazily on read and periodically by
+    a sweeper (`TtlCacheAgent.Sweeper`).
+    """
+
+    use Agent
+
+    @type key :: term()
+    @type value :: term()
+    @type ttl_ms :: pos_integer()
+
+    @doc """
+    Starts the cache. Options:
+
+      * `:name` — optional registered name.
+      * `:default_ttl_ms` — default TTL if none is given to `put/4`
+        (default 60_000).
+    """
+    @spec start_link(keyword()) :: Agent.on_start()
+    def start_link(opts \\ []) do
+      default_ttl = Keyword.get(opts, :default_ttl_ms, 60_000)
+      name_opts = Keyword.take(opts, [:name])
+      Agent.start_link(fn -> %{default_ttl: default_ttl, entries: %{}} end, name_opts)
+    end
+
+    @doc """
+    Puts `value` at `key` with a TTL in milliseconds. If `ttl_ms` is nil,
+    the default TTL configured at start-up is used.
+    """
+    @spec put(Agent.agent(), key(), value(), ttl_ms() | nil) :: :ok
+    def put(cache, key, value, ttl_ms \\ nil) do
+      Agent.update(cache, fn %{default_ttl: default, entries: entries} = state ->
+        ttl = ttl_ms || default
+        expires_at = now_ms() + ttl
+        %{state | entries: Map.put(entries, key, {value, expires_at})}
+      end)
+    end
+
+    @doc """
+    Reads `key`. Returns `{:ok, value}` if present and fresh, `:miss`
+    otherwise. A stale entry is deleted on this call (lazy eviction).
+    """
+    @spec get(Agent.agent(), key()) :: {:ok, value()} | :miss
+    def get(cache, key) do
+      Agent.get_and_update(cache, fn %{entries: entries} = state ->
+        case Map.get(entries, key) do
+          nil ->
+            {:miss, state}
+
+          {value, expires_at} ->
+            if expires_at > now_ms() do
+              {{:ok, value}, state}
+            else
+              {:miss, %{state | entries: Map.delete(entries, key)}}
+            end
+        end
+      end)
+    end
+
+    @doc "Returns the number of entries currently stored (fresh or stale)."
+    @spec size(Agent.agent()) :: non_neg_integer()
+    def size(cache), do: Agent.get(cache, fn %{entries: e} -> map_size(e) end)
+
+    @doc """
+    Removes every entry whose `expires_at` is in the past. Returns the
+    number of entries removed. Called by the sweeper on a timer.
+    """
+    @spec sweep(Agent.agent()) :: non_neg_integer()
+    def sweep(cache) do
+      Agent.get_and_update(cache, fn %{entries: entries} = state ->
+        now = now_ms()
+
+        {kept, removed_count} =
+          Enum.reduce(entries, {%{}, 0}, fn {k, {_v, exp} = entry}, {acc, n} ->
+            if exp > now, do: {Map.put(acc, k, entry), n}, else: {acc, n + 1}
+          end)
+
+        {removed_count, %{state | entries: kept}}
+      end)
+    end
+
+    defp now_ms, do: System.monotonic_time(:millisecond)
+  end
+
+  def main do
+    {:ok, cache} = TtlCacheAgent.start_link(default_ttl_ms: 1000)
+    :ok = TtlCacheAgent.put(cache, :key1, "value1", 500)
+    {:ok, val} = TtlCacheAgent.get(cache, :key1)
+    IO.puts("Cache get: #{val}")
+    IO.puts("Cache size: #{TtlCacheAgent.size(cache)}")
+    IO.puts("✓ TtlCacheAgent works correctly")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Agent` — Elixir stdlib](https://hexdocs.pm/elixir/Agent.html)

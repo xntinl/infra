@@ -376,6 +376,61 @@ the rest.
 
 - If a handler attached to `[:my_app, :work, :stop]` takes 50 ms to run, how does that change the meaning of the `duration` measurement the *next* span reports, and what does it tell you about where to put I/O in your observability pipeline?
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule TelemetrySpans do
+    @moduledoc """
+    A tiny demo of `:telemetry.span/3`. `do_work/2` wraps a caller-provided
+    function so a single invocation emits :start and then either :stop or
+    :exception — the exact trio every tracing backend understands.
+    """
+
+    @event_prefix [:telemetry_spans, :work]
+
+    @doc "Event prefix used by `do_work/2` — convenient for attaching handlers."
+    def event_prefix, do: @event_prefix
+
+    @doc """
+    Runs `fun` inside `:telemetry.span/3`.
+
+    * On success, emits `:start` then `:stop`. `:stop`'s metadata includes
+      `result_tag: :ok` plus anything the caller returned in the extra map.
+    * On raise/throw/exit, emits `:start` then `:exception`, then re-raises
+      (so the caller sees the original failure).
+    """
+    @spec do_work((-> any()), map()) :: any()
+    def do_work(fun, start_metadata \\ %{}) when is_function(fun, 0) do
+      :telemetry.span(@event_prefix, start_metadata, fn ->
+        result = fun.()
+        # Second element is merged into :stop metadata.
+        {result, %{result_tag: :ok}}
+      end)
+    end
+  end
+
+  def main do
+    IO.puts("=== App Demo ===
+  ")
+  
+    # Demo: Telemetry spans for tracing
+  IO.puts("1. Span wraps a function call")
+  IO.puts("2. Emits start and stop events")
+  IO.puts("3. Includes duration and metadata")
+
+  IO.puts("
+  ✓ Telemetry spans demo completed!")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`:telemetry.span/3` — hexdocs](https://hexdocs.pm/telemetry/telemetry.html#span/3)

@@ -31,6 +31,22 @@ A single `:scheduler.utilization/1` call returns values since VM boot — nearly
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Regular vs dirty schedulers
 
 - **Regular schedulers**: default `System.schedulers_online/0` (equal to cores). Run pure Elixir code.
@@ -319,19 +335,75 @@ OTP primitives (GenServer, Supervisor, Application) are tested through their pub
 
 You see aggregate utilization at 30% but tail latencies are 10x normal. Scheduler run queue lengths are all 0. What else do you measure to pinpoint the slowdown? (Hint: scheduler busy is not the only wait.)
 
-## Resources
 
-- [`:scheduler` module — erlang.org](https://www.erlang.org/doc/man/scheduler.html)
-- [`:erlang.statistics/1` — erlang.org](https://www.erlang.org/doc/man/erlang.html#statistics-1)
-- [Erlang in Anger — Fred Hebert, chapter on scheduling](https://www.erlang-in-anger.com/)
-- [Understanding BEAM Schedulers — Lukas Larsson](https://www.erlang.org/blog/a-complete-guide-to-beam-scheduler/)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+defmodule SchedulerObservatory.Sampler do
+  @moduledoc """
+  Samples scheduler utilization on a fixed interval.
+
+  Emits telemetry event [:beam, :scheduler, :sample] with measurements:
+    - active_percent_total    aggregate across all schedulers
+    - active_percent_per      list of per-scheduler percentages
+    - run_queue_total
+    - run_queue_per           per-scheduler run queue length
+  """
+  use GenServer
+
+  def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+
+  @impl true
+  def init(opts) do
+    interval = Keyword.fetch!(opts, :interval_ms)
+    state = %{interval: interval, baseline: :scheduler.sample()}
+    Process.send_after(self(), :sample, interval)
+    {:ok, state}
+  end
+
+  @impl true
+  def handle_info(:sample, %{baseline: baseline, interval: interval} = state) do
+    current = :scheduler.sample()
+
+    util = :scheduler.utilization(baseline, current)
+    aggregate = Enum.find(util, &match?({:total, _, _}, &1))
+    per_scheduler = Enum.filter(util, &match?({:normal, _, _, _}, &1))
+
+    run_q_per = :erlang.statistics(:run_queue_lengths)
+    run_q_total = :erlang.statistics(:total_run_queue_lengths)
+
+    :telemetry.execute(
+      [:beam, :scheduler, :sample],
+      %{
+        active_percent_total: percent(aggregate),
+        active_percent_per: Enum.map(per_scheduler, &percent/1),
+        run_queue_total: run_q_total,
+        run_queue_per: run_q_per
+      },
+      %{}
+    )
+
+    Process.send_after(self(), :sample, interval)
+    {:noreply, %{state | baseline: current}}
+  end
+
+  defp percent({:total, active, total}), do: ratio(active, total)
+  defp percent({:normal, _id, active, total}), do: ratio(active, total)
+  defp percent({_, active, total}), do: ratio(active, total)
+
+  defp ratio(_active, 0), do: 0.0
+  defp ratio(active, total), do: active / total * 100
 end
+
+defmodule Main do
+  def main do
+      IO.puts("Recon diagnostics initialized")
+      memory_stats = :erlang.memory()
+      if is_list(memory_stats) do
+        IO.puts("✓ Recon diagnostics: memory info available")
+      end
+  end
+end
+
+Main.main()
 ```

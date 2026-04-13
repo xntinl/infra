@@ -335,6 +335,74 @@ reach into `Application.env`. Apps own their env; libraries are guests.
 
 - ¿Cuándo `Application.get_env` se vuelve un anti-pattern y pasás a pasar config explícitamente por arg? Definí el límite.
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule AppEnvRuntime.Config do
+    @moduledoc """
+    The single entry point for reading configuration.
+
+    Every function is a runtime read — no module attributes, no compile-time
+    inlining. That means `runtime.exs` overrides are honored immediately,
+    tests can use `Application.put_env/3` per test, and misconfig raises at
+    the first call with a clear message.
+    """
+
+    @app :app_env_runtime
+
+    @spec endpoint() :: String.t()
+    def endpoint, do: Application.fetch_env!(@app, :endpoint)
+
+    @spec http_timeout_ms() :: pos_integer()
+    def http_timeout_ms do
+      value = Application.fetch_env!(@app, :http_timeout_ms)
+      unless is_integer(value) and value > 0 do
+        raise ArgumentError, "expected :http_timeout_ms > 0, got #{inspect(value)}"
+      end
+      value
+    end
+
+    @spec pool_size() :: pos_integer()
+    def pool_size do
+      value = Application.fetch_env!(@app, :pool_size)
+      unless is_integer(value) and value > 0 do
+        raise ArgumentError, "expected :pool_size > 0, got #{inspect(value)}"
+      end
+      value
+    end
+
+    @doc "Snapshot of the current config. Handy for admin endpoints and logs."
+    @spec snapshot() :: %{endpoint: String.t(), http_timeout_ms: pos_integer(), pool_size: pos_integer()}
+    def snapshot do
+      %{endpoint: endpoint(), http_timeout_ms: http_timeout_ms(), pool_size: pool_size()}
+    end
+  end
+
+  def main do
+    # Demo: Application environment at runtime
+    {:ok, _} = Application.ensure_all_started(:app_env_runtime)
+  
+    # Verificar valores de aplicación
+    db_host = Application.get_env(:app_env_runtime, :db_host)
+    db_port = Application.get_env(:app_env_runtime, :db_port)
+  
+    assert db_host == "localhost", "db_host debe estar configurado"
+    assert db_port == 5432, "db_port debe estar configurado"
+  
+    IO.puts("AppEnvRuntime: demostración de configuración exitosa")
+    IO.puts("  db_host: #{db_host}")
+    IO.puts("  db_port: #{db_port}")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Application.fetch_env!/2`](https://hexdocs.pm/elixir/Application.html#fetch_env!/2)

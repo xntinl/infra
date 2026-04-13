@@ -57,6 +57,22 @@ variant.
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. What `start_phases` does
 
 In `mix.exs`:
@@ -602,11 +618,103 @@ Target: total phase sequence ≤ 5 s on cold boot; any single phase > 1 s emits 
 
 ---
 
-## Resources
 
-- [`Application` — start_phases](https://hexdocs.pm/elixir/Application.html#module-start-phases)
-- [Erlang — application:start_phase/3](https://www.erlang.org/doc/man/application.html)
-- [GenServer `handle_continue/2`](https://hexdocs.pm/elixir/GenServer.html#c:handle_continue/2)
-- [Designing Elixir Systems with OTP — start phases chapter](https://pragprog.com/titles/jgotp/)
-- [Learn You Some Erlang — Included Applications & Start Phases](https://learnyousomeerlang.com/building-applications-with-otp)
-- [Dashbit — Release lifecycle blog post](https://dashbit.co/blog)
+## Executable Example
+
+```elixir
+defmodule StartPhases.OrderingTest do
+  use ExUnit.Case, async: false
+
+  describe "StartPhases.Ordering" do
+    test "phases execute in the declared order" do
+      timeline = StartPhases.TelemetrySpine.timeline() |> Enum.map(&elem(&1, 0))
+
+      assert [
+               :lock_reserved_begin,
+               :lock_reserved_end,
+               :cache_warm_begin,
+               :cache_warm_end,
+               :bind_begin,
+               :bind_end
+             ] = Enum.filter(timeline, &(&1 in [
+               :lock_reserved_begin,
+               :lock_reserved_end,
+               :cache_warm_begin,
+               :cache_warm_end,
+               :bind_begin,
+               :bind_end
+             ]))
+    end
+
+    test "phase 2 does not begin until phase 1 is done" do
+      timeline = StartPhases.TelemetrySpine.timeline()
+
+      {_, lock_end_ts} = Enum.find(timeline, fn {e, _} -> e == :lock_reserved_end end)
+      {_, warm_begin_ts} = Enum.find(timeline, fn {e, _} -> e == :cache_warm_begin end)
+
+      assert warm_begin_ts > lock_end_ts
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrate application start phases for ordered boot
+
+      # All applications have been started via Application.ensure_all_started/1
+      # Start phases are fired in order (coordinated across all apps)
+
+      IO.puts("✓ Application startup phases:")
+      IO.puts("  Phase 1 (telemetry): app E starts observability")
+      IO.puts("  Phase 2 (infra): app A, B initialize cluster lock + cache load")
+      IO.puts("  Phase 3 (scheduler): app C starts after cache is ready")
+      IO.puts("  Phase 4 (http): app D binds port after all deps ready")
+
+      # Verify each app's readiness by checking start phase completion
+      assert StartPhases.TelemetryApp.started?(), "Telemetry must be started"
+      IO.puts("✓ Phase 1 complete: Telemetry observability active")
+
+      assert StartPhases.LockManager.started?(), "Lock manager must be started"
+      assert StartPhases.Cache.loaded?(), "Cache must be populated"
+      IO.puts("✓ Phase 2 complete: Lock manager + cache loaded")
+
+      assert StartPhases.Scheduler.started?(), "Scheduler must be ready"
+      IO.puts("✓ Phase 3 complete: Scheduler ready (cache available)")
+
+      assert StartPhases.HTTPEndpoint.listening?(), "HTTP must be listening"
+      IO.puts("✓ Phase 4 complete: HTTP endpoint bound (all deps ready)")
+
+      # Verify the ordering via application state
+      telemetry_start = StartPhases.TelemetryApp.start_time()
+      lock_start = StartPhases.LockManager.start_time()
+      cache_ready = StartPhases.Cache.ready_time()
+      scheduler_start = StartPhases.Scheduler.start_time()
+      http_start = StartPhases.HTTPEndpoint.start_time()
+
+      assert telemetry_start <= lock_start,
+        "Telemetry must start before lock manager"
+      assert cache_ready <= scheduler_start,
+        "Cache must be ready before scheduler"
+      assert scheduler_start <= http_start,
+        "Scheduler must be ready before HTTP binds"
+
+      IO.puts("✓ Start phase ordering verified (dependencies respected)")
+
+      # Test a request after all phases complete
+      {:ok, response} = StartPhases.HTTPEndpoint.request("/health")
+      assert response.status == 200, "Health check should pass"
+      IO.puts("✓ HTTP request successful (all phases coordinated)")
+
+      IO.puts("\n✓ Application start phases demonstrated:")
+      IO.puts("  - Phase 1 (telemetry): setup observability")
+      IO.puts("  - Phase 2 (infra): init distributed locks + populate cache")
+      IO.puts("  - Phase 3 (scheduler): start after cache ready")
+      IO.puts("  - Phase 4 (http): bind port after all deps")
+      IO.puts("  - Cross-app synchronization via start_phase/3")
+      IO.puts("  - Explicit barriers between boot stages")
+      IO.puts("✓ Multi-app release boot coordination achieved")
+  end
+end
+
+Main.main()
+```

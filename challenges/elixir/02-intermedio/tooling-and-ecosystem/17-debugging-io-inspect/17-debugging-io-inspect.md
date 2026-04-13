@@ -383,6 +383,131 @@ If you're debugging concurrency / scheduling, reach for tracing (`:dbg`,
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule TextPipeline do
+    @moduledoc """
+    A trivial pipeline used as a target for debugging practice.
+
+    `process/1` takes a string, normalizes it, and returns a map of word
+    frequencies. The individual steps are exposed so you can probe each one
+    with `IO.inspect`, `dbg`, or `IEx.pry`.
+    """
+
+    @doc """
+    Normalizes, tokenizes, and counts word frequencies.
+
+    ## Examples
+
+        iex> TextPipeline.process("Hello hello world")
+        %{"hello" => 2, "world" => 1}
+    """
+    @spec process(String.t()) :: %{String.t() => non_neg_integer()}
+    def process(text) when is_binary(text) do
+      text
+      |> normalize()
+      |> tokenize()
+      |> count()
+    end
+
+    @doc "Lowercases and trims extra whitespace."
+    @spec normalize(String.t()) :: String.t()
+    def normalize(text) do
+      text
+      |> String.downcase()
+      |> String.trim()
+    end
+
+    @doc "Splits on whitespace, drops empties."
+    @spec tokenize(String.t()) :: [String.t()]
+    def tokenize(text) do
+      String.split(text, ~r/\s+/, trim: true)
+    end
+
+    @doc "Counts occurrences of each word."
+    @spec count([String.t()]) :: %{String.t() => non_neg_integer()}
+    def count(words), do: Enum.frequencies(words)
+
+    # ── Debugging showcase ──────────────────────────────────────────────────
+
+    @doc """
+    Same as `process/1`, but instrumented with `IO.inspect` probes at every
+    stage. Use this to SEE the pipeline values without changing control flow.
+    Each probe returns its argument unchanged, so the final result is identical.
+    """
+    @spec process_with_inspect(String.t()) :: %{String.t() => non_neg_integer()}
+    def process_with_inspect(text) do
+      text
+      |> IO.inspect(label: "input")
+      |> normalize()
+      |> IO.inspect(label: "normalized")
+      |> tokenize()
+      |> IO.inspect(label: "tokens", limit: :infinity)
+      |> count()
+      |> IO.inspect(label: "counts", pretty: true)
+    end
+
+    @doc """
+    Same pipeline wrapped in `dbg/2`. In `iex --dbg pry -S mix`, calling this
+    function PAUSES at each pipe stage and lets you step through interactively.
+    Outside IEx it just prints the expressions and their values.
+    """
+    @spec process_with_dbg(String.t()) :: %{String.t() => non_neg_integer()}
+    def process_with_dbg(text) do
+      text
+      |> normalize()
+      |> tokenize()
+      |> count()
+      |> dbg()
+    end
+
+    @doc """
+    Demonstrates `IEx.pry/0`. Run `iex -S mix` and call
+    `TextPipeline.process_with_pry("hello world")` — execution pauses at the
+    `IEx.pry()` line and you can inspect `normalized`, `tokens`, and `counts`
+    by name from the IEx prompt.
+    """
+    @spec process_with_pry(String.t()) :: %{String.t() => non_neg_integer()}
+    def process_with_pry(text) do
+      require IEx
+
+      normalized = normalize(text)
+      tokens = tokenize(normalized)
+      counts = count(tokens)
+
+      IEx.pry()
+
+      counts
+    end
+  end
+
+  def main do
+    IO.puts("=== Debug Demo ===
+  ")
+  
+    # Demo: Debugging with IO.inspect
+  value = %{name: "alice", age: 30}
+  IO.puts("1. Regular IO.inspect:")
+  result = IO.inspect(value)
+  IO.puts("   Returns: #{inspect(result)}")
+
+  IO.puts("2. IO.inspect with label:")
+  IO.inspect(value, label: "User data")
+
+  IO.puts("
+  ✓ IO.inspect debug demo completed!")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`IO.inspect/2` — Elixir stdlib](https://hexdocs.pm/elixir/IO.html#inspect/2)

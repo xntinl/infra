@@ -345,6 +345,103 @@ correctness.
 
 - Tu `terminate/2` escribe a disco. El supervisor lo mata con `:brutal_kill`. ¿Qué perdiste y cómo lo diseñarías para que no importe?
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule TerminateCleanupGs do
+    @moduledoc """
+    A GenServer that owns a writable file handle. Opens in `init/1`,
+    closes in `terminate/2`. Demonstrates the five shutdown paths and
+    which ones actually run cleanup.
+    """
+
+    use GenServer
+    require Logger
+
+    defmodule State do
+      @moduledoc false
+      @enforce_keys [:path, :io]
+      defstruct [:path, :io]
+
+      @type t :: %__MODULE__{path: Path.t(), io: :file.io_device()}
+    end
+
+    # ── Public API ──────────────────────────────────────────────────────────
+
+    @spec start_link(keyword()) :: GenServer.on_start()
+    def start_link(opts) do
+      {path, opts} = Keyword.pop!(opts, :path)
+      GenServer.start_link(__MODULE__, path, opts)
+    end
+
+    @doc "Writes `line` followed by `\\n` to the owned file."
+    @spec write(GenServer.server(), String.t()) :: :ok
+    def write(server, line), do: GenServer.call(server, {:write, line})
+
+    @doc "Graceful stop — triggers `terminate/2` to close the file."
+    @spec stop(GenServer.server()) :: :ok
+    def stop(server), do: GenServer.stop(server, :normal)
+
+    # ── Callbacks ───────────────────────────────────────────────────────────
+
+    @impl true
+    def init(path) do
+      # trap_exit so a supervisor :shutdown routes through terminate/2.
+      Process.flag(:trap_exit, true)
+
+      case File.open(path, [:write, :utf8]) do
+        {:ok, io} ->
+          {:ok, %State{path: path, io: io}}
+
+        {:error, reason} ->
+          # Fail fast — supervisor will log and decide.
+          {:stop, {:open_failed, reason}}
+      end
+    end
+
+    @impl true
+    def handle_call({:write, line}, _from, %State{io: io} = state) do
+      IO.write(io, line <> "\n")
+      {:reply, :ok, state}
+    end
+
+    @impl true
+    def terminate(reason, %State{io: io, path: path}) do
+      # Close the file. This is the ONE thing this callback must do reliably.
+      # Logging here is helpful for understanding the shutdown path in tests.
+      Logger.debug("terminate/2 running for #{path} with reason #{inspect(reason)}")
+      File.close(io)
+      :ok
+    end
+
+    # Non-state reasons (e.g. init returned :ignore) have no io to close.
+    def terminate(_reason, _state), do: :ok
+  end
+
+  def main do
+    tmpfile = Path.join(System.tmp_dir(), "cleanup_demo.log")
+    {:ok, pid} = TerminateCleanupGs.start_link(path: tmpfile)
+  
+    :ok = TerminateCleanupGs.write(pid, "Test message")
+    :ok = TerminateCleanupGs.stop(pid)
+  
+    Process.sleep(100)
+    content = File.read!(tmpfile)
+    IO.puts("File written: #{String.trim(content)}")
+  
+    File.rm!(tmpfile)
+    IO.puts("✓ TerminateCleanupGs works correctly")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`GenServer.terminate/2` — Elixir stdlib](https://hexdocs.pm/elixir/GenServer.html#c:terminate/2)

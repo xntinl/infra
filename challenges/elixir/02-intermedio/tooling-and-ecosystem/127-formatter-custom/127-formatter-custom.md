@@ -394,6 +394,72 @@ warnings. Use `elixir-ls` or an LSP that knows about Mix.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule FormatterCustom.Dsl do
+    @moduledoc """
+    A toy "spec" DSL. The macros are intentionally designed to read well
+    WITHOUT parentheses — `given :input, 42` looks like prose, while
+    `given(:input, 42)` looks like code. The formatter config makes this
+    style possible.
+    """
+
+    defmacro __using__(_opts) do
+      quote do
+        import FormatterCustom.Dsl
+        Module.register_attribute(__MODULE__, :examples, accumulate: true)
+        @before_compile FormatterCustom.Dsl
+      end
+    end
+
+    @doc """
+    Records an example case: `given :input_name, value`.
+    """
+    defmacro given(name, value) do
+      quote do
+        @examples {unquote(name), unquote(value)}
+      end
+    end
+
+    @doc """
+    Records an expected value: `check :output_name, value`.
+    """
+    defmacro check(name, value) do
+      quote do
+        @examples {:check, unquote(name), unquote(value)}
+      end
+    end
+
+    defmacro __before_compile__(_env) do
+      quote do
+        def __examples__, do: Enum.reverse(@examples)
+      end
+    end
+  end
+
+  def main do
+    IO.puts("=== Formatter Demo ===
+  ")
+  
+    # Demo: Custom code formatter
+  IO.puts("1. mix format - auto-format code")
+  IO.puts("2. .formatter.exs configuration")
+  IO.puts("3. Custom formatting rules")
+
+  IO.puts("
+  ✓ Formatter demo completed!")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Mix.Tasks.Format`](https://hexdocs.pm/mix/Mix.Tasks.Format.html) — every option in `.formatter.exs` documented

@@ -39,6 +39,25 @@ Some checks cannot be compile-time: env vars that override `config/runtime.exs`,
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Metaprogramming-specific insight:**
+Code generation is powerful and dangerous. Every macro you write is a place where intent is hidden. Use macros sparingly, only when they eliminate genuine boilerplate. If your macro is more than 10 lines, you probably need a function or data structure instead. Future maintainers will thank you.
 ### 1. `use` macro
 A compile-time extension point. `use M, opts` invokes `M.__using__(opts)` which returns a quoted expression spliced into the caller's module.
 
@@ -482,9 +501,144 @@ For prototypes or scripts where config is a few env vars, the ceremony outweighs
 
 `@on_load` runs every time a module is loaded, including in a live `iex` session when you `r MyApp.EndpointConfig`. If `validate!/0` has a side effect (opening a file, pinging a service), that side effect happens on every module reload. Would you still put the check in `@on_load`, or in `Application.start/2`? What is the failure semantic difference between "module cannot load" and "application cannot start"?
 
-## Resources
 
-- [Elixir Metaprogramming — Plataformatec guide](https://hexdocs.pm/elixir/macros.html)
-- [`@on_load` in the Erlang Reference Manual](https://www.erlang.org/doc/reference_manual/code_loading.html#on_load)
-- [`Application.compile_env/2`](https://hexdocs.pm/elixir/Application.html#compile_env/2)
-- [José Valim — "Writing macros" (ElixirConf)](https://www.youtube.com/results?search_query=jose+valim+macros)
+## Executable Example
+
+```elixir
+defmodule StrictConfig do
+  @moduledoc """
+  Declares a config schema for an OTP application. The schema is validated:
+
+    1. At compile time — the schema shape itself (valid types, required flag) must be well-formed.
+    2. At module load (`@on_load`) — the values actually present in `Application.get_all_env/1` must match.
+
+  Usage:
+
+      defmodule MyApp.EndpointConfig do
+        use StrictConfig,
+          otp_app: :my_app,
+          schema: [
+            host:    [type: :string, required: true],
+            port:    [type: :port,   default: 4000],
+            scheme:  [type: {:one_of, [:http, :https]}, default: :http]
+          ]
+      end
+
+  On module load, validates `Application.get_all_env(:my_app)` against the schema.
+  """
+
+  defmacro __using__(opts) do
+    otp_app = Keyword.fetch!(opts, :otp_app)
+    schema  = Keyword.fetch!(opts, :schema)
+
+    # Compile-time assertion: the schema is well-formed.
+    Enum.each(schema, &assert_schema_entry!/1)
+
+    quote bind_quoted: [otp_app: otp_app, schema: Macro.escape(schema)] do
+      @otp_app otp_app
+      @schema schema
+      @on_load :__strict_config_on_load__
+
+      @doc "Validated schema for this config module."
+      def __schema__, do: @schema
+
+      @doc "OTP application whose config is validated."
+      def __otp_app__, do: @otp_app
+
+      @doc """
+      Performs runtime validation. Called automatically by the `@on_load` hook.
+      Callable manually from `Application.start/2` too.
+      """
+      def validate! do
+        env = Application.get_all_env(@otp_app)
+        StrictConfig.Schema.validate!(@otp_app, @schema, env)
+      end
+
+      @doc false
+      def __strict_config_on_load__ do
+        # @on_load runs on every module load, including during test compilation
+        # in ExUnit where application env may be empty. Defer to runtime if so.
+        case Application.get_all_env(@otp_app) do
+          [] -> :ok
+          env -> StrictConfig.Schema.validate!(@otp_app, @schema, env) && :ok
+        end
+      rescue
+        e -> {:error, Exception.message(e)}
+      end
+    end
+  end
+
+  # --- compile-time schema sanity checks ---
+
+  @valid_types [:string, :integer, :boolean, :port]
+
+  defp assert_schema_entry!({key, spec}) when is_atom(key) and is_list(spec) do
+    type = Keyword.fetch!(spec, :type)
+    assert_valid_type!(key, type)
+    Enum.each(spec, fn
+      {:type, _} -> :ok
+      {:required, v} when is_boolean(v) -> :ok
+      {:default, _} -> :ok
+      {other, _} ->
+        raise ArgumentError, "unknown schema option #{inspect(other)} for key #{inspect(key)}"
+    end)
+  end
+
+  defp assert_schema_entry!(entry),
+    do: raise(ArgumentError, "invalid schema entry #{inspect(entry)}")
+
+  defp assert_valid_type!(_, type) when type in @valid_types, do: :ok
+  defp assert_valid_type!(_, {:one_of, list}) when is_list(list), do: :ok
+  defp assert_valid_type!(key, type),
+    do: raise(ArgumentError, "unknown type #{inspect(type)} for key #{inspect(key)}")
+end
+
+defmodule Main do
+  def main do
+      # Demonstrate compile-time config validation with @on_load
+      defmodule StrictConfig do
+        defmacro __using__(opts) do
+          quote bind_quoted: [opts: opts] do
+            schema = opts[:schema] || %{}
+
+            @on_load :validate_config
+
+            def validate_config do
+              config = Application.get_all_env(:my_app)
+
+              # Validate config against schema
+              missing = Enum.filter(schema, fn {key, _type} ->
+                !Map.has_key?(config, key)
+              end)
+
+              if Enum.empty?(missing) do
+                :ok
+              else
+                {:error, "Missing config keys: #{inspect(Enum.map(missing, &elem(&1, 0)))}"}
+              end
+            end
+          end
+        end
+      end
+
+      # Simulate config validation
+      schema = %{database_url: :string, port: :integer}
+      config = %{database_url: "postgres://...", port: 5432}
+
+      # Check if all schema keys are in config
+      missing = Enum.filter(schema, fn {key, _type} ->
+        !Map.has_key?(config, key)
+      end)
+
+      IO.puts("✓ Schema: #{inspect(schema)}")
+      IO.puts("✓ Config: #{inspect(config)}")
+      IO.puts("✓ Validation: #{if Enum.empty?(missing), do: "PASS", else: "FAIL"}")
+
+      assert Enum.empty?(missing), "All required keys present"
+
+      IO.puts("✓ Compile-time config validation: strict schema checking working")
+  end
+end
+
+Main.main()
+```

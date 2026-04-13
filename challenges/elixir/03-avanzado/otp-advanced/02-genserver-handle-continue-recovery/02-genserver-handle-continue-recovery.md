@@ -34,6 +34,25 @@ continue_recovery_gs/
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**OTP-specific insight:**
+The OTP framework enforces a discipline: supervision trees, callback modules, and standard return values. This structure is not a constraint — it's the contract that allows Erlang's release handler, hot code upgrades, and clustering to work. Every deviation from the pattern you'll pay for later in production debuggability and operational tooling.
 ### 1. Why `init/1` must be fast
 
 `GenServer.start_link/3` is a synchronous call that does not return until `init/1` returns. Every supervisor that starts it is blocked. If `init` is slow, a transient disk or network stall cascades into failed supervisor starts and dead nodes.
@@ -410,12 +429,50 @@ Target: `init/1` returns in < 5 ms regardless of DETS size; recovery throughput 
 
 ---
 
-## Resources
+## Executable Example
 
-- [`handle_continue/2` — hexdocs](https://hexdocs.pm/elixir/GenServer.html#c:handle_continue/2)
-- [OTP 21 release notes — handle_continue](https://www.erlang.org/blog/otp-21-highlights/)
-- [`:dets` — Erlang docs](https://www.erlang.org/doc/man/dets.html)
-- [Saša Jurić — To Spawn or Not to Spawn](https://www.theerlangelist.com/article/spawn_or_not)
-- [Commanded — event store recovery](https://github.com/commanded/commanded)
-- [Ecto.Adapters.SQL.Sandbox boot sequence](https://github.com/elixir-ecto/ecto_sql)
-- [Dashbit blog — OTP patterns](https://dashbit.co/blog)
+```elixir
+defp deps do
+  []
+end
+
+
+
+
+### Step 1: `mix.exs`
+
+**Objective**: Define OTP application with `mod: {Application, []}` so supervisor boot doesn't block on init/1 before handle_continue runs.
+
+
+
+### Step 2: `lib/continue_recovery_gs/dets_store.ex`
+
+**Objective**: Abstract :dets file operations behind stable interface so recovery logic decouples from disk I/O serialization details.
+
+
+
+### Step 3: `lib/continue_recovery_gs/offsets.ex`
+
+**Objective**: Defer DETS hydration to handle_continue/2 with mailbox priority so supervisor boot + registration happen before recovery latency blocks callers.
+
+
+
+### Step 4: `lib/continue_recovery_gs/application.ex`
+
+**Objective**: Build supervision tree that binds worker lifecycle to DETS handle so termination always flushes final state before close.
+
+
+
+### Step 5: `test/continue_recovery_gs/recovery_test.exs`
+
+**Objective**: Assert init returns < 5ms (supervisor timeout) while handle_continue hydrates DETS independently, proving non-blocking boot.
+
+defmodule Main do
+  def main do
+      # Demonstrating 02-genserver-handle-continue-recovery
+      :ok
+  end
+end
+
+Main.main()
+```

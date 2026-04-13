@@ -34,6 +34,25 @@ hibernating_worker/
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**OTP-specific insight:**
+The OTP framework enforces a discipline: supervision trees, callback modules, and standard return values. This structure is not a constraint — it's the contract that allows Erlang's release handler, hot code upgrades, and clustering to work. Every deviation from the pattern you'll pay for later in production debuggability and operational tooling.
 ### 1. The BEAM process heap model
 
 Every process owns a heap (`old_heap` + `young_heap` in generational GC). Allocations happen on the young heap; long-lived data gets tenured to the old heap. GC is triggered by allocation pressure inside that process — never by external memory pressure. A process holding 40 KB of tenured data and receiving no messages will sit at 40 KB forever.
@@ -505,12 +524,21 @@ Target: idle-worker footprint under 1 KB (`:erlang.process_info(pid, :memory)` <
 
 ---
 
-## Resources
+## Executable Example
 
-- [`:erlang.hibernate/3` — Erlang docs](https://www.erlang.org/doc/man/erlang.html#hibernate-3)
-- [`GenServer` return values — hexdocs](https://hexdocs.pm/elixir/GenServer.html#c:handle_info/2)
-- [Erlang in Anger — Fred Hébert (chapter 7, memory)](https://www.erlang-in-anger.com/)
-- [The Hitchhiker's Guide to the Unexpected — Fred Hébert on GC](https://ferd.ca/erlang-s-tail-call-elimination.html)
-- [Saša Jurić — Elixir in Action, 2nd ed., chapter 11](https://www.manning.com/books/elixir-in-action-second-edition)
-- [Phoenix Channels hibernation in practice](https://github.com/phoenixframework/phoenix/blob/main/lib/phoenix/channel/server.ex) — search for `:hibernate`
-- [`recon_alloc` — process memory inspection](https://github.com/ferd/recon)
+```elixir
+defp deps do
+  [
+    {:benchee, "~> 1.3", only: :dev}
+  ]
+end
+
+defmodule Main do
+  def main do
+      # Demonstrating 01-genserver-hibernation-state-compaction
+      :ok
+  end
+end
+
+Main.main()
+```

@@ -406,6 +406,166 @@ both sides.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Jsonable.Impls do
+  @moduledoc false
+
+  defimpl Jsonable, for: Integer do
+    def to_json(i), do: Integer.to_string(i)
+  end
+
+  defimpl Jsonable, for: Float do
+    def to_json(f), do: Float.to_string(f)
+  end
+
+  defimpl Jsonable, for: Atom do
+    def to_json(nil), do: "null"
+    def to_json(true), do: "true"
+    def to_json(false), do: "false"
+    def to_json(atom), do: ~s("#{Atom.to_string(atom)}")
+  end
+
+  defimpl Jsonable, for: BitString do
+    def to_json(s) when is_binary(s) do
+      escaped = s |> String.replace("\\", "\\\\") |> String.replace("\"", "\\\"")
+      ~s("#{escaped}")
+    end
+  end
+
+  defimpl Jsonable, for: List do
+    def to_json(list) do
+      "[" <> Enum.map_join(list, ",", &Jsonable.to_json/1) <> "]"
+    end
+  end
+
+  defimpl Jsonable, for: Map do
+    # Plain maps (non-struct). Structs with an impl use their own.
+    def to_json(map) do
+      pairs =
+        Enum.map_join(map, ",", fn {k, v} ->
+          Jsonable.to_json(to_string(k)) <> ":" <> Jsonable.to_json(v)
+        end)
+
+      "{" <> pairs <> "}"
+    end
+  end
+
+  defimpl Jsonable, for: Any do
+    @moduledoc """
+    Catch-all for structs (and other types) without an explicit impl. Also
+    implements `__deriving__/3` — the hook for `@derive {Jsonable, only: [...]}`.
+    """
+
+    # Compile-time hook invoked when a struct uses `@derive Jsonable`.
+    defmacro __deriving__(module, struct, options) do
+      fields = fields_for(struct, options)
+
+      quote do
+        defimpl Jsonable, for: unquote(module) do
+          def to_json(value) do
+            pairs =
+              unquote(fields)
+              |> Enum.map_join(",", fn field ->
+                # Encode the key as a JSON string and recurse on the value.
+                key_json = Jsonable.to_json(Atom.to_string(field))
+                value_json = Jsonable.to_json(Map.fetch!(value, field))
+                key_json <> ":" <> value_json
+              end)
+
+            "{" <> pairs <> "}"
+          end
+        end
+      end
+    end
+
+    # Runtime fallback: for structs without @derive, convert to map and recurse.
+    # Throws for types we actively refuse to encode (PIDs, refs, funs) to avoid
+    # silently stringifying values that will never round-trip.
+    def to_json(%_{} = struct) do
+      struct
+      |> Map.from_struct()
+      |> Jsonable.to_json()
+    end
+
+    def to_json(other) do
+      raise Protocol.UndefinedError,
+        protocol: Jsonable,
+        value: other,
+        description: "no Jsonable implementation for #{inspect(other)}"
+    end
+
+    # Compute the list of fields for the derived impl, honoring :only / :except.
+    defp fields_for(struct, options) do
+      all_fields = struct |> Map.from_struct() |> Map.keys()
+
+      cond do
+        only = Keyword.get(options, :only) -> only
+        except = Keyword.get(options, :except) -> all_fields -- except
+        true -> all_fields
+      end
+    end
+  end
+end
+
+# Demonstrate @derive and @fallback_to_any
+IO.puts("=== Jsonable @derive Demo ===")
+
+# Test with Point struct that has @derive
+defmodule Point do
+  @derive Jsonable
+  @enforce_keys [:x, :y]
+  defstruct [:x, :y]
+end
+
+# Test with User that has selective @derive
+defmodule User do
+  @derive {Jsonable, only: [:id, :name]}
+  @enforce_keys [:id, :name, :password]
+  defstruct [:id, :name, :password]
+end
+
+# Test with AuditRow without @derive (uses Any fallback)
+defmodule AuditRow do
+  @enforce_keys [:table, :changes]
+  defstruct [:table, :changes]
+end
+
+# Test Point encoding
+point = %Point{x: 1, y: 2}
+encoded_point = Jsonable.to_json(point)
+assert encoded_point in [~s({"x":1,"y":2}), ~s({"y":2,"x":1})]
+IO.puts("Point encoded: #{encoded_point}")
+
+# Test User with sensitive field filtering
+user = %User{id: 1, name: "Jane", password: "secret"}
+encoded_user = Jsonable.to_json(user)
+refute encoded_user =~ "password"
+refute encoded_user =~ "secret"
+assert encoded_user =~ "Jane"
+IO.puts("User encoded (no password): #{encoded_user}")
+
+# Test AuditRow with Any fallback
+row = %AuditRow{table: "users", changes: %{name: "new"}}
+encoded_row = Jsonable.to_json(row)
+assert encoded_row =~ "table"
+assert encoded_row =~ "users"
+IO.puts("AuditRow encoded (fallback): #{encoded_row}")
+
+# Test composition with primitives
+points = [%Point{x: 0, y: 0}, %Point{x: 3, y: 4}]
+encoded_list = Jsonable.to_json(points)
+assert encoded_list =~ "\"x\":0"
+assert encoded_list =~ "\"x\":3"
+IO.puts("List of points: #{encoded_list}")
+
+IO.puts("All @derive assertions passed!")
+```
+
+
 ## Resources
 
 - [`Protocol` — `@fallback_to_any` and derivation](https://hexdocs.pm/elixir/Protocol.html)

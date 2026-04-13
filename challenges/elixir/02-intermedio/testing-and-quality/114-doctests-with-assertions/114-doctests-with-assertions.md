@@ -332,6 +332,119 @@ for **pure utility functions** where the example is also the tutorial.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule StringKit do
+    @moduledoc """
+    A tiny string-utility module demonstrating doctests. Every public
+    function carries at least one `iex>` example that doubles as a test.
+    """
+
+    @doc """
+    Reverses the order of whitespace-separated words in a string.
+
+    ## Examples
+
+        iex> StringKit.reverse_words("hello world")
+        "world hello"
+
+        iex> StringKit.reverse_words("a b c d")
+        "d c b a"
+
+        iex> StringKit.reverse_words("")
+        ""
+
+    """
+    @spec reverse_words(String.t()) :: String.t()
+    def reverse_words(""), do: ""
+
+    def reverse_words(str) when is_binary(str) do
+      str
+      |> String.split(" ", trim: true)
+      |> Enum.reverse()
+      |> Enum.join(" ")
+    end
+
+    @doc """
+    Counts how many times `needle` appears in `haystack`. Non-overlapping.
+
+    ## Examples
+
+        iex> StringKit.count_occurrences("abababab", "ab")
+        4
+
+        iex> StringKit.count_occurrences("no matches here", "xyz")
+        0
+
+    A longer example with intermediate bindings:
+
+        iex> s = String.duplicate("na", 5)
+        iex> StringKit.count_occurrences(s, "na")
+        5
+
+    """
+    @spec count_occurrences(String.t(), String.t()) :: non_neg_integer()
+    def count_occurrences(_haystack, ""), do: 0
+
+    def count_occurrences(haystack, needle) do
+      haystack
+      |> String.split(needle)
+      |> length()
+      |> Kernel.-(1)
+    end
+
+    @doc """
+    Parses a positive integer. Returns `:error` on any malformed input.
+
+    ## Examples
+
+        iex> StringKit.parse_positive("42")
+        {:ok, 42}
+
+        iex> StringKit.parse_positive("-5")
+        :error
+
+        iex> StringKit.parse_positive("abc")
+        :error
+
+    """
+    @spec parse_positive(String.t()) :: {:ok, pos_integer()} | :error
+    def parse_positive(str) when is_binary(str) do
+      case Integer.parse(str) do
+        {n, ""} when n > 0 -> {:ok, n}
+        _ -> :error
+      end
+    end
+  end
+
+  def main do
+    IO.puts("=== StringKit Demo ===
+  ")
+  
+    # Demo: Run some string transformations
+  IO.puts("1. upcase_first('hello'): '" <> StringKit.upcase_first("hello") <> "'")
+  assert StringKit.upcase_first("hello") == "Hello"
+
+  IO.puts("2. remove_vowels('hello'): '" <> StringKit.remove_vowels("hello") <> "'")
+  assert StringKit.remove_vowels("hello") == "hll"
+
+  IO.puts("3. reverse_words('hello world'): '" <> StringKit.reverse_words("hello world") <> "'")
+  assert StringKit.reverse_words("hello world") == "world hello"
+
+  IO.puts("
+  ✓ StringKit demos completed!")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`ExUnit.DocTest`](https://hexdocs.pm/ex_unit/ExUnit.DocTest.html)

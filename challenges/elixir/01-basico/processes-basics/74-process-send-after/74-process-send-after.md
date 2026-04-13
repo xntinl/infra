@@ -307,7 +307,60 @@ The BEAM timer wheel is a hash-based data structure optimised for O(1) insertion
 
 ---
 
+## Executable Example
 
+Create `lib/timer_demo.ex` and test in `iex`:
+
+```elixir
+defmodule TimerDemo do
+  def delayed_message do
+    ref = Process.send_after(self(), {:delayed, "hello"}, 200)
+    IO.puts("Message scheduled with ref: #{inspect(ref)}")
+    receive do
+      {:delayed, msg} -> IO.puts("Received: #{msg}")
+    after
+      500 -> IO.puts("Timeout waiting")
+    end
+  end
+
+  def cancellable_timer do
+    ref = Process.send_after(self(), :timeout, 1000)
+    IO.puts("Timer started, will cancel in 300ms")
+    Process.sleep(300)
+    Process.cancel_timer(ref)
+    IO.puts("Timer cancelled")
+    receive do
+      :timeout -> IO.puts("Got timeout")
+    after
+      1000 -> IO.puts("No timeout received (correctly cancelled)")
+    end
+  end
+
+  def repeating_timer do
+    spawn(fn -> repeat_loop(3) end)
+  end
+
+  defp repeat_loop(0) do
+    IO.puts("Done")
+  end
+
+  defp repeat_loop(n) do
+    receive do
+      {:tick, num} -> 
+        IO.puts("Tick #{num}")
+        repeat_loop(n - 1)
+    after
+      500 -> repeat_loop(n)
+    end
+  end
+end
+
+# Test it
+TimerDemo.delayed_message()
+TimerDemo.cancellable_timer()
+```
+
+---
 ## Key Concepts
 
 ### 1. `Process.send_after/3` Schedules a Message

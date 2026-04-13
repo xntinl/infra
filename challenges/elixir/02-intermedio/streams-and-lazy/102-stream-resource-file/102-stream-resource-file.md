@@ -313,6 +313,76 @@ consider `File.open/2` with `:delayed_write` for better throughput.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule StreamResourceFile do
+    @moduledoc """
+    Reads files as lazy streams via `Stream.resource/3`, and transforms them
+    without ever loading the whole file into memory.
+    """
+
+    @doc """
+    Returns a lazy stream of lines from `path`. Each element is a string with
+    the trailing newline stripped. Unlike `File.stream!/1`, we own the file
+    handle across the whole enumeration.
+    """
+    @spec lines(Path.t()) :: Enumerable.t()
+    def lines(path) do
+      Stream.resource(
+        fn -> File.open!(path, [:read, :utf8]) end,
+        fn io ->
+          case IO.read(io, :line) do
+            :eof -> {:halt, io}
+            {:error, reason} -> raise File.Error, reason: reason, action: "read", path: path
+            data -> {[String.trim_trailing(data, "\n")], io}
+          end
+        end,
+        fn io -> File.close(io) end
+      )
+    end
+
+    @doc """
+    Counts lines in a file lazily. Works on files far larger than RAM because
+    `lines/1` never materializes more than one line at a time.
+    """
+    @spec count_lines(Path.t()) :: non_neg_integer()
+    def count_lines(path) do
+      path
+      |> lines()
+      |> Enum.count()
+    end
+
+    @doc """
+    Transforms a file line by line, writing the result to `out_path` without
+    buffering the whole thing. Demonstrates pairing `Stream.resource/3` on the
+    read side with `Stream.into/2` on the write side.
+    """
+    @spec transform(Path.t(), Path.t(), (String.t() -> String.t())) :: :ok
+    def transform(in_path, out_path, fun) when is_function(fun, 1) do
+      in_path
+      |> lines()
+      |> Stream.map(fn line -> fun.(line) <> "\n" end)
+      |> Stream.into(File.stream!(out_path))
+      |> Stream.run()
+
+      :ok
+    end
+  end
+
+  def main do
+    IO.puts("StreamResourceFile OK")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Stream.resource/3` — hexdocs](https://hexdocs.pm/elixir/Stream.html#resource/3)

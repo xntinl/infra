@@ -50,6 +50,25 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Pipeline-specific insight:**
+Streams are lazy; Enum is eager. Use Stream for data larger than RAM or when you're building intermediate stages. Use Enum when the collection is small or you need side effects at each step. Mixing them carelessly results in performance cliffs.
 ### 1. DemandDispatcher algorithm
 
 Internally DemandDispatcher keeps a sorted list of `{pending_demand, ref}`
@@ -487,20 +506,146 @@ first; round-robin insists on sending to worker N even if it is busy.
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
 
-- [GenStage.DemandDispatcher — HexDocs](https://hexdocs.pm/gen_stage/GenStage.DemandDispatcher.html)
-- [GenStage.Dispatcher behaviour](https://hexdocs.pm/gen_stage/GenStage.Dispatcher.html)
-- [DemandDispatcher source](https://github.com/elixir-lang/gen_stage/blob/main/lib/gen_stage/demand_dispatcher.ex)
-- [Work-stealing schedulers — Blumofe & Leiserson, 1999](https://dl.acm.org/doi/10.1145/324133.324234)
-- [OTP design principles — Erlang](https://www.erlang.org/doc/design_principles/des_princ.html)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+defmodule DemandDispatcher.RoundRobinDispatcher do
+  @moduledoc """
+  Dispatches events in strict round-robin across subscribers. Each subscriber
+  has a `pending` counter; events are only sent when the target has pending > 0.
+  If the next subscriber has pending = 0, the event is buffered and retried.
+  """
+  @behaviour GenStage.Dispatcher
+
+  @impl true
+  def init(_opts), do: {:ok, {[], 0, []}}
+
+  # state = {subscribers_list, cursor, buffer}
+
+  @impl true
+  def subscribe(_opts, {pid, ref}, {subs, cursor, buf}) do
+    entry = %{pid: pid, ref: ref, pending: 0}
+    {:ok, 0, {subs ++ [entry], cursor, buf}}
+  end
+
+  @impl true
+  def cancel({_pid, ref}, {subs, cursor, buf}) do
+    new_subs = Enum.reject(subs, &(&1.ref == ref))
+    new_cursor = if new_subs == [], do: 0, else: rem(cursor, length(new_subs))
+    {:ok, 0, {new_subs, new_cursor, buf}}
+  end
+
+  @impl true
+  def ask(counter, {_pid, ref}, {subs, cursor, buf}) do
+    new_subs =
+      Enum.map(subs, fn
+        %{ref: ^ref} = s -> %{s | pending: s.pending + counter}
+        s -> s
+      end)
+
+    {flushed, remaining_buf, new_subs2, new_cursor} = flush(buf, new_subs, cursor)
+    # events flushed back from buffer to actual subscribers
+    Enum.each(flushed, fn {pid, r, msgs} ->
+      send(pid, {:"$gen_consumer", {self(), r}, msgs})
+    end)
+
+    ask_up = min(counter, length(remaining_buf))
+    # demand to pass up = total asked - what we could satisfy from buffer
+    {:ok, counter - ask_up, {new_subs2, new_cursor, Enum.drop(remaining_buf, ask_up)}}
+  end
+
+  @impl true
+  def dispatch(events, _length, {subs, cursor, buf}) do
+    {dispatched, leftover, new_subs, new_cursor} = distribute(events, subs, cursor, [])
+    new_buf = buf ++ leftover
+
+    Enum.each(dispatched, fn {pid, ref, msgs} ->
+      send(pid, {:"$gen_consumer", {self(), ref}, msgs})
+    end)
+
+    {:ok, [], {new_subs, new_cursor, new_buf}}
+  end
+
+  @impl true
+  def info(msg, state) do
+    send(self(), msg)
+    {:ok, state}
+  end
+
+  # ---- helpers ----
+
+  defp distribute([], subs, cursor, acc), do: {group(acc), [], subs, cursor}
+
+  defp distribute([e | rest] = all, subs, cursor, acc) do
+    if subs == [] or Enum.all?(subs, &(&1.pending == 0)) do
+      {group(acc), all, subs, cursor}
+    else
+      idx = rem(cursor, length(subs))
+      sub = Enum.at(subs, idx)
+
+      if sub.pending > 0 do
+        new_sub = %{sub | pending: sub.pending - 1}
+        new_subs = List.replace_at(subs, idx, new_sub)
+        distribute(rest, new_subs, cursor + 1, [{sub.pid, sub.ref, e} | acc])
+      else
+        distribute(all, subs, cursor + 1, acc)
+      end
+    end
+  end
+
+  defp flush(buf, subs, cursor), do: flush(buf, [], subs, cursor)
+
+  defp flush([], out, subs, cursor), do: {group(out), [], subs, cursor}
+
+  defp flush([e | rest] = all, out, subs, cursor) do
+    if Enum.all?(subs, &(&1.pending == 0)) do
+      {group(out), all, subs, cursor}
+    else
+      idx = rem(cursor, length(subs))
+      sub = Enum.at(subs, idx)
+
+      if sub.pending > 0 do
+        new_sub = %{sub | pending: sub.pending - 1}
+        new_subs = List.replace_at(subs, idx, new_sub)
+        flush(rest, [{sub.pid, sub.ref, e} | out], new_subs, cursor + 1)
+      else
+        flush(all, out, subs, cursor + 1)
+      end
+    end
+  end
+
+  defp group(entries) do
+    entries
+    |> Enum.reverse()
+    |> Enum.group_by(fn {pid, ref, _} -> {pid, ref} end, fn {_, _, msg} -> msg end)
+    |> Enum.map(fn {{pid, ref}, msgs} -> {pid, ref, msgs} end)
+  end
 end
+
+defmodule Main do
+  def main do
+      # Demonstrate DemandDispatcher: work-stealing, fastest consumer gets next task
+      {:ok, p} = GenStage.start_link(GenstageAdvanced.IngestProducer, 
+        [dispatcher: GenStage.DemandDispatcher, buffer_size: 100], [])
+      {:ok, c1} = GenStage.start_link(GenstageAdvanced.Aggregator, 
+        [subscribe_to: [{p, max_demand: 100}]], [])
+      {:ok, c2} = GenStage.start_link(GenstageAdvanced.Aggregator, 
+        [subscribe_to: [{p, max_demand: 50}]], [])
+
+      Process.sleep(20)
+
+      # Push events
+      for i <- 1..10, do: GenStage.cast(p, {:push, %{id: i, payload: "task", ts: 0}})
+
+      Process.sleep(100)
+
+      c1_count = :sys.get_state(c1).count
+
+      IO.puts("✓ DemandDispatcher: consumer1 (high demand) got #{c1_count} tasks")
+      assert c1_count > 0, "Consumer with higher demand got tasks"
+  end
+end
+
+Main.main()
 ```

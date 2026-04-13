@@ -304,6 +304,67 @@ type information. Add `@type t` even for trivial structs.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule UserSignup do
+  @moduledoc """
+  A signup record with required and optional fields.
+
+  Required: `:email`, `:password_hash`
+  Optional: `:referral_code` (nil), `:newsletter_opt_in` (false)
+  """
+
+  # @enforce_keys is checked at struct construction time.
+  # If a caller writes `%UserSignup{}` without these keys,
+  # the compiler raises an ArgumentError — we fail fast, not at runtime.
+  @enforce_keys [:email, :password_hash]
+
+  # Order matters for documentation but not for runtime.
+  # Optional fields MUST have a default — otherwise they behave as required.
+  defstruct [
+    :email,
+    :password_hash,
+    referral_code: nil,
+    newsletter_opt_in: false
+  ]
+
+  @type t :: %__MODULE__{
+          email: String.t(),
+          password_hash: String.t(),
+          referral_code: String.t() | nil,
+          newsletter_opt_in: boolean()
+        }
+
+  @doc """
+  Builds a signup from a plain map (e.g. a decoded JSON body).
+
+  Returns `{:ok, struct}` or `{:error, {:missing, [atom]}}` — we never let
+  a missing required field reach the caller as an exception because this is
+  I/O boundary code, not internal logic.
+  """
+  @spec from_params(map()) :: {:ok, t()} | {:error, {:missing, [atom()]}}
+  def from_params(params) when is_map(params) do
+    atom_params = for {k, v} <- params, into: %{}, do: {to_existing_atom(k), v}
+
+    required = [:email, :password_hash]
+    missing = Enum.reject(required, &Map.has_key?(atom_params, &1))
+
+    case missing do
+      [] -> {:ok, struct!(__MODULE__, atom_params)}
+      keys -> {:error, {:missing, keys}}
+    end
+  end
+
+  # We use `to_existing_atom` because unbounded `String.to_atom`
+  # on untrusted input leaks atoms — the atom table is not GC'd.
+  defp to_existing_atom(k) when is_atom(k), do: k
+  defp to_existing_atom(k) when is_binary(k), do: String.to_existing_atom(k)
+end
+```
+
 ## Resources
 
 - [Elixir docs — `defstruct`](https://hexdocs.pm/elixir/Kernel.html#defstruct/1)

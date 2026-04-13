@@ -304,7 +304,47 @@ mix test
 
 ---
 
+## Executable Example
 
+Create `lib/monitor_demo.ex` and test in `iex`:
+
+```elixir
+defmodule MonitorDemo do
+  def observed_worker(name) do
+    pid = spawn(fn -> worker_loop(name) end)
+    ref = Process.monitor(pid)
+    {pid, ref}
+  end
+
+  def worker_loop(name) do
+    receive do
+      :stop -> IO.puts("#{name} stopping")
+      msg -> IO.puts("#{name} got: #{inspect(msg)}"); worker_loop(name)
+    after
+      5000 -> worker_loop(name)
+    end
+  end
+
+  def observe(pid, ref) do
+    receive do
+      {:DOWN, ^ref, :process, ^pid, reason} ->
+        IO.inspect({:process_down, pid, reason})
+    after
+      1000 -> IO.puts("Process still alive")
+    end
+  end
+end
+
+# Test it
+{pid, ref} = MonitorDemo.observed_worker("worker1")
+send(pid, "hello")
+Process.sleep(100)
+
+send(pid, :stop)
+MonitorDemo.observe(pid, ref)
+```
+
+---
 ## Key Concepts
 
 ### 1. Monitors Are One-Way Exit Notifications

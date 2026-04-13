@@ -306,6 +306,94 @@ that differ by 20 percent.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule LazyPipeline do
+  @moduledoc """
+  Side-by-side strict (`Enum`) vs lazy (`Stream`) pipelines over a range,
+  plus a tiny memory-measurement helper so you can see the difference
+  instead of taking it on faith.
+  """
+
+  @doc """
+  Strict pipeline: each intermediate collection is fully materialized.
+
+  For `n = 1_000_000` this allocates one list per `Enum.*` stage.
+  """
+  @spec strict_pipeline(pos_integer()) :: [integer()]
+  def strict_pipeline(n) do
+    1..n
+    |> Enum.map(&(&1 * &1))
+    |> Enum.filter(&(rem(&1, 2) == 0))
+    |> Enum.take(10)
+  end
+
+  @doc """
+  Lazy pipeline: identical semantics, single-pass execution, early exit.
+
+  The `Stream.*` calls just build a computation graph. Only `Enum.take/2`
+  (the terminal operation) pulls elements — and it stops at 10.
+  """
+  @spec lazy_pipeline(pos_integer()) :: [integer()]
+  def lazy_pipeline(n) do
+    1..n
+    |> Stream.map(&(&1 * &1))
+    |> Stream.filter(&(rem(&1, 2) == 0))
+    |> Enum.take(10)
+  end
+
+  @doc """
+  Runs `fun` and returns `{result, bytes_delta}` based on `:erlang.memory(:total)`.
+
+  We force a GC before and after so transient allocations from earlier work
+  don't contaminate the measurement. The number is approximate but useful
+  for order-of-magnitude comparisons between strict and lazy pipelines.
+  """
+  @spec measure((-> result)) :: {result, integer()} when result: var
+  def measure(fun) when is_function(fun, 0) do
+    :erlang.garbage_collect()
+    before = :erlang.memory(:total)
+    result = fun.()
+    :erlang.garbage_collect()
+    after_mem = :erlang.memory(:total)
+    {result, after_mem - before}
+  end
+end
+
+# Demonstrate lazy vs strict evaluation
+IO.puts("=== LazyPipeline Demo ===")
+
+# Test with small dataset first
+small_result_strict = LazyPipeline.strict_pipeline(100)
+small_result_lazy = LazyPipeline.lazy_pipeline(100)
+
+# Both should produce the same result
+assert small_result_strict == small_result_lazy
+IO.puts("Small dataset (n=100) — strict and lazy produce same result: #{inspect(small_result_strict)}")
+
+# Test with larger dataset
+n = 100_000
+{strict_result, strict_bytes} = LazyPipeline.measure(fn -> LazyPipeline.strict_pipeline(n) end)
+{lazy_result, lazy_bytes} = LazyPipeline.measure(fn -> LazyPipeline.lazy_pipeline(n) end)
+
+assert strict_result == lazy_result
+IO.puts("\nLarge dataset (n=#{n}):")
+IO.puts("Strict pipeline allocated: #{strict_bytes} bytes")
+IO.puts("Lazy pipeline allocated: #{lazy_bytes} bytes")
+ratio = if lazy_bytes > 0, do: strict_bytes / lazy_bytes, else: 1.0
+IO.puts("Lazy is #{ratio |> Float.round(1)}x more efficient")
+
+# Verify the result contains exactly 10 elements (due to take/1)
+assert Enum.count(strict_result) == 10
+assert Enum.count(lazy_result) == 10
+IO.puts("\nBoth pipelines correctly limited to 10 elements via take/1")
+IO.puts("All lazy evaluation assertions passed!")
+```
+
+
 ## Resources
 
 - [`Stream` — Elixir stdlib](https://hexdocs.pm/elixir/Stream.html)

@@ -313,6 +313,77 @@ or a test-local supervisor you fully control.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule Counter do
+    @moduledoc """
+    Minimal GenServer counter — used to demonstrate `start_supervised!/1`.
+    """
+    use GenServer
+
+    # ── Public API ─────────────────────────────────────────────────────────
+
+    @spec start_link(keyword()) :: GenServer.on_start()
+    def start_link(opts \\ []) do
+      {initial, opts} = Keyword.pop(opts, :initial, 0)
+      GenServer.start_link(__MODULE__, initial, opts)
+    end
+
+    @spec bump(GenServer.server(), pos_integer()) :: :ok
+    def bump(server, by \\ 1), do: GenServer.cast(server, {:bump, by})
+
+    @spec value(GenServer.server()) :: integer()
+    def value(server), do: GenServer.call(server, :value)
+
+    # ── Callbacks ──────────────────────────────────────────────────────────
+
+    @impl true
+    def init(initial), do: {:ok, initial}
+
+    @impl true
+    def handle_cast({:bump, by}, n), do: {:noreply, n + by}
+
+    @impl true
+    def handle_call(:value, _from, n), do: {:reply, n, n}
+  end
+
+  def main do
+    IO.puts("=== start_supervised Demo ===\n")
+  
+    # Demo: Manually start and use a Counter
+    IO.puts("1. Manual GenServer lifecycle:")
+    {:ok, counter} = Counter.start_link(initial: 10)
+    IO.puts("   Started counter with initial=10")
+  
+    IO.puts("   value: #{Counter.value(counter)}")
+    assert Counter.value(counter) == 10
+  
+    Counter.bump(counter, 5)
+    IO.puts("   After bump(5): #{Counter.value(counter)}")
+    assert Counter.value(counter) == 15
+  
+    Counter.bump(counter)
+    IO.puts("   After bump(1): #{Counter.value(counter)}")
+    assert Counter.value(counter) == 16
+  
+    # Cleanup
+    GenServer.stop(counter)
+    IO.puts("   Counter stopped")
+  
+    IO.puts("\n✓ start_supervised demo completed!")
+    IO.puts("\n(In tests, use `start_supervised!({Counter, opts})` for automatic cleanup)")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`ExUnit.Callbacks.start_supervised!/2`](https://hexdocs.pm/ex_unit/ExUnit.Callbacks.html#start_supervised!/2)

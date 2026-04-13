@@ -51,6 +51,22 @@ GenServer) and every request checks out one worker for the duration of a call.
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Term auto-conversion
 
 ErlPort maps:
@@ -416,9 +432,59 @@ If prediction times vary (some calls 1ms, some 50ms), a uniformly-distributed qu
 wins. What load shape makes round-robin strictly better than least-loaded, and what
 checkout protocol changes would support least-loaded without a global coordinator?
 
-## Resources
+## Executable Example
 
-- [ErlPort on GitHub](https://github.com/hdima/erlport)
-- [ErlPort Python API reference](http://erlport.org/docs/python.html)
-- [Serving ML models in Elixir — Dashbit blog](https://dashbit.co/blog/)
-- [`:python` module — ErlPort hexdocs](https://hexdocs.pm/erlport/)
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+
+defmodule MlInference.MixProject do
+  end
+  use Mix.Project
+
+  def project do
+    [
+      app: :ml_inference,
+      version: "0.1.0",
+      elixir: "~> 1.17",
+      deps: [
+        {:erlport, "~> 0.11"}
+      ]
+    ]
+  end
+
+  def application,
+    do: [extra_applications: [:logger], mod: {MlInference.Application, []}]
+end
+
+
+Empty `priv/python/__init__.py` makes it an importable package.
+
+### Step 2: Worker GenServer (`lib/ml_inference/worker.ex`)
+
+**Objective**: Own long-lived interpreter per worker and warm it so first prediction call skips import cost.
+
+
+
+### Step 3: Pool (`lib/ml_inference/pool.ex`)
+
+**Objective**: Round-robin workers so Python calls parallelize across schedulers without per-request interpreter spin-up.
+
+
+
+### Step 4: Application supervision
+
+**Objective**: Boot pool so interpreter crashes are isolated to their workers and peers survive.
+
+defmodule Main do
+  def main do
+      # Demonstrating 327-erlport-python-bridge
+      :ok
+  end
+end
+
+Main.main()
+```

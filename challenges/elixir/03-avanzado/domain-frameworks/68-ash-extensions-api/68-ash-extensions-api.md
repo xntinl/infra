@@ -48,6 +48,22 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Extensions sit on resources, routes sit on domains
 
 Each extension has two parts:
@@ -664,22 +680,128 @@ Benchmark a representative workload with [Wrk](https://github.com/wg/wrk) agains
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
 
-- [AshJsonApi hexdocs](https://hexdocs.pm/ash_json_api/) — full DSL
-- [AshGraphql hexdocs](https://hexdocs.pm/ash_graphql/) — full DSL
-- [AshAdmin hexdocs](https://hexdocs.pm/ash_admin/) — setup guide
-- [JSON:API specification](https://jsonapi.org/format/) — know this before exposing REST routes
-- [Absinthe.Complexity docs](https://hexdocs.pm/absinthe/complexity-analysis.html) — GraphQL safety net
-- [Zach Daniel — "Ash 3.0 overview"](https://www.youtube.com/results?search_query=ash+3.0+zach+daniel) — creator's talks
-- [Ash + Phoenix production guide](https://hexdocs.pm/ash_phoenix/) — recommended integration patterns
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+# lib/ash_extensions/catalog/category.ex
+defmodule AshExtensions.Catalog.Category do
+  use Ash.Resource,
+    domain: AshExtensions.Catalog,
+    data_layer: AshPostgres.DataLayer,
+    extensions: [AshJsonApi.Resource, AshGraphql.Resource]
+
+  postgres do
+    table "categories"
+    repo AshExtensions.Repo
+  end
+
+  attributes do
+    uuid_primary_key :id
+    attribute :name, :string, allow_nil?: false, public?: true
+    attribute :slug, :string, allow_nil?: false, public?: true
+    timestamps()
+  end
+
+  relationships do
+    has_many :products, AshExtensions.Catalog.Product
+  end
+
+  identities do
+    identity :unique_slug, [:slug]
+  end
+
+  actions do
+    defaults [:create, :read, :update, :destroy]
+  end
+
+  json_api do
+    type "category"
+    routes do
+      base "/categories"
+      get :read
+      index :read
+      post :create
+      patch :update
+      delete :destroy
+    end
+  end
+
+  graphql do
+    type :category
+    queries do
+      get :get_category, :read
+      list :list_categories, :read
+    end
+    mutations do
+      create :create_category, :create
+      update :update_category, :update
+      destroy :delete_category, :destroy
+    end
+  end
 end
+
+# lib/ash_extensions/catalog/price.ex
+defmodule AshExtensions.Catalog.Price do
+  use Ash.Resource,
+    domain: AshExtensions.Catalog,
+    data_layer: AshPostgres.DataLayer,
+    extensions: [AshJsonApi.Resource, AshGraphql.Resource]
+
+  postgres do
+    table "prices"
+    repo AshExtensions.Repo
+  end
+
+  attributes do
+    uuid_primary_key :id
+    attribute :amount_cents, :integer, allow_nil?: false, public?: true
+    attribute :currency, :string, allow_nil?: false, public?: true, default: "USD"
+    attribute :valid_from, :utc_datetime_usec, allow_nil?: false, public?: true
+    attribute :valid_until, :utc_datetime_usec, public?: true
+    timestamps()
+  end
+
+  relationships do
+    belongs_to :product, AshExtensions.Catalog.Product do
+      allow_nil? false
+      public? true
+    end
+  end
+
+  actions do
+    defaults [:create, :read, :destroy]
+  end
+
+  json_api do
+    type "price"
+    routes do
+      base "/prices"
+      get :read
+      index :read
+      post :create
+      delete :destroy
+    end
+  end
+
+  graphql do
+    type :price
+    queries do
+      list :list_prices, :read
+    end
+    mutations do
+      create :create_price, :create
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+    IO.puts("✓ Ash extensions — JSON:API, GraphQL, Admin")
+  - Demonstrating core concepts
+    - Implementation patterns and best practices
+  end
+end
+
+Main.main()
 ```

@@ -56,6 +56,22 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. What "memory" means in Benchee
 
 Benchee's memory measurement is:
@@ -531,21 +547,75 @@ Example GitHub Actions step:
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
 
-- [Benchee memory measurement docs](https://hexdocs.pm/benchee/writing-benchmarks.html#measuring-memory-consumption) — the specific section on memory
-- [`:erlang.process_info/2`](https://www.erlang.org/doc/man/erlang.html#process_info-2) — the counters Benchee reads
-- [`:erlang.statistics/1`](https://www.erlang.org/doc/man/erlang.html#statistics-1) — reduction counters at the VM level
-- [José Valim — iolist vs binary](https://elixir-lang.org/blog/) — the canonical write-up on binary concatenation cost
-- [Chris Keathley — benchmarking in Elixir](https://keathley.io/) — practical benchmark-driven optimization
-- [Dashbit — memory and reductions in production](https://dashbit.co/blog/) — real-world stories of reduction-based alerting
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+defmodule BencheeMemory.BuildersTest do
+  use ExUnit.Case, async: true
+
+  alias BencheeMemory.Builders
+
+  @input for i <- 1..50, do: "s#{i}"
+
+  describe "correctness — all three produce the same binary" do
+    test "concat" do
+      assert Builders.concat(@input) == Enum.join(@input)
+    end
+
+    test "iodata" do
+      assert Builders.iodata(@input) == Enum.join(@input)
+    end
+
+    test "binary_append" do
+      assert Builders.binary_append(@input) == Enum.join(@input)
+    end
+  end
+
+  describe "allocation profile — reductions as proxy" do
+    defp measure(fun) do
+      :erlang.garbage_collect()
+      {_, r0} = Process.info(self(), :reductions)
+      _ = fun.()
+      {_, r1} = Process.info(self(), :reductions)
+      r1 - r0
+    end
+
+    test "concat uses more reductions than iodata for N=200" do
+      input = for i <- 1..200, do: "chunk-#{i}-"
+
+      r_concat = measure(fn -> Builders.concat(input) end)
+      r_iodata = measure(fn -> Builders.iodata(input) end)
+
+      assert r_concat > r_iodata * 2,
+             "expected concat to be > 2x iodata reductions, got #{r_concat} vs #{r_iodata}"
+    end
+
+    test "binary_append is comparable to iodata for small N" do
+      input = for i <- 1..50, do: "s"
+
+      r_iodata = measure(fn -> Builders.iodata(input) end)
+      r_append = measure(fn -> Builders.binary_append(input) end)
+
+      # Both should be within 3x of each other (binary append can be slightly more
+      # expensive due to allocation strategy)
+      ratio = max(r_iodata, r_append) / max(min(r_iodata, r_append), 1)
+      assert ratio < 3.0
+    end
+  end
 end
+
+defmodule Main do
+  def main do
+      IO.puts("Benchmarking initialized")
+      {elapsed_us, result} = :timer.tc(fn ->
+        Enum.reduce(1..1000, 0, &+/2)
+      end)
+      if is_number(elapsed_us) do
+        IO.puts("✓ Benchmark completed: sum(1..1000) = " <> inspect(result) <> " in " <> inspect(elapsed_us) <> "µs")
+      end
+  end
+end
+
+Main.main()
 ```

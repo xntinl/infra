@@ -428,6 +428,127 @@ tuples per key — "the" counter is ambiguous. OTP will raise.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule EtsCountersDemo do
+    @moduledoc """
+    Three flavors of counter:
+
+      1. ETS non-atomic (lookup + insert) — wrong on purpose, to prove the race.
+      2. ETS atomic via `:ets.update_counter/3` — the correct ETS approach.
+      3. `:counters` — lock-free, fixed-size, for fixed-shape hot counters.
+
+    Every flavor is racy-tested against N concurrent callers.
+    """
+
+    # ── ETS counter table setup ────────────────────────────────────────────
+
+    @doc "Creates a `:public` table with `:write_concurrency` for hot counter writes."
+    @spec new_ets_table() :: :ets.tid()
+    def new_ets_table do
+      :ets.new(:counters, [
+        :set,
+        :public,
+        write_concurrency: true,
+        read_concurrency: true
+      ])
+    end
+
+    # ── 1. WRONG: lookup + insert ──────────────────────────────────────────
+
+    @doc """
+    THE RACY VERSION. Do not use in real code — included here to prove the race.
+    """
+    @spec racy_inc(:ets.tid(), term()) :: integer()
+    def racy_inc(t, key) do
+      current =
+        case :ets.lookup(t, key) do
+          [{^key, v}] -> v
+          [] -> 0
+        end
+
+      :ets.insert(t, {key, current + 1})
+      current + 1
+    end
+
+    # ── 2. CORRECT: :ets.update_counter/3 ──────────────────────────────────
+
+    @doc """
+    Atomic increment. The 4-arg form inserts the default `{key, 0}` tuple if
+    the key doesn't exist, then applies the `{pos=2, inc=1}` bump.
+
+    Returns the post-increment value.
+    """
+    @spec atomic_inc(:ets.tid(), term()) :: integer()
+    def atomic_inc(t, key) do
+      :ets.update_counter(t, key, {2, 1}, {key, 0})
+    end
+
+    @doc "Read the current value, 0 if absent."
+    @spec read(:ets.tid(), term()) :: integer()
+    def read(t, key) do
+      case :ets.lookup(t, key) do
+        [{^key, v}] -> v
+        [] -> 0
+      end
+    end
+
+    # ── 3. :counters module ────────────────────────────────────────────────
+
+    @doc """
+    Allocate a fixed-size array. Use `:write_concurrency` for max throughput;
+    `:atomics` if you need consistent cross-scheduler reads.
+    """
+    @spec new_counters(pos_integer()) :: :counters.counters_ref()
+    def new_counters(size), do: :counters.new(size, [:write_concurrency])
+
+    @doc "Atomic add at index `ix` (1-indexed)."
+    @spec counters_inc(:counters.counters_ref(), pos_integer()) :: :ok
+    def counters_inc(ref, ix), do: :counters.add(ref, ix, 1)
+
+    @spec counters_read(:counters.counters_ref(), pos_integer()) :: integer()
+    def counters_read(ref, ix), do: :counters.get(ref, ix)
+  end
+
+  def main do
+    # Demo: atomic counter con update_counter/3
+    t = EtsCountersDemo.new_ets_table()
+  
+    # Prueba el contador atómico
+    val1 = EtsCountersDemo.atomic_inc(t, :requests)
+    val2 = EtsCountersDemo.atomic_inc(t, :requests)
+    val3 = EtsCountersDemo.atomic_inc(t, :requests)
+  
+    assert val1 == 1, "primer incremento debe ser 1"
+    assert val2 == 2, "segundo incremento debe ser 2"
+    assert val3 == 3, "tercer incremento debe ser 3"
+  
+    final = EtsCountersDemo.read(t, :requests)
+    assert final == 3, "valor final debe ser 3"
+  
+    # Prueba :counters module
+    ref = EtsCountersDemo.new_counters(1)
+    EtsCountersDemo.counters_inc(ref, 1)
+    EtsCountersDemo.counters_inc(ref, 1)
+    assert EtsCountersDemo.counters_read(ref, 1) == 2, "contador debe ser 2"
+  
+    :ets.delete(t)
+  
+    IO.puts("EtsCountersDemo: demostración de contadores atómicos exitosa")
+    IO.puts("  update_counter/3: requests=#{final}")
+    IO.puts("  :counters: index_1=#{EtsCountersDemo.counters_read(ref, 1)}")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`:ets.update_counter/3` / `/4`](https://www.erlang.org/doc/man/ets.html#update_counter-3)

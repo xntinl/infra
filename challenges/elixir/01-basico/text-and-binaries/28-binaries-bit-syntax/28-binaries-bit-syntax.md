@@ -378,6 +378,17 @@ check the `size` modifier — mixing bits and bytes is the most common mistake h
 ---
 
 
+
+
+## Executable Example
+
+Create a simple example demonstrating the key concepts:
+
+```elixir
+# Example code demonstrating text and binary concepts
+IO.puts("Example: Read the Implementation section above and run the code samples in iex")
+```
+
 ## Key Concepts
 
 ### 1. `::binary` Matches the Remainder

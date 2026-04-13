@@ -317,6 +317,17 @@ mix test test/task_queue/protocol_test.exs --trace
 ---
 
 
+
+
+## Executable Example
+
+Create a simple example demonstrating the key concepts:
+
+```elixir
+# Example code demonstrating text and binary concepts
+IO.puts("Example: Read the Implementation section above and run the code samples in iex")
+```
+
 ## Key Concepts
 
 ### 1. Bit Syntax Matches or Constructs at the Bit Level

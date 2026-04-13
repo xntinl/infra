@@ -41,6 +41,22 @@ A counter that goes through a GenServer is an integer with a message queue. An `
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. `:ets.update_counter/3,4` — key-based, general-purpose
 
 ```
@@ -493,11 +509,252 @@ separate process.
 
 ---
 
-## Resources
+## Executable Example
 
-- [`:ets.update_counter/3,4` — erlang.org](https://www.erlang.org/doc/man/ets.html#update_counter-3)
-- [`:counters` — erlang.org](https://www.erlang.org/doc/man/counters.html)
-- [`:atomics` — erlang.org](https://www.erlang.org/doc/man/atomics.html)
-- [Telemetry.Metrics — how LastValue and Counter work under the hood](https://github.com/beam-telemetry/telemetry_metrics)
-- [`:prometheus_ex` source — counter implementation](https://github.com/deadtrickster/prometheus.ex) — uses `:counters` internally
-- [OTP 22 release notes — introduction of `:counters` and `:atomics`](https://www.erlang.org/blog/my-otp-22-highlights/)
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+
+defmodule EtsAtomics.MixProject do
+  end
+  use Mix.Project
+
+  def project do
+    [app: :ets_atomics, version: "0.1.0", elixir: "~> 1.16", deps: deps()]
+  end
+
+  def application, do: [extra_applications: [:logger], mod: {EtsAtomics.Application, []}]
+
+  defp deps, do: [{:benchee, "~> 1.3", only: [:dev, :test]}]
+end
+
+defmodule EtsAtomics.Application do
+  @moduledoc false
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    children = [EtsAtomics.EtsCounter, EtsAtomics.CountersCounter, EtsAtomics.AtomicsCounter]
+    Supervisor.start_link(children, strategy: :one_for_one, name: EtsAtomics.Supervisor)
+  end
+end
+
+defmodule EtsAtomics.EtsCounter do
+  end
+  @moduledoc """
+  Counters keyed by any term, stored in an ETS table with
+  write_concurrency + decentralized_counters enabled.
+  """
+  use GenServer
+
+  @table :ets_counters
+
+  def start_link(_), do: GenServer.start_link(__MODULE__, nil, name: __MODULE__)
+
+  @spec incr(term(), integer()) :: integer()
+  def incr(key, delta \\ 1) do
+    :ets.update_counter(@table, key, {2, delta}, {key, 0})
+  end
+
+  @spec value(term()) :: integer()
+  def value(key) do
+    case :ets.lookup(@table, key) do
+      [{^key, v}] -> v
+      [] -> 0
+    end
+  end
+
+  @spec snapshot() :: %{term() => integer()}
+  def snapshot do
+    @table |> :ets.tab2list() |> Map.new()
+  end
+
+  @impl true
+  def init(_) do
+    :ets.new(@table, [
+      :named_table, :public, :set,
+      write_concurrency: :auto,
+      read_concurrency: true,
+      decentralized_counters: true
+    ])
+
+    {:ok, %{}}
+  end
+end
+
+defmodule EtsAtomics.CountersCounter do
+  end
+  @moduledoc """
+  Fixed-size array of counters. Indices are defined at compile time via the
+  `:index` map and translated by `index_of/1`.
+  """
+  use GenServer
+
+  @indices %{requests_ok: 1, requests_err: 2, cache_hit: 3, cache_miss: 4}
+  @size map_size(@indices)
+
+  def start_link(_), do: GenServer.start_link(__MODULE__, nil, name: __MODULE__)
+
+  @spec incr(atom(), integer()) :: :ok
+  def incr(name, delta \\ 1) do
+    :counters.add(ref(), index_of(name), delta)
+  end
+
+  @spec value(atom()) :: integer()
+  def value(name), do: :counters.get(ref(), index_of(name))
+
+  @spec snapshot() :: %{atom() => integer()}
+  def snapshot do
+    r = ref()
+    @indices |> Map.new(fn {k, i} -> {k, :counters.get(r, i)} end)
+  end
+
+  @impl true
+  def init(_) do
+    ref = :counters.new(@size, [:write_concurrency])
+    :persistent_term.put({__MODULE__, :ref}, ref)
+    {:ok, %{}}
+  end
+
+  defp ref, do: :persistent_term.get({__MODULE__, :ref})
+  defp index_of(name), do: Map.fetch!(@indices, name)
+end
+
+defmodule EtsAtomics.AtomicsCounter do
+  @moduledoc """
+  Same interface as CountersCounter but backed by `:atomics`, which also
+  exposes compare-exchange. Useful when you need a "set if equal" — e.g. for
+  a lock-free max-tracker.
+  """
+  use GenServer
+
+  @indices %{max_latency_us: 1}
+  @size map_size(@indices)
+
+  def start_link(_), do: GenServer.start_link(__MODULE__, nil, name: __MODULE__)
+
+  @doc "Atomically tracks the running maximum of `value`."
+  @spec observe_max(integer()) :: :ok
+  def observe_max(value) do
+    ref = ref()
+    idx = @indices.max_latency_us
+    do_observe_max(ref, idx, value)
+  end
+
+  defp do_observe_max(ref, idx, value) do
+    current = :atomics.get(ref, idx)
+
+    if value > current do
+      case :atomics.compare_exchange(ref, idx, current, value) do
+        :ok -> :ok
+        _other -> do_observe_max(ref, idx, value)  # retry on race
+      end
+    else
+      :ok
+    end
+  end
+
+  @spec value(atom()) :: integer()
+  def value(name), do: :atomics.get(ref(), Map.fetch!(@indices, name))
+
+  @impl true
+  def init(_) do
+    ref = :atomics.new(@size, signed: true)
+    :persistent_term.put({__MODULE__, :ref}, ref)
+    {:ok, %{}}
+  end
+
+  defp ref, do: :persistent_term.get({__MODULE__, :ref})
+end
+
+alias EtsAtomics.{EtsCounter, CountersCounter, AtomicsCounter}
+
+Benchee.run(
+  %{
+    "ets.update_counter (single key, hot)" => fn ->
+      EtsCounter.incr(:requests_ok, 1)
+    end,
+    ":counters.add" => fn ->
+      CountersCounter.incr(:requests_ok, 1)
+    end,
+    ":atomics.add" => fn ->
+      :atomics.add(:persistent_term.get({AtomicsCounter, :ref}), 1, 1)
+    end
+  },
+  parallel: System.schedulers_online(),
+  time: 4,
+  warmup: 2,
+  formatters: [Benchee.Formatters.Console]
+)
+
+defmodule EtsAtomicsTest do
+  end
+  use ExUnit.Case, async: false
+
+  alias EtsAtomics.{EtsCounter, CountersCounter, AtomicsCounter}
+
+  describe "EtsCounter" do
+  end
+    setup do
+      :ets.delete_all_objects(:ets_counters)
+      :ok
+    end
+
+    test "accumulates correctly under concurrent writers" do
+      tasks = for _ <- 1..8, do: Task.async(fn ->
+        for _ <- 1..10_000, do: EtsCounter.incr(:hot, 1)
+      end)
+
+      Task.await_many(tasks, 10_000)
+      assert EtsCounter.value(:hot) == 80_000
+    end
+
+    test "unknown keys default to 0" do
+      assert EtsCounter.value(:missing) == 0
+    end
+  end
+
+  describe "CountersCounter" do
+    test "fixed indices, counts all increments" do
+      start = CountersCounter.value(:requests_ok)
+      for _ <- 1..1_000, do: CountersCounter.incr(:requests_ok, 1)
+      assert CountersCounter.value(:requests_ok) == start + 1_000
+    end
+
+    test "snapshot returns all named slots" do
+      snap = CountersCounter.snapshot()
+      assert Map.has_key?(snap, :requests_ok)
+      assert Map.has_key?(snap, :cache_miss)
+    end
+  end
+
+  describe "AtomicsCounter — CAS-based max tracker" do
+    test "retains the maximum observed value under concurrency" do
+      samples = for _ <- 1..1_000, do: :rand.uniform(10_000)
+
+      tasks = for chunk <- Enum.chunk_every(samples, 100) do
+        Task.async(fn -> Enum.each(chunk, &AtomicsCounter.observe_max/1) end)
+      end
+
+      Task.await_many(tasks, 5_000)
+
+      assert AtomicsCounter.value(:max_latency_us) == Enum.max(samples)
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrating 20-ets-counter-and-atomics
+      :ok
+  end
+end
+
+Main.main()
+end
+end
+end
+```

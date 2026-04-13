@@ -315,7 +315,75 @@ mix test
 
 The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
 
+---
 
+## Executable Example
+
+Create `lib/webhook_router.ex` and test in `iex`:
+
+```elixir
+defmodule WebhookRouter do
+  def route(%{"event" => "push", "repository" => %{"full_name" => repo}}) do
+    {:ok, :github_push, repo}
+  end
+
+  def route(%{"event" => "pull_request", "repository" => %{"full_name" => repo}}) do
+    {:ok, :github_pr, repo}
+  end
+
+  def route(%{"type" => "charge.created", "data" => %{"id" => charge_id}}) do
+    {:ok, :stripe_charge, charge_id}
+  end
+
+  def route(%{"action" => "created", "user" => %{"id" => user_id}}) do
+    {:ok, :user_created, user_id}
+  end
+
+  def route(_), do: {:error, :unknown_event}
+
+  def extract_user(%{"user" => %{"email" => email, "id" => id}}) when is_binary(email) do
+    {:ok, %{email: email, id: id}}
+  end
+
+  def extract_user(_), do: :error
+
+  def validate(%{"timestamp" => ts} = event) when is_integer(ts) and ts > 0 do
+    {:ok, event}
+  end
+
+  def validate(_), do: {:error, :missing_timestamp}
+end
+
+# Test it
+github_event = %{
+  "event" => "push",
+  "repository" => %{"full_name" => "user/repo"},
+  "timestamp" => 1234567890
+}
+
+{:ok, :github_push, repo} = WebhookRouter.route(github_event)
+IO.inspect(repo)  # "user/repo"
+
+stripe_event = %{
+  "type" => "charge.created",
+  "data" => %{"id" => "ch_1234"},
+  "timestamp" => 1234567890
+}
+
+{:ok, :stripe_charge, charge} = WebhookRouter.route(stripe_event)
+IO.inspect(charge)  # "ch_1234"
+
+user_event = %{
+  "action" => "created",
+  "user" => %{"email" => "test@example.com", "id" => "u-123"}
+}
+
+{:ok, user} = WebhookRouter.extract_user(user_event)
+IO.inspect(user)  # %{email: "test@example.com", id: "u-123"}
+
+{:ok, validated} = WebhookRouter.validate(github_event)
+IO.puts("Event validated successfully")
+```
 
 ---
 ## Key Concepts

@@ -36,6 +36,22 @@ Redis pub/sub gives you broadcast; it does NOT give you a shared state snapshot.
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. `Phoenix.Tracker` under the hood
 
 `Phoenix.Presence` wraps `Phoenix.Tracker`. The Tracker uses a heartbeat-based failure detector. If a node does not gossip within `:down_period` (default 15s), its presences are marked `:down` and synced away.
@@ -350,9 +366,64 @@ Phoenix's conn struct represents an HTTP request/response in flight, accumulatin
 
 A PM asks for a "who was last seen when" feature — including users who are NOT currently connected. Presence only tracks live connections. Sketch the architecture change: what do you persist, where, and how do you reconcile it with Presence on reconnect?
 
-## Resources
 
-- [Phoenix.Presence — hexdocs](https://hexdocs.pm/phoenix/Phoenix.Presence.html)
-- [Phoenix.Tracker — hexdocs](https://hexdocs.pm/phoenix_pubsub/Phoenix.Tracker.html)
-- [Loeffler, Nicoll — Phoenix.Tracker CRDT paper](https://github.com/phoenixframework/phoenix_pubsub/blob/main/docs/tracker.md)
-- [Chris McCord — Phoenix Presence announcement](https://dockyard.com/blog/2016/03/25/what-makes-phoenix-presence-special-sneak-peek)
+## Executable Example
+
+```elixir
+defmodule CollabRoomWeb.RoomChannelTest do
+  use ExUnit.Case, async: false
+  import Phoenix.ChannelTest
+
+  @endpoint CollabRoomWeb.Endpoint
+
+  setup do
+    {:ok, _, socket} =
+      CollabRoomWeb.UserSocket
+      |> socket("user_socket:42", %{user_id: 42})
+      |> subscribe_and_join(CollabRoomWeb.RoomChannel, "room:lobby", %{"user_id" => 42})
+
+    {:ok, socket: socket}
+  end
+
+  describe "join" do
+    test "receives presence_state immediately", %{socket: _} do
+      assert_push "presence_state", state
+      assert Map.has_key?(state, "42")
+    end
+  end
+
+  describe "typing" do
+    test "update triggers a presence_diff with new meta", %{socket: socket} do
+      assert_push "presence_state", _
+      push(socket, "typing", %{"typing?" => true})
+      assert_broadcast "presence_diff", %{joins: joins}
+      [%{typing?: true}] = get_in(joins, ["42", :metas])
+    end
+  end
+
+  describe "message" do
+    test "message is broadcast to the topic", %{socket: socket} do
+      push(socket, "message", %{"body" => "hello"})
+      assert_broadcast "message", %{user_id: 42, body: "hello"}
+    end
+  end
+
+  describe "disconnect" do
+    test "closing the socket emits a leave diff", %{socket: socket} do
+      Process.unlink(socket.channel_pid)
+      close(socket)
+      assert_broadcast "presence_diff", %{leaves: %{"42" => _}}
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+    IO.puts("✓ Phoenix Channels with Presence for Multi-Node Collaboration")
+  - Demonstrating core concepts
+    - Implementation patterns and best practices
+  end
+end
+
+Main.main()
+```

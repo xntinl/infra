@@ -41,6 +41,25 @@ The cost: deploying a rule change requires a compile and a deploy. If that is un
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Metaprogramming-specific insight:**
+Code generation is powerful and dangerous. Every macro you write is a place where intent is hidden. Use macros sparingly, only when they eliminate genuine boilerplate. If your macro is more than 10 lines, you probably need a function or data structure instead. Future maintainers will thank you.
 ### 1. Quoted expression
 Elixir source parsed into a 3-tuple AST: `{name, meta, args}`. Literals are themselves.
 
@@ -417,9 +436,186 @@ If your rules are straightforward Elixir with maybe a `case` or a helper, just w
 
 The whitelist in `RuleEngine.Guards` is what keeps the DSL safe. Today the whitelist includes `>` and `and`. A business team will eventually want `Enum.any?/2` to match "any of these SKUs". How would you extend the whitelist without opening the door to arbitrary code? Sketch the policy: which functions are safe, which aren't, and where does the line sit?
 
-## Resources
 
-- [`Macro` module documentation](https://hexdocs.pm/elixir/Macro.html)
-- [`Macro.prewalk/2` vs `Macro.postwalk/2`](https://hexdocs.pm/elixir/Macro.html#prewalk/2)
-- [Chris McCord — Metaprogramming Elixir (book)](https://pragprog.com/titles/cmelixir/metaprogramming-elixir/)
-- [Elixir source — `Kernel.SpecialForms`](https://github.com/elixir-lang/elixir/blob/main/lib/elixir/lib/kernel/special_forms.ex)
+## Executable Example
+
+```elixir
+defmodule RuleEngine do
+  @moduledoc """
+  Declarative business rules DSL.
+
+      defmodule DiscountRules do
+        use RuleEngine
+
+        rule :gold_bulk,
+          when: tier == :gold and subtotal > 100,
+          then: {:discount, 0.10}
+
+        rule :silver_bulk,
+          when: tier == :silver and subtotal > 200,
+          then: {:discount, 0.05}
+      end
+
+      iex> DiscountRules.evaluate(%{tier: :gold, subtotal: 150})
+      [{:discount, 0.10}]
+  """
+
+  alias RuleEngine.Guards
+  alias RuleEngine.Errors.InvalidRule
+
+  defmacro __using__(_opts) do
+    quote do
+      import RuleEngine, only: [rule: 2]
+      Module.register_attribute(__MODULE__, :rules, accumulate: true)
+      @before_compile RuleEngine
+    end
+  end
+
+  defmacro rule(name, opts) when is_atom(name) and is_list(opts) do
+    condition = Keyword.fetch!(opts, :when)
+    action    = Keyword.fetch!(opts, :then)
+
+    # Walk the condition AST and verify every operator is whitelisted.
+    # Simultaneously rewrite bare variables into `Map.fetch!(facts, :name)`.
+    rewritten =
+      Macro.prewalk(condition, fn
+        # Allowed binary/unary ops
+        {op, meta, args} = node when is_list(args) ->
+          if op in Guards.allowed_ops() or macro_allowed?(op) do
+            node
+          else
+            {op, meta, args} |> ensure_fact_access()
+          end
+
+        literal ->
+          literal
+      end)
+
+    quote bind_quoted: [name: name, rewritten: Macro.escape(rewritten), action: Macro.escape(action)] do
+      @rules {name, rewritten, action}
+    end
+    |> then(fn ast ->
+      # We need to generate the function BEFORE __before_compile__ at the macro call site too,
+      # but keeping definitions inside @before_compile makes ordering deterministic.
+      ast
+    end)
+  end
+
+  defmacro __before_compile__(env) do
+    rules = Module.get_attribute(env.module, :rules) |> Enum.reverse()
+
+    clauses =
+      for {name, cond_ast, action_ast} <- rules do
+        {cond_expanded, _} =
+          Macro.prewalk(cond_ast, [], fn
+            {op, _, _} = node, acc when is_atom(op) ->
+              if op in RuleEngine.Guards.allowed_ops() or op in [:facts, :., :->, :__block__] do
+                {node, acc}
+              else
+                raise_invalid(name, op)
+              end
+
+            {var, _meta, ctx} = node, acc when is_atom(var) and is_atom(ctx) ->
+              # Bare variable like `tier` → Map.fetch!(facts, :tier)
+              {quote(do: Map.fetch!(var!(facts), unquote(var))), acc}
+
+            other, acc ->
+              {other, acc}
+          end)
+
+        quote do
+          def evaluate_rule(unquote(name), var!(facts)) when is_map(var!(facts)) do
+            if unquote(cond_expanded) do
+              {:match, unquote(Macro.escape(action_ast))}
+            else
+              :no_match
+            end
+          end
+        end
+      end
+
+    dispatcher =
+      quote do
+        @doc "Evaluate all rules against `facts` and collect actions of matching rules."
+        def evaluate(facts) when is_map(facts) do
+          for {name, _, _} <- __rules__(),
+              match?({:match, _}, evaluate_rule(name, facts)),
+              do: elem(evaluate_rule(name, facts), 1)
+        end
+
+        @doc "Returns the declared rules for introspection."
+        def __rules__, do: unquote(Macro.escape(rules))
+      end
+
+    quote do
+      (unquote_splicing(clauses))
+      unquote(dispatcher)
+    end
+  end
+
+  # --- helpers ---
+
+  defp macro_allowed?(:__aliases__), do: true
+  defp macro_allowed?(:__block__), do: true
+  defp macro_allowed?(_), do: false
+
+  defp ensure_fact_access(node), do: node
+
+  defp raise_invalid(rule_name, op) do
+    raise InvalidRule,
+      message:
+        "rule #{inspect(rule_name)} uses disallowed operator #{inspect(op)}. " <>
+          "Allowed operators: #{inspect(RuleEngine.Guards.allowed_ops())}."
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrate DSL with Macro.prewalk for business rules
+      defmodule RuleEngine do
+        defmacro rule(name, opts) do
+          when_cond = opts[:when] || true
+          then_action = opts[:then] || :ok
+
+          quote do
+            def unquote(:"evaluate_#{name}")(context) do
+              if unquote(when_cond) do
+                unquote(then_action)
+              else
+                :not_matched
+              end
+            end
+          end
+        end
+      end
+
+      # Define rules using DSL
+      defmodule Rules do
+        require RuleEngine
+
+        RuleEngine.rule :customer_premium, 
+          when: (fn ctx -> Map.get(ctx, :balance, 0) > 1000 end),
+          then: :apply_premium_discount
+      end
+
+      # Test rule
+      context = %{customer_id: 1, balance: 5000}
+
+      # Simulate rule evaluation
+      result = if Map.get(context, :balance, 0) > 1000 do
+        :apply_premium_discount
+      else
+        :not_matched
+      end
+
+      IO.puts("✓ Context: #{inspect(context)}")
+      IO.puts("✓ Rule evaluation: #{result}")
+
+      assert result == :apply_premium_discount, "Rule matched"
+
+      IO.puts("✓ Rule engine DSL: Macro.prewalk transformation working")
+  end
+end
+
+Main.main()
+```

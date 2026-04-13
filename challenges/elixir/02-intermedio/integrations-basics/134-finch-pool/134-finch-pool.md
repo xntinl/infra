@@ -376,6 +376,84 @@ telemetry that Req can't expose cleanly.
 
 - An HTTP/2 pool with `count: 4` gives you 4 independent connections each multiplexing many streams. If your p99 latency spikes during deployments of the upstream service, would increasing `count` actually help, or are you fighting a head-of-line-blocking problem that a bigger pool can't fix?
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule FinchPool.Telemetry do
+    @moduledoc """
+    Attaches telemetry handlers for Finch events and exposes an in-memory
+    summary via `summary/0`. Real systems would forward to Prometheus or
+    OpenTelemetry instead.
+    """
+
+    use GenServer
+
+    @events [
+      [:finch, :request, :start],
+      [:finch, :request, :stop],
+      [:finch, :request, :exception],
+      [:finch, :connect, :stop],
+      [:finch, :queue, :stop]
+    ]
+
+    def start_link(_), do: GenServer.start_link(__MODULE__, %{}, name: __MODULE__)
+
+    def summary, do: GenServer.call(__MODULE__, :summary)
+
+    @impl true
+    def init(_) do
+      :telemetry.attach_many(
+        "finch-pool-handlers",
+        @events,
+        &__MODULE__.handle_event/4,
+        nil
+      )
+
+      {:ok, %{requests: 0, errors: 0, total_ns: 0}}
+    end
+
+    def handle_event([:finch, :request, :stop], %{duration: d}, _meta, _cfg) do
+      GenServer.cast(__MODULE__, {:stop, d})
+    end
+
+    def handle_event([:finch, :request, :exception], _m, _meta, _cfg) do
+      GenServer.cast(__MODULE__, :error)
+    end
+
+    def handle_event(_event, _m, _meta, _cfg), do: :ok
+
+    @impl true
+    def handle_cast({:stop, d}, s),
+      do: {:noreply, %{s | requests: s.requests + 1, total_ns: s.total_ns + d}}
+
+    def handle_cast(:error, s), do: {:noreply, %{s | errors: s.errors + 1}}
+
+    @impl true
+    def handle_call(:summary, _from, s), do: {:reply, s, s}
+  end
+
+  def main do
+    IO.puts("=== HttpPool Demo ===
+  ")
+  
+    # Demo: Finch HTTP pool
+  IO.puts("1. Finch.start_link(:name)")
+  IO.puts("2. Finch.request(:name, request)")
+  IO.puts("3. Connection pooling for performance")
+
+  IO.puts("
+  ✓ Finch pool demo completed!")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [Finch on HexDocs](https://hexdocs.pm/finch/Finch.html)

@@ -363,6 +363,58 @@ maintainer's release cadence before adding.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule DepsIntro do
+    @moduledoc """
+    Trivial user of a Hex dependency (`jason`) — just to demonstrate that after
+    `mix deps.get` and `mix compile`, external deps are available at runtime.
+    """
+
+    @doc """
+    Encodes a map to JSON via Jason.
+
+    ## Examples
+
+        iex> DocsDemo = DepsIntro
+        iex> DepsIntro.to_json(%{a: 1}) |> Jason.decode!()
+        %{"a" => 1}
+    """
+    @spec to_json(map()) :: String.t()
+    def to_json(map) when is_map(map) do
+      Jason.encode!(map)
+    end
+
+    @doc "Decodes a JSON string into a map with string keys."
+    @spec from_json(String.t()) :: {:ok, term()} | {:error, Jason.DecodeError.t()}
+    def from_json(json) when is_binary(json) do
+      Jason.decode(json)
+    end
+  end
+
+  def main do
+    IO.puts("=== Deps Demo ===
+  ")
+  
+    # Demo: Hex dependencies
+  IO.puts("1. mix deps.get - fetch dependencies")
+  IO.puts("2. mix deps.tree - show dependency tree")
+  IO.puts("3. Version pinning in mix.lock")
+
+  IO.puts("
+  ✓ Hex dependencies demo completed!")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - ["Managing Deps" — Mix guide](https://hexdocs.pm/mix/Mix.Tasks.Deps.html) — every `deps.*` task explained

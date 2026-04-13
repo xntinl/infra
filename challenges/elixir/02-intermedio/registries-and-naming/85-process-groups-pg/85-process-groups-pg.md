@@ -413,6 +413,60 @@ Horde), not a pg group.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule PgGroupsDemo do
+    @moduledoc """
+    Thin wrappers around `:pg` for a dedicated scope. The value add is
+    `broadcast/2`, which fans a message out to every member of a group —
+    local *and* remote, cluster-wide.
+    """
+
+    @scope PgGroupsDemo.Scope
+
+    @doc "Adds the calling process to `group`."
+    @spec join(atom()) :: :ok
+    def join(group), do: :pg.join(@scope, group, self())
+
+    @doc "Removes the calling process from `group`."
+    @spec leave(atom()) :: :ok | :not_joined
+    def leave(group), do: :pg.leave(@scope, group, self())
+
+    @doc "All pids currently in `group` across the cluster."
+    @spec members(atom()) :: [pid()]
+    def members(group), do: :pg.get_members(@scope, group)
+
+    @doc "Only pids on this node — cheaper and useful for local-only fans."
+    @spec local_members(atom()) :: [pid()]
+    def local_members(group), do: :pg.get_local_members(@scope, group)
+
+    @doc """
+    Sends `message` to every member of `group`. Returns the number of pids
+    delivered to. Delivery is best-effort `send/2` — same semantics as
+    `Registry.dispatch/3`.
+    """
+    @spec broadcast(atom(), term()) :: non_neg_integer()
+    def broadcast(group, message) do
+      pids = members(group)
+      Enum.each(pids, &send(&1, {:pg_broadcast, group, message}))
+      length(pids)
+    end
+  end
+
+  def main do
+    IO.puts("PgGroupsDemo OK")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`:pg` — Erlang/OTP 23+ docs](https://www.erlang.org/doc/man/pg.html)

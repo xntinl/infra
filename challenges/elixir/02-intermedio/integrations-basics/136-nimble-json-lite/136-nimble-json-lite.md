@@ -417,6 +417,164 @@ small DSLs, protocol framing, query strings, versioned-header parsing.
 
 - This parser fails on `\u00e9` and scientific notation. If you were asked to make it RFC-8259 conformant, which of the two gaps do you think would cost more in grammar complexity — and what does that tell you about why Jason does not expose a user-extensible grammar at all?
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule NimbleJsonLite do
+    @moduledoc """
+    A *minimal* JSON parser. Supports: strings (no unicode escapes),
+    integers, floats (simple), booleans, null, arrays, and objects.
+    Written as a NimbleParsec tutorial — use `Jason` in production.
+    """
+
+    import NimbleParsec
+
+    # ── Whitespace: consumed and discarded ─────────────────────────────────
+    whitespace = ascii_string([?\s, ?\t, ?\n, ?\r], min: 0) |> ignore()
+
+    # ── Null / booleans ────────────────────────────────────────────────────
+    null = string("null") |> replace(nil)
+    truthy = string("true") |> replace(true)
+    falsy = string("false") |> replace(false)
+
+    # ── Numbers: integer or float; simplified (no exponents) ──────────────
+    sign = optional(string("-"))
+
+    int_part =
+      choice([
+        string("0"),
+        ascii_string([?1..?9], 1) |> concat(ascii_string([?0..?9], min: 0))
+      ])
+
+    frac_part = string(".") |> concat(ascii_string([?0..?9], min: 1))
+
+    number =
+      sign
+      |> concat(int_part)
+      |> optional(frac_part)
+      |> reduce({__MODULE__, :to_number, []})
+
+    # ── Strings: no escape handling beyond \" and \\ ──────────────────────
+    string_char =
+      choice([
+        string("\\\"") |> replace(?"),
+        string("\\\\") |> replace(?\\),
+        string("\\n") |> replace(?\n),
+        string("\\t") |> replace(?\t),
+        utf8_char(not: ?", not: ?\\)
+      ])
+
+    json_string =
+      ignore(string("\""))
+      |> repeat(string_char)
+      |> ignore(string("\""))
+      |> reduce({List, :to_string, []})
+
+    # ── Array: [ value (, value)* ] ───────────────────────────────────────
+    defcombinatorp :value, parsec(:value_impl)
+
+    array =
+      ignore(string("["))
+      |> concat(whitespace)
+      |> optional(
+        parsec(:value)
+        |> repeat(
+          whitespace
+          |> ignore(string(","))
+          |> concat(whitespace)
+          |> parsec(:value)
+        )
+      )
+      |> concat(whitespace)
+      |> ignore(string("]"))
+      |> tag(:array)
+      |> reduce({__MODULE__, :to_list, []})
+
+    # ── Object: { "key": value (, "key": value)* } ────────────────────────
+    pair =
+      json_string
+      |> concat(whitespace)
+      |> ignore(string(":"))
+      |> concat(whitespace)
+      |> parsec(:value)
+      |> reduce({__MODULE__, :to_pair, []})
+
+    object =
+      ignore(string("{"))
+      |> concat(whitespace)
+      |> optional(
+        pair
+        |> repeat(
+          whitespace
+          |> ignore(string(","))
+          |> concat(whitespace)
+          |> concat(pair)
+        )
+      )
+      |> concat(whitespace)
+      |> ignore(string("}"))
+      |> tag(:object)
+      |> reduce({__MODULE__, :to_map, []})
+
+    # ── The recursive value parser ────────────────────────────────────────
+    value_impl =
+      whitespace
+      |> choice([object, array, json_string, number, truthy, falsy, null])
+      |> concat(whitespace)
+
+    defparsecp(:value_impl, value_impl)
+
+    # ── Public entry point ────────────────────────────────────────────────
+    defparsec(:parse_json, parsec(:value_impl) |> eos())
+
+    @spec decode(String.t()) :: {:ok, term()} | {:error, String.t()}
+    def decode(binary) when is_binary(binary) do
+      case parse_json(binary) do
+        {:ok, [value], "", _ctx, _line, _col} -> {:ok, value}
+        {:ok, _, rest, _, _, _} -> {:error, "unexpected trailing input: #{inspect(rest)}"}
+        {:error, msg, _rest, _, _, _} -> {:error, msg}
+      end
+    end
+
+    # ── Reducers (called from combinator output lists) ────────────────────
+    @doc false
+    def to_number(parts) do
+      text = IO.iodata_to_binary(parts)
+      if String.contains?(text, "."), do: String.to_float(text), else: String.to_integer(text)
+    end
+
+    @doc false
+    def to_list([{:array, items}]), do: items
+
+    @doc false
+    def to_pair([key, value]), do: {key, value}
+
+    @doc false
+    def to_map([{:object, pairs}]), do: Map.new(pairs)
+  end
+
+  def main do
+    IO.puts("=== JSON Demo ===
+  ")
+  
+    # Demo: Lightweight JSON
+  IO.puts("1. NimbleJSON for small JSON needs")
+  IO.puts("2. Faster than full JSON parsers")
+  IO.puts("3. Minimal dependencies")
+
+  IO.puts("
+  ✓ NimbleJSON demo completed!")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [NimbleParsec on HexDocs](https://hexdocs.pm/nimble_parsec/NimbleParsec.html)

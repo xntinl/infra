@@ -45,6 +45,22 @@ Every replica slows writes (more commit messages). Placing `:disc_copies` on 2�
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Schema bootstrap
 
 Mnesia has a global schema describing tables and replicas. Before creating replicated tables you must:
@@ -433,10 +449,52 @@ Distributed testing with Peer spawns multiple Erlang nodes in separate BEAM inst
 
 Your cluster has `:disc_copies` on nodes 1–2 and `:ram_copies` on nodes 3–5. Node 2 is taken down for maintenance. While it is offline, node 1 reboots unexpectedly. Does the cluster keep accepting writes? If it does, what does the recovery of node 1 look like, and what failure modes should your run-book cover?
 
-## Resources
+## Executable Example
 
-- [Mnesia user guide — Distribution](https://www.erlang.org/doc/apps/mnesia/mnesia_chap5.html)
-- [`:mnesia.change_config/2`](https://www.erlang.org/doc/man/mnesia.html#change_config-2)
-- [Mnesia at scale — Whatsapp Labs](https://www.youtube.com/watch?v=lJQ7HtLrYF8)
-- [Inconsistent database on netsplit](https://www.erlang.org/doc/apps/mnesia/mnesia_chap7.html)
-- [Fred Hebert — Mnesia drawbacks](https://ferd.ca/)
+```elixir
+defmodule ClusterConfig.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :cluster_config, version: "0.1.0", elixir: "~> 1.16", deps: deps()]
+  end
+
+  def application do
+    [
+      extra_applications: [:logger, :mnesia],
+      mod: {ClusterConfig.Application, []}
+    ]
+  end
+
+  defp deps do
+    [{:benchee, "~> 1.3", only: :dev}]
+  end
+end
+
+
+
+### Step 1: Schema setup (safe to run on every node at boot)
+
+**Objective**: Idempotently create a mixed `disc_copies`/`ram_copies` replica set and join peers via `change_config(:extra_db_nodes)`.
+
+
+
+### Step 2: Public API
+
+**Objective**: Expose dirty local reads for hot paths and transactional writes so cross-node commits stay atomic under 2PC.
+
+
+
+### Step 3: Application
+
+**Objective**: Run `Schema.setup/1` at boot so replicas join the cluster before any caller issues a transaction.
+
+defmodule Main do
+  def main do
+      # Demonstrating 378-mnesia-distributed-replicas
+      :ok
+  end
+end
+
+Main.main()
+```

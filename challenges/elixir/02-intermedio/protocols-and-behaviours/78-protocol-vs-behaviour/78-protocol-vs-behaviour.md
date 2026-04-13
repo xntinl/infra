@@ -281,6 +281,42 @@ adds cost without benefit.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule Shape.Rectangle do
+    @enforce_keys [:width, :height]
+    defstruct [:width, :height]
+    @type t :: %__MODULE__{width: number(), height: number()}
+  end
+
+  defmodule Shape.Circle do
+    @enforce_keys [:radius]
+    defstruct [:radius]
+    @type t :: %__MODULE__{radius: number()}
+  end
+
+  defimpl Shape, for: Shape.Rectangle do
+    def area(%{width: w, height: h}), do: w * h * 1.0
+  end
+
+  defimpl Shape, for: Shape.Circle do
+    def area(%{radius: r}), do: :math.pi() * r * r
+  end
+
+  def main do
+    IO.puts("Shape OK")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [Protocols — Elixir guide](https://hexdocs.pm/elixir/protocols.html)

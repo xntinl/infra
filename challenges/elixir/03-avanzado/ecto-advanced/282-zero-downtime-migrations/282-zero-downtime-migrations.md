@@ -33,6 +33,25 @@ schema_evolution/
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Ecto-specific insight:**
+Ecto separates the query layer (building queries) from the execution layer (sending them). This separation allows for debugging, composability, and testing without a database. Never load all rows first and filter in-memory — write the filter into the query itself, or you've just built an N+1 problem.
 ### 1. The four operations that lock a table
 
 Postgres (< 11 has more, ≥ 14 fewer) locks the table exclusively on:
@@ -563,19 +582,223 @@ app? What observability do you add *before* running Phase 3 to catch this earlie
 
 ---
 
-## Resources
-
-- [Postgres — explicit locking](https://www.postgresql.org/docs/current/explicit-locking.html)
-- [PgHero — "Strong Migrations" rules](https://github.com/ankane/strong_migrations)
-- [Ecto — `@disable_ddl_transaction`](https://hexdocs.pm/ecto_sql/Ecto.Migration.html#module-transaction-callbacks)
-- [Dashbit — "Zero-downtime migrations in Ecto"](https://dashbit.co/blog)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
 defp deps do
   [
-    # Add dependencies here
+    {:ecto_sql, "~> 3.12"},
+    {:postgrex, "~> 0.19"},
+    {:benchee, "~> 1.3", only: :dev}
   ]
+
+
+# priv/repo/migrations/20260101000000_create_users.exs
+defmodule SchemaEvolution.Repo.Migrations.CreateUsers do
+  use Ecto.Migration
+
+  def change do
+    create table(:users) do
+      add :email, :string, null: false
+      timestamps()
+    end
+
+    create unique_index(:users, [:email])
+  end
 end
+
+
+# priv/repo/migrations/20260201000000_phase1_add_primary_email.exs
+defmodule SchemaEvolution.Repo.Migrations.Phase1AddPrimaryEmail do
+  use Ecto.Migration
+
+  def change do
+    # New column is nullable; no table rewrite.
+    alter table(:users) do
+      add :primary_email, :string
+      add :email_verified, :boolean, default: false
+    end
+
+    create index(:users, [:primary_email], concurrently: false)
+  end
+end
+
+
+# lib/schema_evolution/schemas/user.ex  — phase 1 version
+defmodule SchemaEvolution.Schemas.User do
+  use Ecto.Schema
+  import Ecto.Changeset
+
+  schema "users" do
+    field :email, :string              # authoritative
+    field :primary_email, :string      # dual-write target
+    field :email_verified, :boolean, default: false
+    timestamps()
+  end
+
+  def changeset(user, attrs) do
+    user
+    |> cast(attrs, [:email, :primary_email, :email_verified])
+    |> validate_required([:email])
+    |> write_through_to_primary_email()
+    |> unique_constraint(:email)
+  end
+
+  # Any write to :email also writes to :primary_email
+  defp write_through_to_primary_email(changeset) do
+    case get_change(changeset, :email) do
+      nil -> changeset
+      new -> put_change(changeset, :primary_email, new)
+    end
+  end
+end
+
+
+# priv/repo/migrations/20260301000000_phase2_backfill_primary_email.exs
+defmodule SchemaEvolution.Repo.Migrations.Phase2BackfillPrimaryEmail do
+  use Ecto.Migration
+  import Ecto.Query
+
+  @disable_ddl_transaction true
+  @disable_migration_lock true
+
+  @batch_size 1_000
+
+  def up do
+    backfill_in_batches()
+  end
+
+  def down, do: :ok
+
+  defp backfill_in_batches do
+    stream_batches(0)
+    |> Enum.reduce(0, fn batch_ids, total ->
+      {n, _} =
+        repo().update_all(
+          from(u in "users", where: u.id in ^batch_ids, update: [set: [primary_email: u.email]]),
+          []
+        )
+
+      # Brief pause between batches to let replication lag recover
+      Process.sleep(25)
+      total + n
+    end)
+  end
+
+  defp stream_batches(last_id) do
+    Stream.unfold(last_id, fn cursor ->
+      ids =
+        from(u in "users",
+          where: u.id > ^cursor and is_nil(u.primary_email),
+          order_by: u.id,
+          limit: @batch_size,
+          select: u.id
+        )
+        |> repo().all()
+
+      case ids do
+        [] -> nil
+        ids -> {ids, List.last(ids)}
+      end
+    end)
+  end
+end
+
+
+# priv/repo/migrations/20260401000000_phase3_enforce_not_null.exs
+defmodule SchemaEvolution.Repo.Migrations.Phase3EnforceNotNull do
+  use Ecto.Migration
+
+  def up do
+    # 1. Add constraint without scan. App already writes primary_email for all new rows.
+    execute """
+    ALTER TABLE users ADD CONSTRAINT primary_email_not_null
+    CHECK (primary_email IS NOT NULL) NOT VALID
+    """
+
+    # 2. Validate without locking writes (reads existing rows).
+    execute "ALTER TABLE users VALIDATE CONSTRAINT primary_email_not_null"
+
+    # 3. Now SET NOT NULL is instant because the CHECK already passed.
+    execute "ALTER TABLE users ALTER COLUMN primary_email SET NOT NULL"
+
+    # 4. Drop the redundant CHECK.
+    execute "ALTER TABLE users DROP CONSTRAINT primary_email_not_null"
+  end
+
+  def down do
+    execute "ALTER TABLE users ALTER COLUMN primary_email DROP NOT NULL"
+  end
+end
+
+
+# lib/schema_evolution/schemas/user.ex  — phase 3 version
+schema "users" do
+  field :email, :string                # deprecated, still dual-written for compat
+  field :primary_email, :string        # authoritative NOW
+  field :email_verified, :boolean, default: false
+  timestamps()
+end
+
+
+# priv/repo/migrations/20260501000000_phase4_drop_email.exs
+defmodule SchemaEvolution.Repo.Migrations.Phase4DropEmail do
+  use Ecto.Migration
+
+  def change do
+    # Instant metadata change. Safe because app no longer reads or writes :email.
+    alter table(:users) do
+      remove :email, :string
+    end
+  end
+end
+
+
+# priv/repo/migrations/20260601000000_phase5_add_verified_index.exs
+defmodule SchemaEvolution.Repo.Migrations.Phase5AddVerifiedIndex do
+  use Ecto.Migration
+
+  @disable_ddl_transaction true
+  @disable_migration_lock true
+
+  def change do
+    create index(:users, [:email_verified], concurrently: true)
+  end
+end
+
+
+# lib/schema_evolution/accounts.ex
+defmodule SchemaEvolution.Accounts do
+  import Ecto.Query
+  alias SchemaEvolution.Repo
+  alias SchemaEvolution.Schemas.User
+
+  @doc """
+  Lookup that reads whichever column is authoritative in the current phase.
+
+  We use COALESCE so queries work during the backfill window when some rows have
+  only :email and others have both.
+  """
+  def find_by_email(addr) do
+    from(u in User,
+      where: fragment("COALESCE(?, ?) = ?", u.primary_email, u.email, ^addr),
+      limit: 1
+    )
+    |> Repo.one()
+  end
+
+  def create(attrs) do
+    %User{}
+    |> User.changeset(attrs)
+    |> Repo.insert()
+  end
+end
+
+defmodule Main do
+  def main do
+      :ok
+  end
+end
+
+Main.main()
 ```

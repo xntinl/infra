@@ -29,6 +29,25 @@ hot_state_migration/
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**OTP-specific insight:**
+The OTP framework enforces a discipline: supervision trees, callback modules, and standard return values. This structure is not a constraint — it's the contract that allows Erlang's release handler, hot code upgrades, and clustering to work. Every deviation from the pattern you'll pay for later in production debuggability and operational tooling.
 ### 1. `@vsn` — the module version attribute
 
 Every Erlang/Elixir module can declare `@vsn <term>`. By default, the VM computes a hash from the module's bytecode. For hot upgrades you override it with a stable term you control:
@@ -488,13 +507,39 @@ A 5 ms blackout is usually fine. A 500 ms blackout (if your migration is expensi
 
 ---
 
-## Resources
+## Executable Example
 
-- [`:sys` — OTP sys interface](https://www.erlang.org/doc/man/sys.html)
-- [`:release_handler` — hot upgrades](https://www.erlang.org/doc/man/release_handler.html)
-- [`GenServer.code_change/3` — hexdocs](https://hexdocs.pm/elixir/GenServer.html#c:code_change/3)
-- [Learn You Some Erlang — Relups](https://learnyousomeerlang.com/relups)
-- [Fred Hébert — Stuff Goes Bad: Erlang in Anger (chapter 2 on upgrades)](https://www.erlang-in-anger.com/)
-- [Nerves — hot code updates for embedded](https://hexdocs.pm/nerves/)
-- [José Valim — on why hot upgrades are rare in Elixir production](https://elixirforum.com/t/hot-code-reloading-in-production/)
-- [`mix release` appup support](https://hexdocs.pm/mix/Mix.Tasks.Release.html)
+```elixir
+defp deps do
+  []
+end
+
+
+
+When OTP performs a release upgrade, it compares the new module's `@vsn` to the running one. If they differ, it calls `code_change/3` with the old version and the old state.
+
+### 2. `code_change/3` callback
+
+
+
+The callback is invoked synchronously during the upgrade. The new module is already loaded; the process is suspended; your job is to transform the state from the old shape to the new shape and return.
+
+### 3. The upgrade dance
+
+
+
+The mailbox keeps buffering during suspension; on resume, all queued messages are processed against the new shape. If your `code_change/3` is buggy, the process crashes and the supervisor decides what happens next — you may have just lost an entire pending queue.
+
+### 4. `.appup` and `.relup` files
+
+A hot upgrade requires a `.appup` describing module-level changes (upgrade/downgrade instructions per module) and a `.relup` describing the release-level transition. For a single GenServer upgrade the `.appup` looks like:
+
+defmodule Main do
+  def main do
+      # Demonstrating 05-genserver-hot-state-migration
+      :ok
+  end
+end
+
+Main.main()
+```

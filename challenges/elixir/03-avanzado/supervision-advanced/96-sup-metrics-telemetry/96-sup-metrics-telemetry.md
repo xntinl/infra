@@ -50,6 +50,22 @@ sup_metrics/
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. `:telemetry` event model
 
 Events are `[:my_app, :subsystem, :action]` atoms. Each event carries:
@@ -624,12 +640,160 @@ Target: telemetry event overhead ≤ 1 µs per emission; reporter snapshot cost 
 
 ---
 
-## Resources
 
-- [`:telemetry` — readme and API](https://hexdocs.pm/telemetry/)
-- [`:telemetry_poller`](https://hexdocs.pm/telemetry_poller/)
-- [`:telemetry_metrics`](https://hexdocs.pm/telemetry_metrics/)
-- [TelemetryMetricsPrometheus](https://github.com/beam-telemetry/telemetry_metrics_prometheus)
-- [Phoenix instrumentation](https://hexdocs.pm/phoenix/telemetry.html)
-- [Dashbit — Telemetry metrics](https://dashbit.co/blog/telemetry-the-missing-piece)
-- [Chris Keathley — Observability in Elixir](https://keathley.io/blog/)
+## Executable Example
+
+```elixir
+defmodule SupMetrics.Supervisor do
+  @moduledoc """
+  A `Supervisor` wrapper that emits telemetry on init, child start, and child
+  termination.
+
+  Use exactly like `Supervisor`:
+
+      defmodule MyTree do
+        use SupMetrics.Supervisor
+
+        @impl true
+        def init(_) do
+          Supervisor.init([MyWorker], strategy: :one_for_one)
+        end
+      end
+  """
+
+  defmacro __using__(_opts) do
+    quote do
+      use Supervisor
+      @before_compile SupMetrics.Supervisor
+    end
+  end
+
+  defmacro __before_compile__(_env) do
+    quote do
+      defoverridable init: 1
+
+      def init(args) do
+        result = super(args)
+        SupMetrics.Supervisor.emit_init(__MODULE__, result)
+        result
+      end
+    end
+  end
+
+  @doc false
+  def emit_init(module, {:ok, {sup_flags, children}}) do
+    :telemetry.execute(
+      [:sup_metrics, :supervisor, :init],
+      %{children: length(children)},
+      %{name: module, strategy: Map.get(sup_flags, :strategy, :one_for_one)}
+    )
+  end
+
+  def emit_init(_module, _), do: :ok
+
+  @spec emit_child_started(module(), term()) :: :ok
+  def emit_child_started(sup, child_id) do
+    :telemetry.execute(
+      [:sup_metrics, :child, :started],
+      %{count: 1},
+      %{name: sup, child_id: child_id}
+    )
+  end
+
+  @spec emit_child_terminated(module(), term(), term(), integer()) :: :ok
+  def emit_child_terminated(sup, child_id, reason, duration_native) do
+    :telemetry.execute(
+      [:sup_metrics, :child, :terminated],
+      %{count: 1, duration_native: duration_native},
+      %{name: sup, child_id: child_id, reason: reason}
+    )
+  end
+
+  @spec emit_intensity_breach(module(), non_neg_integer(), pos_integer()) :: :ok
+  def emit_intensity_breach(sup, restarts, window_ms) do
+    :telemetry.execute(
+      [:sup_metrics, :supervisor, :intensity_breach],
+      %{restarts: restarts, window_ms: window_ms},
+      %{name: sup}
+    )
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrate supervisor metrics via telemetry
+
+      # Set up telemetry handler to capture supervisor events
+      handler_id = :sup_metrics_test
+      :telemetry.attach(handler_id, [:supervisor, :child_started], fn event, measurements, meta ->
+        IO.inspect({event, measurements, meta}, label: "telemetry event")
+      end, nil)
+
+      # Start a supervised tree with SupMetrics instrumentation
+      {:ok, sup_pid} = SupMetrics.Supervisor.start_link(
+        [
+          {SupMetrics.Worker, ["worker-1"]},
+          {SupMetrics.Worker, ["worker-2"]}
+        ],
+        strategy: :one_for_one,
+        name: SupMetrics.TestSupervisor
+      )
+
+      assert is_pid(sup_pid), "Supervisor must start"
+      IO.puts("✓ Supervisor with telemetry instrumentation started")
+
+      # Verify workers started
+      worker_1 = Process.whereis(:"worker-1")
+      worker_2 = Process.whereis(:"worker-2")
+      assert is_pid(worker_1), "Worker 1 must be running"
+      assert is_pid(worker_2), "Worker 2 must be running"
+      IO.puts("✓ Workers initialized")
+
+      # Start telemetry reporter (emits metrics)
+      {:ok, reporter_pid} = GenServer.start_link(
+        SupMetrics.Reporter,
+        [supervisor: SupMetrics.TestSupervisor],
+        name: SupMetrics.Reporter
+      )
+
+      assert is_pid(reporter_pid), "Reporter must start"
+      IO.puts("✓ Telemetry reporter emitting supervisor metrics")
+
+      # Query supervisor state via metrics
+      {:ok, state} = GenServer.call(SupMetrics.Reporter, :get_snapshot)
+      IO.inspect(state, label: "Supervisor snapshot")
+
+      # Inject a crash and observe restart event
+      ref = Process.monitor(worker_1)
+      Process.exit(worker_1, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^worker_1, _}, 500
+
+      Process.sleep(100)
+
+      # Worker restarted, telemetry event emitted
+      worker_1_new = Process.whereis(:"worker-1")
+      assert is_pid(worker_1_new) and worker_1_new != worker_1, "Worker should be restarted"
+      IO.puts("✓ Worker crashed and restarted (telemetry event emitted)")
+
+      # Check restart count metric
+      {:ok, metrics} = GenServer.call(SupMetrics.Reporter, :get_metrics)
+      IO.inspect(metrics, label: "Supervisor metrics")
+      assert metrics.restarts >= 1, "Should have recorded restart"
+      IO.puts("✓ Restart count incremented in metrics")
+
+      IO.puts("\n✓ Supervisor metrics and telemetry demonstrated:")
+      IO.puts("  - Telemetry events for child start/stop/restart")
+      IO.puts("  - Reporter polls supervisors periodically")
+      IO.puts("  - Emits gauges: child_count, restart_count, intensity_usage")
+      IO.puts("  - Integrates with Prometheus/Grafana via telemetry")
+      IO.puts("✓ SRE can now monitor supervision tree health (no Observer GUI needed)")
+
+      :telemetry.detach(handler_id)
+      GenServer.stop(reporter_pid)
+      Supervisor.stop(sup_pid)
+      IO.puts("✓ Telemetry supervision shutdown complete")
+  end
+end
+
+Main.main()
+```

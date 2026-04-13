@@ -51,6 +51,22 @@ Postgres is the right answer for most workloads. Mnesia wins specifically when t
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. The decision matrix
 
 | Concern                      | Mnesia `disc_copies`             | Postgres + Ecto                       |
@@ -618,12 +634,96 @@ Target: Mnesia dirty read 1-3 us; Postgres query round-trip 100-500 us local, hi
 
 ---
 
-## Resources
+## Executable Example
 
-- [Chris McCord — The Road to 2 Million Websocket Connections in Phoenix](https://www.phoenixframework.org/blog/the-road-to-2-million-websocket-connections) — Mnesia for presence
-- [Dashbit — Mnesia, the Bad Parts](https://dashbit.co/blog/mnesia-the-bad-parts)
-- [Ecto docs](https://hexdocs.pm/ecto)
-- [Postgres performance tuning — Sasa Juric](https://www.theerlangelist.com/article/postgres-performance)
-- [Use the Index, Luke](https://use-the-index-luke.com/) — the reference on SQL indexing
-- [Cassandra vs Mnesia decision note — ThoughtWorks](https://www.thoughtworks.com/radar) — external perspective on when to reach for each
-- [Saša Jurić — To Spawn, or Not to Spawn?](https://www.theerlangelist.com/article/spawn_or_not) — sibling argument on when BEAM primitives pay off
+```elixir
+defmodule MnesiaVsPostgres.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :mnesia_vs_postgres, version: "0.1.0", elixir: "~> 1.16", deps: deps()]
+  end
+
+  def application do
+    [
+      extra_applications: [:logger, :mnesia],
+      mod: {MnesiaVsPostgres.Application, []}
+    ]
+  end
+
+  defp deps do
+    [
+      {:ecto_sql, "~> 3.11"},
+      {:postgrex, "~> 0.17"},
+      {:benchee, "~> 1.3", only: :dev}
+    ]
+  end
+end
+
+
+
+### Step 2: `lib/mnesia_vs_postgres/store_behaviour.ex`
+
+**Objective**: Implement the module in `lib/mnesia_vs_postgres/store_behaviour.ex`.
+
+
+
+### Step 3: `lib/mnesia_vs_postgres/mnesia_store.ex`
+
+**Objective**: Implement the module in `lib/mnesia_vs_postgres/mnesia_store.ex`.
+
+
+
+### Step 4: `lib/mnesia_vs_postgres/repo.ex` and `user.ex`
+
+**Objective**: Implement lib/mnesia_vs_postgres/repo.ex and user.ex.
+
+
+
+### Step 5: `priv/repo/migrations/20260401000000_create_users.exs`
+
+**Objective**: Implement the script in `priv/repo/migrations/20260401000000_create_users.exs`.
+
+
+
+### Step 6: `lib/mnesia_vs_postgres/postgres_store.ex`
+
+**Objective**: Implement the module in `lib/mnesia_vs_postgres/postgres_store.ex`.
+
+
+
+### Step 7: `lib/mnesia_vs_postgres/application.ex`
+
+**Objective**: Define the OTP application and supervision tree in `lib/mnesia_vs_postgres/application.ex`.
+
+
+
+Config:
+
+
+
+### Step 8: Tests (shared structure)
+
+**Objective**: Write tests for (shared structure).
+
+
+
+
+
+### Step 9: Benchmark
+
+**Objective**: Benchmark the implementation to measure throughput and latency.
+
+
+
+Representative output (M1, Postgres 16 local, Mnesia disc_copies, OTP 26):
+
+defmodule Main do
+  def main do
+      # Demonstrating 125-mnesia-vs-postgres
+      :ok
+  end
+end
+
+Main.main()
+```

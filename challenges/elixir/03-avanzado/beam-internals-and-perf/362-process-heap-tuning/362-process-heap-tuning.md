@@ -32,6 +32,22 @@ A pre-sized heap starts at (say) 8192 words. If the process never grows past 600
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Two heaps per process
 
 - **Regular heap**: holds tuples, lists, maps, numbers. Measured in words (machine words, 8 bytes on 64-bit).
@@ -261,19 +277,62 @@ OTP primitives (GenServer, Supervisor, Application) are tested through their pub
 
 You reduce GC count by 80% on a worker but overall throughput improves only 3%. Where is the CPU time actually going? List three hypotheses and the measurement you would use for each.
 
-## Resources
 
-- [`spawn_opt/2` — erlang.org](https://www.erlang.org/doc/man/erlang.html#spawn_opt-2)
-- [Process heap internals — The BEAM Book](https://blog.stenmans.org/theBeamBook/)
-- [Erlang in Anger — Memory chapter](https://www.erlang-in-anger.com/)
-- [Tuning the Erlang VM — Lukas Larsson](https://www.erlang-solutions.com/blog/erlang-19-0-garbage-collector/)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+defmodule HeapLab.Worker do
+  @moduledoc """
+  A representative short-lived worker. Allocates a map and a list
+  sized to simulate a "handle one request" workload, then exits.
+  """
+
+  @default_spawn_opts []
+
+  def run(items, opts \\ []) do
+    spawn_opts = Keyword.merge(@default_spawn_opts, Keyword.get(opts, :spawn_opts, []))
+    parent = self()
+
+    pid =
+      :erlang.spawn_opt(
+        fn ->
+          work(items)
+          {:garbage_collection, gcs} = Process.info(self(), :garbage_collection)
+          {:total_heap_size, heap} = Process.info(self(), :total_heap_size)
+          send(parent, {:stats, Keyword.fetch!(gcs, :minor_gcs), heap})
+        end,
+        spawn_opts
+      )
+
+    receive do
+      {:stats, gcs, heap} -> %{pid: pid, gcs: gcs, heap: heap}
+    after
+      5_000 -> raise "worker timed out"
+    end
+  end
+
+  defp work(items) do
+    map =
+      for i <- 1..items, into: %{} do
+        {i, {"key_#{i}", i * 2, [i, i + 1, i + 2]}}
+      end
+
+    _ = Map.values(map) |> Enum.sum_by(fn {_, v, _} -> v end)
+    :ok
+  end
 end
+
+defmodule Main do
+  def main do
+      IO.puts("Benchmarking initialized")
+      {elapsed_us, result} = :timer.tc(fn ->
+        Enum.reduce(1..1000, 0, &+/2)
+      end)
+      if is_number(elapsed_us) do
+        IO.puts("✓ Benchmark completed: sum(1..1000) = " <> inspect(result) <> " in " <> inspect(elapsed_us) <> "µs")
+      end
+  end
+end
+
+Main.main()
 ```

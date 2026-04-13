@@ -40,6 +40,22 @@ significant_child/
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. The matrix: restart × significant × auto_shutdown
 
 | Child `restart` | Child `significant` | Supervisor `auto_shutdown` | What happens on normal exit |
@@ -440,11 +456,149 @@ Target: 10k concurrent batch subtrees with ≤ 50 MB total supervisor-layer over
 
 ---
 
-## Resources
 
-- [Elixir 1.15 CHANGELOG — Supervisor auto_shutdown](https://github.com/elixir-lang/elixir/blob/v1.15/CHANGELOG.md) — the introduction.
-- [`Supervisor` — auto_shutdown docs](https://hexdocs.pm/elixir/Supervisor.html#module-significant-children-and-auto-shutdown) — canonical reference.
-- [OTP 25 sig_child feature](https://www.erlang.org/blog/otp-25-highlights/) — the underlying Erlang/OTP 25 feature `supervisor` added.
-- [José Valim on significant children — Dashbit](https://dashbit.co/blog/welcome-to-elixir-1-15) — design rationale.
-- [Oban — per-job subtree teardown](https://github.com/sorentwo/oban/) — similar pattern with different primitives.
-- [Commanded — per-aggregate subtrees](https://github.com/commanded/commanded) — event-sourced framework with short-lived subtrees, could benefit from this pattern.
+## Executable Example
+
+```elixir
+# test/significant_child/auto_shutdown_test.exs
+defmodule SignificantChild.AutoShutdownTest do
+  use ExUnit.Case, async: false
+
+  alias SignificantChild.{Batches, JobCoordinator}
+
+  describe "SignificantChild.AutoShutdown" do
+    test "normal coordinator exit auto-shuts-down the batch subtree" do
+      {:ok, batch_sup} = Batches.start_batch("batch-normal", 3)
+      before = Batches.active_batches()
+      assert before >= 1
+
+      # Verify all children alive
+      children = Supervisor.which_children(batch_sup)
+      assert length(children) == 4  # 1 coordinator + 3 workers
+
+      ref = Process.monitor(batch_sup)
+      JobCoordinator.complete("batch-normal")
+
+      # BatchSupervisor should die with :shutdown (auto_shutdown).
+      assert_receive {:DOWN, ^ref, :process, ^batch_sup, :shutdown}, 2_000
+
+      # DynamicSupervisor has one fewer child.
+      assert Batches.active_batches() == before - 1
+    end
+
+    test "abnormal coordinator crash restarts (does NOT auto-shutdown)" do
+      {:ok, batch_sup} = Batches.start_batch("batch-crash", 2)
+
+      coordinator =
+        Registry.lookup(SignificantChild.Registry, {:coordinator, "batch-crash"})
+        |> hd()
+        |> elem(0)
+
+      ref_coord = Process.monitor(coordinator)
+      JobCoordinator.crash("batch-crash")
+      assert_receive {:DOWN, ^ref_coord, :process, _, _}, 500
+
+      # Supervisor is still alive; coordinator is restarted.
+      assert Process.alive?(batch_sup)
+
+      # Clean up
+      :ok = DynamicSupervisor.terminate_child(SignificantChild.BatchRegistry, batch_sup)
+    end
+
+    test "multiple batches are independent" do
+      {:ok, b1} = Batches.start_batch("batch-a", 1)
+      {:ok, b2} = Batches.start_batch("batch-b", 1)
+
+      ref1 = Process.monitor(b1)
+      JobCoordinator.complete("batch-a")
+      assert_receive {:DOWN, ^ref1, :process, ^b1, :shutdown}, 2_000
+
+      assert Process.alive?(b2)
+
+      ref2 = Process.monitor(b2)
+      JobCoordinator.complete("batch-b")
+      assert_receive {:DOWN, ^ref2, :process, ^b2, :shutdown}, 2_000
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrate significant children and auto_shutdown (Elixir 1.15+)
+
+      # Start a batch supervisor with auto_shutdown: :any_significant
+      {:ok, batch_sup} = Supervisor.start_link(
+        [
+          %{
+            id: SignificantChild.JobCoordinator,
+            start: {SignificantChild.JobCoordinator, :start_link, []},
+            significant: true,
+            restart: :temporary
+          },
+          %{
+            id: SignificantChild.Worker1,
+            start: {SignificantChild.Worker, :start_link, ["worker-1"]},
+            restart: :permanent
+          },
+          %{
+            id: SignificantChild.Worker2,
+            start: {SignificantChild.Worker, :start_link, ["worker-2"]},
+            restart: :permanent
+          }
+        ],
+        strategy: :one_for_all,
+        auto_shutdown: :any_significant,
+        name: SignificantChild.BatchSupervisor
+      )
+
+      assert is_pid(batch_sup), "Batch supervisor must start"
+      IO.inspect(batch_sup, label: "Batch supervisor PID")
+
+      # Verify all children started
+      coordinator_pid = Process.whereis(SignificantChild.JobCoordinator)
+      worker1_pid = Process.whereis(SignificantChild.Worker1)
+      worker2_pid = Process.whereis(SignificantChild.Worker2)
+
+      assert is_pid(coordinator_pid), "Coordinator must be running"
+      assert is_pid(worker1_pid), "Worker 1 must be running"
+      assert is_pid(worker2_pid), "Worker 2 must be running"
+
+      IO.puts("✓ Batch supervisor with 1 coordinator + 2 workers initialized")
+      IO.puts("✓ JobCoordinator marked as significant: true")
+      IO.puts("✓ auto_shutdown: :any_significant enabled")
+
+      # Simulate batch work: coordinator does work, then exits normally
+      IO.puts("✓ Coordinator processing batch jobs...")
+      Process.sleep(100)
+
+      # Coordinator exits normally (batch complete)
+      ref = Process.monitor(batch_sup)
+      Process.exit(coordinator_pid, :normal)
+
+      # The supervisor should also exit because:
+      # - JobCoordinator is marked as significant: true
+      # - JobCoordinator exited normally
+      # - auto_shutdown: :any_significant triggers
+      assert_receive {:DOWN, ^ref, :process, ^batch_sup, :shutdown}, 500
+
+      IO.puts("✓ Coordinator exited normally")
+      IO.puts("✓ auto_shutdown triggered: supervisor shutdown cascade")
+
+      # Verify workers are no longer running
+      assert Process.whereis(SignificantChild.Worker1) == nil, "Worker 1 should be stopped"
+      assert Process.whereis(SignificantChild.Worker2) == nil, "Worker 2 should be stopped"
+
+      IO.puts("✓ Workers automatically stopped (no idle workers left behind)")
+
+      IO.puts("\n✓ Significant children and auto_shutdown demonstrated:")
+      IO.puts("  - significant: true marks critical children")
+      IO.puts("  - auto_shutdown: :any_significant triggers on normal exit")
+      IO.puts("  - Supervisor cascades shutdown to all children")
+      IO.puts("  - No manual shutdown messages needed")
+      IO.puts("  - No idle worker subtrees left behind")
+      IO.puts("✓ Clean batch lifecycle management (Elixir 1.15+)")
+  end
+end
+
+Main.main()
+```

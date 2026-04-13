@@ -379,6 +379,100 @@ need range queries or match patterns.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule SetVsBag.TagStore do
+    @moduledoc """
+    A "which tags does this item have?" store, implemented four ways so you can
+    compare table types side by side. Tuples are `{item_id, tag}`.
+
+    The *behavior* of `add_tag/3` changes dramatically based on the table type,
+    even though the code is identical. That's the whole point.
+    """
+
+    @type type :: :set | :ordered_set | :bag | :duplicate_bag
+
+    @doc "Creates a store of the given ETS type."
+    @spec new(type()) :: :ets.tid()
+    def new(type) when type in [:set, :ordered_set, :bag, :duplicate_bag] do
+      :ets.new(:tag_store, [type, :public])
+    end
+
+    @doc "Adds a tag for an item. The *effect* depends on the table type."
+    @spec add_tag(:ets.tid(), term(), term()) :: true
+    def add_tag(t, item_id, tag), do: :ets.insert(t, {item_id, tag})
+
+    @doc "Returns all tuples for an item. Always a list, always `{item_id, tag}`."
+    @spec tags_for(:ets.tid(), term()) :: [{term(), term()}]
+    def tags_for(t, item_id), do: :ets.lookup(t, item_id)
+
+    @doc """
+    Traverses the entire table in key order. Meaningful only for `:ordered_set`;
+    for the other types the traversal order is implementation-defined.
+    """
+    @spec all_in_order(:ets.tid()) :: [tuple()]
+    def all_in_order(t) do
+      # tab2list walks the whole table; for :ordered_set the order is by key,
+      # for the others it's whatever the hash iteration happens to produce.
+      :ets.tab2list(t)
+    end
+  end
+
+  defmodule SetVsBag do
+    @moduledoc """
+    Top-level helpers that *explain* the differences by constructing identical
+    inputs against all four table types and returning what each one stored.
+    Think of it as a live truth table.
+    """
+
+    alias SetVsBag.TagStore
+
+    @doc """
+    Inserts `{:item1, :red}` twice and `{:item1, :blue}` once into a table of
+    the requested type, then returns `tags_for(:item1)`. The shape of the
+    returned list is the signature of the table type.
+    """
+    @spec demo(TagStore.type()) :: [{term(), term()}]
+    def demo(type) do
+      t = TagStore.new(type)
+
+      TagStore.add_tag(t, :item1, :red)
+      TagStore.add_tag(t, :item1, :red)
+      TagStore.add_tag(t, :item1, :blue)
+
+      result = TagStore.tags_for(t, :item1)
+      :ets.delete(t)
+      result
+    end
+  end
+
+  def main do
+    # Demo: comparar tipos de tablas ETS
+    set_result = SetVsBag.demo(:set)
+    bag_result = SetVsBag.demo(:bag)
+    duplicate_bag_result = SetVsBag.demo(:duplicate_bag)
+  
+    # Verificar resultados esperados
+    assert set_result == [{:item1, :blue}], "set debe tener solo el último valor"
+    assert Enum.sort(bag_result) == [{:item1, :blue}, {:item1, :red}], "bag debe deduplicar tuplas idénticas"
+    assert Enum.sort(duplicate_bag_result) == [{:item1, :blue}, {:item1, :red}, {:item1, :red}], "duplicate_bag debe mantener todo"
+  
+    IO.puts("SetVsBag: demostración de tipos de tablas exitosa")
+    IO.puts("  :set → #{inspect(set_result)}")
+    IO.puts("  :bag → #{inspect(Enum.sort(bag_result))}")
+    IO.puts("  :duplicate_bag → #{inspect(Enum.sort(duplicate_bag_result))}")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [Erlang `ets` — `new/2` table types](https://www.erlang.org/doc/man/ets.html#new-2)

@@ -387,6 +387,77 @@ feature flags) but a poor substitute for the real ecosystem.
 
 - `:telemetry` handlers run synchronously in the caller's process and a raised exception permanently detaches them. If you were reviewing a PR that added a handler doing `Logger.info/2` plus a `Map.fetch!/2` on metadata keys, which of those two lines is more likely to eventually silently disable your metrics in production, and what changes to the handler would make it safe?
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule TelemetryIntro do
+    @moduledoc """
+    Emits domain events via `:telemetry` and provides a tiny in-memory counter
+    handler. This is the same mechanism Phoenix, Ecto and Finch use — with a
+    fancier handler on the other end.
+    """
+
+    @order_created [:telemetry_intro, :order, :created]
+    @work_event [:telemetry_intro, :work]
+
+    @doc "Event name emitted when an order is created."
+    def order_created_event, do: @order_created
+
+    @doc "Event *prefix* used by `do_work/2` via `:telemetry.span/3`."
+    def work_event, do: @work_event
+
+    @doc """
+    Records an order. Emits `[:telemetry_intro, :order, :created]` with
+    `%{count: 1, amount: amount}` measurements and `%{order_id: id}` metadata.
+    """
+    @spec record_order(String.t(), number()) :: :ok
+    def record_order(order_id, amount) when is_binary(order_id) and is_number(amount) do
+      :telemetry.execute(
+        @order_created,
+        %{count: 1, amount: amount},
+        %{order_id: order_id}
+      )
+    end
+
+    @doc """
+    Runs `fun` inside `:telemetry.span/3`. Emits `:start` / `:stop` with
+    `duration` in native time units, or `:exception` if `fun` raises.
+
+    The caller passes a plain 0-arity function; we wrap it in the span's
+    `{result, extra_metadata}` shape.
+    """
+    @spec do_work((-> any()), map()) :: any()
+    def do_work(fun, start_metadata \\ %{}) when is_function(fun, 0) do
+      :telemetry.span(@work_event, start_metadata, fn ->
+        result = fun.()
+        # The second element is *additional* metadata merged into :stop.
+        {result, %{result_byte_size: byte_size(to_string(result))}}
+      end)
+    end
+  end
+
+  def main do
+    IO.puts("=== App Demo ===
+  ")
+  
+    # Demo: Basic Telemetry
+  IO.puts("1. :telemetry.attach - subscribe to events")
+  IO.puts("2. :telemetry.execute - emit event")
+  IO.puts("3. Handlers receive metrics")
+
+  IO.puts("
+  ✓ Telemetry basics demo completed!")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`:telemetry` — hexdocs](https://hexdocs.pm/telemetry/) — the entire API in ~5 functions

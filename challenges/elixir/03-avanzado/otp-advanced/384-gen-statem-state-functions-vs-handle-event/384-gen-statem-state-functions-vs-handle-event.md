@@ -42,6 +42,25 @@ A `GenServer` can implement a state machine by keeping `state.mode` as a field a
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**OTP-specific insight:**
+The OTP framework enforces a discipline: supervision trees, callback modules, and standard return values. This structure is not a constraint — it's the contract that allows Erlang's release handler, hot code upgrades, and clustering to work. Every deviation from the pattern you'll pay for later in production debuggability and operational tooling.
 ### 1. Callback mode
 `:state_functions` (one function per state) vs `:handle_event_function` (one function, multi-clause by state).
 
@@ -404,8 +423,39 @@ If your process has 1–2 states and the transitions are trivial, a GenServer is
 
 You implemented the same machine twice. Which file would you rather revisit six months from now? Which would you rather extend with a new `maintenance_mode` state? The real question `:state_functions` vs `:handle_event_function` asks is: *does your machine organise around states (each state knows what it can do) or around events (each event knows how to dispatch)?* Pick based on the grain of change.
 
-## Resources
+## Executable Example
 
-- [`:gen_statem` reference](https://www.erlang.org/doc/man/gen_statem.html)
-- [`:gen_statem` user's guide](https://www.erlang.org/doc/design_principles/statem.html) — read it end to end
-- [Fred Hebert — `gen_statem` deep dive (Learn You Some Erlang)](https://learnyousomeerlang.com/) — chapter on FSMs
+```elixir
+defp deps do
+  [
+    {:benchee, "~> 1.3", only: [:dev, :test]}
+  ]
+end
+
+
+
+### Step 1: Shared PIN validator
+
+**Objective**: Extract PIN logic to pure module so state_functions vs handle_event_function comparison isolates dispatch overhead only.
+
+
+
+### Step 2: `:state_functions` implementation
+
+**Objective**: Dispatch by state function so each state colocates its legal transitions, illegal events raise FunctionClauseError.
+
+
+
+### Step 3: `:handle_event_function` implementation
+
+**Objective**: Centralize all event dispatch so cross-state logic instruments once, at cost of per-state readability.
+
+defmodule Main do
+  def main do
+      # Demonstrating 384-gen-statem-state-functions-vs-handle-event
+      :ok
+  end
+end
+
+Main.main()
+```

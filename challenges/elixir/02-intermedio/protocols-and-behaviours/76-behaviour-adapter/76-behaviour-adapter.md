@@ -395,6 +395,44 @@ to a behaviour the day you add the second backend.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule Notifier.Slack do
+    @moduledoc """
+    Slack adapter. Expects the recipient to be a channel name starting with `#`.
+    Network call stubbed, same as Email.
+    """
+
+    @behaviour Notifier
+
+    @impl Notifier
+    def deliver("#" <> _channel, message) when message != "" do
+      :ok
+    end
+
+    def deliver("#" <> _channel, "") do
+      {:error, :empty_message}
+    end
+
+    def deliver(_recipient, _message) do
+      {:error, :invalid_channel}
+    end
+  end
+
+  def main do
+    IO.puts("Notifier OK")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Application.fetch_env!/2` — Elixir stdlib](https://hexdocs.pm/elixir/Application.html#fetch_env!/2)

@@ -524,6 +524,225 @@ If the filesystem has symlink loops, your walker enters an infinite recursion. H
 
 Would you parallelize the tree walk with `Task.async_stream/3`? What would you gain on a 10-drive NAS, and what would you lose on a single SSD?
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Tree do
+  @moduledoc """
+  Recursive file system tree walker.
+
+  Demonstrates tail recursion with accumulators, depth-limited
+  recursion, and the difference between body recursion and
+  tail recursion for stack safety.
+  """
+
+  @type entry :: %{
+          path: String.t(),
+          name: String.t(),
+          type: :file | :directory,
+          size: non_neg_integer(),
+          depth: non_neg_integer()
+        }
+
+  @doc """
+  Lists all files and directories under the given path recursively.
+
+  Options:
+    - `:max_depth` — maximum recursion depth (default: infinity)
+    - `:extensions` — list of file extensions to include, e.g. `[".ex", ".exs"]`
+    - `:include_dirs` — whether to include directories in output (default: true)
+
+  ## Examples
+
+      iex> entries = Tree.list("/tmp/tree_test_dir", max_depth: 1)
+      iex> is_list(entries)
+      true
+
+  """
+  @spec list(String.t(), keyword()) :: [entry()]
+  def list(root_path, opts \\ []) do
+    max_depth = Keyword.get(opts, :max_depth, :infinity)
+    extensions = Keyword.get(opts, :extensions, nil)
+    include_dirs = Keyword.get(opts, :include_dirs, true)
+
+    walk([{root_path, 0}], [], max_depth, extensions, include_dirs)
+  end
+
+  @doc """
+  Calculates the total size of all files matching the given criteria.
+
+  Uses a tail-recursive accumulator to avoid stack overflow on
+  deeply nested directories with millions of files.
+
+  ## Examples
+
+      iex> Tree.total_size("/tmp/tree_test_dir")
+      size when is_integer(size) and size >= 0
+
+  """
+  @spec total_size(String.t(), keyword()) :: non_neg_integer()
+  def total_size(root_path, opts \\ []) do
+    root_path
+    |> list(Keyword.put(opts, :include_dirs, false))
+    |> sum_sizes(0)
+  end
+
+  @doc """
+  Formats a tree listing as an indented string, similar to the Unix `tree` command.
+
+  ## Examples
+
+      iex> entries = [
+      ...>   %{path: "/a", name: "a", type: :directory, size: 0, depth: 0},
+      ...>   %{path: "/a/b.ex", name: "b.ex", type: :file, size: 100, depth: 1}
+      ...> ]
+      iex> Tree.format(entries)
+      "a/\\n  b.ex (100 B)"
+
+  """
+  @spec format([entry()]) :: String.t()
+  def format(entries) do
+    entries
+    |> Enum.map(&format_entry/1)
+    |> Enum.join("\n")
+  end
+
+  @doc """
+  Counts files grouped by extension.
+
+  Returns a map of extension => count.
+
+  ## Examples
+
+      iex> entries = [
+      ...>   %{path: "/a.ex", name: "a.ex", type: :file, size: 0, depth: 0},
+      ...>   %{path: "/b.ex", name: "b.ex", type: :file, size: 0, depth: 0},
+      ...>   %{path: "/c.md", name: "c.md", type: :file, size: 0, depth: 0}
+      ...> ]
+      iex> Tree.count_by_extension(entries)
+      %{".ex" => 2, ".md" => 1}
+
+  """
+  @spec count_by_extension([entry()]) :: %{String.t() => non_neg_integer()}
+  def count_by_extension(entries) do
+    entries
+    |> Enum.filter(&(&1.type == :file))
+    |> Enum.group_by(&Path.extname(&1.name))
+    |> Enum.map(fn {ext, files} -> {ext, length(files)} end)
+    |> Map.new()
+  end
+
+  # --- Private: tail-recursive tree walker ---
+
+  # The work list pattern: instead of recursive function calls that build up
+  # the stack, we maintain an explicit work list (stack) of paths to visit.
+  # This is tail-recursive because `walk` is the last call in every branch.
+
+  @spec walk(
+          [{String.t(), non_neg_integer()}],
+          [entry()],
+          non_neg_integer() | :infinity,
+          [String.t()] | nil,
+          boolean()
+        ) :: [entry()]
+  defp walk([], acc, _max_depth, _extensions, _include_dirs) do
+    Enum.reverse(acc)
+  end
+
+  defp walk([{path, depth} | rest], acc, max_depth, extensions, include_dirs) do
+    case File.stat(path) do
+      {:ok, %File.Stat{type: :directory, size: size}} ->
+        entry = %{
+          path: path,
+          name: Path.basename(path),
+          type: :directory,
+          size: size,
+          depth: depth
+        }
+
+        new_acc = if include_dirs, do: [entry | acc], else: acc
+
+        children =
+          if depth_allowed?(depth, max_depth) do
+            list_children(path, depth + 1)
+          else
+            []
+          end
+
+        walk(children ++ rest, new_acc, max_depth, extensions, include_dirs)
+
+      {:ok, %File.Stat{type: :regular, size: size}} ->
+        name = Path.basename(path)
+
+        if extension_matches?(name, extensions) do
+          entry = %{
+            path: path,
+            name: name,
+            type: :file,
+            size: size,
+            depth: depth
+          }
+
+          walk(rest, [entry | acc], max_depth, extensions, include_dirs)
+        else
+          walk(rest, acc, max_depth, extensions, include_dirs)
+        end
+
+      _ ->
+        walk(rest, acc, max_depth, extensions, include_dirs)
+    end
+  end
+
+  @spec depth_allowed?(non_neg_integer(), non_neg_integer() | :infinity) :: boolean()
+  defp depth_allowed?(_depth, :infinity), do: true
+  defp depth_allowed?(depth, max_depth), do: depth < max_depth
+
+  @spec list_children(String.t(), non_neg_integer()) ::
+          [{String.t(), non_neg_integer()}]
+  defp list_children(dir_path, child_depth) do
+    case File.ls(dir_path) do
+      {:ok, names} ->
+        names
+        |> Enum.sort()
+        |> Enum.map(fn name -> {Path.join(dir_path, name), child_depth} end)
+
+      {:error, _} ->
+        []
+    end
+  end
+
+  @spec extension_matches?(String.t(), [String.t()] | nil) :: boolean()
+  defp extension_matches?(_name, nil), do: true
+
+  defp extension_matches?(name, extensions) do
+    Path.extname(name) in extensions
+  end
+
+  # Tail-recursive size accumulator
+  @spec sum_sizes([entry()], non_neg_integer()) :: non_neg_integer()
+  defp sum_sizes([], acc), do: acc
+  defp sum_sizes([%{size: size} | rest], acc), do: sum_sizes(rest, acc + size)
+
+  @spec format_entry(entry()) :: String.t()
+  defp format_entry(%{name: name, type: :directory, depth: depth}) do
+    indent = String.duplicate("  ", depth)
+    "#{indent}#{name}/"
+  end
+
+  defp format_entry(%{name: name, type: :file, size: size, depth: depth}) do
+    indent = String.duplicate("  ", depth)
+    "#{indent}#{name} (#{format_size(size)})"
+  end
+
+  @spec format_size(non_neg_integer()) :: String.t()
+  defp format_size(bytes) when bytes < 1024, do: "#{bytes} B"
+  defp format_size(bytes) when bytes < 1_048_576, do: "#{div(bytes, 1024)} KB"
+  defp format_size(bytes), do: "#{div(bytes, 1_048_576)} MB"
+end
+```
+
 ## Resources
 
 - [Recursion — Elixir Getting Started](https://elixir-lang.org/getting-started/recursion.html)

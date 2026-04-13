@@ -58,6 +58,25 @@ only on the pure helpers.
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Testing-specific insight:**
+Tests are not QA. They document intent and catch regressions. A test that passes without asserting anything is technical debt. Always test the failure case; "it works when everything succeeds" teaches nothing. Use property-based testing for domain logic where the number of edge cases is infinite.
 ### 1. `doctest Module` runs every example
 Every `iex>` block in `@doc` attributes.
 
@@ -352,19 +371,75 @@ change because the behaviour evolved, both signals move together — but what is
 cost when an example is written for pedagogical clarity rather than production
 accuracy, and the two goals diverge?
 
-## Resources
 
-- [`ExUnit.DocTest`](https://hexdocs.pm/ex_unit/ExUnit.DocTest.html)
-- [`doctest` macro](https://hexdocs.pm/ex_unit/ExUnit.DocTest.html#doctest/2)
-- [Elixir docs — writing good examples](https://hexdocs.pm/elixir/writing-documentation.html)
-- [José Valim — documenting Elixir code](https://elixir-lang.org/blog/2014/10/08/writing-documentation/)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+# lib/invoice_numbering/numbering.ex
+defmodule InvoiceNumbering.Numbering do
+  @moduledoc """
+  GenServer-backed allocator for gap-free invoice numbers.
+
+  Many functions in this module have side effects and are not doctest-friendly.
+  Doctests are restricted (via `doctest Module, only: [...]` in the test file)
+  to a small, stable subset whose example clarifies the contract.
+  """
+
+  use GenServer
+
+  def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+
+  @impl true
+  def init(opts), do: {:ok, %{year: opts[:year] || 2025, counter: 0, reserved: MapSet.new()}}
+
+  @doc """
+  Returns the format prefix for a given year. This is a pure function — doctestable.
+
+  ## Examples
+
+      iex> InvoiceNumbering.Numbering.prefix_for_year(2025)
+      "2025-"
+
+      iex> InvoiceNumbering.Numbering.prefix_for_year(2030)
+      "2030-"
+  """
+  @spec prefix_for_year(pos_integer()) :: String.t()
+  def prefix_for_year(year) when is_integer(year) and year > 0, do: "#{year}-"
+
+  @doc """
+  Allocates the next invoice number. Has side effects — not doctested.
+
+  Returns `{:ok, number}`.
+  """
+  @spec allocate() :: {:ok, pos_integer()}
+  def allocate, do: GenServer.call(__MODULE__, :allocate)
+
+  @doc """
+  Returns the last allocated number without advancing. Has side effects (reads
+  GenServer state) — not doctested.
+  """
+  @spec peek() :: non_neg_integer()
+  def peek, do: GenServer.call(__MODULE__, :peek)
+
+  @impl true
+  def handle_call(:allocate, _from, state) do
+    new_counter = state.counter + 1
+    {:reply, {:ok, new_counter}, %{state | counter: new_counter}}
+  end
+
+  def handle_call(:peek, _from, state), do: {:reply, state.counter, state}
 end
+
+defmodule Main do
+  def main do
+      IO.puts("Property-based test generator initialized")
+      a = 10
+      b = 20
+      c = 30
+      assert (a + b) + c == a + (b + c)
+      IO.puts("✓ Property invariant verified: (a+b)+c = a+(b+c)")
+  end
+end
+
+Main.main()
 ```

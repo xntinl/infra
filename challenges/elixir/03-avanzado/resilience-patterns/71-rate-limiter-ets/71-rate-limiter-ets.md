@@ -468,9 +468,119 @@ Graceful degradation means serving stale data or reduced functionality when a se
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
 
-- [`:ets` documentation — Erlang/OTP](https://www.erlang.org/doc/man/ets.html) — read the section on `type` and `access`
-- [Erlang in Anger — Fred Hebert](https://www.erlang-in-anger.com/) — chapter on ETS in production (free PDF)
-- [Plug.Session.ETS source](https://github.com/elixir-plug/plug/blob/main/lib/plug/session/ets.ex) — how Plug uses ETS as session store (similar pattern)
-- [Benchee](https://github.com/bencheeorg/benchee) — idiomatic benchmarking in Elixir
+## Executable Example
+
+```elixir
+defmodule ApiGateway.RateLimiter.Server do
+  use GenServer
+
+  @table :rate_limiter_windows
+  @cleanup_interval_ms 60_000
+
+  # ---------------------------------------------------------------------------
+  # Public API — entry points used by the router and tests
+  # ---------------------------------------------------------------------------
+
+  @doc """
+  Checks whether `client_id` is allowed to make a request given the limit and window.
+
+  Returns `{:allow, remaining}` or `{:deny, retry_after_ms}`.
+
+  This function reads directly from ETS — it does NOT go through the GenServer.
+  """
+  @spec check(String.t(), pos_integer(), pos_integer()) ::
+          {:allow, non_neg_integer()} | {:deny, pos_integer()}
+  def check(client_id, limit, window_ms) do
+    # HINT: use :ets.lookup/2 to get all timestamps for client_id
+    # HINT: filter for timestamps that fall within the window (now - window_ms)
+    # HINT: if count < limit → {:allow, limit - count}
+    # HINT: if count >= limit → {:deny, time_until_oldest_entry_expires}
+    # TODO: implement
+  end
+
+  @doc """
+  Records a new request for `client_id` with the current timestamp.
+
+  Only call this if check/3 returned :allow. This is a cast — fire and forget.
+  """
+  @spec record(String.t()) :: :ok
+  def record(client_id) do
+    ts = System.monotonic_time(:millisecond)
+    GenServer.cast(__MODULE__, {:record, client_id, ts})
+  end
+
+  # ---------------------------------------------------------------------------
+  # GenServer lifecycle
+  # ---------------------------------------------------------------------------
+
+  def start_link(opts \\ []) do
+    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+  end
+
+  @impl true
+  def init(_opts) do
+    # TODO: create the ETS table with the correct options
+    #
+    # Options to consider:
+    #   :named_table   → access by name instead of pid, needed for reads in check/3
+    #   :public        → any process can read/write (needed for check/3 without GenServer)
+    #   :bag           → allows multiple values per key (needed for timestamps)
+    #
+    # Design question: why :bag and not :set here?
+    # With :set, {client_id} can only have ONE value. With :bag, it can have N.
+    # We need to store one timestamp per request — we need :bag.
+
+    table = :ets.new(@table, [:named_table, :public, :bag])
+    Process.send_after(self(), :cleanup, @cleanup_interval_ms)
+    {:ok, %{table: table}}
+  end
+
+  # ---------------------------------------------------------------------------
+  # Callbacks
+  # ---------------------------------------------------------------------------
+
+  @impl true
+  def handle_cast({:record, client_id, timestamp}, state) do
+    # TODO: insert {client_id, timestamp} into the ETS table
+    # HINT: :ets.insert/2 takes the table name and a tuple {key, value}
+    {:noreply, state}
+  end
+
+  @impl true
+  def handle_info(:cleanup, state) do
+    # Periodic cleanup: delete entries older than 1 hour.
+    # ETS has no native TTL — cleanup is the owner's responsibility.
+    #
+    # Option A (simple, to start):
+    #   :ets.tab2list/1 + Enum.filter + :ets.delete_object/2
+    #   Pros: easy to read. Cons: O(n) memory (copies the entire table).
+    #
+    # Option B (efficient for production):
+    #   :ets.select_delete/2 with a match spec
+    #   Pros: operates directly in ETS, no copy. Cons: match spec syntax.
+    #
+    # Start with Option A. If benchmarks show cleanup is a bottleneck,
+    # migrate to Option B.
+
+    cutoff = System.monotonic_time(:millisecond) - 3_600_000
+
+    # TODO: delete all entries with timestamp < cutoff
+    # HINT (Option A): :ets.tab2list(@table) returns [{client_id, ts}, ...]
+    # HINT (Option A): to delete a specific entry: :ets.delete_object(@table, {client_id, ts})
+
+    Process.send_after(self(), :cleanup, @cleanup_interval_ms)
+    {:noreply, state}
+  end
+end
+
+defmodule Main do
+  def main do
+    IO.puts("✓ Rate Limiter with ETS and Sliding Window")
+  - ETS-based rate limiting
+    - Concurrent counter management
+  end
+end
+
+Main.main()
+```

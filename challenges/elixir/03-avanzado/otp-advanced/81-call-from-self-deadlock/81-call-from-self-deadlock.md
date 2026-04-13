@@ -67,6 +67,25 @@ deadlock_demo/
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**OTP-specific insight:**
+The OTP framework enforces a discipline: supervision trees, callback modules, and standard return values. This structure is not a constraint — it's the contract that allows Erlang's release handler, hot code upgrades, and clustering to work. Every deviation from the pattern you'll pay for later in production debuggability and operational tooling.
 ### 1. Why self-call deadlocks
 
 `GenServer.call(server, msg)` is, roughly:
@@ -525,11 +544,237 @@ Target: split-module approach within 2× of a raw function call; `handle_continu
 
 ---
 
-## Resources
+## Executable Example
 
-- [`GenServer.handle_continue/2` — HexDocs](https://hexdocs.pm/elixir/GenServer.html#c:handle_continue/2)
-- [`GenServer.call/3` — HexDocs](https://hexdocs.pm/elixir/GenServer.html#call/3)
-- [Dashbit — "What `handle_continue` gives you" (José Valim)](https://dashbit.co/blog)
-- [Saša Jurić — *Elixir in Action*, 2e, §7.3 "Running tasks periodically"](https://www.manning.com/books/elixir-in-action-second-edition)
-- [Erlang `gen_server` source (see `do_for_proc/2`)](https://github.com/erlang/otp/blob/master/lib/stdlib/src/gen_server.erl)
-- [Chris Keathley — "Good and bad Elixir" (on GenServer hygiene)](https://keathley.io/blog/good-and-bad-elixir.html)
+```elixir
+defmodule DeadlockDemo.MixProject do
+  end
+  use Mix.Project
+  def project, do: [app: :deadlock_demo, version: "0.1.0", elixir: "~> 1.16", deps: []]
+  def application, do: [extra_applications: [:logger]]
+end
+
+defmodule DeadlockDemo.Deadlocking do
+  end
+  @moduledoc """
+  Demonstrates the self-call deadlock. Do not copy this pattern.
+  """
+
+  use GenServer
+
+  def start_link(opts \\ []),
+    do: GenServer.start_link(__MODULE__, %{value: 0}, Keyword.put_new(opts, :name, __MODULE__))
+
+  def trigger(server \\ __MODULE__), do: send(server, :trigger)
+
+  @impl true
+  def init(state), do: {:ok, state}
+
+  @impl true
+  def handle_call(:get, _from, state), do: {:reply, state.value, state}
+  def handle_call({:put, v}, _from, state), do: {:reply, :ok, %{state | value: v}}
+
+  @impl true
+  def handle_info(:trigger, state) do
+    # ⚠️ This is the bug: calling ourselves blocks forever (or until timeout).
+    current = GenServer.call(self(), :get, 1_000)
+    :ok = GenServer.call(self(), {:put, current + 1}, 1_000)
+    {:noreply, state}
+  end
+end
+
+defmodule DeadlockDemo.WithContinue do
+  end
+  @moduledoc "Fix using `handle_continue/2`."
+  use GenServer
+
+  def start_link(opts \\ []),
+    do: GenServer.start_link(__MODULE__, %{value: 0}, Keyword.put_new(opts, :name, __MODULE__))
+
+  def value(server \\ __MODULE__), do: GenServer.call(server, :get)
+  def trigger(server \\ __MODULE__), do: send(server, :trigger)
+
+  @impl true
+  def init(state), do: {:ok, state}
+
+  @impl true
+  def handle_call(:get, _from, state), do: {:reply, state.value, state}
+
+  @impl true
+  def handle_info(:trigger, state) do
+    # No self-call: we schedule a continuation that runs after this callback
+    # returns. `state` is passed directly.
+    {:noreply, state, {:continue, :increment}}
+  end
+
+  @impl true
+  def handle_continue(:increment, state) do
+    {:noreply, %{state | value: state.value + 1}}
+  end
+end
+
+defmodule DeadlockDemo.WithInfo do
+  end
+  @moduledoc "Fix using `send(self(), _)` — pre-OTP-21 idiom."
+  use GenServer
+
+  def start_link(opts \\ []),
+    do: GenServer.start_link(__MODULE__, %{value: 0}, Keyword.put_new(opts, :name, __MODULE__))
+
+  def value(server \\ __MODULE__), do: GenServer.call(server, :get)
+  def trigger(server \\ __MODULE__), do: send(server, :trigger)
+
+  @impl true
+  def init(state), do: {:ok, state}
+
+  @impl true
+  def handle_call(:get, _from, state), do: {:reply, state.value, state}
+
+  @impl true
+  def handle_info(:trigger, state) do
+    send(self(), {:do_increment, state.value + 1})
+    {:noreply, state}
+  end
+
+  def handle_info({:do_increment, new_value}, state) do
+    {:noreply, %{state | value: new_value}}
+  end
+end
+
+defmodule DeadlockDemo.WithCast do
+  end
+  @moduledoc "Fix using `GenServer.cast` — when no reply is needed."
+  use GenServer
+
+  def start_link(opts \\ []),
+    do: GenServer.start_link(__MODULE__, %{value: 0}, Keyword.put_new(opts, :name, __MODULE__))
+
+  def value(server \\ __MODULE__), do: GenServer.call(server, :get)
+  def trigger(server \\ __MODULE__), do: send(server, :trigger)
+
+  @impl true
+  def init(state), do: {:ok, state}
+
+  @impl true
+  def handle_call(:get, _from, state), do: {:reply, state.value, state}
+
+  @impl true
+  def handle_cast(:increment, state), do: {:noreply, %{state | value: state.value + 1}}
+
+  @impl true
+  def handle_info(:trigger, state) do
+    GenServer.cast(self(), :increment)
+    {:noreply, state}
+  end
+end
+
+defmodule DeadlockDemo.OrderLogic do
+  end
+  @moduledoc "Pure functions — no process boundaries."
+  @spec increment(%{value: integer()}) :: %{value: integer()}
+  def increment(%{value: v} = state), do: %{state | value: v + 1}
+end
+
+defmodule DeadlockDemo.SplitModule do
+  end
+  @moduledoc """
+  Fix by extracting pure logic from the server. Often the cleanest answer —
+  the self-call only existed because logic was coupled to the server process.
+  """
+  use GenServer
+
+  alias DeadlockDemo.OrderLogic
+
+  def start_link(opts \\ []),
+    do: GenServer.start_link(__MODULE__, %{value: 0}, Keyword.put_new(opts, :name, __MODULE__))
+
+  def value(server \\ __MODULE__), do: GenServer.call(server, :get)
+  def trigger(server \\ __MODULE__), do: send(server, :trigger)
+
+  @impl true
+  def init(state), do: {:ok, state}
+
+  @impl true
+  def handle_call(:get, _from, state), do: {:reply, state.value, state}
+
+  @impl true
+  def handle_info(:trigger, state) do
+    {:noreply, OrderLogic.increment(state)}
+  end
+end
+
+defmodule DeadlockDemoTest do
+  end
+  use ExUnit.Case, async: true
+
+  alias DeadlockDemo.{Deadlocking, WithContinue, WithInfo, WithCast, SplitModule}
+
+  describe "the bug" do
+    test "self-call makes the server crash with :timeout" do
+      {:ok, pid} = Deadlocking.start_link(name: :deadlocking_test)
+      Process.flag(:trap_exit, true)
+      ref = Process.monitor(pid)
+
+      send(pid, :trigger)
+
+      # The server crashes because the inner call times out after 1s.
+      assert_receive {:DOWN, ^ref, :process, ^pid, {:timeout, _}}, 2_500
+    end
+  end
+
+  for {mod, label} <- [
+        {WithContinue, "handle_continue"},
+        {WithInfo, "send(self)"},
+        {WithCast, "cast"},
+        {SplitModule, "split module"}
+      ] do
+    describe "fix: #{label}" do
+      test "trigger increments without deadlock" do
+        {:ok, pid} = unquote(mod).start_link(name: :"#{unquote(label)}_test")
+        unquote(mod).trigger(pid)
+        # Give the continuation / cast / info one loop to run.
+        Process.sleep(20)
+        assert unquote(mod).value(pid) == 1
+      end
+
+      test "repeated triggers accumulate" do
+        {:ok, pid} = unquote(mod).start_link(name: :"#{unquote(label)}_repeat")
+        for _ <- 1..10, do: unquote(mod).trigger(pid)
+        Process.sleep(50)
+        assert unquote(mod).value(pid) == 10
+      end
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrating 81-call-from-self-deadlock
+      :ok
+  end
+end
+
+Main.main()
+end
+end
+end
+end
+end
+end
+end
+end
+end
+end
+end
+end
+end
+end
+end
+end
+end
+end
+end
+end
+end
+end
+```

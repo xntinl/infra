@@ -363,6 +363,116 @@ exercise exists only so the abstractions above stop feeling magical.
 
 - ¿Cuándo deberías escribir tu propio receive-loop en lugar de usar GenServer? Dá 2 casos reales.
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule ProcessPrimitives do
+    @moduledoc """
+    A stateful counter implemented without GenServer — only `spawn`, `send`,
+    and `receive`. Demonstrates exactly what OTP abstractions build on top of.
+    """
+
+    @doc """
+    Spawns a counter process starting at `initial`. Returns the pid.
+
+    The spawned process runs a tail-recursive receive loop. Each iteration
+    reads one message, handles it, and recurses with the (possibly updated)
+    state. When the loop function returns without recursing, the process exits.
+    """
+    @spec start(integer()) :: pid()
+    def start(initial \\ 0) when is_integer(initial) do
+      spawn(fn -> loop(initial) end)
+    end
+
+    @doc """
+    Synchronous increment. Uses the tag-reply-timeout idiom that GenServer.call
+    formalizes: we include `self()` and a fresh ref, then wait for exactly that
+    ref to come back so concurrent callers cannot see each other's replies.
+    """
+    @spec increment(pid(), timeout()) :: {:ok, integer()} | {:error, :timeout}
+    def increment(pid, timeout \\ 5_000) do
+      call(pid, :increment, timeout)
+    end
+
+    @doc "Synchronous read of the current value."
+    @spec value(pid(), timeout()) :: {:ok, integer()} | {:error, :timeout}
+    def value(pid, timeout \\ 5_000) do
+      call(pid, :value, timeout)
+    end
+
+    @doc """
+    Fire-and-forget stop. The server exits with reason `:normal` — no reply.
+    This is the raw-process equivalent of `GenServer.cast`.
+    """
+    @spec stop(pid()) :: :ok
+    def stop(pid) do
+      send(pid, :stop)
+      :ok
+    end
+
+    # ── Private ─────────────────────────────────────────────────────────────
+
+    # The tail-recursive receive loop IS the process. Each clause returns by
+    # calling `loop/1` again with new state, except `:stop` which returns,
+    # ending the function and killing the process with reason :normal.
+    defp loop(state) do
+      receive do
+        {:call, from, ref, :increment} ->
+          new_state = state + 1
+          send(from, {ref, new_state})
+          loop(new_state)
+
+        {:call, from, ref, :value} ->
+          send(from, {ref, state})
+          loop(state)
+
+        :stop ->
+          :ok
+
+        _other ->
+          # Unknown messages would otherwise stay in the mailbox forever and
+          # slow down every selective receive. Drain and ignore.
+          loop(state)
+      end
+    end
+
+    # The `call` helper: tag, send, wait-for-exactly-our-ref, timeout.
+    defp call(pid, request, timeout) do
+      ref = make_ref()
+      send(pid, {:call, self(), ref, request})
+
+      receive do
+        {^ref, reply} -> {:ok, reply}
+      after
+        timeout -> {:error, :timeout}
+      end
+    end
+  end
+
+  def main do
+    pid = ProcessPrimitives.start(0)
+  
+    {:ok, v1} = ProcessPrimitives.increment(pid)
+    {:ok, v2} = ProcessPrimitives.increment(pid)
+    {:ok, current} = ProcessPrimitives.value(pid)
+  
+    IO.puts("Counter incremented to: #{current}")
+  
+    ProcessPrimitives.stop(pid)
+    Process.sleep(100)
+  
+    IO.puts("✓ ProcessPrimitives works correctly")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [Elixir: Processes — getting started](https://hexdocs.pm/elixir/processes.html)

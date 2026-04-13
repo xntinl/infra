@@ -385,6 +385,59 @@ Enforce on libraries, domain modules, and anything with business rules.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule CoverageCi.MixProject do
+    use Mix.Project
+
+    def project do
+      [
+        app: :coverage_ci,
+        version: "0.1.0",
+        elixir: "~> 1.15",
+        deps: deps(),
+        test_coverage: [tool: ExCoveralls],
+        preferred_cli_env: [
+          coveralls: :test,
+          "coveralls.detail": :test,
+          "coveralls.html": :test,
+          "coveralls.json": :test,
+          "coveralls.github": :test
+        ]
+      ]
+    end
+
+    defp deps do
+      [{:excoveralls, "~> 0.18", only: :test}]
+    end
+  end
+
+  def main do
+    IO.puts("=== Calculator Demo ===
+  ")
+  
+    # Demo: Call some functions for coverage
+  IO.puts("1. Calculator.add(5, 3): #{Calculator.add(5, 3)}")
+  assert Calculator.add(5, 3) == 8
+
+  IO.puts("2. Calculator.multiply(4, 7): #{Calculator.multiply(4, 7)}")
+  assert Calculator.multiply(4, 7) == 28
+
+  IO.puts("
+  (Run with: mix test --cover)")
+  IO.puts("✓ Coverage demo completed!")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`mix test --cover` — Mix task docs](https://hexdocs.pm/mix/Mix.Tasks.Test.html)

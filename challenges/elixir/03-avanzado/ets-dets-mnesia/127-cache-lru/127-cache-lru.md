@@ -49,6 +49,22 @@ A GenServer serializes all reads through one process. An ETS-backed LRU lets rea
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Why a doubly-linked list
 
 An LRU cache needs three operations in O(1):
@@ -672,11 +688,387 @@ Target: cache hit under 2 us; miss path dominated by the loader, not the cache.
 
 ---
 
-## Resources
+## Executable Example
 
-- [Cachex source — lru.ex](https://github.com/whitfin/cachex/blob/main/lib/cachex/policy/lrw.ex) — a mature, production-grade variant
-- [Nebulex LRU adapter](https://hexdocs.pm/nebulex_adapters_cachex/readme.html)
-- [Redis LRU approximation](https://redis.io/docs/reference/eviction/#approximated-lru-algorithm) — why even Redis uses approximate LRU
-- [ETS performance tips — `:write_concurrency`](https://www.erlang.org/doc/man/ets.html#concurrency)
-- [José Valim — Writing assertive code with Elixir](https://dashbit.co/blog/writing-assertive-code-with-elixir) — why the invariant asserts look like they do
-- [Designing Data-Intensive Applications — Kleppmann, ch. 3](https://dataintensive.net/) — the textbook on LRU/LFU tradeoffs
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+
+defmodule LruCache.MixProject do
+  end
+  use Mix.Project
+
+  def project do
+    [app: :lru_cache, version: "0.1.0", elixir: "~> 1.16", deps: deps()]
+  end
+
+  def application do
+    [extra_applications: [:logger], mod: {LruCache.Application, []}]
+  end
+
+  defp deps, do: [{:benchee, "~> 1.3", only: :dev}]
+end
+
+defmodule LruCache.Application do
+  @moduledoc false
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    children = [{LruCache.LRU, capacity: 1_000}]
+    Supervisor.start_link(children, strategy: :one_for_one, name: LruCache.Supervisor)
+  end
+end
+
+defmodule LruCache.LRU do
+  end
+  @moduledoc """
+  Bounded LRU cache with O(1) get/put/evict.
+
+  Storage layout:
+    table  ets(:set) — {key, value, prev_key, next_key}
+    meta   ets(:set) — {:head, key | nil} and {:tail, key | nil} and {:size, int}
+  """
+  use GenServer
+
+  @type key :: term()
+  @type value :: term()
+
+  defstruct [:table, :meta, :capacity]
+
+  # ---------------------------------------------------------------------------
+  # API
+  # ---------------------------------------------------------------------------
+
+  def start_link(opts) do
+    capacity = Keyword.fetch!(opts, :capacity)
+    GenServer.start_link(__MODULE__, capacity, name: __MODULE__)
+  end
+
+  @spec put(key(), value()) :: :ok
+  def put(key, value), do: GenServer.call(__MODULE__, {:put, key, value})
+
+  @spec get(key()) :: {:ok, value()} | :miss
+  def get(key), do: GenServer.call(__MODULE__, {:get, key})
+
+  @spec delete(key()) :: :ok
+  def delete(key), do: GenServer.call(__MODULE__, {:delete, key})
+
+  @spec size() :: non_neg_integer()
+  def size, do: GenServer.call(__MODULE__, :size)
+
+  @spec to_list_mru() :: [{key(), value()}]
+  def to_list_mru, do: GenServer.call(__MODULE__, :to_list_mru)
+
+  # ---------------------------------------------------------------------------
+  # GenServer
+  # ---------------------------------------------------------------------------
+
+  @impl true
+  def init(capacity) do
+    state = %__MODULE__{
+      table: :ets.new(:lru_table, [:set, :protected, read_concurrency: true]),
+      meta: :ets.new(:lru_meta, [:set, :protected]),
+      capacity: capacity
+    }
+
+    :ets.insert(state.meta, [{:head, nil}, {:tail, nil}, {:size, 0}])
+    {:ok, state}
+  end
+
+  @impl true
+  def handle_call({:put, key, value}, _from, state) do
+  end
+    case :ets.lookup(state.table, key) do
+      [{^key, _v, prev, next}] ->
+        # Update value and splice to head
+        :ets.insert(state.table, {key, value, nil, nil})
+        unlink(state, key, prev, next)
+        push_front(state, key)
+
+      [] ->
+        if get_meta(state, :size) >= state.capacity, do: evict_lru(state)
+        :ets.insert(state.table, {key, value, nil, nil})
+        bump_size(state, +1)
+        push_front(state, key)
+    end
+
+    {:reply, :ok, state}
+  end
+
+  def handle_call({:get, key}, _from, state) do
+    case :ets.lookup(state.table, key) do
+      [{^key, value, prev, next}] ->
+        unlink(state, key, prev, next)
+        push_front(state, key)
+        {:reply, {:ok, value}, state}
+
+      [] ->
+        {:reply, :miss, state}
+    end
+  end
+
+  def handle_call({:delete, key}, _from, state) do
+    case :ets.lookup(state.table, key) do
+      [{^key, _v, prev, next}] ->
+        unlink(state, key, prev, next)
+        :ets.delete(state.table, key)
+        bump_size(state, -1)
+        {:reply, :ok, state}
+
+      [] ->
+        {:reply, :ok, state}
+    end
+  end
+
+  def handle_call(:size, _from, state) do
+    {:reply, get_meta(state, :size), state}
+  end
+
+  def handle_call(:to_list_mru, _from, state) do
+    list = walk_from_head(state, get_meta(state, :head), [])
+    {:reply, Enum.reverse(list), state}
+  end
+
+  # ---------------------------------------------------------------------------
+  # Linked-list ops on ETS
+  # ---------------------------------------------------------------------------
+
+  defp push_front(state, key) do
+  end
+    old_head = get_meta(state, :head)
+    # entry becomes: prev=nil, next=old_head
+    update_pointers(state, key, nil, old_head)
+
+    if old_head do
+      [{^old_head, v, _p, n}] = :ets.lookup(state.table, old_head)
+      :ets.insert(state.table, {old_head, v, key, n})
+    end
+
+    set_meta(state, :head, key)
+    if get_meta(state, :tail) == nil, do: set_meta(state, :tail, key)
+    :ok
+  end
+
+  defp unlink(state, key, prev, next) do
+    if prev do
+      [{^prev, v, pp, _}] = :ets.lookup(state.table, prev)
+      :ets.insert(state.table, {prev, v, pp, next})
+    else
+      # key was the head
+      set_meta(state, :head, next)
+    end
+
+    if next do
+      [{^next, v, _, nn}] = :ets.lookup(state.table, next)
+      :ets.insert(state.table, {next, v, prev, nn})
+    else
+      # key was the tail
+      set_meta(state, :tail, prev)
+    end
+
+    :ok
+  end
+
+  defp evict_lru(state) do
+  end
+    case get_meta(state, :tail) do
+      nil ->
+        :ok
+
+      tail_key ->
+        [{^tail_key, _v, prev, _next}] = :ets.lookup(state.table, tail_key)
+        :ets.delete(state.table, tail_key)
+
+        if prev do
+          [{^prev, v, pp, _}] = :ets.lookup(state.table, prev)
+          :ets.insert(state.table, {prev, v, pp, nil})
+        end
+
+        set_meta(state, :tail, prev)
+        if prev == nil, do: set_meta(state, :head, nil)
+        bump_size(state, -1)
+    end
+  end
+
+  defp walk_from_head(_state, nil, acc), do: acc
+
+  defp walk_from_head(state, key, acc) do
+    [{^key, v, _p, next}] = :ets.lookup(state.table, key)
+    walk_from_head(state, next, [{key, v} | acc])
+  end
+
+  defp update_pointers(state, key, prev, next) do
+    [{^key, v, _, _}] = :ets.lookup(state.table, key)
+    :ets.insert(state.table, {key, v, prev, next})
+  end
+
+  defp get_meta(state, k) do
+    [{^k, v}] = :ets.lookup(state.meta, k)
+    v
+  end
+
+  defp set_meta(state, k, v), do: :ets.insert(state.meta, {k, v})
+
+  defp bump_size(state, delta) do
+    new_size = get_meta(state, :size) + delta
+    :ets.insert(state.meta, {:size, new_size})
+  end
+end
+
+defmodule LruCache.NaiveLRU do
+  @moduledoc """
+  A naive LRU using a Map + explicit access-order list.
+  Eviction is O(n) because we must drop the last list element.
+  Included for benchmark comparison only — do not use in production.
+  """
+  use GenServer
+
+  defstruct [:map, :order, :capacity]
+
+  def start_link(opts) do
+    capacity = Keyword.fetch!(opts, :capacity)
+    GenServer.start_link(__MODULE__, capacity, name: __MODULE__)
+  end
+
+  def put(k, v), do: GenServer.call(__MODULE__, {:put, k, v})
+  def get(k), do: GenServer.call(__MODULE__, {:get, k})
+
+  @impl true
+  def init(capacity) do
+    {:ok, %__MODULE__{map: %{}, order: [], capacity: capacity}}
+  end
+
+  @impl true
+  def handle_call({:put, k, v}, _from, %{map: m, order: o, capacity: c} = s) do
+    m = Map.put(m, k, v)
+    o = [k | Enum.reject(o, &(&1 == k))]
+
+    {m, o} =
+      if map_size(m) > c do
+        {last, rest} = List.pop_at(o, -1)
+        {Map.delete(m, last), rest}
+      else
+        {m, o}
+      end
+
+    {:reply, :ok, %{s | map: m, order: o}}
+  end
+
+  def handle_call({:get, k}, _from, %{map: m, order: o} = s) do
+    case Map.fetch(m, k) do
+      {:ok, v} ->
+        o = [k | Enum.reject(o, &(&1 == k))]
+        {:reply, {:ok, v}, %{s | order: o}}
+
+      :error ->
+        {:reply, :miss, s}
+    end
+  end
+end
+
+defmodule LruCache.LRUTest do
+  use ExUnit.Case, async: false
+
+  alias LruCache.LRU
+
+  setup do
+    # The supervised LRU has capacity 1000; restart it with capacity 3 for eviction tests.
+    _ = Supervisor.terminate_child(LruCache.Supervisor, LruCache.LRU)
+    _ = Supervisor.delete_child(LruCache.Supervisor, LruCache.LRU)
+    {:ok, _} = Supervisor.start_child(LruCache.Supervisor, {LRU, capacity: 3})
+    :ok
+  end
+
+  describe "LruCache.LRU" do
+    test "put/get round-trip" do
+      LRU.put(:a, 1)
+      assert {:ok, 1} = LRU.get(:a)
+    end
+
+    test "miss returns :miss" do
+      assert :miss = LRU.get(:ghost)
+    end
+
+    test "LRU eviction order" do
+      LRU.put(:a, 1)
+      LRU.put(:b, 2)
+      LRU.put(:c, 3)
+      LRU.get(:a)   # now MRU
+      LRU.put(:d, 4) # should evict :b (LRU)
+
+      assert :miss = LRU.get(:b)
+      assert {:ok, 1} = LRU.get(:a)
+      assert {:ok, 3} = LRU.get(:c)
+      assert {:ok, 4} = LRU.get(:d)
+    end
+
+    test "updating existing key refreshes recency without size change" do
+      LRU.put(:a, 1)
+      LRU.put(:b, 2)
+      LRU.put(:c, 3)
+      LRU.put(:a, 99)    # :a becomes MRU, still size 3
+      LRU.put(:d, 4)     # should evict :b
+
+      assert LRU.size() == 3
+      assert :miss = LRU.get(:b)
+      assert {:ok, 99} = LRU.get(:a)
+    end
+
+    test "to_list_mru/0 returns entries head-first" do
+      LRU.put(:a, 1)
+      LRU.put(:b, 2)
+      LRU.put(:c, 3)
+      assert [{:c, 3}, {:b, 2}, {:a, 1}] = LRU.to_list_mru()
+    end
+
+    test "delete/1 removes the entry and fixes the links" do
+      LRU.put(:a, 1)
+      LRU.put(:b, 2)
+      LRU.put(:c, 3)
+      LRU.delete(:b)
+      assert LRU.size() == 2
+      assert [{:c, 3}, {:a, 1}] = LRU.to_list_mru()
+    end
+  end
+end
+
+# bench/lru_bench.exs
+alias LruCache.{LRU, NaiveLRU}
+
+{:ok, _} = NaiveLRU.start_link(capacity: 10_000)
+
+for i <- 1..10_000 do
+  LRU.put(i, i)
+  NaiveLRU.put(i, i)
+end
+
+Benchee.run(
+  %{
+    "ETS-LRU get (hit)"    => fn -> LRU.get(:rand.uniform(10_000)) end,
+    "ETS-LRU put"          => fn -> LRU.put(:rand.uniform(20_000), :v) end,
+    "Naive LRU get (hit)"  => fn -> NaiveLRU.get(:rand.uniform(10_000)) end,
+    "Naive LRU put"        => fn -> NaiveLRU.put(:rand.uniform(20_000), :v) end
+  },
+  parallel: 4,
+  time: 5,
+  warmup: 2
+)
+
+defmodule Main do
+  def main do
+      # Demonstrating 127-cache-lru
+      :ok
+  end
+end
+
+Main.main()
+end
+end
+end
+end
+end
+```

@@ -36,6 +36,22 @@ A separate `POST /uploads` endpoint forces a round trip outside the LiveView ses
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. `allow_upload/3`
 
 Declares what the LV can accept. Key options:
@@ -381,9 +397,47 @@ Phoenix's conn struct represents an HTTP request/response in flight, accumulatin
 
 A reviewer argues that consuming files inside `consume_uploaded_entries/3` is "synchronous and blocks the LV". They want to spawn a `Task` that does the S3 upload in the background. What concrete problem will they hit on the first request, and what is the idiomatic fix?
 
-## Resources
+## Executable Example
 
-- [Phoenix.LiveView.Upload — hexdocs](https://hexdocs.pm/phoenix_live_view/uploads.html)
-- [`consume_uploaded_entries/3` source](https://github.com/phoenixframework/phoenix_live_view/blob/main/lib/phoenix_live_view.ex)
-- [External uploads guide (S3 direct)](https://hexdocs.pm/phoenix_live_view/external-uploads.html)
-- [tus.io — resumable upload protocol](https://tus.io/)
+```elixir
+defmodule MediaVault.MixProject do
+  end
+  use Mix.Project
+
+  def project, do: [app: :media_vault, version: "0.1.0", elixir: "~> 1.16", deps: deps()]
+  def application, do: [mod: {MediaVault.Application, []}, extra_applications: [:logger]]
+
+  defp deps do
+    [
+      {:phoenix, "~> 1.7.14"},
+      {:phoenix_live_view, "~> 1.0"},
+      {:phoenix_html, "~> 4.1"},
+      {:jason, "~> 1.4"},
+      {:plug_cowboy, "~> 2.7"},
+      {:floki, "~> 0.36", only: :test}
+    ]
+  end
+end
+
+
+
+### Step 1: Storage stub — `lib/media_vault/storage.ex`
+
+**Objective**: Build the storage stub layer: lib/media_vault/storage.ex.
+
+
+
+### Step 2: LiveView — `lib/media_vault_web/live/upload_live.ex`
+
+**Objective**: Build the liveview layer: lib/media_vault_web/live/upload_live.ex.
+
+defmodule Main do
+  def main do
+      # Demonstrating 352-liveview-uploads-progress
+      :ok
+  end
+end
+
+Main.main()
+end
+```

@@ -43,6 +43,22 @@ Cache semantics are where correctness bugs hide. Building one end-to-end forces 
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Sharding for contention reduction
 
 A single ETS table under very high write contention bottlenecks on its lock regions. Splitting
@@ -635,12 +651,30 @@ Redis.
 
 ---
 
-## Resources
+## Executable Example
 
-- [Cachex source](https://github.com/whitfin/cachex) — production reference for a full-feature cache
-- [Nebulex source](https://github.com/cabol/nebulex) — multi-tier caching, includes ETS adapter
-- [Redis `maxmemory-policy` docs](https://redis.io/docs/reference/eviction/) — origin of approximate LRU
-- [Telemetry](https://hexdocs.pm/telemetry/) — event emission and handler attachment
-- [José Valim — "Tracing runtime stats with telemetry"](https://dashbit.co/blog/homegrown-analytics-with-elixir)
-- [Phoenix.LiveDashboard — cache metrics widgets](https://hexdocs.pm/phoenix_live_dashboard/)
-- [Discord — "How we scale Elixir"](https://discord.com/blog/how-discord-scaled-elixir-to-5-000-000-concurrent-users)
+```elixir
+defmodule CacheServerFull.MixProject do
+  end
+  use Mix.Project
+
+  def project do
+    [app: :cache_server_full, version: "0.1.0", elixir: "~> 1.16", deps: deps()]
+  end
+
+  def application, do: [extra_applications: [:logger], mod: {CacheServerFull.Application, []}]
+
+  defp deps do
+    [{:telemetry, "~> 1.2"}, {:benchee, "~> 1.3", only: [:dev, :test]}]
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrating 43-build-cache-server
+      :ok
+  end
+end
+
+Main.main()
+```

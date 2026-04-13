@@ -55,6 +55,22 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. The middleware contract
 
 Inspired by Plug and Tesla, every middleware is a module implementing one
@@ -659,12 +675,34 @@ expose.
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
+## Executable Example
 
-- [Tesla middleware docs](https://hexdocs.pm/tesla/Tesla.html#module-writing-middleware) — the original Elixir middleware pattern
-- [`:telemetry.span/3`](https://hexdocs.pm/telemetry/telemetry.html#span/3) — official span convention
-- [Finch](https://hexdocs.pm/finch/Finch.html) — HTTP client this exercise assumes as adapter
-- [AWS Architecture Blog — Exponential Backoff and Jitter](https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/) — the paper on full vs equal vs decorrelated jitter
-- [Req](https://hexdocs.pm/req/Req.html) — batteries-included alternative built on Finch
-- [Stripe API — Errors](https://stripe.com/docs/api/errors) — taxonomy of HTTP errors to model your `ClientError` after
-- [Chris Keathley — Good and Bad Elixir](https://keathley.io/posts/good-and-bad-elixir) — why `with` chains + error structs beat tagged tuples for client layers
+```elixir
+defp deps do
+  [
+    {:finch, "~> 0.18"},
+    {:jason, "~> 1.4"},
+    {:telemetry, "~> 1.2"}
+  ]
+end
+
+
+
+Order matters: Telemetry outermost (captures everything including breaker
+rejections); CircuitBreaker before RateLimit (don't waste rate-limit tokens on
+a known-dead upstream); Retry inside both so retries are counted against the
+breaker and the rate limiter.
+
+### 3. Structured error taxonomy
+
+Returning `{:error, :something}` loses causal chain. We use a struct:
+
+defmodule Main do
+  def main do
+      # Demonstrating 45-build-api-client-wrapper
+      :ok
+  end
+end
+
+Main.main()
+```

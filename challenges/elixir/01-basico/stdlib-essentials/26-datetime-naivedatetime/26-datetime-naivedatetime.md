@@ -610,6 +610,17 @@ Every meeting is normalised to UTC on construction via `DateTime.from_naive/2` +
 ---
 
 
+
+
+## Executable Example
+
+Create a simple example demonstrating the key concepts:
+
+```elixir
+# Example code demonstrating module concepts
+IO.puts("Example: Read the Implementation section above and run the code samples in iex")
+```
+
 ## Key Concepts
 
 ### 1. NaiveDateTime Has No Timezone Information

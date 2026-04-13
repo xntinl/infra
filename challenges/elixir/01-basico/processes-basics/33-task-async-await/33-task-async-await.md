@@ -476,7 +476,47 @@ mix format
 
 ---
 
+## Executable Example
 
+Create `lib/parallel_fetcher.ex` and test in `iex`:
+
+```elixir
+defmodule ParallelFetcher do
+  def fetch_user_and_posts(user_id) do
+    user_task = Task.async(fn -> fetch_user(user_id) end)
+    posts_task = Task.async(fn -> fetch_posts(user_id) end)
+
+    user = Task.await(user_task, 5000)
+    posts = Task.await(posts_task, 5000)
+
+    {:ok, user, posts}
+  end
+
+  defp fetch_user(user_id) do
+    Process.sleep(100)
+    %{id: user_id, name: "User #{user_id}"}
+  end
+
+  defp fetch_posts(user_id) do
+    Process.sleep(150)
+    [%{id: 1, title: "Post 1"}, %{id: 2, title: "Post 2"}]
+  end
+
+  def fetch_all_users(ids) do
+    ids
+    |> Enum.map(&Task.async(fn -> fetch_user(&1) end))
+    |> Enum.map(&Task.await(&1, 5000))
+  end
+end
+
+# Test it
+{:ok, user, posts} = ParallelFetcher.fetch_user_and_posts(123)
+IO.inspect(user)
+IO.inspect(posts)
+
+users = ParallelFetcher.fetch_all_users([1, 2, 3])
+IO.inspect(length(users))
+```
 
 ---
 ## Key Concepts

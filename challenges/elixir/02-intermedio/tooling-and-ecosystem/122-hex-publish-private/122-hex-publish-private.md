@@ -392,6 +392,88 @@ private dep needs the flag.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule PrivateHexDemo.MixProject do
+    use Mix.Project
+
+    @version "0.1.0"
+    @source_url "https://github.com/example/private_hex_demo"
+
+    def project do
+      [
+        app: :private_hex_demo,
+        version: @version,
+        elixir: "~> 1.15",
+        start_permanent: Mix.env() == :prod,
+        deps: deps(),
+
+        # --- Publishing metadata ---
+        name: "PrivateHexDemo",
+        description: "Demo library for learning `mix hex.publish`.",
+        package: package(),
+        source_url: @source_url,
+        docs: docs()
+      ]
+    end
+
+    def application, do: [extra_applications: [:logger]]
+
+    defp deps do
+      [
+        {:ex_doc, "~> 0.31", only: :dev, runtime: false}
+      ]
+    end
+
+    defp package do
+      [
+        # --- Required ---
+        licenses: ["Apache-2.0"],
+        links: %{"GitHub" => @source_url, "Changelog" => "#{@source_url}/blob/main/CHANGELOG.md"},
+
+        # --- Whitelist: nothing outside this gets shipped ---
+        files: ~w(lib mix.exs README.md LICENSE CHANGELOG.md .formatter.exs),
+
+        # --- For private publishing, uncomment:
+        # organization: "your_org",
+
+        maintainers: ["Your Name <you@example.com>"]
+      ]
+    end
+
+    defp docs do
+      [
+        main: "readme",
+        extras: ["README.md", "CHANGELOG.md"],
+        source_ref: "v#{@version}",
+        source_url: @source_url
+      ]
+    end
+  end
+
+  def main do
+    IO.puts("=== Package Demo ===
+  ")
+  
+    # Demo: Hex package publishing
+  IO.puts("1. mix hex.publish - publish to hex.pm")
+  IO.puts("2. Private Hex for internal packages")
+  IO.puts("3. Semver versioning")
+
+  IO.puts("
+  ✓ Hex publishing demo completed!")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [Hex.pm docs — Publishing a package](https://hex.pm/docs/publish) — the canonical guide

@@ -328,6 +328,48 @@ pipeline, not a fresh `GenStage`.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule GenstageIntro.Producer do
+    @moduledoc """
+    A trivial counter producer. It emits consecutive integers starting at 0,
+    as many per batch as the consumer demands.
+    """
+
+    use GenStage
+
+    @spec start_link(non_neg_integer()) :: GenServer.on_start()
+    def start_link(initial \\ 0) do
+      GenStage.start_link(__MODULE__, initial, name: __MODULE__)
+    end
+
+    @impl true
+    def init(counter), do: {:producer, counter}
+
+    @impl true
+    def handle_demand(demand, counter) when demand > 0 do
+      # Emit exactly `demand` events: counter, counter+1, ..., counter+demand-1.
+      # The producer contract is "emit AT MOST demand"; we always have more
+      # integers to hand out, so we satisfy the full request.
+      events = Enum.to_list(counter..(counter + demand - 1))
+      {:noreply, events, counter + demand}
+    end
+  end
+
+  def main do
+    IO.puts("GenstageIntro OK")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`GenStage` — hexdocs](https://hexdocs.pm/gen_stage/GenStage.html)

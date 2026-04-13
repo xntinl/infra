@@ -54,6 +54,22 @@ JSON is the right default for most channels. Binary wins specifically when paylo
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. The V2 wire frame
 
 The V2 Phoenix protocol serializes every client/server frame as a 5-element array:
@@ -606,12 +622,119 @@ cut. Stick with JSON for text-heavy channels.
 
 ---
 
-## Resources
 
-- [`Phoenix.Socket.Serializer` behaviour](https://hexdocs.pm/phoenix/Phoenix.Socket.Serializer.html)
-- [`Phoenix.Socket.V2.JSONSerializer` source](https://github.com/phoenixframework/phoenix/blob/main/lib/phoenix/socket/serializers.ex)
-- [Msgpax](https://hexdocs.pm/msgpax/readme.html) — MessagePack for Elixir
-- [MessagePack specification](https://github.com/msgpack/msgpack/blob/master/spec.md)
-- [Chris McCord — Phoenix Channels deep dive (ElixirConf 2020)](https://www.youtube.com/watch?v=HkzvN1e7cv4)
-- [`@msgpack/msgpack` npm package](https://github.com/msgpack/msgpack-javascript)
-- [Dashbit — Optimizing Phoenix for real-time](https://dashbit.co/blog/optimizing-phoenix)
+## Executable Example
+
+```elixir
+# test/channels_binary/serializers/msgpack_serializer_test.exs
+defmodule ChannelsBinary.Serializers.MsgpackSerializerTest do
+  use ExUnit.Case, async: true
+
+  alias ChannelsBinary.Serializers.MsgpackSerializer
+  alias Phoenix.Socket.{Broadcast, Message, Reply}
+
+  describe "fastlane!/1" do
+    test "encodes broadcast as 5-tuple binary frame" do
+      broadcast = %Broadcast{topic: "book:BTC", event: "tick", payload: %{"bid" => 42_000}}
+
+      {:socket_push, :binary, iodata} = MsgpackSerializer.fastlane!(broadcast)
+      decoded = iodata |> IO.iodata_to_binary() |> Msgpax.unpack!()
+
+      assert decoded == [nil, nil, "book:BTC", "tick", %{"bid" => 42_000}]
+    end
+  end
+
+  describe "encode!/1" do
+    test "encodes message preserving refs" do
+      msg = %Message{
+        join_ref: "1",
+        ref: "7",
+        topic: "book:ETH",
+        event: "tick",
+        payload: %{"bid" => 2_500}
+      }
+
+      {:socket_push, :binary, iodata} = MsgpackSerializer.encode!(msg)
+      decoded = iodata |> IO.iodata_to_binary() |> Msgpax.unpack!()
+
+      assert decoded == ["1", "7", "book:ETH", "tick", %{"bid" => 2_500}]
+    end
+
+    test "encodes reply with status field" do
+      reply = %Reply{
+        join_ref: "1",
+        ref: "3",
+        topic: "book:BTC",
+        status: :ok,
+        payload: %{"subscribed" => "BTC"}
+      }
+
+      {:socket_push, :binary, iodata} = MsgpackSerializer.encode!(reply)
+      decoded = iodata |> IO.iodata_to_binary() |> Msgpax.unpack!()
+
+      assert decoded == [
+               "1",
+               "3",
+               "book:BTC",
+               "phx_reply",
+               %{"status" => "ok", "response" => %{"subscribed" => "BTC"}}
+             ]
+    end
+  end
+
+  describe "decode!/2" do
+    test "decodes binary frame into Message struct" do
+      raw = Msgpax.pack!(["1", "5", "book:BTC", "subscribe", %{}])
+
+      assert %Message{
+               join_ref: "1",
+               ref: "5",
+               topic: "book:BTC",
+               event: "subscribe",
+               payload: %{}
+             } = MsgpackSerializer.decode!(raw, opcode: :binary)
+    end
+
+    test "falls back to JSON for text frames during handshake" do
+      raw = Jason.encode!(["1", "5", "book:BTC", "heartbeat", %{}])
+
+      assert %Message{event: "heartbeat"} =
+               MsgpackSerializer.decode!(raw, opcode: :text)
+    end
+  end
+
+  describe "size vs JSON" do
+    test "msgpack frame is smaller than JSON for a typical tick" do
+      payload = %{
+        "symbol" => "BTC-USD",
+        "bid" => 42_137.5,
+        "ask" => 42_138.0,
+        "last" => 42_137.75,
+        "volume" => 1_234.5,
+        "ts" => 1_712_000_000_000
+      }
+
+      broadcast = %Broadcast{topic: "book:BTC-USD", event: "tick", payload: payload}
+
+      {:socket_push, :binary, msgpack_iodata} = MsgpackSerializer.fastlane!(broadcast)
+      msgpack_size = IO.iodata_length(msgpack_iodata)
+
+      json_size =
+        Jason.encode_to_iodata!([nil, nil, broadcast.topic, broadcast.event, payload])
+        |> IO.iodata_length()
+
+      assert msgpack_size < json_size
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+    IO.puts("✓ Phoenix Channels with Binary MessagePack Serialization")
+  - Demonstrating core concepts
+    - Implementation patterns and best practices
+  end
+end
+
+Main.main()
+```

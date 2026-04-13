@@ -614,6 +614,264 @@ If one validation step is expensive (e.g., a database uniqueness check), how wou
 
 Your product owner asks to collect *all* validation errors, not just the first. Does `with` still fit, or do you need a different structure? Sketch the alternative.
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Validator do
+  @moduledoc """
+  Validates user registration data using idiomatic Elixir control flow.
+
+  Demonstrates `with` for sequential validation chains,
+  `case` for pattern-based branching, and `cond` for boolean conditions.
+  """
+
+  @type validation_result :: :ok | {:error, String.t()}
+  @type field_errors :: %{atom() => [String.t()]}
+
+  @doc """
+  Validates all registration fields using a `with` chain.
+
+  Stops at the first validation failure and returns the error.
+  Use `validate_all/1` to collect all errors at once.
+
+  ## Examples
+
+      iex> Validator.validate(%{email: "user@example.com", password: "Str0ng!Pass", username: "alice", age: 25})
+      :ok
+
+      iex> Validator.validate(%{email: "bad", password: "Str0ng!Pass", username: "alice", age: 25})
+      {:error, "email must contain exactly one @ character"}
+
+  """
+  @spec validate(map()) :: :ok | {:error, String.t()}
+  def validate(params) when is_map(params) do
+    with :ok <- validate_email(params[:email]),
+         :ok <- validate_password(params[:password]),
+         :ok <- validate_username(params[:username]),
+         :ok <- validate_age(params[:age]) do
+      :ok
+    end
+  end
+
+  @doc """
+  Validates all fields and collects ALL errors, not just the first.
+
+  This is the production pattern: show the user every problem at once
+  so they can fix everything in one round.
+
+  ## Examples
+
+      iex> Validator.validate_all(%{email: "bad", password: "short", username: "", age: -1})
+      {:error, %{email: ["email must contain exactly one @ character"], password: ["password must be at least 8 characters"], username: ["username is required"], age: ["age must be between 13 and 120"]}}
+
+      iex> Validator.validate_all(%{email: "a@b.com", password: "Str0ng!Pass", username: "alice", age: 25})
+      :ok
+
+  """
+  @spec validate_all(map()) :: :ok | {:error, field_errors()}
+  def validate_all(params) when is_map(params) do
+    validations = [
+      {:email, validate_email(params[:email])},
+      {:password, validate_password(params[:password])},
+      {:username, validate_username(params[:username])},
+      {:age, validate_age(params[:age])}
+    ]
+
+    errors =
+      validations
+      |> Enum.filter(fn {_field, result} -> result != :ok end)
+      |> Enum.map(fn {field, {:error, msg}} -> {field, [msg]} end)
+      |> Map.new()
+
+    case errors do
+      empty when map_size(empty) == 0 -> :ok
+      errors -> {:error, errors}
+    end
+  end
+
+  @doc """
+  Validates an email address using pattern matching and string functions.
+
+  ## Examples
+
+      iex> Validator.validate_email("user@example.com")
+      :ok
+
+      iex> Validator.validate_email(nil)
+      {:error, "email is required"}
+
+      iex> Validator.validate_email("no-at-sign")
+      {:error, "email must contain exactly one @ character"}
+
+  """
+  @spec validate_email(term()) :: validation_result()
+  def validate_email(nil), do: {:error, "email is required"}
+  def validate_email(""), do: {:error, "email is required"}
+
+  def validate_email(email) when is_binary(email) do
+    case String.split(email, "@") do
+      [local, domain] when byte_size(local) > 0 and byte_size(domain) > 2 ->
+        if String.contains?(domain, ".") do
+          :ok
+        else
+          {:error, "email domain must contain a dot"}
+        end
+
+      [_, _] ->
+        {:error, "email local part or domain is too short"}
+
+      _ ->
+        {:error, "email must contain exactly one @ character"}
+    end
+  end
+
+  def validate_email(_), do: {:error, "email must be a string"}
+
+  @doc """
+  Validates password strength using `cond` for multi-condition checks.
+
+  ## Examples
+
+      iex> Validator.validate_password("Str0ng!Pass")
+      :ok
+
+      iex> Validator.validate_password("short")
+      {:error, "password must be at least 8 characters"}
+
+  """
+  @spec validate_password(term()) :: validation_result()
+  def validate_password(nil), do: {:error, "password is required"}
+
+  def validate_password(password) when is_binary(password) do
+    cond do
+      String.length(password) < 8 ->
+        {:error, "password must be at least 8 characters"}
+
+      not Regex.match?(~r/[A-Z]/, password) ->
+        {:error, "password must contain at least one uppercase letter"}
+
+      not Regex.match?(~r/[0-9]/, password) ->
+        {:error, "password must contain at least one digit"}
+
+      not Regex.match?(~r/[^a-zA-Z0-9]/, password) ->
+        {:error, "password must contain at least one special character"}
+
+      true ->
+        :ok
+    end
+  end
+
+  def validate_password(_), do: {:error, "password must be a string"}
+
+  @doc """
+  Classifies password strength using `cond`.
+
+  ## Examples
+
+      iex> Validator.password_strength("Str0ng!Password123")
+      :strong
+
+      iex> Validator.password_strength("Str0ng!P")
+      :medium
+
+      iex> Validator.password_strength("weak")
+      :weak
+
+  """
+  @spec password_strength(String.t()) :: :weak | :medium | :strong
+  def password_strength(password) when is_binary(password) do
+    score = compute_strength_score(password)
+
+    cond do
+      score >= 4 -> :strong
+      score >= 2 -> :medium
+      true -> :weak
+    end
+  end
+
+  @doc """
+  Validates a username.
+
+  ## Examples
+
+      iex> Validator.validate_username("alice")
+      :ok
+
+      iex> Validator.validate_username("")
+      {:error, "username is required"}
+
+      iex> Validator.validate_username("ab")
+      {:error, "username must be between 3 and 20 characters"}
+
+  """
+  @spec validate_username(term()) :: validation_result()
+  def validate_username(nil), do: {:error, "username is required"}
+  def validate_username(""), do: {:error, "username is required"}
+
+  def validate_username(username) when is_binary(username) do
+    len = String.length(username)
+
+    cond do
+      len < 3 or len > 20 ->
+        {:error, "username must be between 3 and 20 characters"}
+
+      not Regex.match?(~r/^[a-zA-Z0-9_]+$/, username) ->
+        {:error, "username must contain only letters, numbers, and underscores"}
+
+      true ->
+        :ok
+    end
+  end
+
+  def validate_username(_), do: {:error, "username must be a string"}
+
+  @doc """
+  Validates age using guards.
+
+  ## Examples
+
+      iex> Validator.validate_age(25)
+      :ok
+
+      iex> Validator.validate_age(10)
+      {:error, "age must be between 13 and 120"}
+
+      iex> Validator.validate_age(nil)
+      {:error, "age is required"}
+
+  """
+  @spec validate_age(term()) :: validation_result()
+  def validate_age(nil), do: {:error, "age is required"}
+
+  def validate_age(age) when is_integer(age) and age >= 13 and age <= 120 do
+    :ok
+  end
+
+  def validate_age(age) when is_integer(age) do
+    {:error, "age must be between 13 and 120"}
+  end
+
+  def validate_age(_), do: {:error, "age must be an integer"}
+
+  # --- Private helpers ---
+
+  @spec compute_strength_score(String.t()) :: non_neg_integer()
+  defp compute_strength_score(password) do
+    checks = [
+      String.length(password) >= 12,
+      Regex.match?(~r/[A-Z]/, password),
+      Regex.match?(~r/[a-z]/, password),
+      Regex.match?(~r/[0-9]/, password),
+      Regex.match?(~r/[^a-zA-Z0-9]/, password)
+    ]
+
+    Enum.count(checks, & &1)
+  end
+end
+```
+
 ## Resources
 
 - [case, cond, and if — Elixir Getting Started](https://elixir-lang.org/getting-started/case-cond-and-if.html)

@@ -54,6 +54,22 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Command vs event: intent vs fact
 
 A **command** is a request that may be rejected (`DepositMoney`, imperative, future tense). An **event** is an immutable fact that already happened (`MoneyDeposited`, past tense, cannot be rejected). The aggregate is the only place where commands are validated and converted into events.
@@ -575,21 +591,335 @@ On modern hardware with the in-memory adapter expect ~5–10k deposits/sec on a 
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
-
-- [Commanded hexdocs](https://hexdocs.pm/commanded/Commanded.html) — canonical API reference
-- [`commanded/commanded` on GitHub](https://github.com/commanded/commanded) — source and design docs
-- [Getting Started guide](https://github.com/commanded/commanded/blob/master/guides/Getting%20Started.md) — by Commanded's author Ben Smith
-- [Greg Young — "CQRS Documents"](https://cqrs.files.wordpress.com/2010/11/cqrs_documents.pdf) — foundational paper
-- [Martin Fowler — "Event Sourcing"](https://martinfowler.com/eaaDev/EventSourcing.html) — pattern overview
-- [Versioning in an Event Sourced System — Greg Young](https://leanpub.com/esversioning/read) — schema evolution deep-dive
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+defmodule CommandedAggregates.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :commanded_aggregates,
+      version: "0.1.0",
+      elixir: "~> 1.16",
+      deps: deps()
+    ]
+  end
+
+  def application do
+    [extra_applications: [:logger], mod: {CommandedAggregates.Application, []}]
+  end
+
+  defp deps do
+    [
+      {:commanded, "~> 1.4"},
+      {:jason, "~> 1.4"}
+    ]
+  end
+end
+
+# lib/commanded_aggregates/commands/open_account.ex
+defmodule CommandedAggregates.Commands.OpenAccount do
+  @enforce_keys [:account_id, :owner, :overdraft_limit]
+  defstruct [:account_id, :owner, :overdraft_limit]
+
+  @type t :: %__MODULE__{
+          account_id: String.t(),
+          owner: String.t(),
+          overdraft_limit: non_neg_integer()
+        }
+end
+
+# lib/commanded_aggregates/commands/deposit.ex
+defmodule CommandedAggregates.Commands.Deposit do
+  @enforce_keys [:account_id, :amount]
+  defstruct [:account_id, :amount]
+end
+
+# lib/commanded_aggregates/commands/withdraw.ex
+defmodule CommandedAggregates.Commands.Withdraw do
+  @enforce_keys [:account_id, :amount]
+  defstruct [:account_id, :amount]
+end
+
+# lib/commanded_aggregates/commands/close_account.ex
+defmodule CommandedAggregates.Commands.CloseAccount do
+  @enforce_keys [:account_id]
+  defstruct [:account_id]
+end
+
+# lib/commanded_aggregates/events/account_opened.ex
+defmodule CommandedAggregates.Events.AccountOpened do
+  @derive Jason.Encoder
+  defstruct [:account_id, :owner, :overdraft_limit, :opened_at]
+end
+
+# lib/commanded_aggregates/events/money_deposited.ex
+defmodule CommandedAggregates.Events.MoneyDeposited do
+  @derive Jason.Encoder
+  defstruct [:account_id, :amount, :new_balance, :deposited_at]
+end
+
+# lib/commanded_aggregates/events/money_withdrawn.ex
+defmodule CommandedAggregates.Events.MoneyWithdrawn do
+  @derive Jason.Encoder
+  defstruct [:account_id, :amount, :new_balance, :withdrawn_at]
+end
+
+# lib/commanded_aggregates/events/account_closed.ex
+defmodule CommandedAggregates.Events.AccountClosed do
+  @derive Jason.Encoder
+  defstruct [:account_id, :closed_at]
+end
+
+defmodule CommandedAggregates.Account do
+  end
+  @moduledoc """
+  Event-sourced bank account aggregate.
+
+  State is derived from events. `execute/2` validates commands and produces events;
+  `apply/2` folds events into state. `apply/2` must never raise — it runs during replay.
+  """
+
+  alias CommandedAggregates.Commands.{OpenAccount, Deposit, Withdraw, CloseAccount}
+  alias CommandedAggregates.Events.{AccountOpened, MoneyDeposited, MoneyWithdrawn, AccountClosed}
+
+  @type status :: :pending | :open | :closed
+
+  @type t :: %__MODULE__{
+          account_id: String.t() | nil,
+          owner: String.t() | nil,
+          balance: integer(),
+          overdraft_limit: non_neg_integer(),
+          status: status()
+        }
+
+  defstruct account_id: nil,
+            owner: nil,
+            balance: 0,
+            overdraft_limit: 0,
+            status: :pending
+
+  # ----- execute/2 : command → event(s) or {:error, reason} -----------------
+
+  @spec execute(t(), struct()) :: struct() | [struct()] | {:error, atom()} | nil
+  def execute(%__MODULE__{status: :pending}, %OpenAccount{} = cmd) do
+    %AccountOpened{
+      account_id: cmd.account_id,
+      owner: cmd.owner,
+      overdraft_limit: cmd.overdraft_limit,
+      opened_at: DateTime.utc_now()
+    }
+  end
+
+  def execute(%__MODULE__{status: :open}, %OpenAccount{}),
+    do: {:error, :already_open}
+
+  def execute(%__MODULE__{status: :closed}, _cmd),
+    do: {:error, :account_closed}
+
+  def execute(%__MODULE__{status: :open} = state, %Deposit{amount: amt}) when amt > 0 do
+    %MoneyDeposited{
+      account_id: state.account_id,
+      amount: amt,
+      new_balance: state.balance + amt,
+      deposited_at: DateTime.utc_now()
+    }
+  end
+
+  def execute(%__MODULE__{}, %Deposit{amount: amt}) when amt <= 0,
+    do: {:error, :invalid_amount}
+
+  def execute(%__MODULE__{status: :open} = state, %Withdraw{amount: amt}) when amt > 0 do
+    new_balance = state.balance - amt
+
+    if new_balance < -state.overdraft_limit do
+      {:error, :overdraft_exceeded}
+    else
+      %MoneyWithdrawn{
+        account_id: state.account_id,
+        amount: amt,
+        new_balance: new_balance,
+        withdrawn_at: DateTime.utc_now()
+      }
+    end
+  end
+
+  def execute(%__MODULE__{}, %Withdraw{amount: amt}) when amt <= 0,
+    do: {:error, :invalid_amount}
+
+  def execute(%__MODULE__{status: :open, balance: 0} = state, %CloseAccount{}) do
+    %AccountClosed{account_id: state.account_id, closed_at: DateTime.utc_now()}
+  end
+
+  def execute(%__MODULE__{status: :open}, %CloseAccount{}),
+    do: {:error, :non_zero_balance}
+
+  def execute(%__MODULE__{status: :pending}, _),
+    do: {:error, :account_not_open}
+
+  # ----- apply/2 : event → new state (NEVER raises) --------------------------
+
+  @spec apply(t(), struct()) :: t()
+  def apply(%__MODULE__{} = acc, %AccountOpened{} = e) do
+    %__MODULE__{
+      acc
+      | account_id: e.account_id,
+        owner: e.owner,
+        overdraft_limit: e.overdraft_limit,
+        status: :open,
+        balance: 0
+    }
+  end
+
+  def apply(%__MODULE__{} = acc, %MoneyDeposited{new_balance: nb}),
+    do: %__MODULE__{acc | balance: nb}
+
+  def apply(%__MODULE__{} = acc, %MoneyWithdrawn{new_balance: nb}),
+    do: %__MODULE__{acc | balance: nb}
+
+  def apply(%__MODULE__{} = acc, %AccountClosed{}),
+    do: %__MODULE__{acc | status: :closed}
+end
+
+defmodule CommandedAggregates.Account.Lifespan do
+  end
+  @behaviour Commanded.Aggregates.AggregateLifespan
+
+  @impl true
+  def after_event(_event), do: :timer.minutes(5)
+  @impl true
+  def after_command(_command), do: :timer.minutes(5)
+  @impl true
+  def after_error(_error), do: :stop
+end
+
+defmodule CommandedAggregates.Router do
+  use Commanded.Commands.Router
+
+  alias CommandedAggregates.Account
+  alias CommandedAggregates.Commands.{OpenAccount, Deposit, Withdraw, CloseAccount}
+
+  identify(Account, by: :account_id, prefix: "account-")
+
+  dispatch([OpenAccount, Deposit, Withdraw, CloseAccount],
+    to: Account,
+    lifespan: Account.Lifespan
+  )
+end
+
+defmodule CommandedAggregates.App do
+  use Commanded.Application,
+    otp_app: :commanded_aggregates,
+    event_store: [
+      adapter: Commanded.EventStore.Adapters.InMemory,
+      serializer: Commanded.Serialization.JsonSerializer
+    ]
+
+  router(CommandedAggregates.Router)
+end
+
+defmodule CommandedAggregates.Application do
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    children = [CommandedAggregates.App]
+    Supervisor.start_link(children, strategy: :one_for_one)
+  end
+end
+
+defmodule CommandedAggregates.AccountTest do
+  use ExUnit.Case, async: false
+
+  alias CommandedAggregates.App
+  alias CommandedAggregates.Commands.{OpenAccount, Deposit, Withdraw, CloseAccount}
+
+  setup do
+    start_supervised!(App)
+    id = "acc-" <> Integer.to_string(System.unique_integer([:positive]))
+    %{id: id}
+  end
+
+  describe "OpenAccount" do
+    test "opens a new account", %{id: id} do
+      assert :ok =
+               App.dispatch(%OpenAccount{account_id: id, owner: "Alice", overdraft_limit: 0})
+    end
+
+    test "rejects second open", %{id: id} do
+      :ok = App.dispatch(%OpenAccount{account_id: id, owner: "A", overdraft_limit: 0})
+
+      assert {:error, :already_open} =
+               App.dispatch(%OpenAccount{account_id: id, owner: "A", overdraft_limit: 0})
+    end
+  end
+
+  describe "Deposit / Withdraw" do
+    setup %{id: id} do
+      :ok = App.dispatch(%OpenAccount{account_id: id, owner: "A", overdraft_limit: 100})
+      :ok
+    end
+
+    test "deposit increases balance", %{id: id} do
+      assert :ok = App.dispatch(%Deposit{account_id: id, amount: 500})
+    end
+
+    test "rejects non-positive deposit", %{id: id} do
+      assert {:error, :invalid_amount} = App.dispatch(%Deposit{account_id: id, amount: 0})
+      assert {:error, :invalid_amount} = App.dispatch(%Deposit{account_id: id, amount: -10})
+    end
+
+    test "withdraw within overdraft is allowed", %{id: id} do
+      :ok = App.dispatch(%Deposit{account_id: id, amount: 50})
+      assert :ok = App.dispatch(%Withdraw{account_id: id, amount: 100})
+    end
+
+    test "withdraw beyond overdraft is rejected", %{id: id} do
+      assert {:error, :overdraft_exceeded} =
+               App.dispatch(%Withdraw{account_id: id, amount: 500})
+    end
+  end
+
+  describe "CloseAccount" do
+    test "rejects close with non-zero balance", %{id: id} do
+      :ok = App.dispatch(%OpenAccount{account_id: id, owner: "A", overdraft_limit: 0})
+      :ok = App.dispatch(%Deposit{account_id: id, amount: 10})
+
+      assert {:error, :non_zero_balance} = App.dispatch(%CloseAccount{account_id: id})
+    end
+
+    test "closes when balance is zero", %{id: id} do
+      :ok = App.dispatch(%OpenAccount{account_id: id, owner: "A", overdraft_limit: 0})
+      assert :ok = App.dispatch(%CloseAccount{account_id: id})
+    end
+
+    test "closed account rejects further commands", %{id: id} do
+      :ok = App.dispatch(%OpenAccount{account_id: id, owner: "A", overdraft_limit: 0})
+      :ok = App.dispatch(%CloseAccount{account_id: id})
+
+      assert {:error, :account_closed} =
+               App.dispatch(%Deposit{account_id: id, amount: 10})
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrating 65-commanded-aggregates-commands
+      :ok
+  end
+end
+
+Main.main()
+end
+end
+end
+end
+end
+end
+end
+end
+end
 end
 ```

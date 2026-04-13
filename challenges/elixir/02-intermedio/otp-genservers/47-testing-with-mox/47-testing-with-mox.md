@@ -367,6 +367,61 @@ external collaborators.
 
 - Si las behaviours cambian cada sprint, ¿Mox sigue valiendo la pena o caes en integración? Definí el punto de inflexión.
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule MockableGs.SystemClock do
+    @moduledoc "Production implementation of `MockableGs.Clock` using `System.os_time/1`."
+
+    @behaviour MockableGs.Clock
+
+    @impl true
+    def now, do: System.os_time(:second)
+  end
+
+  defmodule MockableGs.Clock do
+    @callback now() :: integer()
+  end
+
+  defmodule MockableGs do
+    use GenServer
+  
+    defmodule State do
+      defstruct [:events]
+    end
+  
+    def start_link, do: GenServer.start_link(__MODULE__, :ok)
+    def record(server, event), do: GenServer.call(server, {:record, event})
+    def events(server), do: GenServer.call(server, :events)
+  
+    def init(:ok), do: {:ok, %State{events: []}}
+    def handle_call({:record, event}, _from, %State{events: evs} = state) do
+      ts = System.os_time(:second)
+      {:reply, :ok, %{state | events: [{ts, event} | evs]}}
+    end
+    def handle_call(:events, _from, %State{events: evs} = state) do
+      {:reply, evs, state}
+    end
+  end
+
+  def main do
+    {:ok, pid} = MockableGs.start_link()
+    :ok = MockableGs.record(pid, :event1)
+    :ok = MockableGs.record(pid, :event2)
+    evs = MockableGs.events(pid)
+    IO.puts("Recorded #{length(evs)} events")
+    IO.puts("✓ MockableGs works correctly")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Mox` — library docs](https://hexdocs.pm/mox/)

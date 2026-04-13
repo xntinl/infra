@@ -47,6 +47,22 @@ tree_design/
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Failure domains from dependency graphs
 
 Draw your system as a directed graph of "uses":
@@ -563,11 +579,161 @@ Target: cold-boot end-to-end ≤ 200 ms for the full tree; any single `init/1` �
 
 ---
 
-## Resources
 
-- [Designing Elixir Systems with OTP — James Edward Gray II & Bruce Tate](https://pragprog.com/titles/jgotp/designing-elixir-systems-with-otp/) — the definitive book on tree design.
-- [Supervisor — hexdocs](https://hexdocs.pm/elixir/Supervisor.html) — strategies, start/shutdown order.
-- [Fred Hébert — Stuff Goes Bad: Erlang in Anger](https://www.erlang-in-anger.com/) — free PDF, chapter on supervision trees in production.
-- [Phoenix Application supervisor](https://github.com/phoenixframework/phoenix/blob/main/lib/phoenix/endpoint/supervisor.ex) — read a real three-level tree.
-- [Dashbit blog — Your OTP app as an umbrella or not](https://dashbit.co/blog/are-umbrella-apps-dead-in-elixir) — José Valim on structural choices.
-- [Saša Jurić — Elixir in Action, 2nd ed., Ch. 9](https://www.manning.com/books/elixir-in-action-second-edition) — worked examples of supervisor hierarchies.
+## Executable Example
+
+```elixir
+# test/tree_design/tree_topology_test.exs
+defmodule TreeDesign.TreeTopologyTest do
+  use ExUnit.Case, async: false
+
+  describe "TreeDesign.TreeTopology" do
+    test "root children start in declared order" do
+      children = Supervisor.which_children(TreeDesign.Supervisor)
+      ids = Enum.map(children, fn {id, _, _, _} -> id end) |> Enum.reverse()
+
+      assert ids == [
+               TreeDesign.Observability.Supervisor,
+               TreeDesign.Infra.Supervisor,
+               TreeDesign.Domain.Supervisor,
+               TreeDesign.Edge.Supervisor
+             ]
+    end
+
+    test "infra crash restarts domain and edge (rest_for_one at root)" do
+      pid_obs = Process.whereis(TreeDesign.Observability.Supervisor)
+      pid_domain = Process.whereis(TreeDesign.Domain.Supervisor)
+      pid_edge = Process.whereis(TreeDesign.Edge.Supervisor)
+      pid_infra = Process.whereis(TreeDesign.Infra.Supervisor)
+
+      ref = Process.monitor(pid_infra)
+      Process.exit(pid_infra, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^pid_infra, _}, 500
+
+      wait_until(fn ->
+        pid_domain_new = Process.whereis(TreeDesign.Domain.Supervisor)
+        pid_edge_new = Process.whereis(TreeDesign.Edge.Supervisor)
+
+        is_pid(pid_domain_new) and pid_domain_new != pid_domain and
+          is_pid(pid_edge_new) and pid_edge_new != pid_edge
+      end)
+
+      # Observability is BEFORE infra in the rest_for_one order → untouched.
+      assert Process.whereis(TreeDesign.Observability.Supervisor) == pid_obs
+    end
+
+    test "leaf inventory crash does not affect orders' siblings above" do
+      pid_inv = Process.whereis(TreeDesign.Domain.Inventory)
+      pid_pricing = Process.whereis(TreeDesign.Domain.Pricing)
+      pid_orders = Process.whereis(TreeDesign.Domain.Orders)
+
+      ref = Process.monitor(pid_inv)
+      Process.exit(pid_inv, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^pid_inv, _}, 500
+
+      wait_until(fn ->
+        pricing_new = Process.whereis(TreeDesign.Domain.Pricing)
+        orders_new = Process.whereis(TreeDesign.Domain.Orders)
+        # rest_for_one: inventory crash restarts pricing and orders
+        pricing_new != pid_pricing and orders_new != pid_orders
+      end)
+    end
+  end
+
+  defp wait_until(fun, timeout \\ 1_000) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+
+    Stream.repeatedly(fn -> fun.() end)
+    |> Enum.find(fn
+      true -> true
+      _ ->
+        if System.monotonic_time(:millisecond) > deadline,
+          do: raise("wait_until timeout"),
+          else: (Process.sleep(10); false)
+    end)
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrate realistic multi-layer supervision tree design
+
+      # Start the application supervisor
+      {:ok, sup_pid} = TreeDesign.Application.start(:normal, [])
+
+      assert is_pid(sup_pid), "Root supervisor must start"
+      IO.inspect(sup_pid, label: "Root supervisor PID")
+
+      # Verify the tree structure: root → Observability + Infrastructure
+      obs_sup = Process.whereis(TreeDesign.Observability.Supervisor)
+      infra_sup = Process.whereis(TreeDesign.Infrastructure.Supervisor)
+
+      assert is_pid(obs_sup), "Observability.Supervisor must be running"
+      assert is_pid(infra_sup), "Infrastructure.Supervisor must be running"
+
+      IO.puts("✓ Root one_for_one supervisor started")
+      IO.puts("✓ Observability subsystem (independent, tight budget) initialized")
+      IO.puts("✓ Infrastructure subsystem (dependent stages) initialized")
+
+      # Verify infrastructure's rest_for_one structure: Cache → Database → Edge
+      cache_pid = Process.whereis(TreeDesign.Infrastructure.Cache)
+      db_pid = Process.whereis(TreeDesign.Infrastructure.Database)
+      edge_pid = Process.whereis(TreeDesign.Infrastructure.Edge)
+
+      assert is_pid(cache_pid), "Cache must exist"
+      assert is_pid(db_pid), "Database must exist"
+      assert is_pid(edge_pid), "Edge must exist"
+
+      IO.puts("✓ rest_for_one pipeline verified (Cache → Database → Edge)")
+
+      # Verify domain's rest_for_one structure: Inventory → Pricing → Orders
+      domain_sup = Process.whereis(TreeDesign.Domain.Supervisor)
+      assert is_pid(domain_sup), "Domain.Supervisor must be running"
+
+      inv_pid = Process.whereis(TreeDesign.Domain.Inventory)
+      pricing_pid = Process.whereis(TreeDesign.Domain.Pricing)
+      orders_pid = Process.whereis(TreeDesign.Domain.Orders)
+
+      assert is_pid(inv_pid), "Inventory must exist"
+      assert is_pid(pricing_pid), "Pricing must exist"
+      assert is_pid(orders_pid), "Orders must exist"
+
+      IO.puts("✓ Domain rest_for_one structure verified (Inventory → Pricing → Orders)")
+
+      # Test independent leaf: Observability should survive domain failures
+      obs_before = Process.whereis(TreeDesign.Observability.Supervisor)
+
+      # Kill an infrastructure leaf (Cache)
+      ref = Process.monitor(cache_pid)
+      Process.exit(cache_pid, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^cache_pid, _}, 500
+
+      Process.sleep(100)
+
+      # Observability should still be the same PID (rest_for_one at root only affects its children)
+      obs_after = Process.whereis(TreeDesign.Observability.Supervisor)
+      assert obs_before == obs_after, "Observability should be unaffected by infrastructure crash"
+
+      IO.puts("✓ Failure isolation: Observability unaffected by infrastructure crash")
+
+      # Verify cache was restarted (rest_for_one restarts it)
+      cache_new = Process.whereis(TreeDesign.Infrastructure.Cache)
+      assert is_pid(cache_new), "Cache should be restarted"
+      assert cache_new != cache_pid, "Cache PID should be new after restart"
+
+      IO.puts("✓ rest_for_one restart verified: Cache restarted after crash")
+
+      IO.puts("\n✓ Multi-layer supervision tree structure demonstrated:")
+      IO.puts("  - Root (one_for_one): contains independent subsystems")
+      IO.puts("  - Observability (one_for_one): independent telemetry workers")
+      IO.puts("  - Infrastructure (rest_for_one): stateful pipeline (Cache → DB → Edge)")
+      IO.puts("  - Domain (rest_for_one): business logic pipeline")
+      IO.puts("✓ Failure domain isolation working correctly")
+
+      Supervisor.stop(sup_pid)
+      IO.puts("✓ Supervision tree shutdown complete")
+  end
+end
+
+Main.main()
+```

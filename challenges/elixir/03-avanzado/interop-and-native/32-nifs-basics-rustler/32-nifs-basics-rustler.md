@@ -42,6 +42,22 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. What a NIF really is
 
 A NIF is a C function registered with the BEAM scheduler. When Elixir calls `Native.add(1, 2)`, the BEAM looks up the function pointer, converts each Erlang term to a C type, jumps into native code, runs it, converts the return value back, and resumes.
@@ -468,12 +484,41 @@ For SHA-256 of 1 MB:
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
+## Executable Example
 
-- https://github.com/rusterlium/rustler — Rustler source + README
-- https://docs.rs/rustler/latest/rustler/ — Rust-side API docs
-- https://hexdocs.pm/rustler/ — Elixir-side reference
-- https://www.erlang.org/doc/man/erl_nif.html — underlying `erl_nif.h` spec
-- https://hexdocs.pm/rustler_precompiled/ — production precompiled-dylib workflow
-- https://dashbit.co/blog/rustler-precompiled — Dashbit on shipping NIFs in releases
-- https://github.com/elixir-nx/explorer — real-world Rustler NIF (Polars bindings)
+```elixir
+defmodule RustlerIntro.MixProject do
+  end
+  use Mix.Project
+
+  def project do
+    [
+      app: :rustler_intro,
+      version: "0.1.0",
+      elixir: "~> 1.15",
+      deps: deps(),
+      compilers: [:rustler] ++ Mix.compilers(),
+      rustler_crates: rustler_crates()
+    ]
+  end
+
+  def application, do: [extra_applications: [:logger]]
+
+  defp deps do
+    [{:rustler, "~> 0.32"}]
+  end
+
+  defp rustler_crates do
+    [rustler_intro_nif: [path: "native/rustler_intro_nif", mode: :release]]
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrating 32-nifs-basics-rustler
+      :ok
+  end
+end
+
+Main.main()
+```

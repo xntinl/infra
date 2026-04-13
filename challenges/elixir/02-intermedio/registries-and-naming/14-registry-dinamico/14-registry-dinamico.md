@@ -433,6 +433,140 @@ need duplicate-key pubsub semantics.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule ChatRoomsRegistry.Room do
+  @moduledoc """
+  A single chat room. State is just a list of messages; what matters for
+  this exercise is that the room is *addressable by name* via the Registry.
+  """
+
+  use GenServer
+
+  # ── Public API ──────────────────────────────────────────────────────────
+
+  @doc "Starts a room registered under `name` in the shared Registry."
+  @spec start_link(String.t()) :: GenServer.on_start()
+  def start_link(name) when is_binary(name) do
+    GenServer.start_link(__MODULE__, name, name: via(name))
+  end
+
+  @doc "Appends a message to the room. Accepts the room name, not a pid."
+  @spec post(String.t(), String.t()) :: :ok
+  def post(name, msg), do: GenServer.cast(via(name), {:post, msg})
+
+  @doc "Returns all messages in the room (newest last)."
+  @spec history(String.t()) :: [String.t()]
+  def history(name), do: GenServer.call(via(name), :history)
+
+  # Construct the `:via` tuple once — every caller uses this helper so the
+  # registry name is defined in one place.
+  defp via(name), do: {:via, Registry, {ChatRoomsRegistry.Registry, name}}
+
+  # ── Callbacks ───────────────────────────────────────────────────────────
+
+  @impl true
+  def init(name), do: {:ok, %{name: name, messages: []}}
+
+  @impl true
+  def handle_cast({:post, msg}, %{messages: msgs} = state) do
+    {:noreply, %{state | messages: msgs ++ [msg]}}
+  end
+
+  @impl true
+  def handle_call(:history, _from, %{messages: msgs} = state) do
+    {:reply, msgs, state}
+  end
+end
+
+defmodule ChatRoomsRegistry.Rooms do
+  @moduledoc """
+  Façade over the Registry + DynamicSupervisor pair. `find_or_start/1` is
+  the usual "get me a room by name, spawning one if needed" operation.
+  """
+
+  alias ChatRoomsRegistry.Room
+
+  @registry ChatRoomsRegistry.Registry
+  @sup ChatRoomsRegistry.RoomSup
+
+  @doc """
+  Returns `{:ok, pid}` for the room named `name`, starting it under the
+  DynamicSupervisor if it does not yet exist. Idempotent and safe to call
+  from many processes concurrently.
+  """
+  @spec find_or_start(String.t()) :: {:ok, pid()}
+  def find_or_start(name) do
+    case Registry.lookup(@registry, name) do
+      [{pid, _}] ->
+        {:ok, pid}
+
+      [] ->
+        # The Registry itself handles the concurrent race: a second starter
+        # will receive `{:error, {:already_started, pid}}` from start_child,
+        # and we return that pid.
+        case DynamicSupervisor.start_child(@sup, {Room, name}) do
+          {:ok, pid} -> {:ok, pid}
+          {:error, {:already_started, pid}} -> {:ok, pid}
+        end
+    end
+  end
+
+  @doc "List currently registered room names."
+  @spec list() :: [String.t()]
+  def list do
+    # select/2 with a match spec is the cheapest way to enumerate keys.
+    Registry.select(@registry, [{{:"$1", :_, :_}, [], [:"$1"]}])
+  end
+
+  @doc "Stop a room by name. Returns :ok whether or not it existed."
+  @spec stop(String.t()) :: :ok
+  def stop(name) do
+    case Registry.lookup(@registry, name) do
+      [{pid, _}] -> DynamicSupervisor.terminate_child(@sup, pid)
+      [] -> :ok
+    end
+
+    :ok
+  end
+end
+
+# Demonstrate Registry-based dynamic process registration
+IO.puts("=== ChatRoomsRegistry Demo ===")
+
+# Start Registry and DynamicSupervisor
+{:ok, _registry} = Registry.start_link(keys: :unique, name: ChatRoomsRegistry.Registry)
+{:ok, _sup} = DynamicSupervisor.start_link(strategy: :one_for_one, name: ChatRoomsRegistry.RoomSup)
+
+# Find or start rooms
+{:ok, room_a} = ChatRoomsRegistry.Rooms.find_or_start("general")
+{:ok, room_b} = ChatRoomsRegistry.Rooms.find_or_start("dev-ops")
+assert Process.alive?(room_a)
+assert Process.alive?(room_b)
+
+# Post messages and verify
+ChatRoomsRegistry.Room.post("general", "hello")
+ChatRoomsRegistry.Room.post("general", "world")
+assert ChatRoomsRegistry.Room.history("general") == ["hello", "world"]
+
+ChatRoomsRegistry.Room.post("dev-ops", "testing")
+assert ChatRoomsRegistry.Room.history("dev-ops") == ["testing"]
+
+# Verify list
+rooms = ChatRoomsRegistry.Rooms.list()
+assert "general" in rooms
+assert "dev-ops" in rooms
+
+IO.puts("Rooms registered: #{inspect(rooms)}")
+IO.puts("General room messages: #{inspect(ChatRoomsRegistry.Room.history("general"))}")
+IO.puts("Dev-ops room messages: #{inspect(ChatRoomsRegistry.Room.history("dev-ops"))}")
+IO.puts("All registry assertions passed!")
+```
+
+
 ## Resources
 
 - [`Registry` — Elixir stdlib](https://hexdocs.pm/elixir/Registry.html)

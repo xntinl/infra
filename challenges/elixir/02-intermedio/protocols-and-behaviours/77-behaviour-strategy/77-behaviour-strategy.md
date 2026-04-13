@@ -367,6 +367,61 @@ algorithms have distinct shapes and likely continue to diverge.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule PricingStrategy.Tiered do
+    @moduledoc """
+    Tiered/volume pricing. `tiers` is a list of `{min_quantity, unit_price}`
+    sorted ascending by `min_quantity`. The matching tier is the highest
+    `min_quantity` ≤ `quantity`.
+    """
+
+    @behaviour PricingStrategy
+
+    @impl PricingStrategy
+    def calculate(quantity, opts) do
+      with {:ok, tiers} <- fetch_tiers(opts),
+           {:ok, unit_price} <- pick_tier(tiers, quantity) do
+        {:ok, quantity * unit_price}
+      end
+    end
+
+    defp fetch_tiers(opts) do
+      case Keyword.fetch(opts, :tiers) do
+        {:ok, tiers} when is_list(tiers) and tiers != [] -> {:ok, tiers}
+        _ -> {:error, :missing_tiers}
+      end
+    end
+
+    # Walk tiers sorted descending and pick the first whose min_quantity fits.
+    # Sorting here rather than trusting caller input avoids a sneaky bug class.
+    defp pick_tier(tiers, quantity) do
+      match =
+        tiers
+        |> Enum.sort_by(fn {min, _price} -> min end, :desc)
+        |> Enum.find(fn {min, _price} -> quantity >= min end)
+
+      case match do
+        {_min, price} -> {:ok, price}
+        nil -> {:error, :no_matching_tier}
+      end
+    end
+  end
+
+  def main do
+    IO.puts("PricingStrategy OK")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Module.add_behaviour/3` and behaviours](https://hexdocs.pm/elixir/Module.html)

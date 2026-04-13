@@ -347,6 +347,146 @@ GenStage job, not a supervision strategy.
 
 - Si agregás un child al medio del orden, ¿qué pasa con la semántica de `:rest_for_one`? Describí los riesgos operacionales.
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule RestForOneDemo.Stage do
+  @moduledoc """
+  A pipeline stage that, at init time, reads the pid of its upstream stage
+  and stores it. If upstream restarts, this stage is now holding a stale
+  pid — which is exactly why :rest_for_one also restarts downstream stages
+  when an upstream one dies.
+  """
+
+  use GenServer
+
+  @type name :: atom()
+
+  @spec start_link(keyword()) :: GenServer.on_start()
+  def start_link(opts) do
+    name = Keyword.fetch!(opts, :name)
+    upstream = Keyword.get(opts, :upstream)
+    GenServer.start_link(__MODULE__, {name, upstream}, name: name)
+  end
+
+  @spec upstream_pid(name()) :: pid() | nil
+  def upstream_pid(name), do: GenServer.call(name, :upstream_pid)
+
+  @spec crash(name()) :: :ok
+  def crash(name), do: GenServer.cast(name, :crash)
+
+  @impl true
+  def init({_name, nil}), do: {:ok, %{upstream: nil}}
+
+  def init({_name, upstream_name}) do
+    # Resolve the upstream pid at init time. A restart re-runs this,
+    # ensuring we pick up the NEW upstream pid after it's restarted.
+    case Process.whereis(upstream_name) do
+      nil -> {:stop, {:missing_upstream, upstream_name}}
+      pid -> {:ok, %{upstream: pid}}
+    end
+  end
+
+  @impl true
+  def handle_call(:upstream_pid, _from, %{upstream: pid} = s), do: {:reply, pid, s}
+
+  @impl true
+  def handle_cast(:crash, _s), do: raise("stage boom")
+end
+
+defmodule RestForOneDemo.Supervisor do
+  @moduledoc """
+  Supervisor with :rest_for_one strategy. s1 → s2 → s3 form a pipeline.
+  If s1 crashes, all three restart. If s3 crashes, only s3 restarts.
+  """
+
+  use Supervisor
+
+  @spec start_link(keyword()) :: Supervisor.on_start()
+  def start_link(opts \\ []) do
+    Supervisor.start_link(__MODULE__, :ok, opts)
+  end
+
+  @impl true
+  def init(:ok) do
+    children = [
+      Supervisor.child_spec({RestForOneDemo.Stage, [name: :s1, upstream: nil]}, id: :s1),
+      Supervisor.child_spec({RestForOneDemo.Stage, [name: :s2, upstream: :s1]}, id: :s2),
+      Supervisor.child_spec({RestForOneDemo.Stage, [name: :s3, upstream: :s2]}, id: :s3)
+    ]
+
+    Supervisor.init(children, strategy: :rest_for_one)
+  end
+end
+
+# Demonstrate :rest_for_one strategy
+IO.puts("=== RestForOne Strategy Demo ===")
+
+{:ok, _sup} = RestForOneDemo.Supervisor.start_link()
+
+s1_old = Process.whereis(:s1)
+s2_old = Process.whereis(:s2)
+s3_old = Process.whereis(:s3)
+
+# Verify each knows its upstream
+assert RestForOneDemo.Stage.upstream_pid(:s2) == s1_old
+assert RestForOneDemo.Stage.upstream_pid(:s3) == s2_old
+
+IO.puts("Pipeline initialized: s1 → s2 → s3")
+
+# Crash s3 (the sink) — only s3 restarts
+ref_s3 = Process.monitor(s3_old)
+RestForOneDemo.Stage.crash(:s3)
+assert_receive {:DOWN, ^ref_s3, :process, ^s3_old, _}, 500
+
+Process.sleep(50)
+
+# s1 and s2 are untouched
+assert Process.whereis(:s1) == s1_old
+assert Process.whereis(:s2) == s2_old
+# s3 was restarted
+assert Process.whereis(:s3) != s3_old
+
+IO.puts("After crashing s3 (sink):")
+IO.puts("  s1 untouched")
+IO.puts("  s2 untouched")
+IO.puts("  s3 restarted")
+
+# Crash s1 (the source) — all restart
+s3_new = Process.whereis(:s3)
+ref_s1 = Process.monitor(s1_old)
+ref_s2 = Process.monitor(s2_old)
+ref_s3_new = Process.monitor(s3_new)
+
+RestForOneDemo.Stage.crash(:s1)
+
+assert_receive {:DOWN, ^ref_s1, :process, ^s1_old, _}, 500
+assert_receive {:DOWN, ^ref_s2, :process, ^s2_old, _}, 500
+assert_receive {:DOWN, ^ref_s3_new, :process, ^s3_new, _}, 500
+
+Process.sleep(50)
+
+# All three restarted
+assert Process.whereis(:s1) != s1_old
+assert Process.whereis(:s2) != s2_old
+assert Process.whereis(:s3) != s3_new
+
+# Verify new s2 and s3 have the new s1 and s2 pids respectively
+s1_restarted = Process.whereis(:s1)
+s2_restarted = Process.whereis(:s2)
+assert RestForOneDemo.Stage.upstream_pid(:s2) == s1_restarted
+assert RestForOneDemo.Stage.upstream_pid(:s3) == s2_restarted
+
+IO.puts("After crashing s1 (source):")
+IO.puts("  All three restarted")
+IO.puts("  New s2 has new s1 pid")
+IO.puts("  New s3 has new s2 pid")
+IO.puts("All :rest_for_one assertions passed!")
+```
+
+
 ## Resources
 
 - [`Supervisor` strategies — `:rest_for_one`](https://hexdocs.pm/elixir/Supervisor.html#module-strategies)

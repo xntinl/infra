@@ -335,6 +335,80 @@ serialization boundary.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule VisitorTracker do
+  @moduledoc """
+  Daily unique-visitor tracking with set algebra.
+  """
+
+  @type visitor_id :: integer() | String.t()
+
+  @doc """
+  Builds a MapSet from a raw list of visitor IDs (duplicates OK).
+
+  We accept an Enumerable so callers can pass a lazy stream from a DB cursor
+  without materializing the full list in memory.
+  """
+  @spec from_events(Enumerable.t()) :: MapSet.t(visitor_id())
+  def from_events(events), do: MapSet.new(events)
+
+  @doc """
+  Visitors that appeared on BOTH days — "returning users".
+
+  Intersection is commutative: order of args doesn't matter.
+  """
+  @spec returning(MapSet.t(), MapSet.t()) :: MapSet.t()
+  def returning(yesterday, today), do: MapSet.intersection(yesterday, today)
+
+  @doc """
+  Visitors that appear only `today` — "new users".
+
+  Difference is NOT commutative: `difference(today, yesterday)` =
+  "today minus yesterday", which is what we want here.
+  """
+  @spec new_today(MapSet.t(), MapSet.t()) :: MapSet.t()
+  def new_today(yesterday, today), do: MapSet.difference(today, yesterday)
+
+  @doc """
+  All unique visitors across both days — "total reach".
+  """
+  @spec total_reach(MapSet.t(), MapSet.t()) :: MapSet.t()
+  def total_reach(yesterday, today), do: MapSet.union(yesterday, today)
+
+  @doc """
+  Full daily report as a plain map of sizes (cheap to log, easy to compare).
+
+  We return counts, not the sets themselves — callers rarely need the IDs,
+  and serializing a 100k-element MapSet to JSON is a footgun.
+  """
+  @spec report(MapSet.t(), MapSet.t()) :: %{
+          returning: non_neg_integer(),
+          new_today: non_neg_integer(),
+          total_reach: non_neg_integer(),
+          retention: float()
+        }
+  def report(yesterday, today) do
+    returning_count = MapSet.size(returning(yesterday, today))
+    yesterday_count = MapSet.size(yesterday)
+
+    # Guard against empty yesterday — dividing by zero would crash the whole batch.
+    retention =
+      if yesterday_count == 0, do: 0.0, else: returning_count / yesterday_count
+
+    %{
+      returning: returning_count,
+      new_today: MapSet.size(new_today(yesterday, today)),
+      total_reach: MapSet.size(total_reach(yesterday, today)),
+      retention: retention
+    }
+  end
+end
+```
+
 ## Resources
 
 - [`MapSet` docs](https://hexdocs.pm/elixir/MapSet.html)

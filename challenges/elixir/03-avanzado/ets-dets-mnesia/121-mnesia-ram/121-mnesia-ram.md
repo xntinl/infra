@@ -52,6 +52,22 @@ ETS is a hash table. Mnesia gives the same storage plus transactions and replica
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. `ram_copies` vs `disc_copies` vs `disc_only_copies`
 
 Mnesia table storage types are chosen per-replica, not per-table. The same
@@ -728,11 +744,52 @@ two-phase commit and lock acquisition across replicas.
 
 ---
 
-## Resources
+## Executable Example
 
-- [Mnesia User's Guide — erlang.org](https://www.erlang.org/doc/apps/mnesia/users_guide.html)
-- [`:mnesia` reference — erlang.org](https://www.erlang.org/doc/man/mnesia.html)
-- [Mnesia — The Bad Parts (Dashbit)](https://dashbit.co/blog/mnesia-the-bad-parts) — mandatory reading
-- [Learn You Some Erlang — Mnesia](https://learnyousomeerlang.com/mnesia) — chapter on table types and replication
-- [libcluster](https://hexdocs.pm/libcluster/readme.html) — cluster formation strategies
-- [Horde](https://github.com/derekkraan/horde) — how Horde uses CRDTs instead of Mnesia for distributed registries
+```elixir
+defmodule MnesiaRamDemo.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :mnesia_ram_demo,
+      version: "0.1.0",
+      elixir: "~> 1.16",
+      start_permanent: Mix.env() == :prod,
+      deps: deps()
+    ]
+  end
+
+  def application do
+    [
+      extra_applications: [:logger, :mnesia],
+      mod: {MnesiaRamDemo.Application, []}
+    ]
+  end
+
+  defp deps do
+    [
+      {:libcluster, "~> 3.3"},
+      {:benchee, "~> 1.3", only: :dev}
+    ]
+  end
+end
+
+
+
+from a node that already holds the table. Mnesia streams the current contents
+to the new node and keeps it in sync from that point forward.
+
+### 4. Netsplit detection — `:inconsistent_database`
+
+When a cluster heals after a partition, Mnesia emits a system event:
+
+defmodule Main do
+  def main do
+      # Demonstrating 121-mnesia-ram
+      :ok
+  end
+end
+
+Main.main()
+```

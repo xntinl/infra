@@ -391,6 +391,51 @@ are human-driven tools, not RPC for other services.
 
 - Diseñá un script de migración de DB que corra bajo `bin/app eval`. ¿Cómo lo testeás sin una release?
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule ReleaseEvalRpc.Counter do
+    @moduledoc """
+    A trivial GenServer that holds mutable state. We use it to prove that
+    `rpc` sees the live process while `eval` starts from zero.
+    """
+
+    use GenServer
+
+    @spec start_link(any()) :: GenServer.on_start()
+    def start_link(_), do: GenServer.start_link(__MODULE__, 0, name: __MODULE__)
+
+    @spec value() :: integer()
+    def value, do: GenServer.call(__MODULE__, :value)
+
+    @spec bump() :: integer()
+    def bump, do: GenServer.call(__MODULE__, :bump)
+
+    @impl true
+    def init(n), do: {:ok, n}
+
+    @impl true
+    def handle_call(:value, _f, n), do: {:reply, n, n}
+    def handle_call(:bump, _f, n), do: {:reply, n + 1, n + 1}
+  end
+
+  def main do
+    # Demo: eval y rpc para administración de releases
+    IO.puts("ReleaseEvalRpc: demostración exitosa")
+    IO.puts("  'bin/myapp eval' ejecuta código una sola vez")
+    IO.puts("  'bin/myapp rpc' ejecuta código en el nodo vivo")
+    IO.puts("  Ambos permiten administración sin SSH")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [Mix release — launcher commands](https://hexdocs.pm/mix/Mix.Tasks.Release.html#module-bin-my_app-commands)

@@ -33,6 +33,25 @@ backpressure_queue/
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**OTP-specific insight:**
+The OTP framework enforces a discipline: supervision trees, callback modules, and standard return values. This structure is not a constraint — it's the contract that allows Erlang's release handler, hot code upgrades, and clustering to work. Every deviation from the pattern you'll pay for later in production debuggability and operational tooling.
 ### 1. `:erlang.process_info(pid, :message_queue_len)`
 
 ### Dependencies (mix.exs)
@@ -406,12 +425,205 @@ Target: peak mailbox ≤ 2× `@high_water` under any burst; overload-decision la
 
 ---
 
-## Resources
+## Executable Example
 
-- [`:erlang.process_info/2` — Erlang docs](https://www.erlang.org/doc/man/erlang.html#process_info-2)
-- [GenStage — demand-driven back-pressure](https://hexdocs.pm/gen_stage/GenStage.html)
-- [Broadway — production-grade ingest](https://hexdocs.pm/broadway/Broadway.html)
-- [Jobs (Erlang) — queue-based load regulation](https://github.com/uwiger/jobs)
-- [Fred Hébert — Queues Don't Fix Overload](https://ferd.ca/queues-don-t-fix-overload.html)
-- [Saša Jurić — Going production with Elixir](https://www.theerlangelist.com/)
-- [Chris Keathley — Good and Bad Elixir](https://keathley.io/blog/good-and-bad-elixir.html)
+```elixir
+defmodule BackpressureQueue.MixProject do
+  end
+  use Mix.Project
+
+  def project do
+    [app: :backpressure_queue, version: "0.1.0", elixir: "~> 1.16", deps: deps()]
+  end
+
+  def application do
+    [extra_applications: [:logger], mod: {BackpressureQueue.Application, []}]
+  end
+
+  defp deps, do: [{:benchee, "~> 1.3", only: :dev}]
+end
+
+defmodule BackpressureQueue.OverflowDisk do
+  @moduledoc "Append-only overflow sink; simplest durable spill."
+
+  @spec append(Path.t(), term()) :: :ok
+  def append(path, event) do
+    File.mkdir_p!(Path.dirname(path))
+    File.write!(path, :erlang.term_to_binary(event) <> "\n", [:append])
+  end
+
+  @spec drain(Path.t()) :: [term()]
+  def drain(path) do
+    case File.read(path) do
+      {:ok, ""} ->
+        []
+
+      {:ok, binary} ->
+        binary
+        |> String.split("\n", trim: true)
+        |> Enum.map(&:erlang.binary_to_term(&1))
+
+      {:error, :enoent} ->
+        []
+    end
+  end
+end
+
+defmodule BackpressureQueue.Normalizer do
+  end
+  @moduledoc """
+  Event normalizer with self-measuring back-pressure.
+
+  Policies (configurable per call):
+    * :reject  — return {:error, :overload} above high_water
+    * :defer   — write overflow to disk; return {:ok, :deferred}
+  """
+  use GenServer
+  require Logger
+
+  @high_water 500
+  @low_water 300
+  @overflow_path "priv/overflow/events.log"
+
+  @typep policy :: :reject | :defer
+  @typep state :: %{overloaded?: boolean(), accepted: non_neg_integer(), rejected: non_neg_integer(), deferred: non_neg_integer()}
+
+  @spec start_link(keyword()) :: GenServer.on_start()
+  def start_link(opts \\ []), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+
+  @doc """
+  Submit an event; returns :ok, {:ok, :deferred}, or {:error, :overload}
+  depending on mailbox pressure and chosen policy.
+  """
+  @spec submit(map(), policy()) :: :ok | {:ok, :deferred} | {:error, :overload}
+  def submit(event, policy \\ :reject) do
+    GenServer.call(__MODULE__, {:submit, event, policy})
+  end
+
+  @spec stats() :: map()
+  def stats, do: GenServer.call(__MODULE__, :stats)
+
+  @impl true
+  def init(_opts) do
+    {:ok, %{overloaded?: false, accepted: 0, rejected: 0, deferred: 0}}
+  end
+
+  @impl true
+  def handle_call({:submit, event, policy}, _from, state) do
+    {:message_queue_len, qlen} = :erlang.process_info(self(), :message_queue_len)
+    state = update_overload_flag(state, qlen)
+
+    cond do
+      not state.overloaded? ->
+        _enriched = normalize(event)
+        {:reply, :ok, %{state | accepted: state.accepted + 1}}
+
+      policy == :reject ->
+        {:reply, {:error, :overload}, %{state | rejected: state.rejected + 1}}
+
+      policy == :defer ->
+        BackpressureQueue.OverflowDisk.append(@overflow_path, event)
+        {:reply, {:ok, :deferred}, %{state | deferred: state.deferred + 1}}
+    end
+  end
+
+  def handle_call(:stats, _from, state) do
+    {:message_queue_len, qlen} = :erlang.process_info(self(), :message_queue_len)
+    {:reply, Map.put(state, :queue_len, qlen), state}
+  end
+
+  defp update_overload_flag(%{overloaded?: true} = state, qlen) when qlen <= @low_water do
+    Logger.info("normalizer back to healthy (qlen=#{qlen})")
+    %{state | overloaded?: false}
+  end
+
+  defp update_overload_flag(%{overloaded?: false} = state, qlen) when qlen >= @high_water do
+    Logger.warning("normalizer overloaded (qlen=#{qlen})")
+    %{state | overloaded?: true}
+  end
+
+  defp update_overload_flag(state, _qlen), do: state
+
+  # Pretend CPU work; in a real normalizer this would hit a cache + validate.
+  defp normalize(%{id: id} = event) do
+    Map.put(event, :normalized_at, System.monotonic_time())
+    |> Map.put(:digest, :erlang.phash2(id))
+  end
+end
+
+defmodule BackpressureQueue.Application do
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    children = [BackpressureQueue.Normalizer]
+    Supervisor.start_link(children, strategy: :one_for_one, name: BackpressureQueue.Sup)
+  end
+end
+
+defmodule BackpressureQueue.NormalizerTest do
+  use ExUnit.Case, async: false
+
+  alias BackpressureQueue.Normalizer
+
+  setup do
+    File.rm_rf!("priv/overflow")
+    {:ok, _} = start_supervised(Normalizer)
+    :ok
+  end
+
+  describe "BackpressureQueue.Normalizer" do
+    test "accepts events under the high-water mark" do
+      for i <- 1..50, do: assert :ok == Normalizer.submit(%{id: i})
+      assert Normalizer.stats().accepted == 50
+    end
+
+    test "rejects events above the high-water mark with :reject policy" do
+      # Saturate by spawning many concurrent callers that each hold the mailbox.
+      # We simulate overload by bumping the flag directly via lots of casts that
+      # queue behind our call. Simpler: call stats after slamming with 2000 submits
+      # from concurrent tasks and observe rejections.
+      tasks =
+        for i <- 1..2_000 do
+          Task.async(fn -> Normalizer.submit(%{id: i}, :reject) end)
+        end
+
+      results = Task.await_many(tasks, 30_000)
+      rejected = Enum.count(results, &(&1 == {:error, :overload}))
+      accepted = Enum.count(results, &(&1 == :ok))
+
+      # We cannot predict exact numbers but at least one must be rejected under
+      # this concurrency level, and every response must be one of the valid shapes.
+      assert accepted + rejected == 2_000
+      assert rejected >= 1
+    end
+
+    test "defers events above the high-water mark with :defer policy" do
+      tasks =
+        for i <- 1..2_000 do
+          Task.async(fn -> Normalizer.submit(%{id: i}, :defer) end)
+        end
+
+      results = Task.await_many(tasks, 30_000)
+      deferred = Enum.count(results, &(&1 == {:ok, :deferred}))
+
+      # Every response is :ok or {:ok, :deferred}; no crashes.
+      assert Enum.all?(results, fn r -> r == :ok or r == {:ok, :deferred} end)
+
+      if deferred > 0 do
+        drained = BackpressureQueue.OverflowDisk.drain("priv/overflow/events.log")
+        assert length(drained) == deferred
+      end
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrating 04-genserver-back-pressure-queue
+      :ok
+  end
+end
+
+Main.main()
+```

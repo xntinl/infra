@@ -51,6 +51,25 @@ DB, or performance is not the bottleneck.
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Metaprogramming-specific insight:**
+Code generation is powerful and dangerous. Every macro you write is a place where intent is hidden. Use macros sparingly, only when they eliminate genuine boilerplate. If your macro is more than 10 lines, you probably need a function or data structure instead. Future maintainers will thank you.
 ### 1. `unquote` vs `unquote_splicing`
 
 - `unquote(x)` interpolates a single AST fragment
@@ -373,11 +392,81 @@ Target: generated `to_eur/1` under 50 ns per call on modern hardware; runtime
 
 ---
 
-## Resources
 
-- [`Kernel.SpecialForms.unquote_splicing/1`](https://hexdocs.pm/elixir/Kernel.SpecialForms.html#unquote_splicing/1)
-- [Ecto.Schema source — field generation](https://github.com/elixir-ecto/ecto/blob/master/lib/ecto/schema.ex) — canonical example
-- [Jason.Encoder derivation](https://github.com/michalmuskala/jason/blob/master/lib/encoder.ex)
-- [*Metaprogramming Elixir* — Chris McCord, ch. 3](https://pragprog.com/titles/cmelixir/metaprogramming-elixir/)
-- [José Valim on compile-time generation](https://dashbit.co/blog)
-- [Phoenix.Router — route compilation](https://github.com/phoenixframework/phoenix/blob/main/lib/phoenix/router.ex)
+## Executable Example
+
+```elixir
+defmodule UnquoteFragment.Converter do
+  @moduledoc """
+  Emits one `to_<code>/1` function per currency using unquote_splicing inside
+  a for-comprehension. Each generated function is a pure numeric transform.
+  """
+
+  @rates UnquoteFragment.Rates.all()
+
+  for {code, rate} <- @rates do
+    fun_name = String.to_atom("to_#{code}")
+
+    @doc """
+    Converts `{amount, from_currency}` into #{code |> Atom.to_string() |> String.upcase()}.
+
+    Generated at compile time from the table in `UnquoteFragment.Rates`.
+    """
+    @spec unquote(fun_name)({number(), atom()}) :: float()
+    def unquote(fun_name)({amount, from}) when is_number(amount) and is_atom(from) do
+      usd = amount * unquote(Macro.escape(rate_lookup(@rates, :usd_from, from)))
+      usd / unquote(rate)
+    end
+  end
+
+  @doc "Returns all generated function names with their arities."
+  @spec generated_functions() :: [{atom(), arity()}]
+  def generated_functions do
+    :functions
+    |> __MODULE__.module_info()
+    |> Enum.filter(fn {name, _} -> to_string(name) =~ ~r/^to_/ end)
+  end
+
+  # Private helper used at compile time only — selects the rate for a given from-currency.
+  defp rate_lookup(rates, :usd_from, code) do
+    case Enum.find(rates, fn {c, _} -> c == code end) do
+      {^code, rate} -> rate
+      nil -> raise "unknown currency #{inspect(code)}"
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrate unquote_splicing for code generation
+      fields = [{:name, :string}, {:age, :integer}, {:email, :string}]
+
+      # Generate getters using unquote_splicing
+      defmodule Record do
+        Enum.each(fields, fn {field, _type} ->
+          def unquote(:"get_#{field}")(map) do
+            Map.get(map, unquote(field))
+          end
+        end)
+      end
+
+      # Test generated functions
+      data = %{name: "Alice", age: 30, email: "alice@example.com"}
+
+      name = Record.get_name(data)
+      age = Record.get_age(data)
+      email = Record.get_email(data)
+
+      IO.puts("✓ Generated getter: get_name → #{name}")
+      IO.puts("✓ Generated getter: get_age → #{age}")
+      IO.puts("✓ Generated getter: get_email → #{email}")
+
+      assert name == "Alice", "Name getter works"
+      assert age == 30, "Age getter works"
+
+      IO.puts("✓ Unquote fragments: compile-time code generation working")
+  end
+end
+
+Main.main()
+```

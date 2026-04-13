@@ -314,6 +314,68 @@ If your file processor is called 10_000 times per second, is the `try`/`after` o
 
 When would you prefer `File.stream!/1` (which handles cleanup via the stream protocol) over explicit `try`/`after`? Is there a case where both are wrong?
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule FileProcessorTest do
+  use ExUnit.Case, async: true
+
+  alias FileProcessor.Processor
+
+  @tmp_dir System.tmp_dir!()
+
+  setup do
+    path = Path.join(@tmp_dir, "fp_#{System.unique_integer([:positive])}.txt")
+    on_exit(fn -> File.rm(path) end)
+    {:ok, path: path}
+  end
+
+  describe "process/2 — happy path" do
+    test "applies transform to each line", %{path: path} do
+      File.write!(path, "alpha\nbeta\ngamma\n")
+      assert Processor.process(path, &String.upcase/1) == {:ok, ["ALPHA", "BETA", "GAMMA"]}
+    end
+
+    test "empty file returns empty list", %{path: path} do
+      File.write!(path, "")
+      assert Processor.process(path, &String.upcase/1) == {:ok, []}
+    end
+  end
+
+  describe "process/2 — errors" do
+    test "missing file returns {:error, :enoent}" do
+      assert {:error, :enoent} = Processor.process("/nonexistent/path.txt", &String.upcase/1)
+    end
+
+    test "raising transform is converted to {:error, _}", %{path: path} do
+      File.write!(path, "will crash\n")
+      boom = fn _ -> raise "boom" end
+      assert {:error, "boom"} = Processor.process(path, boom)
+    end
+
+    test "throwing transform is converted to {:error, {:throw, _}}", %{path: path} do
+      File.write!(path, "will throw\n")
+      thrower = fn _ -> throw(:nope) end
+      assert {:error, {:throw, :nope}} = Processor.process(path, thrower)
+    end
+  end
+
+  describe "process/2 — cleanup" do
+    test "file handle is released even when transform raises", %{path: path} do
+      File.write!(path, "one\ntwo\n")
+      boom = fn _ -> raise "boom" end
+
+      # If the handle were leaked, opening with :exclusive would fail afterward
+      # on some OSes. A subtler portable check: we can re-process successfully.
+      assert {:error, "boom"} = Processor.process(path, boom)
+      assert {:ok, ["one", "two"]} = Processor.process(path, & &1)
+    end
+  end
+end
+```
+
 ## Resources
 
 - [Elixir — try, catch, and rescue](https://hexdocs.pm/elixir/try-catch-and-rescue.html)

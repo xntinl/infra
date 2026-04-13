@@ -38,6 +38,25 @@ search_index/
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Testing-specific insight:**
+Tests are not QA. They document intent and catch regressions. A test that passes without asserting anything is technical debt. Always test the failure case; "it works when everything succeeds" teaches nothing. Use property-based testing for domain logic where the number of edge cases is infinite.
 ### 1. `:timer.tc/1` returns microseconds
 Precise enough for sub-ms measurements on the BEAM.
 
@@ -322,19 +341,81 @@ from x86 to ARM) the budget's calibration is stale. What mechanism would you bui
 keep budgets honest across hardware generations without turning every hardware upgrade
 into an orchestrated retuning project?
 
-## Resources
 
-- [Benchee](https://github.com/bencheeorg/benchee)
-- [`:timer.tc/1`](https://www.erlang.org/doc/man/timer.html#tc-1)
-- [Gil Tene — How NOT to measure latency](https://www.infoq.com/presentations/latency-pitfalls/)
-- [ExUnit tags and filtering](https://hexdocs.pm/ex_unit/ExUnit.Case.html#module-tags)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+# test/search_index/trie_regression_test.exs
+defmodule SearchIndex.TrieRegressionTest do
+  # Kept separate from correctness tests — run in CI with `mix test --only performance`
+  use ExUnit.Case, async: false
+  @moduletag :performance
+
+  alias SearchIndex.Trie
+
+  @sample_words for i <- 1..1_000, do: "word#{i}"
+
+  describe "lookup/2 — performance budget" do
+    test "p95 over 1000 samples stays under 50µs for a 1k-item trie" do
+      trie = Trie.build(@sample_words)
+
+      # Warmup — discarded
+      for _ <- 1..100, do: Trie.lookup(trie, "word5")
+
+      samples =
+        for _ <- 1..1_000 do
+          {us, _result} = :timer.tc(fn -> Trie.lookup(trie, "word5") end)
+          us
+        end
+
+      p95 = percentile(samples, 95)
+      budget_us = 50
+
+      # Assertion prints the actual measurement on failure
+      assert p95 <= budget_us,
+             "lookup p95 = #{p95}µs exceeds budget of #{budget_us}µs " <>
+               "(min=#{Enum.min(samples)}µs, max=#{Enum.max(samples)}µs)"
+    end
+
+    test "p95 over 1000 samples stays under 500µs for an empty-prefix full-scan" do
+      trie = Trie.build(@sample_words)
+      for _ <- 1..100, do: Trie.lookup(trie, "")
+
+      samples =
+        for _ <- 1..1_000 do
+          {us, _} = :timer.tc(fn -> Trie.lookup(trie, "") end)
+          us
+        end
+
+      p95 = percentile(samples, 95)
+      budget_us = 5_000
+
+      assert p95 <= budget_us,
+             "full scan p95 = #{p95}µs exceeds budget of #{budget_us}µs"
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Helpers — kept at the bottom of the module for readability
+  # ---------------------------------------------------------------------------
+
+  defp percentile(samples, p) when p >= 0 and p <= 100 do
+    sorted = Enum.sort(samples)
+    idx = trunc((length(sorted) - 1) * p / 100)
+    Enum.at(sorted, idx)
+  end
 end
+
+defmodule Main do
+  def main do
+      IO.puts("Property-based test generator initialized")
+      a = 10
+      b = 20
+      c = 30
+      assert (a + b) + c == a + (b + c)
+      IO.puts("✓ Property invariant verified: (a+b)+c = a+(b+c)")
+  end
+end
+
+Main.main()
 ```

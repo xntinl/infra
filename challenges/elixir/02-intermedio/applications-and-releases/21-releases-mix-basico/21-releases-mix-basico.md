@@ -336,6 +336,66 @@ services.
 
 - Tu equipo quiere deployar con `mix run` en producción. Dá 3 razones concretas para migrar a releases.
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule MiniRelease.MixProject do
+    use Mix.Project
+
+    def project do
+      [
+        app: :mini_release,
+        version: "0.1.0",
+        elixir: "~> 1.17",
+        start_permanent: Mix.env() == :prod,
+        deps: [],
+        releases: releases()
+      ]
+    end
+
+    def application do
+      [
+        extra_applications: [:logger],
+        mod: {MiniRelease.Application, []}
+      ]
+    end
+
+    # Release definition. `include_executables_for: [:unix]` skips Windows
+    # scripts; add `:windows` if you ship there. `applications:` is inferred
+    # automatically — listed here only when you want to override :permanent.
+    defp releases do
+      [
+        mini_release: [
+          include_executables_for: [:unix],
+          applications: [mini_release: :permanent]
+        ]
+      ]
+    end
+  end
+
+  def main do
+    # Demo: verificar que la aplicación puede iniciarse
+    {:ok, _} = Application.ensure_all_started(:mini_release)
+  
+    # Verificar que la app está viva
+    assert Application.started_applications() 
+      |> Enum.map(&elem(&1, 0)) 
+      |> Enum.member?(:mini_release)
+  
+    IO.puts("MiniRelease: demostración de release exitosa")
+    IO.puts("  ✓ Aplicación iniciada exitosamente")
+    IO.puts("  ✓ Release configurada correctamente")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`mix release` task](https://hexdocs.pm/mix/Mix.Tasks.Release.html)

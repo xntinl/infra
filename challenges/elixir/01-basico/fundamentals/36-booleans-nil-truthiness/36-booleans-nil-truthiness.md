@@ -268,9 +268,70 @@ mix test
 
 The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
 
+---
 
+## Executable Example
+
+Create a file `lib/access_control.ex` with the module above, then test it in `iex`:
+
+```elixir
+defmodule AccessControl do
+  def check_access(user, resource, action) do
+    cond do
+      user == nil -> :no_auth
+      not is_authenticated?(user) -> :not_authenticated
+      not has_permission?(user, resource, action) -> :forbidden
+      true -> :allowed
+    end
+  end
+
+  defp is_authenticated?(%{"email" => email}) when is_binary(email) and byte_size(email) > 0, do: true
+  defp is_authenticated?(_), do: false
+
+  defp has_permission?(%{"role" => role}, _resource, _action) when role in ["admin", "moderator"], do: true
+  defp has_permission?(%{"role" => "user"}, _resource, "read"), do: true
+  defp has_permission?(%{"role" => "user"} = user, "own_resource", "write") do
+    user["resource_id"] == user["id"]
+  end
+  defp has_permission?(_, _, _), do: false
+
+  def user_is_admin?(user) do
+    case user do
+      %{"role" => "admin"} -> true
+      _ -> false
+    end
+  end
+
+  def get_user_message(user) do
+    message = cond do
+      user == nil -> "No user found"
+      not is_authenticated?(user) -> "User not authenticated"
+      true -> "User #{user["email"]} authenticated"
+    end
+    message
+  end
+end
+
+# Test it:
+admin = %{"email" => "admin@test.com", "role" => "admin", "id" => 1}
+user = %{"email" => "user@test.com", "role" => "user", "id" => 2}
+guest = nil
+
+IO.inspect(AccessControl.check_access(admin, "reports", "write"))  # :allowed
+IO.inspect(AccessControl.check_access(user, "reports", "write"))   # :forbidden
+IO.inspect(AccessControl.check_access(user, "articles", "read"))   # :allowed
+IO.inspect(AccessControl.check_access(guest, "data", "read"))      # :no_auth
+
+IO.inspect(AccessControl.user_is_admin?(admin))   # true
+IO.inspect(AccessControl.user_is_admin?(user))    # false
+IO.inspect(AccessControl.user_is_admin?(guest))   # false
+
+IO.inspect(AccessControl.get_user_message(user))  # "User user@test.com authenticated"
+IO.inspect(AccessControl.get_user_message(guest)) # "No user found"
+```
 
 ---
+
 ## Key Concepts
 
 ### 1. Only `false` and `nil` are Falsy

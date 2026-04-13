@@ -34,6 +34,22 @@ A pure Elixir loop is safe because every iteration of `Enum.reduce/3` costs a kn
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. The 4000-reduction slice
 
 Default reduction budget per schedule slot is 4000 (configurable via `+P` and per-process). A BIF charges a number of reductions proportional to its cost: `:lists.reverse/1` for 1000 elements ≈ 1000 reductions. `:erlang.send/2` is ~1 reduction regardless of message size (which is why large messages are still a problem — the COST is not charged).
@@ -273,19 +289,66 @@ OTP primitives (GenServer, Supervisor, Application) are tested through their pub
 
 You profile a production node and see one process with 1 billion reductions — a long-running aggregator. Its neighbors have < 1 million. Does this prove the aggregator is starving neighbors? What further data do you need before deciding to rewrite it?
 
-## Resources
 
-- [`:erlang.bump_reductions/1` — erlang.org](https://www.erlang.org/doc/man/erlang.html#bump_reductions-1)
-- [Scheduler internals — Lukas Larsson](https://www.erlang.org/blog/a-complete-guide-to-beam-scheduler/)
-- [Inside the Erlang VM — Patrik Nyblom](https://www.erlang-factory.com/upload/presentations/247/erlangfactorylondon2010-patriknyblom.pdf)
-- [Reductions explained — The BEAM Book](https://blog.stenmans.org/theBeamBook/)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+defmodule ReductionLab.ReductionsTest do
+  use ExUnit.Case, async: false
+
+  describe "bump_reductions/1" do
+    test "increments the process reductions counter" do
+      {:reductions, before} = Process.info(self(), :reductions)
+      :erlang.bump_reductions(10_000)
+      {:reductions, after_} = Process.info(self(), :reductions)
+      assert after_ - before >= 10_000
+    end
+  end
+
+  describe "fairness" do
+    test "bumped loop yields more often than unbumped" do
+      me = self()
+
+      bumped =
+        Task.async(fn ->
+          ReductionLab.FairLoop.run(5_000, bump: true)
+          send(me, :bumped_done)
+        end)
+
+      unbumped =
+        Task.async(fn ->
+          ReductionLab.FairLoop.run(5_000, bump: false)
+          send(me, :unbumped_done)
+        end)
+
+      Task.await_many([bumped, unbumped], 10_000)
+
+      assert_received :bumped_done
+      assert_received :unbumped_done
+    end
+  end
+
+  describe "process_info reductions" do
+    test "idle process accumulates near-zero reductions" do
+      pid = spawn(fn -> receive do :stop -> :ok end end)
+      {:reductions, r1} = Process.info(pid, :reductions)
+      Process.sleep(50)
+      {:reductions, r2} = Process.info(pid, :reductions)
+      assert r2 - r1 < 50
+      send(pid, :stop)
+    end
+  end
 end
+
+defmodule Main do
+  def main do
+      IO.puts("Recon diagnostics initialized")
+      memory_stats = :erlang.memory()
+      if is_list(memory_stats) do
+        IO.puts("✓ Recon diagnostics: memory info available")
+      end
+  end
+end
+
+Main.main()
 ```

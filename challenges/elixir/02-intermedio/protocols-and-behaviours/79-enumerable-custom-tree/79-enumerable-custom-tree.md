@@ -301,6 +301,90 @@ picking one arbitrarily misleads callers.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule Tree do
+    @moduledoc """
+    Minimal binary tree with pre-order DFS iteration via `Enumerable`.
+    Fully supports `:cont`, `:halt`, and `:suspend`.
+    """
+
+    defstruct value: nil, left: nil, right: nil
+
+    @type t :: %__MODULE__{value: term(), left: t | nil, right: t | nil}
+
+    @doc "Leaf node (no children)."
+    @spec leaf(term()) :: t
+    def leaf(value), do: %__MODULE__{value: value}
+
+    @doc "Node with explicit left/right children (either can be nil)."
+    @spec node(term(), t | nil, t | nil) :: t
+    def node(value, left, right), do: %__MODULE__{value: value, left: left, right: right}
+  end
+
+  defimpl Enumerable, for: Tree do
+    # We don't cheaply know size or membership without traversal.
+    # Returning {:error, __MODULE__} delegates to reduce/3.
+    def count(_tree), do: {:error, __MODULE__}
+    def member?(_tree, _element), do: {:error, __MODULE__}
+    def slice(_tree), do: {:error, __MODULE__}
+
+    # ── reduce/3 entry point ────────────────────────────────────────────────
+    #
+    # We convert the tree walk into walking a list of "pending" sub-trees,
+    # pre-order. The pending list is what a continuation needs to carry.
+    def reduce(%Tree{} = tree, acc, fun) do
+      do_reduce([tree], acc, fun)
+    end
+
+    # ── accumulator-state dispatch (the three required clauses) ─────────────
+    defp do_reduce(_pending, {:halt, acc}, _fun), do: {:halted, acc}
+
+    defp do_reduce(pending, {:suspend, acc}, fun) do
+      # Captured continuation: when the caller resumes with a fresh acc, we
+      # pick up with the same pending list and reducer.
+      {:suspended, acc, &do_reduce(pending, &1, fun)}
+    end
+
+    # Empty pending with :cont — traversal complete.
+    defp do_reduce([], {:cont, acc}, _fun), do: {:done, acc}
+
+    # Nil branches are "no tree" — skip them.
+    defp do_reduce([nil | rest], {:cont, _} = acc, fun) do
+      do_reduce(rest, acc, fun)
+    end
+
+    # Core step: emit current node's value, then schedule left then right
+    # (the list acts as a stack — prepending left then right means left runs
+    # first, which is pre-order DFS).
+    defp do_reduce([%Tree{value: v, left: l, right: r} | rest], {:cont, acc}, fun) do
+      case fun.(v, acc) do
+        {:halt, new_acc} ->
+          do_reduce(rest, {:halt, new_acc}, fun)
+
+        {:suspend, new_acc} ->
+          do_reduce([l, r | rest], {:suspend, new_acc}, fun)
+
+        {:cont, new_acc} ->
+          do_reduce([l, r | rest], {:cont, new_acc}, fun)
+      end
+    end
+  end
+
+  def main do
+    IO.puts("Tree OK")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Enumerable` — Elixir stdlib](https://hexdocs.pm/elixir/Enumerable.html)

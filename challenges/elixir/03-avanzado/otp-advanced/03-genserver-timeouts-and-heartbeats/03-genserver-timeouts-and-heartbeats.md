@@ -35,6 +35,25 @@ heartbeat_gs/
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**OTP-specific insight:**
+The OTP framework enforces a discipline: supervision trees, callback modules, and standard return values. This structure is not a constraint — it's the contract that allows Erlang's release handler, hot code upgrades, and clustering to work. Every deviation from the pattern you'll pay for later in production debuggability and operational tooling.
 ### 1. The 5th-element timeout
 
 ```elixir
@@ -518,12 +537,43 @@ Target: peer-death detection p99 ≤ `@ping_ms + @pong_ms + 200 ms` (= 7.2 s wit
 
 ---
 
-## Resources
+## Executable Example
 
-- [`GenServer` timeout returns — hexdocs](https://hexdocs.pm/elixir/GenServer.html#c:handle_info/2)
-- [`Process.cancel_timer/2` — hexdocs](https://hexdocs.pm/elixir/Process.html#cancel_timer/2)
-- [Fred Hébert — The Hitchhiker's Guide to Concurrency](https://learnyousomeerlang.com/more-on-multiprocessing)
-- [Phoenix Channels — heartbeat implementation](https://github.com/phoenixframework/phoenix/blob/main/lib/phoenix/channel/server.ex)
-- [Saša Jurić — Elixir in Action, chapter on supervision](https://www.manning.com/books/elixir-in-action-second-edition)
-- [Dashbit — Cerberus style heartbeats](https://dashbit.co/blog)
-- [Erlang monitors vs. links](https://www.erlang.org/doc/reference_manual/processes.html#monitors)
+```elixir
+defp deps do
+  []
+end
+
+
+
+OTP stores the timeout internally; it is not a `Process.send_after` call. Every subsequent callback either re-arms it (by including a timeout in the return) or disables it (by omitting it). No refs, no leaks.
+
+### 2. Why the 5th-element timeout is not a heartbeat
+
+If *any* message arrives — a telemetry probe, a debug ping, a spurious `:DOWN` from an unrelated monitor — the timeout resets. The process thinks it is "active" even though no real work has occurred. You need a separate mechanism that measures peer liveness, not mailbox activity.
+
+
+
+### 3. Heartbeat pattern
+
+
+
+A separate `:pong_deadline` timer fires only if the peer does not respond within `@pong_ms`. The `:send_ping` timer triggers the next ping after `@ping_ms`. Two timers; `Process.cancel_timer/2` cleans up the deadline when a pong arrives.
+
+### 4. Interaction with the 5th-element timeout
+
+This is where most implementations break. If you return `{:noreply, state, @idle_ms}` after every heartbeat-related callback, the heartbeat traffic itself resets the inactivity timer and the process never dies from client inactivity. The fix is to separate concerns: use the heartbeat to kill on peer silence, and use the 5th-element timeout only for a truly orthogonal condition (e.g. "no client-initiated action in 30 min" vs. "no pong in 10 s").
+
+### 5. `Process.cancel_timer/2` semantics
+
+`Process.cancel_timer/2` returns the milliseconds remaining or `false` if the timer already fired. If it already fired, the message is sitting in the mailbox. You must consume it:
+
+defmodule Main do
+  def main do
+      # Demonstrating 03-genserver-timeouts-and-heartbeats
+      :ok
+  end
+end
+
+Main.main()
+```

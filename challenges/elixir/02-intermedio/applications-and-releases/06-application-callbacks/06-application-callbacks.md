@@ -320,6 +320,105 @@ app is enough — starting it is overhead for a library with no runtime.
 
 - Tu `start/2` necesita leer config de DB antes de construir el tree. ¿Dónde leés y qué pasa si la DB no responde?
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule MyServiceApp.Application do
+    @moduledoc """
+    OTP entry point. BEAM invokes `start/2` when the application boots and
+    `stop/1` when it shuts down. The pid returned from `start/2` is the root
+    of the supervision tree — the single point BEAM uses to stop everything.
+    """
+
+    use Application
+    require Logger
+
+    @impl true
+    @spec start(Application.start_type(), term()) :: {:ok, pid()} | {:error, term()}
+    def start(type, args) do
+      Logger.info("MyServiceApp starting: type=#{inspect(type)} args=#{inspect(args)}")
+
+      children = [
+        # A single demo worker — real apps have pools, registries, endpoints here.
+        MyServiceApp.Worker
+      ]
+
+      # `:one_for_one` — if a child dies, only that child restarts. The app
+      # stays up as long as the supervisor itself is alive.
+      opts = [strategy: :one_for_one, name: MyServiceApp.Supervisor]
+      Supervisor.start_link(children, opts)
+    end
+
+    @impl true
+    @spec stop(term()) :: :ok
+    def stop(state) do
+      # Children are already being terminated by the supervisor. Use this hook
+      # only for *application-level* cleanup (flushing, telemetry, external notice).
+      Logger.info("MyServiceApp stopping: state=#{inspect(state)}")
+      :ok
+    end
+  end
+
+  defmodule MyServiceApp.Worker do
+    @moduledoc """
+    Trivial GenServer that exposes a ping for tests and logs its own lifecycle —
+    the point is to prove the supervision tree actually started it.
+    """
+
+    use GenServer
+    require Logger
+
+    @spec start_link(keyword()) :: GenServer.on_start()
+    def start_link(opts \\ []) do
+      GenServer.start_link(__MODULE__, :ok, Keyword.put_new(opts, :name, __MODULE__))
+    end
+
+    @spec ping(GenServer.server()) :: :pong
+    def ping(server \\ __MODULE__), do: GenServer.call(server, :ping)
+
+    @impl true
+    def init(:ok) do
+      Logger.debug("Worker booted pid=#{inspect(self())}")
+      {:ok, %{started_at: System.system_time(:millisecond)}}
+    end
+
+    @impl true
+    def handle_call(:ping, _from, state), do: {:reply, :pong, state}
+  end
+
+  def main do
+    # Demo: iniciar aplicación OTP con supervisor y worker
+    {:ok, _apps} = Application.ensure_all_started(:my_service_app)
+  
+    # Verificar que el supervisor está vivo
+    sup = Process.whereis(MyServiceApp.Supervisor)
+    assert is_pid(sup) and Process.alive?(sup), "supervisor debe estar activo"
+  
+    # Verificar que el worker responde
+    assert MyServiceApp.Worker.ping() == :pong, "worker debe responder a ping"
+  
+    # Detener y reiniciar
+    :ok = Application.stop(:my_service_app)
+    {:ok, _} = Application.ensure_all_started(:my_service_app)
+  
+    # Verificar que sigue funcionando
+    assert MyServiceApp.Worker.ping() == :pong, "worker debe responder después de reinicio"
+  
+    IO.puts("MyServiceApp: demostración de callbacks de aplicación OTP exitosa")
+    IO.puts("  ✓ Supervisor iniciado y vivo")
+    IO.puts("  ✓ Worker responde a ping")
+    IO.puts("  ✓ Aplicación reiniciable")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Application` — Elixir stdlib](https://hexdocs.pm/elixir/Application.html)

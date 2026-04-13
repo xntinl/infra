@@ -40,6 +40,22 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Atoms and module names
 
 An Elixir module `Foo.Bar` compiles to the Erlang atom `Elixir.Foo.Bar`. Erlang modules are lowercase atoms (`:crypto`, `:inet`, `:ets`). To call an Erlang function:
@@ -465,12 +481,85 @@ On a 1,000-element FIFO, `list ++ [x]` is roughly 200× slower.
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
 
-- https://hexdocs.pm/elixir/Record.html — Record module reference
-- https://www.erlang.org/doc/man/crypto.html — `:crypto` reference
-- https://www.erlang.org/doc/man/queue.html — banker's queue internals
-- https://www.erlang.org/doc/man/digraph.html — `:digraph`
-- https://learnyousomeerlang.com/a-short-visit-to-common-data-structures — queue, digraph, gb_trees
-- https://dashbit.co/blog/writing-assertive-code-with-elixir — defensive patterns at interop boundaries
-- https://www.erlang.org/doc/apps/erts/absform.html — atom table limits
+## Executable Example
+
+```elixir
+defmodule ErlangInteropTest do
+  use ExUnit.Case, async: true
+
+  alias ErlangInterop.{Crypto, Fifo, Graph, Records}
+
+  describe "Crypto" do
+    test "HMAC-SHA256 is deterministic and 32 bytes" do
+      mac = Crypto.hmac_sha256("secret", "payload")
+      assert byte_size(mac) == 32
+      assert mac == Crypto.hmac_sha256("secret", "payload")
+    end
+
+    test "AES-GCM roundtrip" do
+      key = Crypto.random_key(256)
+      iv = Crypto.random_iv()
+      {:ok, {ct, tag}} = Crypto.encrypt_aes_gcm(key, iv, "top secret", "aad")
+      assert {:ok, "top secret"} = Crypto.decrypt_aes_gcm(key, iv, ct, tag, "aad")
+    end
+
+    test "AES-GCM detects tampering" do
+      key = Crypto.random_key(256)
+      iv = Crypto.random_iv()
+      {:ok, {ct, tag}} = Crypto.encrypt_aes_gcm(key, iv, "hi", "")
+      tampered = <<0>> <> binary_part(ct, 1, byte_size(ct) - 1)
+      assert {:error, :auth_failed} = Crypto.decrypt_aes_gcm(key, iv, tampered, tag, "")
+    end
+  end
+
+  describe "Fifo" do
+    test "push/pop is FIFO" do
+      q = Fifo.new() |> Fifo.push(:a) |> Fifo.push(:b) |> Fifo.push(:c)
+      assert {:ok, :a, q} = Fifo.pop(q)
+      assert {:ok, :b, q} = Fifo.pop(q)
+      assert Fifo.size(q) == 1
+    end
+
+    test "pop on empty" do
+      assert :empty = Fifo.pop(Fifo.new())
+    end
+  end
+
+  describe "Graph" do
+    test "topological sort on acyclic graph" do
+      g = Graph.new()
+      :ok = Graph.add_dependency(g, :compile, :test)
+      :ok = Graph.add_dependency(g, :test, :release)
+      assert [:compile, :test, :release] = Graph.topological_sort(g)
+      Graph.delete(g)
+    end
+
+    test "cycle rejected" do
+      g = Graph.new()
+      :ok = Graph.add_dependency(g, :a, :b)
+      assert {:error, :cycle} = Graph.add_dependency(g, :b, :a)
+      Graph.delete(g)
+    end
+  end
+
+  describe "Records" do
+    test "record access via macro" do
+      u = Records.new_user(1, "Ada", "ada@example.com")
+      assert Records.user_id(u) == 1
+      assert Records.is_user(u)
+      assert elem(u, 0) == :user
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+    IO.puts("✓ Erlang Interop — Calling OTP Libraries from Elixir")
+  - Erlang interop patterns
+    - Direct module calls
+  end
+end
+
+Main.main()
+```

@@ -48,6 +48,22 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. What the scheduler actually is
 
 A BEAM scheduler is an OS thread that runs Erlang processes cooperatively. By
@@ -601,21 +617,77 @@ Use `:recon.proc_count(:reductions, N)` for large nodes.
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
 
-- [Erlang `:erlang.statistics/1`](https://www.erlang.org/doc/man/erlang.html#statistics-1) — authoritative docs on every counter
-- [The BEAM Book — Scheduling](https://blog.stenmans.org/theBeamBook/#CH-Scheduling) — Erik Stenman, free
-- [Erlang in Anger — Fred Hébert](https://www.erlang-in-anger.com/) — chapter 4 on `scheduler_wall_time` and recon
-- [`:recon.scheduler_usage/1`](https://ferd.github.io/recon/recon.html#scheduler_usage-1) — source implementation of the same idea
-- ["A Brief BEAM Primer" — Rickard Green](https://www.erlang.org/blog/a-brief-beam-primer/) — Erlang/OTP core developer
-- [Phoenix LiveDashboard source — Home page](https://github.com/phoenixframework/phoenix_live_dashboard/blob/main/lib/phoenix/live_dashboard/pages/home_page.ex)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+defmodule SchedulersDeep.Reporter do
+  @moduledoc """
+  Samples `:scheduler_wall_time` over a window and returns per-scheduler
+  utilization as a percentage.
+
+  Rationale: `:scheduler_wall_time` is cumulative since the flag was enabled.
+  A single read is useless. You need two reads delta-ed over a window.
+  """
+
+  @type utilization :: %{pos_integer() => float()}
+
+  @doc "Enables the `:scheduler_wall_time` flag globally."
+  @spec enable() :: boolean()
+  def enable, do: :erlang.system_flag(:scheduler_wall_time, true)
+
+  @spec disable() :: boolean()
+  def disable, do: :erlang.system_flag(:scheduler_wall_time, false)
+
+  @doc """
+  Samples utilization over `window_ms` and returns a map
+  `%{scheduler_id => utilization_percent}`.
+  """
+  @spec sample(pos_integer()) :: utilization()
+  def sample(window_ms) when window_ms > 0 do
+    before = read_sorted()
+    Process.sleep(window_ms)
+    now = read_sorted()
+    diff(before, now)
+  end
+
+  defp read_sorted do
+    :erlang.statistics(:scheduler_wall_time)
+    |> Enum.sort()
+  end
+
+  defp diff(before, now) do
+    Enum.zip(before, now)
+    |> Enum.reduce(%{}, fn {{id, a0, t0}, {id, a1, t1}}, acc ->
+      active = a1 - a0
+      total = t1 - t0
+      ratio = if total == 0, do: 0.0, else: active / total * 100.0
+      Map.put(acc, id, Float.round(ratio, 2))
+    end)
+  end
+
+  @doc "Returns counts of normal, dirty-cpu and dirty-io schedulers."
+  @spec scheduler_counts() :: %{normal: pos_integer(), dirty_cpu: non_neg_integer(), dirty_io: non_neg_integer()}
+  def scheduler_counts do
+    %{
+      normal: :erlang.system_info(:schedulers),
+      dirty_cpu: :erlang.system_info(:dirty_cpu_schedulers),
+      dirty_io: :erlang.system_info(:dirty_io_schedulers)
+    }
+  end
 end
+
+defmodule Main do
+  def main do
+      IO.puts("Benchmarking initialized")
+      {elapsed_us, result} = :timer.tc(fn ->
+        Enum.reduce(1..1000, 0, &+/2)
+      end)
+      if is_number(elapsed_us) do
+        IO.puts("✓ Benchmark completed: sum(1..1000) = " <> inspect(result) <> " in " <> inspect(elapsed_us) <> "µs")
+      end
+  end
+end
+
+Main.main()
 ```

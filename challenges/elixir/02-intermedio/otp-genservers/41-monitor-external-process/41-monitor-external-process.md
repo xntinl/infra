@@ -429,6 +429,90 @@ own when you need per-entry business logic on DOWN.
 
 - ¿Cuándo usarías `link` en lugar de `monitor`? Describí un caso donde cambiar de monitor a link mejoraría la arquitectura.
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule ExternalMonitorGs do
+    use GenServer
+
+    def start_link(opts \\ []) do
+      GenServer.start_link(__MODULE__, %{}, opts)
+    end
+
+    def register(server, pid, payload) do
+      GenServer.call(server, {:register, pid, payload})
+    end
+
+    def fetch(server, pid) do
+      GenServer.call(server, {:fetch, pid})
+    end
+
+    def count(server) do
+      GenServer.call(server, :count)
+    end
+
+    def deregister(server, pid) do
+      GenServer.call(server, {:deregister, pid})
+    end
+
+    def init(_), do: {:ok, %{}}
+
+    def handle_call({:register, pid, payload}, _from, state) do
+      ref = Process.monitor(pid)
+      new_state = Map.put(state, pid, {ref, payload})
+      {:reply, :ok, new_state}
+    end
+
+    def handle_call({:fetch, pid}, _from, state) do
+      case Map.get(state, pid) do
+        nil -> {:reply, :error, state}
+        {_ref, payload} -> {:reply, {:ok, payload}, state}
+      end
+    end
+
+    def handle_call(:count, _from, state) do
+      {:reply, map_size(state), state}
+    end
+
+    def handle_call({:deregister, pid}, _from, state) do
+      case Map.get(state, pid) do
+        {ref, _} -> 
+          Process.demonitor(ref, [:flush])
+          {:reply, :ok, Map.delete(state, pid)}
+        nil ->
+          {:reply, :ok, state}
+      end
+    end
+
+    def handle_info({:DOWN, ref, :process, pid, _reason}, state) do
+      {:noreply, Map.delete(state, pid)}
+    end
+
+    def handle_info(_other, state) do
+      {:noreply, state}
+    end
+  end
+
+  def main do
+    {:ok, mon} = ExternalMonitorGs.start_link()
+  
+    pid = spawn(fn -> Process.sleep(:infinity) end)
+    :ok = ExternalMonitorGs.register(mon, pid, :data)
+    {:ok, :data} = ExternalMonitorGs.fetch(mon, pid)
+    IO.puts("Registered and fetched: #{ExternalMonitorGs.count(mon)}")
+  
+    IO.puts("✓ ExternalMonitorGs works correctly")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Process.monitor/1` — Elixir stdlib](https://hexdocs.pm/elixir/Process.html#monitor/1)

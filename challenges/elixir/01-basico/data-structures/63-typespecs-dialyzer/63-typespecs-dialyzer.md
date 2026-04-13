@@ -325,6 +325,62 @@ or struct destructuring.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule TypedCalc do
+  @moduledoc """
+  A calculator with strict arithmetic types.
+
+  All operations are total on `number()` — we never return floats from
+  integer inputs except when division would truncate.
+  """
+
+  # Public types. Callers can write `@spec foo(TypedCalc.op())`.
+  @type op :: :add | :sub | :mul | :div
+
+  # Tagged-tuple result type. We avoid exceptions for user-facing errors
+  # and reserve raise for programmer errors (invariant violations).
+  @type result :: {:ok, number()} | {:error, :division_by_zero}
+
+  # Private helper type — hidden from callers.
+  @typep non_zero :: number()
+
+  @doc """
+  Applies `op` to `a` and `b`. Integer division by zero yields `{:error, ...}`.
+  """
+  @spec apply_op(op(), number(), number()) :: result()
+  def apply_op(:add, a, b), do: {:ok, a + b}
+  def apply_op(:sub, a, b), do: {:ok, a - b}
+  def apply_op(:mul, a, b), do: {:ok, a * b}
+  def apply_op(:div, _a, 0), do: {:error, :division_by_zero}
+  def apply_op(:div, _a, 0.0), do: {:error, :division_by_zero}
+  def apply_op(:div, a, b), do: {:ok, safe_div(a, b)}
+
+  # The typep forbids zero at the call site — but Elixir does not enforce it
+  # at runtime. Dialyzer catches misuse statically.
+  @spec safe_div(number(), non_zero()) :: number()
+  defp safe_div(a, b), do: a / b
+
+  @doc """
+  Reduces a list of operations left-to-right from an initial value.
+
+  Stops and returns the first error encountered.
+  """
+  @spec evaluate(number(), [{op(), number()}]) :: result()
+  def evaluate(initial, ops) when is_number(initial) and is_list(ops) do
+    Enum.reduce_while(ops, {:ok, initial}, fn {op, val}, {:ok, acc} ->
+      case apply_op(op, acc, val) do
+        {:ok, _} = r -> {:cont, r}
+        {:error, _} = e -> {:halt, e}
+      end
+    end)
+  end
+end
+```
+
 ## Resources
 
 - [Elixir docs — Typespecs reference](https://hexdocs.pm/elixir/typespecs.html)

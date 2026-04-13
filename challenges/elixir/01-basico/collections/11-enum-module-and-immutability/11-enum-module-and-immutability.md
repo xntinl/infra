@@ -563,6 +563,239 @@ correct but sometimes confusing.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Analytics do
+  @moduledoc """
+  Event log analytics using Enum transformations on immutable data.
+
+  All functions are pure — they take data in and return data out.
+  No state mutation, no side effects, no database calls.
+  """
+
+  @type event :: %{
+          id: String.t(),
+          user_id: String.t(),
+          action: String.t(),
+          timestamp: DateTime.t(),
+          metadata: map()
+        }
+
+  @type metric :: %{
+          group: term(),
+          count: non_neg_integer(),
+          events: [event()]
+        }
+
+  @doc """
+  Filters events by a predicate function.
+
+  The predicate receives an event and returns a boolean.
+
+  ## Examples
+
+      iex> events = [%{action: "click", user_id: "u1"}, %{action: "view", user_id: "u2"}]
+      iex> Analytics.filter_by(events, fn e -> e.action == "click" end)
+      [%{action: "click", user_id: "u1"}]
+
+  """
+  @spec filter_by([event()], (event() -> boolean())) :: [event()]
+  def filter_by(events, predicate) when is_list(events) and is_function(predicate, 1) do
+    Enum.filter(events, predicate)
+  end
+
+  @doc """
+  Groups events by a key function and returns a map of group => events.
+
+  ## Examples
+
+      iex> events = [
+      ...>   %{action: "click", user_id: "u1"},
+      ...>   %{action: "view", user_id: "u1"},
+      ...>   %{action: "click", user_id: "u2"}
+      ...> ]
+      iex> groups = Analytics.group_by_key(events, fn e -> e.action end)
+      iex> length(groups["click"])
+      2
+      iex> length(groups["view"])
+      1
+
+  """
+  @spec group_by_key([event()], (event() -> term())) :: %{term() => [event()]}
+  def group_by_key(events, key_fn) when is_list(events) and is_function(key_fn, 1) do
+    Enum.group_by(events, key_fn)
+  end
+
+  @doc """
+  Counts events per group.
+
+  Returns a list of {group_key, count} tuples sorted by count descending.
+
+  ## Examples
+
+      iex> events = [
+      ...>   %{action: "click", user_id: "u1"},
+      ...>   %{action: "click", user_id: "u2"},
+      ...>   %{action: "view", user_id: "u1"}
+      ...> ]
+      iex> Analytics.count_by(events, fn e -> e.action end)
+      [{"click", 2}, {"view", 1}]
+
+  """
+  @spec count_by([event()], (event() -> term())) :: [{term(), non_neg_integer()}]
+  def count_by(events, key_fn) when is_list(events) and is_function(key_fn, 1) do
+    events
+    |> Enum.group_by(key_fn)
+    |> Enum.map(fn {key, group} -> {key, length(group)} end)
+    |> Enum.sort_by(fn {_key, count} -> count end, :desc)
+  end
+
+  @doc """
+  Computes aggregate metrics per group.
+
+  For each group, returns the count, and the list of events.
+
+  ## Examples
+
+      iex> events = [
+      ...>   %{action: "purchase", user_id: "u1", metadata: %{amount: 100}},
+      ...>   %{action: "purchase", user_id: "u1", metadata: %{amount: 200}},
+      ...>   %{action: "purchase", user_id: "u2", metadata: %{amount: 50}}
+      ...> ]
+      iex> metrics = Analytics.aggregate(events, fn e -> e.user_id end)
+      iex> Enum.find(metrics, fn m -> m.group == "u1" end).count
+      2
+
+  """
+  @spec aggregate([event()], (event() -> term())) :: [metric()]
+  def aggregate(events, group_fn) when is_list(events) and is_function(group_fn, 1) do
+    events
+    |> Enum.group_by(group_fn)
+    |> Enum.map(fn {group, group_events} ->
+      %{
+        group: group,
+        count: length(group_events),
+        events: group_events
+      }
+    end)
+    |> Enum.sort_by(fn m -> m.count end, :desc)
+  end
+
+  @doc """
+  Sums a numeric field from event metadata across all events.
+
+  Uses Enum.reduce/3 — the most general Enum function. Any Enum
+  operation can be expressed as a reduce.
+
+  ## Examples
+
+      iex> events = [
+      ...>   %{metadata: %{amount: 100}},
+      ...>   %{metadata: %{amount: 200}},
+      ...>   %{metadata: %{amount: 50}}
+      ...> ]
+      iex> Analytics.sum_field(events, [:metadata, :amount])
+      350
+
+  """
+  @spec sum_field([map()], [atom()]) :: number()
+  def sum_field(events, field_path) when is_list(events) and is_list(field_path) do
+    Enum.reduce(events, 0, fn event, acc ->
+      value = get_in(event, field_path) || 0
+      acc + value
+    end)
+  end
+
+  @doc """
+  Returns the top N events sorted by a comparator function.
+
+  ## Examples
+
+      iex> events = [
+      ...>   %{metadata: %{amount: 50}},
+      ...>   %{metadata: %{amount: 300}},
+      ...>   %{metadata: %{amount: 100}}
+      ...> ]
+      iex> top = Analytics.top_n(events, 2, fn e -> e.metadata.amount end)
+      iex> length(top)
+      2
+      iex> hd(top).metadata.amount
+      300
+
+  """
+  @spec top_n([event()], non_neg_integer(), (event() -> term())) :: [event()]
+  def top_n(events, n, sort_fn) when is_list(events) and is_integer(n) do
+    events
+    |> Enum.sort_by(sort_fn, :desc)
+    |> Enum.take(n)
+  end
+
+  @doc """
+  Builds a full analytics report from raw events.
+
+  Demonstrates composing multiple Enum operations into a single
+  data transformation pipeline.
+
+  Returns a map with:
+    - `:total_events` — total event count
+    - `:by_action` — count per action type
+    - `:by_user` — count per user
+    - `:total_amount` — sum of metadata.amount across all events
+
+  ## Examples
+
+      iex> events = [
+      ...>   %{id: "1", action: "purchase", user_id: "u1", timestamp: ~U[2024-01-01 00:00:00Z], metadata: %{amount: 100}},
+      ...>   %{id: "2", action: "purchase", user_id: "u2", timestamp: ~U[2024-01-01 01:00:00Z], metadata: %{amount: 200}},
+      ...>   %{id: "3", action: "view", user_id: "u1", timestamp: ~U[2024-01-01 02:00:00Z], metadata: %{}}
+      ...> ]
+      iex> report = Analytics.build_report(events)
+      iex> report.total_events
+      3
+      iex> report.total_amount
+      300
+
+  """
+  @spec build_report([event()]) :: map()
+  def build_report(events) when is_list(events) do
+    %{
+      total_events: length(events),
+      by_action: count_by(events, fn e -> e.action end),
+      by_user: count_by(events, fn e -> e.user_id end),
+      total_amount: sum_field(events, [:metadata, :amount])
+    }
+  end
+
+  @doc """
+  Demonstrates the difference between Enum (eager) and Stream (lazy).
+
+  For small datasets, Enum is faster (no overhead from lazy evaluation).
+  For large datasets or when you only need the first N results,
+  Stream avoids building intermediate collections.
+
+  This function shows both approaches for comparison.
+  """
+  @spec unique_users_eager([event()]) :: [String.t()]
+  def unique_users_eager(events) do
+    events
+    |> Enum.map(fn e -> e.user_id end)
+    |> Enum.uniq()
+    |> Enum.sort()
+  end
+
+  @spec unique_users_lazy([event()]) :: [String.t()]
+  def unique_users_lazy(events) do
+    events
+    |> Stream.map(fn e -> e.user_id end)
+    |> Stream.uniq()
+    |> Enum.sort()
+  end
+end
+```
+
 ## Resources
 
 - [Enum — HexDocs](https://hexdocs.pm/elixir/Enum.html)

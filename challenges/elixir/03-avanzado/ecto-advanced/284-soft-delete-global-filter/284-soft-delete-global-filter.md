@@ -55,6 +55,25 @@ you forget it, the query returns everything — and you see it in tests.
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Ecto-specific insight:**
+Ecto separates the query layer (building queries) from the execution layer (sending them). This separation allows for debugging, composability, and testing without a database. Never load all rows first and filter in-memory — write the filter into the query itself, or you've just built an N+1 problem.
 ### 1. The filter as a composable query
 
 ```elixir
@@ -531,19 +550,103 @@ run to compare heap size vs. active rows?
 
 ---
 
-## Resources
 
-- [Ecto — composable queries](https://hexdocs.pm/ecto/Ecto.Query.html#module-query-expressions)
-- [Postgres partial indexes](https://www.postgresql.org/docs/current/indexes-partial.html)
-- [Thoughtbot — "Soft deletion in Ecto"](https://thoughtbot.com/blog)
-- [GDPR and soft delete](https://gdpr.eu) — legal constraints on data retention
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+# test/crm_contacts/contacts_test.exs
+defmodule CrmContacts.ContactsTest do
+  use ExUnit.Case, async: false
+  alias CrmContacts.{Contacts, Repo, SoftDelete}
+  alias CrmContacts.Schemas.{Contact, Note}
+
+  setup do
+    Ecto.Adapters.SQL.Sandbox.checkout(Repo)
+    Ecto.Adapters.SQL.Sandbox.mode(Repo, {:shared, self()})
+    :ok
+  end
+
+  defp new_contact(attrs) do
+    %Contact{} |> Contact.changeset(attrs) |> Repo.insert!()
+  end
+
+  describe "list/1" do
+    test "excludes soft-deleted contacts" do
+      alive = new_contact(%{email: "a@x.com", name: "Alive"})
+      dead = new_contact(%{email: "b@x.com", name: "Dead"})
+      {:ok, _} = Contacts.delete(dead)
+
+      results = Contacts.list()
+      assert Enum.map(results, & &1.id) == [alive.id]
+    end
+  end
+
+  describe "list_including_deleted/0" do
+    test "returns both states" do
+      new_contact(%{email: "a@x.com"})
+      dead = new_contact(%{email: "b@x.com"})
+      {:ok, _} = Contacts.delete(dead)
+
+      all = Contacts.list_including_deleted()
+      assert length(all) == 2
+    end
+  end
+
+  describe "preload scoping" do
+    test "does not return soft-deleted notes" do
+      c = new_contact(%{email: "c@x.com"})
+      {:ok, n1} = Repo.insert(Note.changeset(%Note{}, %{body: "active", contact_id: c.id}))
+      {:ok, n2} = Repo.insert(Note.changeset(%Note{}, %{body: "dead", contact_id: c.id}))
+      {:ok, _} = SoftDelete.delete(n2)
+
+      [loaded] = Contacts.list_with_notes()
+      assert Enum.map(loaded.notes, & &1.id) == [n1.id]
+    end
+  end
+
+  describe "uniqueness with partial index" do
+    test "rejects duplicate active email" do
+      new_contact(%{email: "dup@x.com"})
+
+      {:error, cs} =
+        %Contact{} |> Contact.changeset(%{email: "dup@x.com"}) |> Repo.insert()
+
+      refute cs.valid?
+      assert [email: {"already in use by an active contact", _}] = cs.errors
+    end
+
+    test "allows reuse of a soft-deleted email" do
+      dead = new_contact(%{email: "reuse@x.com"})
+      {:ok, _} = Contacts.delete(dead)
+
+      assert %Contact{} = new_contact(%{email: "reuse@x.com"})
+    end
+  end
+
+  describe "restore" do
+    test "brings soft-deleted contact back" do
+      c = new_contact(%{email: "r@x.com"})
+      {:ok, _} = Contacts.delete(c)
+      refute Enum.any?(Contacts.list(), &(&1.id == c.id))
+
+      {:ok, c} = Contacts.restore(c)
+      assert Enum.any?(Contacts.list(), &(&1.id == c.id))
+    end
+  end
 end
+
+defmodule Main do
+  def main do
+    IO.puts("✓ Soft Delete with Global Query Filter:")
+    IO.puts("  - Contact schema with deleted_at timestamp")
+    IO.puts("  - Contacts.list() automatically excludes soft-deleted rows")
+    IO.puts("  - Contacts.list_including_deleted() shows all rows")
+    IO.puts("  - delete/1 and restore/1 mutations")
+    IO.puts("  - Partial unique index: rejects duplicates of active contacts")
+    IO.puts("  - Allows reuse of soft-deleted email addresses")
+    IO.puts("  - Preload scoping: associated notes also respect soft-delete filter")
+  end
+end
+
+Main.main()
 ```

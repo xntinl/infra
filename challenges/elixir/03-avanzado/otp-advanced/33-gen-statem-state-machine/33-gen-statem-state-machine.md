@@ -35,6 +35,25 @@ tcp_connection_fsm/
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**OTP-specific insight:**
+The OTP framework enforces a discipline: supervision trees, callback modules, and standard return values. This structure is not a constraint — it's the contract that allows Erlang's release handler, hot code upgrades, and clustering to work. Every deviation from the pattern you'll pay for later in production debuggability and operational tooling.
 ### 1. State diagram
 
 ```
@@ -515,12 +534,25 @@ Target: transition latency ≤ 5 µs; postponed-event re-delivery ≤ 10 µs; no
 
 ---
 
-## Resources
+## Executable Example
 
-- [`:gen_statem` — Erlang docs](https://www.erlang.org/doc/man/gen_statem.html)
-- [`:gen_statem` Design Principles](https://www.erlang.org/doc/design_principles/statem.html)
-- [Fred Hébert — Erlang/OTP in Action, state machines chapter](https://www.manning.com/books/erlang-and-otp-in-action)
-- [Ulf Wiger on FSMs in Erlang](https://erlangcentral.org/wiki/index.php/Gen_statem)
-- [Machinery — Elixir state machine library](https://hexdocs.pm/machinery)
-- [RabbitMQ `rabbit_reader` — gen_statem in production](https://github.com/rabbitmq/rabbitmq-server/blob/main/deps/rabbit/src/rabbit_reader.erl)
-- [Dashbit blog — gen_statem walkthrough](https://dashbit.co/blog)
+```elixir
+defp deps do
+  []
+end
+
+
+
+The first argument is the **event type**: `{:call, from}`, `:cast`, `:info`, `:state_timeout`, `:timeout`, `:internal`. The second is the event payload. The third is your data (analogous to GenServer state).
+
+### 4. Returning actions
+
+defmodule Main do
+  def main do
+      # Demonstrating 33-gen-statem-state-machine
+      :ok
+  end
+end
+
+Main.main()
+```

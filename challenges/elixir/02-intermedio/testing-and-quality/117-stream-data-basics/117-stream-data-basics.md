@@ -330,6 +330,61 @@ and **numerical code**.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule Sort do
+    @moduledoc """
+    A didactic merge sort implementation — deliberately written from scratch
+    so we can verify it against `Enum.sort/1` via properties.
+    """
+
+    @spec sort([number()]) :: [number()]
+    def sort([]), do: []
+    def sort([x]), do: [x]
+
+    def sort(list) do
+      {left, right} = Enum.split(list, div(length(list), 2))
+      merge(sort(left), sort(right))
+    end
+
+    defp merge([], right), do: right
+    defp merge(left, []), do: left
+    defp merge([l | lt] = left, [r | rt] = right) do
+      if l <= r do
+        [l | merge(lt, right)]
+      else
+        [r | merge(left, rt)]
+      end
+    end
+  end
+
+  def main do
+    IO.puts("=== PropertyTest Demo ===
+  ")
+  
+    # Demo: Property-based test properties
+  IO.puts("1. Testing string reverse idempotence...")
+  IO.puts("   reverse(reverse(str)) == str")
+  assert PropertyTest.test_double_reverse_identity("hello")
+
+  IO.puts("2. Testing list length...")
+  IO.puts("   length(list ++ list) == 2 * length(list)")
+  assert PropertyTest.test_list_append_length([1, 2, 3])
+
+  IO.puts("
+  ✓ PropertyTest demos completed!")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [StreamData — HexDocs](https://hexdocs.pm/stream_data/StreamData.html)

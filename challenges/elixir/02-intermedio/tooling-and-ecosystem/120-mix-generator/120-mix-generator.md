@@ -404,6 +404,49 @@ test files, migration stubs, config skeletons. Not business logic.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule Solution do
+    def main do
+      IO.puts("=== Elixir Tooling Info ===\n")
+    
+      IO.puts("Elixir version: " <> System.version())
+      IO.puts("OTP version: " <> :erlang.system_info(:otp_release) |> to_string())
+    
+      IO.puts("\nLoaded modules:")
+      modules = :code.all_loaded() |> length()
+      IO.puts("Total: " <> inspect(modules))
+    
+      IO.puts("\nMemory info:")
+      info = :erlang.memory()
+      total = :proplists.get_value(:total, info)
+      IO.puts("Total memory: " <> inspect(total) <> " bytes")
+    end
+  end
+
+  def main do
+    IO.puts("=== Generator Demo ===
+  ")
+  
+    # Demo: Mix generator pattern
+  IO.puts("1. mix my_generator creates project structure")
+  IO.puts("2. Copies templates and runs eex")
+  IO.puts("3. Automates boilerplate")
+
+  IO.puts("
+  ✓ Mix generator demo completed!")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Mix.Generator`](https://hexdocs.pm/mix/Mix.Generator.html) — every helper documented

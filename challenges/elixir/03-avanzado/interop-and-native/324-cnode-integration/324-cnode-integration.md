@@ -51,6 +51,22 @@ All new C nodes should use `ei` + either `ei_connect` (builtin) or a small helpe
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. epmd discovery
 
 Nodes register with `epmd` (Erlang Port Mapper Daemon) on port 4369. A C node calls
@@ -509,9 +525,57 @@ its own pace. What operational differences (restart behavior, observability, rol
 upgrades) make you prefer one deployment topology over the other for a vendor-controlled
 piece of C code that you cannot audit?
 
-## Resources
+## Executable Example
 
-- [`ei` reference manual — Erlang/OTP](https://www.erlang.org/doc/man/ei.html)
-- [C Node tutorial — learnyousomeerlang.com](https://learnyousomeerlang.com/distribunomicon)
-- [epmd — Erlang Port Mapper Daemon](https://www.erlang.org/doc/man/epmd.html)
-- [Erlang distribution protocol spec](https://www.erlang.org/doc/apps/erts/erl_dist_protocol.html)
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+
+defmodule HwBridge.MixProject do
+  end
+  use Mix.Project
+
+  def project do
+    [
+      app: :hw_bridge,
+      version: "0.1.0",
+      elixir: "~> 1.17",
+      compilers: [:elixir_make] ++ Mix.compilers(),
+      make_makefile: "Makefile",
+      deps: [{:elixir_make, "~> 0.8", runtime: false}]
+    ]
+  end
+
+  def application,
+    do: [extra_applications: [:logger], mod: {HwBridge.Application, []}]
+end
+
+
+### Step 2: The C node (`c_src/hw_node.c`)
+
+**Objective**: Publish node via epmd and reply to distribution RPC calls so BEAM sees a native peer.
+
+
+
+### Step 3: Elixir client (`lib/hw_bridge/client.ex`)
+
+**Objective**: Own C node subprocess lifecycle and wait for distribution handshake so callers never race connection setup.
+
+
+
+### Step 4: Application
+
+**Objective**: Enforce distributed mode at boot so connection failures are caught early, not silently ignored.
+
+defmodule Main do
+  def main do
+      # Demonstrating 324-cnode-integration
+      :ok
+  end
+end
+
+Main.main()
+```

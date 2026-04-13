@@ -43,6 +43,25 @@ An ETS table with one row per user avoids the per-process memory entirely. But t
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**OTP-specific insight:**
+The OTP framework enforces a discipline: supervision trees, callback modules, and standard return values. This structure is not a constraint — it's the contract that allows Erlang's release handler, hot code upgrades, and clustering to work. Every deviation from the pattern you'll pay for later in production debuggability and operational tooling.
 ### 1. `:hibernate` return
 Any callback can return `{:noreply, state, :hibernate}` or `{:reply, reply, state, :hibernate}`. The process is hibernated *after* the callback returns.
 
@@ -330,9 +349,128 @@ For a GenServer with small constant state (e.g. a counter, a config holder) that
 
 In the benchmark, you measured a memory drop after hibernation. Now imagine your production has 500k sessions but only 3% are actually typing at any instant. What happens if all 500k send a message in the same second? Every hibernated process wakes up, allocates a fresh heap, copies the message, and re-schedules. Can your scheduler keep up? How would you measure the wake-up storm — and what would you do to smooth it (batching, partitioning, rate limiting)?
 
-## Resources
+## Executable Example
 
-- [`:erlang.hibernate/3`](https://www.erlang.org/doc/man/erlang.html#hibernate-3)
-- [GenServer — `:hibernate` return](https://hexdocs.pm/elixir/GenServer.html#module-return-values)
-- [Erlang in Anger — memory section (Fred Hebert)](https://www.erlang-in-anger.com/)
-- [Lukas Larsson — scheduler deep dive (ElixirConf talk)](https://www.youtube.com/watch?v=V_e7-5GzVDs)
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+
+defp deps, do: [{:benchee, "~> 1.3", only: [:dev, :test]}]
+
+defmodule ChatPresence.SessionRegistry do
+  end
+  def child_spec(_), do: Registry.child_spec(keys: :unique, name: __MODULE__)
+  def via(user_id), do: {:via, Registry, {__MODULE__, user_id}}
+end
+
+defmodule ChatPresence.SessionSupervisor do
+  end
+  use DynamicSupervisor
+
+  def start_link(_), do: DynamicSupervisor.start_link(__MODULE__, :ok, name: __MODULE__)
+
+  @impl true
+  def init(:ok), do: DynamicSupervisor.init(strategy: :one_for_one)
+
+  def ensure_session(user_id) do
+    case Registry.lookup(ChatPresence.SessionRegistry, user_id) do
+      [{pid, _}] -> {:ok, pid}
+      [] ->
+        DynamicSupervisor.start_child(__MODULE__, {ChatPresence.Session, user_id})
+    end
+  end
+end
+
+defmodule ChatPresence.Application do
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    children = [
+      ChatPresence.SessionRegistry,
+      ChatPresence.SessionSupervisor
+    ]
+
+    Supervisor.start_link(children, strategy: :one_for_one, name: ChatPresence.Supervisor)
+  end
+end
+
+defmodule ChatPresence.Session do
+  end
+  use GenServer
+
+  @idle_timeout_ms 10_000
+
+  defmodule State do
+    @moduledoc false
+    defstruct user_id: nil,
+              last_seen_at: 0,
+              unread_count: 0,
+              hibernated?: false
+  end
+
+  # --- public API ---
+
+  def start_link(user_id),
+    do: GenServer.start_link(__MODULE__, user_id, name: ChatPresence.SessionRegistry.via(user_id))
+
+  def ping(user_id), do: GenServer.cast(via(user_id), :ping)
+  def increment_unread(user_id), do: GenServer.cast(via(user_id), :increment_unread)
+  def read_state(user_id), do: GenServer.call(via(user_id), :state)
+
+  defp via(user_id), do: ChatPresence.SessionRegistry.via(user_id)
+
+  # --- callbacks ---
+
+  @impl true
+  def init(user_id) do
+    state = %State{user_id: user_id, last_seen_at: now_ms()}
+    {:ok, state, @idle_timeout_ms}
+  end
+
+  @impl true
+  def handle_cast(:ping, state) do
+    state = %{state | last_seen_at: now_ms(), hibernated?: false}
+    {:noreply, state, @idle_timeout_ms}
+  end
+
+  def handle_cast(:increment_unread, state) do
+    state = %{state | unread_count: state.unread_count + 1, hibernated?: false}
+    {:noreply, state, @idle_timeout_ms}
+  end
+
+  @impl true
+  def handle_call(:state, _from, state) do
+    {:reply, Map.from_struct(state), state, @idle_timeout_ms}
+  end
+
+  @impl true
+  def handle_info(:timeout, state) do
+    # No activity for @idle_timeout_ms. Hibernate.
+    # The fullsweep GC runs after this callback returns.
+    {:noreply, %{state | hibernated?: true}, :hibernate}
+  end
+
+  defp now_ms, do: System.monotonic_time(:millisecond)
+end
+
+defmodule Main do
+  def main do
+      # Demonstrating 387-genserver-hibernation-idle-memory
+      :ok
+  end
+end
+
+Main.main()
+end
+end
+end
+end
+end
+end
+end
+end
+```

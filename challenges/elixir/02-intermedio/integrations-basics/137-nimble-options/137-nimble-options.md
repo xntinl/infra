@@ -379,6 +379,110 @@ large configs, generate docs into a separate `.md` file.
 
 - `NimbleOptions` rejects unknown keys, which protects against typos but also breaks forward compatibility: a new version that adds an option fails old callers who pass it in advance. How do Broadway and LiveView reconcile that tension, and what would it cost you to adopt the same pattern in a library you own?
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule NimbleOptsDemo do
+    @moduledoc """
+    A tiny HTTP-client-like façade that validates options using
+    `NimbleOptions`. Highlights:
+
+      * schema lives at the top of the module
+      * `@moduledoc` includes auto-generated option docs
+      * `start_link/1` raises with a clear message on misuse
+
+    ## Options
+
+    #{NimbleOptions.docs(
+      [
+        name: [
+          type: :atom,
+          required: true,
+          doc: "Registered process name for this client."
+        ],
+        base_url: [
+          type: :string,
+          required: true,
+          doc: "Base URL to prepend to all requests."
+        ],
+        timeout: [
+          type: :pos_integer,
+          default: 5_000,
+          doc: "Request timeout in milliseconds."
+        ],
+        retries: [
+          type: :non_neg_integer,
+          default: 2,
+          doc: "How many times to retry on transient failures."
+        ],
+        strategy: [
+          type: {:in, [:linear, :exponential]},
+          default: :exponential,
+          doc: "Retry backoff strategy."
+        ],
+        headers: [
+          type: {:list, {:tuple, [:string, :string]}},
+          default: [],
+          doc: "Extra headers sent with every request."
+        ],
+        adapter: [
+          type: {:or, [:atom, {:tuple, [:atom, :keyword_list]}]},
+          default: :finch,
+          doc: "Adapter backend. Either an atom or `{adapter, opts}`."
+        ]
+      ]
+    )}
+    """
+
+    # Duplicate the schema as module attribute so validate/1 can reference
+    # it at runtime. (You can also keep only one copy and derive docs from
+    # the module attribute.)
+    @schema [
+      name: [type: :atom, required: true],
+      base_url: [type: :string, required: true],
+      timeout: [type: :pos_integer, default: 5_000],
+      retries: [type: :non_neg_integer, default: 2],
+      strategy: [type: {:in, [:linear, :exponential]}, default: :exponential],
+      headers: [type: {:list, {:tuple, [:string, :string]}}, default: []],
+      adapter: [
+        type: {:or, [:atom, {:tuple, [:atom, :keyword_list]}]},
+        default: :finch
+      ]
+    ]
+
+    @spec start_link(keyword()) :: {:ok, map()} | no_return()
+    def start_link(opts) do
+      # validate! raises a NimbleOptions.ValidationError with a good message.
+      validated = NimbleOptions.validate!(opts, @schema)
+      {:ok, Map.new(validated)}
+    end
+
+    @doc "Returns the compiled schema for external introspection."
+    def schema, do: @schema
+  end
+
+  def main do
+    IO.puts("=== Config Demo ===
+  ")
+  
+    # Demo: Validate options with NimbleOptions
+  schema = [url: [type: :string, required: true], timeout: [type: :integer, default: 5000]]
+  validated = NimbleOptions.validate([url: "http://example.com"], schema)
+  IO.puts("1. Validated options: #{inspect(validated)}")
+
+  IO.puts("
+  ✓ NimbleOptions demo completed!")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [NimbleOptions on HexDocs](https://hexdocs.pm/nimble_options/NimbleOptions.html)

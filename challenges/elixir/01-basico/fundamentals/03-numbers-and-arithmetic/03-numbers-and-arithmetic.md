@@ -570,6 +570,219 @@ Always compare money as integer cents: `price_cents == 1999`.
 
 ---
 
+## Executable Example
+
+Create a file `lib/money.ex` with the complete `Money` module code from above, then run these in `iex`:
+
+```elixir
+defmodule Money do
+  @moduledoc """
+  Safe monetary arithmetic using integer cents.
+
+  All amounts are stored as integers representing the smallest currency unit
+  (cents for USD/EUR, pence for GBP). This eliminates floating-point rounding
+  errors entirely.
+
+  Currency is tracked to prevent accidentally adding USD to EUR.
+  """
+
+  @type t :: %{amount: integer(), currency: atom()}
+
+  @doc """
+  Creates a Money value from an integer amount in cents.
+
+  ## Examples
+
+      iex> Money.new(1999, :usd)
+      %{amount: 1999, currency: :usd}
+
+  """
+  @spec new(integer(), atom()) :: t()
+  def new(amount, currency) when is_integer(amount) and is_atom(currency) do
+    %{amount: amount, currency: currency}
+  end
+
+  @doc """
+  Creates a Money value from a float dollar amount.
+
+  Converts to cents internally using rounding to handle float imprecision.
+  This is the ONLY place where floats touch the money system.
+
+  ## Examples
+
+      iex> Money.from_float(19.99, :usd)
+      %{amount: 1999, currency: :usd}
+
+      iex> Money.from_float(0.1 + 0.2, :usd)
+      %{amount: 30, currency: :usd}
+
+  """
+  @spec from_float(float(), atom()) :: t()
+  def from_float(dollars, currency) when is_float(dollars) and is_atom(currency) do
+    cents = round(dollars * 100)
+    new(cents, currency)
+  end
+
+  @doc """
+  Adds two money values. Both must have the same currency.
+
+  ## Examples
+
+      iex> a = Money.new(1000, :usd)
+      iex> b = Money.new(599, :usd)
+      iex> Money.add(a, b)
+      {:ok, %{amount: 1599, currency: :usd}}
+
+      iex> a = Money.new(1000, :usd)
+      iex> b = Money.new(500, :eur)
+      iex> Money.add(a, b)
+      {:error, :currency_mismatch}
+
+  """
+  @spec add(t(), t()) :: {:ok, t()} | {:error, :currency_mismatch}
+  def add(%{currency: c} = a, %{currency: c} = b) do
+    {:ok, new(a.amount + b.amount, c)}
+  end
+
+  def add(%{currency: _}, %{currency: _}), do: {:error, :currency_mismatch}
+
+  @doc """
+  Subtracts the second money value from the first.
+
+  ## Examples
+
+      iex> a = Money.new(1000, :usd)
+      iex> b = Money.new(300, :usd)
+      iex> Money.subtract(a, b)
+      {:ok, %{amount: 700, currency: :usd}}
+
+  """
+  @spec subtract(t(), t()) :: {:ok, t()} | {:error, :currency_mismatch}
+  def subtract(%{currency: c} = a, %{currency: c} = b) do
+    {:ok, new(a.amount - b.amount, c)}
+  end
+
+  def subtract(%{currency: _}, %{currency: _}), do: {:error, :currency_mismatch}
+
+  @doc """
+  Multiplies a money value by a scalar (quantity, tax rate, etc.).
+
+  The result is rounded to the nearest cent. This is the only operation
+  that introduces rounding, and it happens at the integer level.
+
+  ## Examples
+
+      iex> price = Money.new(999, :usd)
+      iex> Money.multiply(price, 3)
+      %{amount: 2997, currency: :usd}
+
+      iex> subtotal = Money.new(1000, :usd)
+      iex> Money.multiply(subtotal, 1.0825)
+      %{amount: 1083, currency: :usd}
+
+  """
+  @spec multiply(t(), number()) :: t()
+  def multiply(%{amount: amount, currency: currency}, factor) when is_number(factor) do
+    new(round(amount * factor), currency)
+  end
+
+  @doc """
+  Splits a money value into N equal parts without losing cents.
+
+  The remainder is distributed one cent at a time to the first parts.
+  This guarantees that the parts always sum to the original amount.
+
+  ## Examples
+
+      iex> bill = Money.new(1001, :usd)
+      iex> Money.split(bill, 3)
+      [
+        %{amount: 334, currency: :usd},
+        %{amount: 334, currency: :usd},
+        %{amount: 333, currency: :usd}
+      ]
+
+      iex> bill = Money.new(1000, :usd)
+      iex> parts = Money.split(bill, 3)
+      iex> parts |> Enum.map(& &1.amount) |> Enum.sum()
+      1000
+
+  """
+  @spec split(t(), pos_integer()) :: [t()]
+  def split(%{amount: amount, currency: currency}, parts)
+      when is_integer(parts) and parts > 0 do
+    base = div(amount, parts)
+    remainder = rem(amount, parts)
+
+    for i <- 1..parts do
+      extra = if i <= remainder, do: 1, else: 0
+      new(base + extra, currency)
+    end
+  end
+
+  @doc """
+  Formats a money value as a human-readable string.
+
+  ## Examples
+
+      iex> Money.format(Money.new(1999, :usd))
+      "$19.99"
+
+      iex> Money.format(Money.new(500, :eur))
+      "€5.00"
+
+      iex> Money.format(Money.new(-250, :usd))
+      "-$2.50"
+
+  """
+  @spec format(t()) :: String.t()
+  def format(%{amount: amount, currency: currency}) do
+    symbol = currency_symbol(currency)
+    {sign, abs_amount} = if amount < 0, do: {"-", -amount}, else: {"", amount}
+    major = div(abs_amount, 100)
+    minor = rem(abs_amount, 100) |> Integer.to_string() |> String.pad_leading(2, "0")
+    "#{sign}#{symbol}#{major}.#{minor}"
+  end
+
+  @doc """
+  Returns true if the money amount is zero.
+  """
+  @spec zero?(t()) :: boolean()
+  def zero?(%{amount: 0}), do: true
+  def zero?(%{amount: _}), do: false
+
+  @doc """
+  Returns true if the money amount is positive.
+  """
+  @spec positive?(t()) :: boolean()
+  def positive?(%{amount: amount}) when amount > 0, do: true
+  def positive?(%{amount: _}), do: false
+
+  @spec currency_symbol(atom()) :: String.t()
+  defp currency_symbol(:usd), do: "$"
+  defp currency_symbol(:eur), do: "€"
+  defp currency_symbol(:gbp), do: "£"
+  defp currency_symbol(:jpy), do: "¥"
+  defp currency_symbol(other), do: "#{other} "
+end
+
+# Test the Money module
+m1 = Money.new(1000, :usd)
+m2 = Money.new(599, :usd)
+IO.inspect(Money.add(m1, m2))  # {:ok, %{amount: 1599, currency: :usd}}
+
+IO.inspect(Money.format(m1))  # "$10.00"
+
+bill = Money.new(1001, :usd)
+parts = Money.split(bill, 3)
+IO.inspect(parts)  # [%{amount: 334, currency: :usd}, %{amount: 334, currency: :usd}, %{amount: 333, currency: :usd}]
+
+sum = parts |> Enum.map(& &1.amount) |> Enum.sum()
+IO.inspect(sum)  # 1001 - guarantees all cents are preserved
+```
+
+---
+
 ## Reflection
 
 If your product sold items priced in currencies with 3 decimal places (Kuwaiti Dinar, Tunisian Dinar), how would you adapt the `Money` module without introducing floats?

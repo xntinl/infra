@@ -59,6 +59,22 @@ An SPA duplicates state between client and server, with a JSON API as the bridge
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. The two-phase `mount/3`
 
 A LiveView mounts twice per session. First over plain HTTP (to produce crawlable,
@@ -537,11 +553,45 @@ Target: diff payload under 1 KB for typical updates; update round-trip under 100
 
 ---
 
-## Resources
+## Executable Example
 
-- [Phoenix LiveView docs](https://hexdocs.pm/phoenix_live_view/) — read the full `Phoenix.LiveView` module doc
-- [`Phoenix.PubSub`](https://hexdocs.pm/phoenix_pubsub/Phoenix.PubSub.html) — adapter model and semantics
-- [Chris McCord — LiveView announcement](https://dockyard.com/blog/2018/12/12/phoenix-liveview-interactive-real-time-apps-no-need-to-write-javascript)
-- [LiveView performance: temporary assigns](https://hexdocs.pm/phoenix_live_view/assigns-eex.html#temporary-assigns)
-- [`:pg` — Erlang process groups](https://www.erlang.org/doc/man/pg.html) — the primitive under PubSub
-- [Dashbit blog — Operable Phoenix](https://dashbit.co/blog/operable-phoenix) — supervision for real-time apps
+```elixir
+### Step 2: The domain — `lib/liveview_realtime/ticker.ex`
+
+**Objective**: Model ticks as immutable struct via System.monotonic_time/1 so ordering survives clock drift.
+
+
+
+### Step 3: The feed simulator — `lib/liveview_realtime/price_feed.ex`
+
+**Objective**: Simulate exchange via GenServer broadcasting on Phoenix.PubSub so subscribers fan out decoupled.
+
+
+
+### Step 4: The LiveView — `lib/liveview_realtime_web/live/dashboard_live.ex`
+
+**Objective**: Buffer ticks and flush on timer so 50ms bursts render as one diff, not N re-renders.
+
+
+
+### Step 5: Router and supervision
+
+**Objective**: Mount LiveView via live/3 and boot PriceFeed under supervisor so feed restarts independently.
+
+
+
+
+
+### Step 6: Tests — `test/liveview_realtime_web/live/dashboard_live_test.exs`
+
+**Objective**: Use Phoenix.LiveViewTest.live/2 to assert disconnected HTML, PubSub gating, and tick coalescing.
+
+defmodule Main do
+  def main do
+      # Demonstrating 51-phoenix-liveview-real-time
+      :ok
+  end
+end
+
+Main.main()
+```

@@ -324,6 +324,48 @@ interact — a tiny upward window on a huge downward one starves downstream.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule ProducerConsumer.Squarer do
+    @moduledoc """
+    The middle stage: receives integers from the Producer, squares them,
+    and forwards to anyone subscribed. No `handle_demand` needed — GenStage
+    forwards demand from downstream upstream automatically.
+    """
+
+    use GenStage
+
+    def start_link(_ \\ []), do: GenStage.start_link(__MODULE__, :ok, name: __MODULE__)
+
+    @impl true
+    def init(:ok) do
+      # subscribe_to must come from init — we want to be connected at startup.
+      {:producer_consumer, :no_state,
+       subscribe_to: [{ProducerConsumer.Producer, max_demand: 20, min_demand: 10}]}
+    end
+
+    @impl true
+    def handle_events(events, _from, state) do
+      # 1:1 transform — squaring. Could also filter (return fewer) or expand
+      # (return more) events. Return shape is the same.
+      {:noreply, Enum.map(events, &(&1 * &1)), state}
+    end
+  end
+
+  def main do
+    IO.puts("ProducerConsumer OK")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`GenStage` — hexdocs](https://hexdocs.pm/gen_stage/GenStage.html)

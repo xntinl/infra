@@ -43,6 +43,25 @@ Mandatory callbacks force users to write trivial stubs just to satisfy the compi
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Metaprogramming-specific insight:**
+Code generation is powerful and dangerous. Every macro you write is a place where intent is hidden. Use macros sparingly, only when they eliminate genuine boilerplate. If your macro is more than 10 lines, you probably need a function or data structure instead. Future maintainers will thank you.
 ### 1. `@optional_callbacks`
 
 Declares which callbacks are optional. The compiler then does NOT warn when an
@@ -391,12 +410,99 @@ Target: one-time `function_exported?/3` check cached away; hot path identical to
 
 ---
 
-## Resources
 
-- [`Module` — `@optional_callbacks`](https://hexdocs.pm/elixir/Module.html#module-optional_callbacks)
-- [`Code.ensure_loaded?/1`](https://hexdocs.pm/elixir/Code.html#ensure_loaded?/1)
-- [`function_exported?/3`](https://hexdocs.pm/elixir/Kernel.html#function_exported?/3)
-- [Phoenix.Endpoint optional init/2](https://github.com/phoenixframework/phoenix/blob/main/lib/phoenix/endpoint.ex)
-- [Plug — optional call/2 variants](https://github.com/elixir-plug/plug/blob/main/lib/plug.ex)
-- [Erlang docs — `:embedded` mode](https://www.erlang.org/doc/man/erl.html)
-- [Dashbit blog — behaviours in practice](https://dashbit.co/blog)
+## Executable Example
+
+```elixir
+defmodule OptionalCallbacksTest do
+  use ExUnit.Case, async: true
+
+  alias OptionalCallbacks.Orchestrator
+  alias OptionalCallbacks.PSPs.{Stripe, WireTransfer, PayPal}
+
+  describe "supports?/3" do
+    test "Stripe supports everything" do
+      assert Orchestrator.supports?(Stripe, :refund, 3)
+      assert Orchestrator.supports?(Stripe, :capture, 2)
+    end
+
+    test "WireTransfer does NOT support refund" do
+      refute Orchestrator.supports?(WireTransfer, :refund, 3)
+    end
+
+    test "PayPal supports refund but not capture" do
+      assert Orchestrator.supports?(PayPal, :refund, 3)
+      refute Orchestrator.supports?(PayPal, :capture, 2)
+    end
+  end
+
+  describe "capabilities/1" do
+    test "lists only implemented optional callbacks" do
+      assert Orchestrator.capabilities(Stripe) ==
+               [capture: 2, refund: 3, void: 2, webhook_validate: 2]
+
+      assert Orchestrator.capabilities(WireTransfer) == []
+      assert Orchestrator.capabilities(PayPal) == [refund: 3, void: 2]
+    end
+  end
+
+  describe "orchestrator dispatch" do
+    test "refund is :not_supported on WireTransfer" do
+      assert {:error, :not_supported} = Orchestrator.refund(WireTransfer, "w_1", 100, %{})
+    end
+
+    test "refund works on PayPal" do
+      assert :ok = Orchestrator.refund(PayPal, "pp_1", 50, %{})
+    end
+
+    test "any_supporting returns only capable PSPs" do
+      psps = [Stripe, WireTransfer, PayPal]
+      assert Orchestrator.any_supporting(:refund, 3, psps) == [Stripe, PayPal]
+      assert Orchestrator.any_supporting(:capture, 2, psps) == [Stripe]
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrate optional callbacks with runtime guards
+      defmodule PluginBehaviour do
+        @callback on_start() :: :ok
+        @callback on_stop() :: :ok
+        @doc false
+        @callback optional_hook(term()) :: term()  # Optional
+      end
+
+      defmodule MyPlugin do
+        @behaviour PluginBehaviour
+
+        def on_start(), do: IO.puts("Started")
+        def on_stop(), do: IO.puts("Stopped")
+        # optional_hook/1 not implemented
+      end
+
+      # Safe calling with guards
+      def call_hook(module, hook, args \\ []) do
+        if Code.ensure_loaded?(module) and function_exported?(module, hook, length(args)) do
+          {:ok, apply(module, hook, args)}
+        else
+          {:not_impl, :function_not_exported}
+        end
+      end
+
+      # Test
+      on_start = call_hook(MyPlugin, :on_start)
+      optional = call_hook(MyPlugin, :optional_hook, [nil])
+
+      IO.puts("✓ on_start result: #{inspect(on_start)}")
+      IO.puts("✓ optional_hook result: #{inspect(optional)}")
+
+      assert match?({:ok, _}, on_start), "Required callback works"
+      assert match?({:not_impl, _}, optional), "Optional hook correctly not found"
+
+      IO.puts("✓ Optional callbacks: safe runtime dispatch working")
+  end
+end
+
+Main.main()
+```

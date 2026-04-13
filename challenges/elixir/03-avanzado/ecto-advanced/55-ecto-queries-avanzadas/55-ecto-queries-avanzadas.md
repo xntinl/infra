@@ -62,6 +62,25 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Ecto-specific insight:**
+Ecto separates the query layer (building queries) from the execution layer (sending them). This separation allows for debugging, composability, and testing without a database. Never load all rows first and filter in-memory — write the filter into the query itself, or you've just built an N+1 problem.
 ### 1. Query composability
 
 Every `Ecto.Query` is a struct. `from`, `where`, `join`, `select`, `order_by` all return a
@@ -615,21 +634,49 @@ BEAM heap, because the aggregated result set is ~10 rows.
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
-
-- [`Ecto.Query` — hexdocs](https://hexdocs.pm/ecto/Ecto.Query.html) — canonical reference; read Composition and Bindings sections first.
-- [Ecto.Query.dynamic/2](https://hexdocs.pm/ecto/Ecto.Query.html#dynamic/2) — official examples of runtime filter composition.
-- [Programming Ecto — Darin Wilson & Eric Meadows-Jönsson](https://pragprog.com/titles/wmecto/programming-ecto/) — chapters 5–7 on query composition.
-- [PostgreSQL `EXPLAIN ANALYZE`](https://www.postgresql.org/docs/current/using-explain.html) — understand what your Ecto query actually runs.
-- [Dashbit blog](https://dashbit.co/blog) — recurring posts on Ecto query composition.
-- [Phoenix LiveDashboard Ecto page source](https://github.com/phoenixframework/phoenix_live_dashboard) — real-world aggregation queries.
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+`mix.exs`:
+
+
+
+`config/config.exs`:
+
+
+
+### Step 2: Repo and schemas
+
+**Objective**: Define Customer, Product, Order, and LineItem with bidirectional assocs so joins, subqueries, and dynamic filters can share bindings.
+
+
+
+Schemas (trimmed; see project tree):
+
+
+
+### Step 3: Migrations
+
+**Objective**: Back every FK and filter column (placed_at, status, customer_id) with an index so reporting queries stay planner-friendly.
+
+
+
+### Step 4: Reports module — the core of this exercise
+
+**Objective**: Push aggregation, subqueries, LEFT JOINs, and dynamic filters into SQL so reports return maps without N+1 or in-memory reduce.
+
+
+
+### Step 5: Tests
+
+**Objective**: Seed fixtures then assert revenue, category averages, slow movers, and dynamic search against the Repo sandbox to lock semantics.
+
+defmodule Main do
+  def main do
+      # Demonstrating 55-ecto-queries-avanzadas
+      :ok
+  end
 end
+
+Main.main()
 ```

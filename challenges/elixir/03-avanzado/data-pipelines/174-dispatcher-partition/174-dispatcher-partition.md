@@ -44,6 +44,25 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Pipeline-specific insight:**
+Streams are lazy; Enum is eager. Use Stream for data larger than RAM or when you're building intermediate stages. Use Enum when the collection is small or you need side effects at each step. Mixing them carelessly results in performance cliffs.
 ### 1. How PartitionDispatcher routes
 
 ```
@@ -364,20 +383,81 @@ partition saturates at ~20k events/sec while the others idle.
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
 
-- [GenStage.PartitionDispatcher — HexDocs](https://hexdocs.pm/gen_stage/GenStage.PartitionDispatcher.html)
-- [GenStage source — partition_dispatcher.ex](https://github.com/elixir-lang/gen_stage/blob/main/lib/gen_stage/partition_dispatcher.ex)
-- [`:erlang.phash2/2` — Erlang/OTP](https://www.erlang.org/doc/man/erlang.html#phash2-2)
-- [Consistent hashing — David Karger et al., 1997](https://www.akamai.com/site/en/documents/research-paper/consistent-hashing-and-random-trees-distributed-caching-protocols-for-relieving-hot-spots-on-the-world-wide-web-technical-publication.pdf)
-- [Flow — partition_by under the hood](https://hexdocs.pm/flow/Flow.html#partition/2)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+defmodule PartitionDispatcher.OrderingTest do
+  use ExUnit.Case, async: false
+
+  alias PartitionDispatcher.{BookProducer, BookWorker}
+
+  setup do
+    Application.stop(:partition_dispatcher)
+    Application.start(:partition_dispatcher)
+    Process.sleep(50)
+    :ok
+  end
+
+  describe "PartitionDispatcher.Ordering" do
+    test "events for the same symbol land in one partition in order" do
+      for seq <- 1..200 do
+        BookProducer.push(%{symbol: "AAPL", kind: :new, order_id: seq, seq: seq})
+      end
+
+      Process.sleep(300)
+
+      {_last, violations} =
+        0..(BookProducer.partitions() - 1)
+        |> Enum.map(&BookWorker.seen/1)
+        |> Enum.reduce({%{}, []}, fn {l, v}, {lacc, vacc} ->
+          {Map.merge(lacc, l), vacc ++ v}
+        end)
+
+      assert violations == []
+    end
+
+    test "different symbols distribute across partitions" do
+      symbols = for i <- 1..50, do: "SYM#{i}"
+
+      for sym <- symbols, seq <- 1..20 do
+        BookProducer.push(%{symbol: sym, kind: :new, order_id: seq, seq: seq})
+      end
+
+      Process.sleep(500)
+
+      per_partition_counts =
+        for p <- 0..(BookProducer.partitions() - 1) do
+          {_last, _v} = BookWorker.seen(p)
+          :sys.get_state(BookWorker.via(p)).last_seq |> map_size()
+        end
+
+      assert Enum.all?(per_partition_counts, &(&1 > 0))
+    end
+  end
 end
+
+defmodule Main do
+  def main do
+      # Demonstrate PartitionDispatcher: events for same key go to same consumer
+      {:ok, p} = GenStage.start_link(GenstageAdvanced.IngestProducer, 
+        [dispatcher: GenStage.PartitionDispatcher, buffer_size: 100], [])
+      {:ok, c1} = GenStage.start_link(GenstageAdvanced.Aggregator, 
+        [subscribe_to: [{p, max_demand: 10}]], [])
+
+      Process.sleep(20)
+
+      # Push events with same key (id) -> same partition
+      for i <- 1..3, do: GenStage.cast(p, {:push, %{id: 1, payload: "msg_#{i}", ts: 0}})
+
+      Process.sleep(50)
+
+      seen = :sys.get_state(c1).seen
+
+      IO.inspect(Enum.map(seen, & &1.id), label: "✓ Partition events (all same id)")
+      assert Enum.all?(seen, &(&1.id == 1)), "All events have same partition key"
+  end
+end
+
+Main.main()
 ```

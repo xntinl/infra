@@ -42,6 +42,22 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. What "distributed" means in BEAM
 
 A BEAM node is an OS process with a **node name** (`alpha@host`) that has joined the distributed runtime by starting `:net_kernel`. Once started, the node is reachable by name, can send messages to pids on other nodes, spawn processes remotely, monitor remote processes, and link across the network. Pids, references, and port identifiers become network-routable.
@@ -529,22 +545,108 @@ Cross-node calls add ~200µs overhead from TCP + ETF encode/decode. Across a 1Gb
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
 
-- [Erlang/OTP — Distributed Erlang](https://www.erlang.org/doc/reference_manual/distributed.html) — the canonical reference
-- [`:net_kernel`](https://www.erlang.org/doc/man/net_kernel.html) — `monitor_nodes/2`, `connect_node/1`
-- [`:erpc` module](https://www.erlang.org/doc/man/erpc.html) — the modern successor to `:rpc`
-- [Fred Hébert — Erlang in Anger, chapter 8 "Network"](https://www.erlang-in-anger.com/) — busy dist ports, atom exhaustion
-- [Saša Jurić — "Why Elixir"](https://www.theerlangelist.com/article/why_elixir) — background on BEAM distribution model
-- [Discord Engineering — Scaling Elixir to 5M concurrent users](https://discord.com/blog/how-discord-scaled-elixir-to-5-000-000-concurrent-users) — production disterl
-- [`inet_tls_dist` — Erlang/OTP](https://www.erlang.org/doc/apps/ssl/ssl_distribution.html) — securing disterl with TLS
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+defmodule NodeClusterDemo.ClusterMonitor do
+  @moduledoc """
+  Subscribes to `:net_kernel.monitor_nodes/2` and keeps an in-memory view
+  of the cluster membership, timestamped with the local monotonic clock.
+
+  Publishes `{:cluster_event, event}` to all subscribers registered via
+  `subscribe/0`. This is the foundation of every libcluster-style topology
+  strategy.
+  """
+  use GenServer
+  require Logger
+
+  @type event :: {:nodeup, node()} | {:nodedown, node()}
+
+  @spec start_link(keyword()) :: GenServer.on_start()
+  def start_link(opts \\ []) do
+    GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+  end
+
+  @spec subscribe() :: :ok
+  def subscribe do
+    GenServer.call(__MODULE__, {:subscribe, self()})
+  end
+
+  @spec known_nodes() :: [{node(), integer()}]
+  def known_nodes do
+    GenServer.call(__MODULE__, :known_nodes)
+  end
+
+  @impl true
+  def init(_opts) do
+    :ok = :net_kernel.monitor_nodes(true, node_type: :visible)
+    Logger.info("ClusterMonitor started on #{inspect(node())}")
+
+    state = %{
+      nodes: Map.new(Node.list(), &{&1, System.monotonic_time(:millisecond)}),
+      subscribers: MapSet.new()
+    }
+
+    {:ok, state}
+  end
+
+  @impl true
+  def handle_call({:subscribe, pid}, _from, state) do
+    ref = Process.monitor(pid)
+    {:reply, :ok, %{state | subscribers: MapSet.put(state.subscribers, {pid, ref})}}
+  end
+
+  def handle_call(:known_nodes, _from, state) do
+    {:reply, Enum.to_list(state.nodes), state}
+  end
+
+  @impl true
+  def handle_info({:nodeup, node}, state) do
+    Logger.info("[ClusterMonitor] nodeup #{inspect(node)}")
+    ts = System.monotonic_time(:millisecond)
+    broadcast(state.subscribers, {:nodeup, node})
+    {:noreply, %{state | nodes: Map.put(state.nodes, node, ts)}}
+  end
+
+  def handle_info({:nodedown, node}, state) do
+    Logger.warning("[ClusterMonitor] nodedown #{inspect(node)}")
+    broadcast(state.subscribers, {:nodedown, node})
+    {:noreply, %{state | nodes: Map.delete(state.nodes, node)}}
+  end
+
+  def handle_info({:DOWN, _ref, :process, pid, _reason}, state) do
+    subs = Enum.reject(state.subscribers, fn {p, _} -> p == pid end) |> MapSet.new()
+    {:noreply, %{state | subscribers: subs}}
+  end
+
+  defp broadcast(subscribers, event) do
+    for {pid, _ref} <- subscribers, do: send(pid, {:cluster_event, event})
+  end
 end
+
+defmodule Main do
+  def main do
+      # Demonstrate distributed Erlang basics: node connectivity and messaging
+      {:ok, _pid} = NodeClusterDemo.ClusterMonitor.start_link()
+      {:ok, _pid} = NodeClusterDemo.RemoteEcho.start_link()
+
+      # Check known nodes (locally, just this node)
+      nodes = NodeClusterDemo.ClusterMonitor.known_nodes()
+      IO.puts("✓ Known nodes: #{inspect(nodes)}")
+
+      # Subscribe to cluster events
+      :ok = NodeClusterDemo.ClusterMonitor.subscribe()
+
+      # Test remote echo locally
+      result = NodeClusterDemo.RemoteEcho.echo(node(), "test_payload")
+      IO.inspect(result, label: "✓ Local echo result")
+
+      assert match?({:echo_from, _, "test_payload"}, result), "Echo works"
+
+      IO.puts("✓ Distributed Erlang: node connectivity and messaging working")
+  end
+end
+
+Main.main()
 ```

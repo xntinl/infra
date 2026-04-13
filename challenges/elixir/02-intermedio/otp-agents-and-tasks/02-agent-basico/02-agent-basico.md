@@ -332,6 +332,97 @@ pass the pid through the context.
 
 - Si agregás validación y side-effects al Agent, ¿cuándo sabés que es momento de migrar a GenServer? Dá el criterio concreto.
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule ConfigAgent do
+    @moduledoc """
+    A small key/value configuration store backed by `Agent`.
+
+    Designed for low-frequency reads and writes of process-shared settings
+    (feature flags, tunables, the current theme). For high-frequency reads,
+    see the trade-offs section and consider `:ets` or `:persistent_term`.
+    """
+
+    use Agent
+
+    @type key :: atom() | String.t()
+    @type value :: term()
+
+    @doc """
+    Starts the agent with an initial map of settings.
+
+    Options:
+      * `:name` — optional registered name (defaults to `__MODULE__`).
+      * `:initial` — initial map of settings (defaults to `%{}`).
+    """
+    @spec start_link(keyword()) :: Agent.on_start()
+    def start_link(opts \\ []) do
+      initial = Keyword.get(opts, :initial, %{})
+      name = Keyword.get(opts, :name, __MODULE__)
+      Agent.start_link(fn -> initial end, name: name)
+    end
+
+    @doc "Returns the value at `key`, or `default` if absent."
+    @spec get(Agent.agent(), key(), value()) :: value()
+    def get(agent \\ __MODULE__, key, default \\ nil) do
+      Agent.get(agent, fn state -> Map.get(state, key, default) end)
+    end
+
+    @doc "Returns the full settings map — useful for diagnostics."
+    @spec all(Agent.agent()) :: map()
+    def all(agent \\ __MODULE__) do
+      Agent.get(agent, & &1)
+    end
+
+    @doc "Puts `value` at `key`, overwriting any previous value."
+    @spec put(Agent.agent(), key(), value()) :: :ok
+    def put(agent \\ __MODULE__, key, value) do
+      Agent.update(agent, fn state -> Map.put(state, key, value) end)
+    end
+
+    @doc """
+    Atomically updates `key` by applying `fun` to the current value (or to
+    `default` if absent). Returns the new value.
+    """
+    @spec update(Agent.agent(), key(), value(), (value() -> value())) :: value()
+    def update(agent \\ __MODULE__, key, default, fun) when is_function(fun, 1) do
+      Agent.get_and_update(agent, fn state ->
+        new_value = fun.(Map.get(state, key, default))
+        {new_value, Map.put(state, key, new_value)}
+      end)
+    end
+
+    @doc "Removes `key` from the store."
+    @spec delete(Agent.agent(), key()) :: :ok
+    def delete(agent \\ __MODULE__, key) do
+      Agent.update(agent, fn state -> Map.delete(state, key) end)
+    end
+  end
+
+  def main do
+    {:ok, agent} = ConfigAgent.start_link(name: nil, initial: %{theme: :dark})
+  
+    assert :dark == ConfigAgent.get(agent, :theme)
+  
+    :ok = ConfigAgent.put(agent, :theme, :light)
+    assert :light == ConfigAgent.get(agent, :theme)
+  
+    :ok = ConfigAgent.delete(agent, :theme)
+    assert nil == ConfigAgent.get(agent, :theme, nil)
+  
+    IO.puts("✓ ConfigAgent works correctly")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Agent` — Elixir stdlib](https://hexdocs.pm/elixir/Agent.html)

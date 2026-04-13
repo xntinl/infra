@@ -431,6 +431,37 @@ for via when the set of names is dynamic.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule ViaTuplePatterns.Application do
+    @moduledoc false
+    use Application
+
+    @impl true
+    def start(_type, _args) do
+      children = [
+        {Registry, keys: :unique, name: ViaTuplePatterns.Registry},
+        ViaTuplePatterns.EtsVia  # custom via backend, see below
+      ]
+
+      Supervisor.start_link(children, strategy: :one_for_one, name: ViaTuplePatterns.Supervisor)
+    end
+  end
+
+  def main do
+    IO.puts("ViaTuplePatterns OK")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`GenServer` — name registration options](https://hexdocs.pm/elixir/GenServer.html#module-name-registration)

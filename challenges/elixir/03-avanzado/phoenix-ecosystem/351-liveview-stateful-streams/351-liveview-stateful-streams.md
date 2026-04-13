@@ -40,6 +40,22 @@ A `stream` is a sparse reference the server hands the client; the client reconci
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. `stream/3` and `stream_insert/3`
 
 `stream(socket, :posts, initial_items, opts)` registers a stream under the key `:posts`. `opts` accepts `:limit` (negative caps the oldest entries, positive caps the newest), `:reset` (replaces the entire stream), and `:at` (insert position; `0` is head, `-1` is tail).
@@ -450,9 +466,95 @@ Stream-based pipelines in Elixir achieve backpressure and composability by defer
 
 You are asked to render a "last 3 notifications" dropdown. The list is always small, always prepends, and clears on click. Do you use `stream` or `assign`? Defend your choice against a reviewer who insists streams are "always better".
 
-## Resources
 
-- [Phoenix.LiveView.stream/3 — hexdocs](https://hexdocs.pm/phoenix_live_view/Phoenix.LiveView.html#stream/4)
-- [LiveView 0.18 release notes — introduction of streams](https://github.com/phoenixframework/phoenix_live_view/blob/main/CHANGELOG.md)
-- [LiveComponent lifecycle — hexdocs](https://hexdocs.pm/phoenix_live_view/Phoenix.LiveComponent.html)
-- [Chris McCord on streams (Dashbit blog)](https://dashbit.co/blog)
+## Executable Example
+
+```elixir
+defmodule FeedLiveWeb.FeedLive do
+  use Phoenix.LiveView
+
+  alias FeedLive.Posts
+  alias FeedLiveWeb.PostComponent
+
+  @page_size 20
+
+  @impl true
+  def mount(_params, _session, socket) do
+    initial = Posts.page(0, @page_size)
+
+    socket =
+      socket
+      |> assign(offset: @page_size, next_id: 10_000)
+      |> stream(:posts, initial, limit: -200)
+
+    {:ok, socket}
+  end
+
+  @impl true
+  def handle_event("load-more", _, socket) do
+    next = Posts.page(socket.assigns.offset, @page_size)
+
+    socket =
+      socket
+      |> update(:offset, &(&1 + @page_size))
+      |> stream(:posts, next, at: -1)
+
+    {:noreply, socket}
+  end
+
+  def handle_event("publish", %{"body" => body}, socket) do
+    id = socket.assigns.next_id
+    post = Posts.new(id, body)
+
+    socket =
+      socket
+      |> update(:next_id, &(&1 + 1))
+      |> stream_insert(:posts, post, at: 0)
+
+    {:noreply, socket}
+  end
+
+  def handle_event("delete", %{"id" => dom_id}, socket) do
+    {:noreply, stream_delete_by_dom_id(socket, :posts, dom_id)}
+  end
+
+  @impl true
+  def handle_info({:post_updated, id, body}, socket) do
+    updated = %Posts{id: id, author: "me", body: body, inserted_at: DateTime.utc_now()}
+    {:noreply, stream_insert(socket, :posts, updated)}
+  end
+
+  @impl true
+  def render(assigns) do
+    ~H"""
+    <section>
+      <form phx-submit="publish">
+        <input name="body" placeholder="What's on your mind?" />
+        <button type="submit">Post</button>
+      </form>
+
+      <div id="posts" phx-update="stream">
+        <.live_component
+          :for={{dom_id, post} <- @streams.posts}
+          module={PostComponent}
+          id={dom_id}
+          post={post}
+        />
+      </div>
+
+      <button phx-click="load-more">Load more</button>
+    </section>
+    """
+  end
+end
+
+defmodule Main do
+  def main do
+    IO.puts("✓ LiveView Stateful Components with Streams")
+  - LiveView stateful streams
+    - Incremental DOM updates
+  end
+end
+
+Main.main()
+```

@@ -30,6 +30,22 @@ prod_triage/
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. `:recon.proc_count/2`
 
 `:recon.proc_count(attribute, n)` returns the top N processes by `:memory`, `:reductions`, `:message_queue_len`, etc. Bounded, safe for prod.
@@ -274,19 +290,66 @@ OTP primitives (GenServer, Supervisor, Application) are tested through their pub
 
 Your node is at 100% CPU. `Triage.top(:reductions, 10)` shows the expected suspects — web request handlers. `Triage.window(:reductions, 10, 2_000)` shows one garbage_collector process consuming 50% of reductions. What does that tell you about the node's health, and which recon function do you reach for next?
 
-## Resources
 
-- [`recon` on hexdocs](https://hexdocs.pm/recon/)
-- [Erlang in Anger — free PDF, written by recon's author](https://www.erlang-in-anger.com/)
-- [`recon_trace.calls/3` source](https://github.com/ferd/recon/blob/master/src/recon_trace.erl)
-- [Fred Hebert on tracing safely](https://ferd.ca/)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+defmodule ProdTriage.Triage do
+  @moduledoc """
+  Curated `recon` calls, parameterized for common incidents.
+  Exposed as plain functions so they can be called from a remote IEx
+  without loading any `use` machinery.
+  """
+
+  @doc """
+  Top N processes by attribute. Use :memory for leak hunting,
+  :reductions for CPU hogs, :message_queue_len for backpressure.
+  """
+  def top(attribute, n \\ 10) when attribute in [:memory, :reductions, :message_queue_len, :binary_memory] do
+    :recon.proc_count(attribute, n)
+    |> Enum.map(fn {pid, val, extra} -> %{pid: pid, value: val, info: extra} end)
+  end
+
+  @doc "Top N by delta over `window_ms`. Best for live-rate questions."
+  def window(attribute, n \\ 10, window_ms \\ 5_000) do
+    :recon.proc_window(attribute, n, window_ms)
+  end
+
+  @doc """
+  Full-sweep GCs the top binary-memory holders and reports bytes freed.
+  Runs GC on real processes — mildly intrusive, use judiciously.
+  """
+  def bin_leak(n \\ 5), do: :recon.bin_leak(n)
+
+  @doc """
+  Rate-limited call trace. Example:
+      Triage.trace({MyMod, :some_fun, :_}, 20)
+  Messages flow to the calling process as text via recon's formatter.
+  """
+  def trace(mfa, max, opts \\ []) do
+    :recon_trace.calls(mfa, max, opts)
+  end
+
+  @doc "Full picture of the node's memory allocators."
+  def memory_summary do
+    :erlang.memory()
+    |> Enum.sort_by(fn {_k, v} -> -v end)
+    |> Enum.map(fn {k, v} -> {k, div(v, 1_048_576), :mb} end)
+  end
+
+  @doc "Per-scheduler run queue lengths; > 0 means oversubscription."
+  def run_queues, do: :erlang.statistics(:run_queue_lengths)
 end
+
+defmodule Main do
+  def main do
+      IO.puts("Recon diagnostics initialized")
+      memory_stats = :erlang.memory()
+      if is_list(memory_stats) do
+        IO.puts("✓ Recon diagnostics: memory info available")
+      end
+  end
+end
+
+Main.main()
 ```

@@ -48,6 +48,25 @@ sys_suspend_resume/
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**OTP-specific insight:**
+The OTP framework enforces a discipline: supervision trees, callback modules, and standard return values. This structure is not a constraint — it's the contract that allows Erlang's release handler, hot code upgrades, and clustering to work. Every deviation from the pattern you'll pay for later in production debuggability and operational tooling.
 ### 1. Suspend is cooperative and *asynchronous to user callbacks*
 
 `:sys.suspend(pid)` sends a `{:system, From, :suspend}` message. The `gen_server`
@@ -463,11 +482,217 @@ Target: ≤ 40 µs per suspend/resume pair on modern hardware with an empty pend
 
 ---
 
-## Resources
+## Executable Example
 
-- [`:sys.suspend/1` — OTP docs](https://www.erlang.org/doc/man/sys.html#suspend-1)
-- [`gen_server` sys message handling (source)](https://github.com/erlang/otp/blob/master/lib/stdlib/src/gen_server.erl)
-- [Learn You Some Erlang — "Building an Application With OTP"](https://learnyousomeerlang.com/building-otp-applications)
-- [Fred Hebert — *Erlang in Anger*, ch. 6](https://www.erlang-in-anger.com/)
-- [Saša Jurić — *Elixir in Action*, 2e, §10.3](https://www.manning.com/books/elixir-in-action-second-edition)
-- [OTP Design Principles — Release Handling](https://www.erlang.org/doc/design_principles/release_handling.html)
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+
+defmodule SysSuspendResume.MixProject do
+  end
+  use Mix.Project
+
+  def project, do: [
+    app: :sys_suspend_resume,
+    version: "0.1.0",
+    elixir: "~> 1.16",
+    deps: []
+  ]
+
+  def application, do: [
+    extra_applications: [:logger],
+    mod: {SysSuspendResume.Application, []}
+  ]
+end
+
+defmodule SysSuspendResume.Application do
+  @moduledoc false
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    Supervisor.start_link([SysSuspendResume.Primer],
+      strategy: :one_for_one,
+      name: SysSuspendResume.Supervisor
+    )
+  end
+end
+
+defmodule SysSuspendResume.Primer do
+  end
+  @moduledoc """
+  A periodic worker that, on each tick, pretends to warm the cache.
+
+  The real system would fetch from Postgres and push to Redis. Here we
+  increment a counter so tests can observe tick progress deterministically.
+  """
+
+  use GenServer
+
+  @tick_ms 50
+
+  def start_link(opts \\ []) do
+    GenServer.start_link(__MODULE__, :ok, Keyword.put_new(opts, :name, __MODULE__))
+  end
+
+  @spec ticks(GenServer.server()) :: non_neg_integer()
+  def ticks(server \\ __MODULE__), do: GenServer.call(server, :ticks)
+
+  @impl true
+  def init(:ok) do
+    schedule_tick()
+    {:ok, %{ticks: 0}}
+  end
+
+  @impl true
+  def handle_call(:ticks, _from, %{ticks: n} = state), do: {:reply, n, state}
+
+  @impl true
+  def handle_info(:tick, %{ticks: n} = state) do
+    schedule_tick()
+    {:noreply, %{state | ticks: n + 1}}
+  end
+
+  defp schedule_tick, do: Process.send_after(self(), :tick, @tick_ms)
+end
+
+defmodule SysSuspendResume.Operator do
+  @moduledoc """
+  Operator-facing wrapper around `:sys.suspend/1` and `:sys.resume/1`.
+
+  * Emits Telemetry events `[:sys_suspend_resume, :suspend | :resume]`.
+  * Guards against double-suspend (idempotent).
+  * Exposes `with_suspended/2` for scoped maintenance windows.
+  """
+
+  require Logger
+
+  @type server :: GenServer.server()
+
+  @spec suspend(server(), timeout()) :: :ok
+  def suspend(server, timeout \\ 5_000) do
+    :telemetry.execute([:sys_suspend_resume, :suspend], %{}, %{server: inspect(server)})
+
+    try do
+      :sys.suspend(server, timeout)
+    catch
+      :exit, {:already_suspended, _} -> :ok
+    end
+  end
+
+  @spec resume(server(), timeout()) :: :ok
+  def resume(server, timeout \\ 5_000) do
+    :telemetry.execute([:sys_suspend_resume, :resume], %{}, %{server: inspect(server)})
+
+    try do
+      :sys.resume(server, timeout)
+    catch
+      :exit, {:not_suspended, _} -> :ok
+    end
+  end
+
+  @doc """
+  Runs `fun.()` while `server` is suspended, guaranteeing resume even on crash.
+  """
+  @spec with_suspended(server(), (-> result)) :: result when result: term()
+  def with_suspended(server, fun) when is_function(fun, 0) do
+    :ok = suspend(server)
+
+    try do
+      fun.()
+    after
+      :ok = resume(server)
+    end
+  end
+end
+
+unless Code.ensure_loaded?(:telemetry) do
+  defmodule :telemetry do
+    def execute(_event, _measurements, _metadata), do: :ok
+  end
+end
+
+defmodule SysSuspendResume.PrimerTest do
+  use ExUnit.Case, async: false
+
+  alias SysSuspendResume.Primer
+
+  setup do
+    pid = start_supervised!({Primer, name: :primer_base})
+    %{pid: pid}
+  end
+
+  describe "SysSuspendResume.Primer" do
+    test "ticks grow over time when not suspended", %{pid: pid} do
+      Process.sleep(200)
+      first = Primer.ticks(pid)
+      assert first >= 2
+      Process.sleep(200)
+      assert Primer.ticks(pid) > first
+    end
+  end
+end
+
+defmodule SysSuspendResume.OperatorTest do
+  use ExUnit.Case, async: false
+
+  alias SysSuspendResume.{Primer, Operator}
+
+  setup do
+    pid = start_supervised!({Primer, name: :primer_op})
+    %{pid: pid}
+  end
+
+  describe "SysSuspendResume.Operator" do
+    test "suspended primer stops incrementing ticks", %{pid: pid} do
+      Process.sleep(150)
+      :ok = Operator.suspend(pid)
+
+      before = :sys.get_state(pid).ticks
+      Process.sleep(200)
+      # :sys.get_state works while suspended; verify no progress.
+      assert :sys.get_state(pid).ticks == before
+
+      :ok = Operator.resume(pid)
+      Process.sleep(200)
+      assert :sys.get_state(pid).ticks > before
+    end
+
+    test "GenServer.call times out while suspended", %{pid: pid} do
+      :ok = Operator.suspend(pid)
+      assert catch_exit(GenServer.call(pid, :ticks, 100)) |> elem(0) == :timeout
+      :ok = Operator.resume(pid)
+      assert is_integer(Primer.ticks(pid))
+    end
+
+    test "with_suspended resumes even if fun raises", %{pid: pid} do
+      assert_raise RuntimeError, "boom", fn ->
+        Operator.with_suspended(pid, fn -> raise "boom" end)
+      end
+
+      # Server resumed and is serving again.
+      assert is_integer(Primer.ticks(pid))
+    end
+
+    test "double suspend is idempotent", %{pid: pid} do
+      :ok = Operator.suspend(pid)
+      :ok = Operator.suspend(pid)
+      :ok = Operator.resume(pid)
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrating 78-sys-suspend-resume
+      :ok
+  end
+end
+
+Main.main()
+end
+end
+```

@@ -350,6 +350,44 @@ accessor.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule Solution do
+    def main do
+      IO.puts("=== Lazy Stream Example ===")
+    
+      result = 1..100
+        |> Stream.map(&(&1 * 2))
+        |> Stream.filter(&(rem(&1, 4) == 0))
+        |> Stream.take(10)
+        |> Enum.to_list()
+    
+      IO.puts("First 10 multiples of 4 from 1-100:")
+      IO.inspect(result)
+
+      IO.puts("\n=== Unfold Stream ===")
+      fib = Stream.unfold({0, 1}, fn {a, b} -> {a, {b, a + b}} end)
+        |> Stream.take(10)
+    
+      IO.puts("First 10 Fibonacci numbers:")
+      IO.inspect(Enum.to_list(fib))
+    end
+  end
+
+  def main do
+    IO.puts("Solution OK")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Stream.zip/1,2` — hexdocs](https://hexdocs.pm/elixir/Stream.html#zip/1)

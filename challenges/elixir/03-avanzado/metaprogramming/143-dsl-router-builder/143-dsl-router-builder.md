@@ -71,6 +71,25 @@ A runtime dispatcher walks a list of patterns for every request. Compile-time ro
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Metaprogramming-specific insight:**
+Code generation is powerful and dangerous. Every macro you write is a place where intent is hidden. Use macros sparingly, only when they eliminate genuine boilerplate. If your macro is more than 10 lines, you probably need a function or data structure instead. Future maintainers will thank you.
 ### 1. Scopes are compile-time stacks
 
 `scope "/admin" do ... end` pushes `"/admin"` onto a stack; every nested `get` reads
@@ -491,11 +510,191 @@ Expect ~80–200 ns per dispatch — the BEAM pattern-matching jump.
 
 ---
 
-## Resources
 
-- [Phoenix.Router source](https://github.com/phoenixframework/phoenix/blob/main/lib/phoenix/router.ex) — reference implementation
-- [Plug.Router — minimal router](https://github.com/elixir-plug/plug/blob/main/lib/plug/router.ex)
-- [*Programming Phoenix* — Chris McCord](https://pragprog.com/titles/phoenix14/programming-phoenix-1-4/) — router chapter
-- [*Metaprogramming Elixir* — ch. 6](https://pragprog.com/titles/cmelixir/metaprogramming-elixir/) — DSL building
-- [Dashbit blog on Phoenix internals](https://dashbit.co/blog)
-- [BEAM pattern matching efficiency](https://blog.stenmans.org/theBeamBook/)
+## Executable Example
+
+```elixir
+defmodule RouterDSL do
+  @moduledoc """
+  Compile-time HTTP router DSL.
+
+      use RouterDSL
+
+      scope "/api" do
+        get "/users", UserController, :index
+      end
+  """
+
+  alias RouterDSL.{Route, ScopeStack}
+
+  defmacro __using__(_opts) do
+    quote do
+      Module.register_attribute(__MODULE__, :routes, accumulate: true)
+      Module.register_attribute(__MODULE__, :pipelines_map, accumulate: false)
+      @scope_prefix []
+      @current_pipelines []
+      @pipelines_map %{}
+      import RouterDSL, only: [scope: 2, pipeline: 2, pipe_through: 1, plug: 1,
+                               get: 3, post: 3, put: 3, delete: 3, patch: 3]
+      @before_compile RouterDSL
+    end
+  end
+
+  # ------------------------------------------------------------------
+  # Scope + pipeline directives
+  # ------------------------------------------------------------------
+
+  defmacro scope(path, do: block) do
+    quote do
+      parent_prefix = @scope_prefix
+      parent_pipelines = @current_pipelines
+      @scope_prefix parent_prefix ++ RouterDSL.ScopeStack.parse_path(unquote(path))
+      unquote(block)
+      @scope_prefix parent_prefix
+      @current_pipelines parent_pipelines
+    end
+  end
+
+  defmacro pipeline(name, do: block) do
+    quote do
+      @pipeline_current []
+      import RouterDSL, only: [plug: 1]
+      unquote(block)
+      @pipelines_map Map.put(@pipelines_map, unquote(name), Enum.reverse(@pipeline_current))
+    end
+  end
+
+  defmacro plug(name) do
+    quote bind_quoted: [name: name] do
+      @pipeline_current [name | @pipeline_current]
+    end
+  end
+
+  defmacro pipe_through(name) do
+    quote do
+      plugs = Map.fetch!(@pipelines_map, unquote(name))
+      @current_pipelines @current_pipelines ++ plugs
+    end
+  end
+
+  # ------------------------------------------------------------------
+  # HTTP verbs
+  # ------------------------------------------------------------------
+
+  for verb <- [:get, :post, :put, :delete, :patch] do
+    defmacro unquote(verb)(path, controller, action) do
+      verb = unquote(verb) |> Atom.to_string() |> String.upcase()
+      verb_atom = unquote(verb)
+
+      quote bind_quoted: [
+              verb: verb,
+              verb_atom: verb_atom,
+              path: path,
+              controller: controller,
+              action: action
+            ] do
+        full =
+          @scope_prefix ++ RouterDSL.ScopeStack.parse_path(path)
+
+        @routes %RouterDSL.Route{
+          verb: verb,
+          path_segments: full,
+          controller: controller,
+          action: action,
+          pipelines: @current_pipelines
+        }
+      end
+    end
+  end
+
+  # ------------------------------------------------------------------
+  # Compilation
+  # ------------------------------------------------------------------
+
+  defmacro __before_compile__(env) do
+    routes = env.module |> Module.get_attribute(:routes) |> Enum.reverse()
+
+    clauses =
+      for %Route{} = r <- routes do
+        match = ScopeStack.build_match_ast(r.path_segments)
+        params = ScopeStack.build_params_map(r.path_segments)
+
+        quote do
+          def dispatch(_conn, unquote(r.verb), unquote(match)) do
+            {:ok,
+             {unquote(r.controller), unquote(r.action), unquote(params), unquote(r.pipelines)}}
+          end
+        end
+      end
+
+    fallback =
+      quote do
+        def dispatch(_conn, _verb, _segments), do: {:error, :not_found}
+
+        @spec __routes__() :: [RouterDSL.Route.t()]
+        def __routes__, do: unquote(Macro.escape(routes))
+      end
+
+    quote do
+      (unquote_splicing(clauses))
+      unquote(fallback)
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+      # Simulate Phoenix-style router DSL
+      defmodule Router do
+        defmacro route(method, path, handler) do
+          quote do
+            @routes (@routes || []) ++ [{unquote(method), unquote(path), unquote(handler)}]
+          end
+        end
+
+        defmacro __using__(_opts) do
+          quote do
+            @routes []
+            import Router
+
+            def __routes__, do: @routes
+
+            def dispatch(method, path) do
+              Enum.find_value(__routes__, fn {m, p, handler} ->
+                if m == method and p == path do
+                  {:ok, handler}
+                end
+              end) || {:error, :not_found}
+            end
+          end
+        end
+      end
+
+      # Define router using DSL
+      defmodule AppRouter do
+        use Router
+
+        route :get, "/users", :list_users
+        route :post, "/users", :create_user
+        route :get, "/users/:id", :get_user
+      end
+
+      # Test
+      routes = AppRouter.__routes__
+      result_get = AppRouter.dispatch(:get, "/users")
+      result_missing = AppRouter.dispatch(:delete, "/users")
+
+      IO.inspect(routes, label: "✓ Compiled routes")
+      IO.puts("✓ GET /users: #{inspect(result_get)}")
+      IO.puts("✓ DELETE /users (missing): #{inspect(result_missing)}")
+
+      assert length(routes) == 3, "All routes defined"
+      assert match?({:ok, :list_users}, result_get), "Route found"
+      assert match?({:error, :not_found}, result_missing), "Missing route not found"
+
+      IO.puts("✓ Router DSL: Phoenix-style routing working")
+  end
+end
+
+Main.main()
+```

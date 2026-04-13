@@ -376,6 +376,64 @@ in a distributed KV). If every reasonable backend implements it, make it mandato
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule KvStoreTest do
+  use ExUnit.Case, async: true
+
+  # We run the same test suite against both backends.
+  # If the contract is respected, both pass identically.
+
+  describe "InMemory backend" do
+    setup do
+      {:ok, h} = KvStore.InMemory.init([])
+      %{h: h, mod: KvStore.InMemory}
+    end
+
+    test "put then get", %{h: h, mod: mod} do
+      :ok = mod.put(h, "a", 1)
+      assert {:ok, 1} = mod.get(h, "a")
+    end
+
+    test "get on missing key returns :not_found", %{h: h, mod: mod} do
+      assert :not_found = mod.get(h, "nope")
+    end
+
+    test "delete is idempotent", %{h: h, mod: mod} do
+      assert :ok = mod.delete(h, "nope")
+    end
+
+    test "list_keys is available", %{h: h, mod: mod} do
+      :ok = mod.put(h, "a", 1)
+      :ok = mod.put(h, "b", 2)
+      assert Enum.sort(mod.list_keys(h)) == ["a", "b"]
+    end
+  end
+
+  describe "File backend" do
+    setup do
+      dir = Path.join(System.tmp_dir!(), "kv_#{System.unique_integer([:positive])}")
+      {:ok, h} = KvStore.File.init(dir: dir)
+      on_exit(fn -> File.rm_rf!(dir) end)
+      %{h: h, mod: KvStore.File}
+    end
+
+    test "put then get", %{h: h, mod: mod} do
+      :ok = mod.put(h, "a", %{complex: [1, 2, 3]})
+      assert {:ok, %{complex: [1, 2, 3]}} = mod.get(h, "a")
+    end
+
+    test "optional callback is absent — caller must detect it", %{mod: mod} do
+      # This is how a generic client safely uses optional callbacks.
+      refute function_exported?(mod, :list_keys, 1)
+    end
+  end
+end
+```
+
 ## Resources
 
 - [Elixir docs — Behaviours guide](https://hexdocs.pm/elixir/typespecs.html#behaviours)

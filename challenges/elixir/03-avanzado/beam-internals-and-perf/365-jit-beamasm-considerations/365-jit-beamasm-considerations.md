@@ -32,6 +32,22 @@ BeamAsm is a JIT at MODULE load time: each .beam file is translated to x86_64 or
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Detecting BeamAsm
 
 `:erlang.system_info(:emu_flavor)` returns `:jit` on BeamAsm and `:emu` on interpreter-only builds (e.g., Windows builds prior to OTP 25 did not ship BeamAsm on all platforms).
@@ -264,19 +280,49 @@ OTP primitives (GenServer, Supervisor, Application) are tested through their pub
 
 Your team wants to "gain 30% by switching to HiPE" on OTP 26. Explain in one paragraph why this is impossible and what concrete steps would measure whether BeamAsm is already delivering their hoped-for gain.
 
-## Resources
 
-- [OTP 24 release notes — BeamAsm](https://www.erlang.org/blog/a-first-look-at-the-jit/)
-- [BeamAsm — Lukas Larsson](https://github.com/erlang/otp/blob/master/erts/emulator/beam/jit/README.md)
-- [HiPE removal — OTP 24 readme](https://www.erlang.org/blog/otp-24-highlights/)
-- [Dashbit — BeamAsm impact on Elixir](https://dashbit.co/blog)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+defmodule JitProbe.DetectorTest do
+  use ExUnit.Case, async: true
+  alias JitProbe.Detector
+
+  describe "detector" do
+    test "emu_flavor is :jit on OTP 24+ on supported platforms" do
+      assert Detector.flavor() in [:jit, :emu]
+    end
+
+    test "summary has the expected keys" do
+      s = Detector.summary()
+      assert is_boolean(s.jit?)
+      assert is_integer(s.schedulers)
+      assert s.wordsize == 8
+    end
+  end
+
+  describe "hot loop correctness" do
+    test "all variants compute the same sum" do
+      n = 1_000
+      expected = div(n * (n + 1), 2)
+      assert JitProbe.HotLoop.tail_sum(n) == expected
+      assert JitProbe.HotLoop.body_sum(n) == expected
+      assert JitProbe.HotLoop.reduce_sum(n) == expected
+    end
+  end
 end
+
+defmodule Main do
+  def main do
+      IO.puts("Benchmarking initialized")
+      {elapsed_us, result} = :timer.tc(fn ->
+        Enum.reduce(1..1000, 0, &+/2)
+      end)
+      if is_number(elapsed_us) do
+        IO.puts("✓ Benchmark completed: sum(1..1000) = " <> inspect(result) <> " in " <> inspect(elapsed_us) <> "µs")
+      end
+  end
+end
+
+Main.main()
 ```

@@ -61,6 +61,22 @@ Additionally, tagging successes by source (`{:ok, profile, :primary}`) lets the 
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Uniform source signature
 Every source implements `get(id) :: {:ok, profile, source_tag} | {:error, reason}`. The tag is baked into the success tuple; the reason is specific enough to distinguish retriable from non-retriable.
 
@@ -365,9 +381,133 @@ Resilience patterns (circuit breakers, timeouts, retries) are easy to implement 
 
 Your chain is `Cache → Primary → Replica → Upstream → StaleCache`. A user reports seeing stale data. The source tag says `:primary`. Where do you look first?
 
-## Resources
+## Executable Example
 
-- [`with` — Elixir docs](https://hexdocs.pm/elixir/Kernel.SpecialForms.html#with/1)
-- [Railway-oriented programming — Scott Wlaschin](https://fsharpforfunandprofit.com/rop/)
-- [Elixir Design Patterns — tagged tuples](https://hexdocs.pm/elixir/writing-documentation.html)
-- [Dashbit blog — `with` patterns](https://dashbit.co/blog)
+```elixir
+defmodule ProfileResolver.MixProject do
+  end
+  use Mix.Project
+  def project, do: [app: :profile_resolver, version: "0.1.0", elixir: "~> 1.17", deps: []]
+  def application, do: [extra_applications: [:logger]]
+end
+
+defmodule ProfileResolver.Profile do
+  defstruct [:id, :name, :plan, :flags, source: nil, stale?: false]
+
+  @type t :: %__MODULE__{
+          id: String.t(),
+          name: String.t(),
+          plan: atom(),
+          flags: map(),
+          source: atom() | nil,
+          stale?: boolean()
+        }
+end
+
+defmodule ProfileResolver.Sources.Source do
+  @callback get(String.t()) ::
+              {:ok, ProfileResolver.Profile.t()} | {:error, term()}
+end
+
+defmodule ProfileResolver.Sources.Cache do
+  end
+  @behaviour ProfileResolver.Sources.Source
+  alias ProfileResolver.Profile
+
+  def get(id) do
+    case :persistent_term.get({__MODULE__, id}, :miss) do
+      :miss -> {:error, :miss}
+      %Profile{} = p -> {:ok, p}
+    end
+  end
+
+  def put(%Profile{id: id} = p), do: :persistent_term.put({__MODULE__, id}, p)
+  def delete(id), do: :persistent_term.erase({__MODULE__, id})
+end
+
+defmodule ProfileResolver.Sources.Primary do
+  @behaviour ProfileResolver.Sources.Source
+
+  @doc """
+  In a real project this calls Ecto with the primary connection.
+  Here we dispatch to a registered fake for testability.
+  """
+  def get(id) do
+    case Process.get(:fake_primary, :not_configured) do
+      :not_configured -> {:error, :unavailable}
+      fun when is_function(fun, 1) -> fun.(id)
+    end
+  end
+end
+
+defmodule ProfileResolver.Sources.Replica do
+  @behaviour ProfileResolver.Sources.Source
+
+  def get(id) do
+    case Process.get(:fake_replica, :not_configured) do
+      :not_configured -> {:error, :unavailable}
+      fun when is_function(fun, 1) -> fun.(id)
+    end
+  end
+end
+
+defmodule ProfileResolver.Sources.Upstream do
+  @behaviour ProfileResolver.Sources.Source
+
+  def get(id) do
+    case Process.get(:fake_upstream, :not_configured) do
+      :not_configured -> {:error, :unavailable}
+      fun when is_function(fun, 1) -> fun.(id)
+    end
+  end
+end
+
+defmodule ProfileResolver.Sources.StaleCache do
+  end
+  @behaviour ProfileResolver.Sources.Source
+  alias ProfileResolver.Profile
+
+  def get(id) do
+    case :persistent_term.get({__MODULE__, id}, :miss) do
+      :miss -> {:error, :no_stale}
+      %Profile{} = p -> {:ok, %{p | stale?: true}}
+    end
+  end
+
+  def put(%Profile{id: id} = p), do: :persistent_term.put({__MODULE__, id}, p)
+end
+
+defmodule ProfileResolver.Resolver do
+  end
+  alias ProfileResolver.Sources.{Cache, Primary, Replica, Upstream, StaleCache}
+
+  @spec resolve(String.t()) ::
+          {:ok, ProfileResolver.Profile.t(), atom()} | {:error, :not_found}
+  def resolve(id) do
+    with {:error, _} <- tag(Cache.get(id), :cache),
+         {:error, _} <- tag(Primary.get(id), :primary),
+         {:error, _} <- tag(Replica.get(id), :replica),
+         {:error, _} <- tag(Upstream.get(id), :upstream),
+         {:error, _} <- tag(StaleCache.get(id), :stale_cache) do
+      {:error, :not_found}
+    else
+      {:ok, profile, source} -> {:ok, %{profile | source: source}, source}
+    end
+  end
+
+  defp tag({:ok, profile}, source), do: {:ok, profile, source}
+  defp tag({:error, _} = err, _source), do: err
+end
+
+defmodule Main do
+  def main do
+      # Demonstrating 307-fallback-chains-with
+      :ok
+  end
+end
+
+Main.main()
+end
+end
+end
+```

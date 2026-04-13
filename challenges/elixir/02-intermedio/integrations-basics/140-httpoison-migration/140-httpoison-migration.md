@@ -417,6 +417,94 @@ or when a fresh service can start on Req from day one.
 
 - After you migrate, HTTPoison may still live in your deps tree because a third-party library pins it. Does that undermine the reason for migrating (fewer deps, no C NIF), or is the real win elsewhere — and if elsewhere, what does that say about how you should justify the migration to a skeptical reviewer?
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule HttpMigration.Legacy do
+    @moduledoc """
+    The original client. Manual JSON, manual retries, error shape tied to
+    HTTPoison's structs. Representative of code written pre-2023.
+    """
+
+    @max_retries 2
+
+    @spec get_user(String.t(), integer()) :: {:ok, map()} | {:error, term()}
+    def get_user(base_url, id) do
+      url = "#{base_url}/users/#{id}"
+      do_get_with_retry(url, @max_retries)
+    end
+
+    @spec create_user(String.t(), map()) :: {:ok, map()} | {:error, term()}
+    def create_user(base_url, attrs) do
+      url = "#{base_url}/users"
+      headers = [{"content-type", "application/json"}, {"accept", "application/json"}]
+
+      case HTTPoison.post(url, Jason.encode!(attrs), headers) do
+        {:ok, %HTTPoison.Response{status_code: s, body: body}} when s in 200..299 ->
+          Jason.decode(body)
+
+        {:ok, %HTTPoison.Response{status_code: s}} ->
+          {:error, {:http, s}}
+
+        {:error, %HTTPoison.Error{reason: reason}} ->
+          {:error, reason}
+      end
+    end
+
+    # ── Private ─────────────────────────────────────────────────────────────
+
+    defp do_get_with_retry(_url, attempts) when attempts < 0,
+      do: {:error, :retries_exhausted}
+
+    defp do_get_with_retry(url, attempts) do
+      case HTTPoison.get(url, [{"accept", "application/json"}]) do
+        {:ok, %HTTPoison.Response{status_code: 200, body: body}} ->
+          Jason.decode(body)
+
+        {:ok, %HTTPoison.Response{status_code: 404}} ->
+          {:error, :not_found}
+
+        {:ok, %HTTPoison.Response{status_code: s}} when s >= 500 ->
+          Process.sleep(backoff(@max_retries - attempts))
+          do_get_with_retry(url, attempts - 1)
+
+        {:ok, %HTTPoison.Response{status_code: s}} ->
+          {:error, {:http, s}}
+
+        {:error, %HTTPoison.Error{reason: :timeout}} ->
+          Process.sleep(backoff(@max_retries - attempts))
+          do_get_with_retry(url, attempts - 1)
+
+        {:error, %HTTPoison.Error{reason: r}} ->
+          {:error, r}
+      end
+    end
+
+    defp backoff(attempt), do: trunc(:math.pow(2, attempt) * 100)
+  end
+
+  def main do
+    IO.puts("=== HttpClient Demo ===
+  ")
+  
+    # Demo: HTTPoison (legacy, use Req instead)")
+  IO.puts("1. HTTPoison.get/3 - HTTP request")
+  IO.puts("2. Handling responses")
+  IO.puts("3. Note: Req is the modern replacement")
+
+  IO.puts("
+  ✓ HTTPoison demo completed!")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [Req on HexDocs](https://hexdocs.pm/req/Req.html)

@@ -372,6 +372,86 @@ it. Overlays are for files whose lifecycle matches the release.
 
 - ¿Cuándo un overlay es preferible a un `runtime.exs` con `System.get_env`? Dá el criterio.
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule RuntimeOverlays.MixProject do
+    use Mix.Project
+
+    def project do
+      [
+        app: :runtime_overlays,
+        version: "0.1.0",
+        elixir: "~> 1.17",
+        start_permanent: Mix.env() == :prod,
+        deps: [],
+        releases: releases()
+      ]
+    end
+
+    def application do
+      [extra_applications: [:logger], mod: {RuntimeOverlays.Application, []}]
+    end
+
+    # `steps:` controls the release assembly pipeline.
+    # `:assemble` is the built-in step that builds the release tree.
+    # `&copy_overlays/1` runs AFTER assembly and injects our files.
+    defp releases do
+      [
+        runtime_overlays: [
+          include_executables_for: [:unix],
+          steps: [:assemble, &copy_overlays/1]
+        ]
+      ]
+    end
+
+    # Walks rel/overlays/ and copies everything into the release root,
+    # preserving directory structure. Shell scripts are made executable.
+    defp copy_overlays(%Mix.Release{path: release_path} = release) do
+      source = Path.join([File.cwd!(), "rel", "overlays"])
+
+      if File.dir?(source) do
+        File.cp_r!(source, release_path)
+        make_scripts_executable(Path.join(release_path, "scripts"))
+        Mix.shell().info("Overlays copied from #{source} → #{release_path}")
+      end
+
+      release
+    end
+
+    defp make_scripts_executable(scripts_dir) do
+      if File.dir?(scripts_dir) do
+        scripts_dir
+        |> File.ls!()
+        |> Enum.filter(&String.ends_with?(&1, ".sh"))
+        |> Enum.each(fn f ->
+          path = Path.join(scripts_dir, f)
+          File.chmod!(path, 0o755)
+        end)
+      end
+    end
+  end
+
+  def main do
+    # Demo: release overlays para archivos adicionales
+    {:ok, _} = Application.ensure_all_started(:runtime_overlays)
+  
+    overlay_value = Application.get_env(:runtime_overlays, :overlay_setting, "none")
+  
+    IO.puts("RuntimeOverlays: demostración exitosa")
+    IO.puts("  overlay_setting: #{overlay_value}")
+    IO.puts("  Los overlays permiten incluir archivos adicionales en releases")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [Mix release — Customization with steps](https://hexdocs.pm/mix/Mix.Tasks.Release.html#module-steps)

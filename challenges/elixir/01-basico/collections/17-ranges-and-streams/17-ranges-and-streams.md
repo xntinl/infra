@@ -560,6 +560,79 @@ the bug. Always decide your error policy explicitly.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule PageStream.ExporterTest do
+  use ExUnit.Case, async: true
+
+  alias PageStream.Exporter
+
+  defmodule TxClient do
+    @behaviour PageStream.ApiClient
+
+    # 6 transactions across 2 pages. Half test_mode, mixed amounts.
+    @pages %{
+      nil => %{
+        items: [
+          %{id: "t1", amount: 100, currency: "USD", created_at: "2026-01-01", test_mode: false},
+          %{id: "t2", amount: 5, currency: "USD", created_at: "2026-01-01", test_mode: false},
+          %{id: "t3", amount: 200, currency: "EUR", created_at: "2026-01-01", test_mode: true}
+        ],
+        next_cursor: "p2"
+      },
+      "p2" => %{
+        items: [
+          %{id: "t4", amount: 500, currency: "USD", created_at: "2026-01-02", test_mode: false},
+          %{id: "t5", amount: 50, currency: "USD", created_at: "2026-01-02", test_mode: false},
+          %{id: "t6", amount: 1_000, currency: "USD", created_at: "2026-01-02", test_mode: false}
+        ],
+        next_cursor: nil
+      }
+    }
+
+    @impl true
+    def fetch_page(cursor), do: {:ok, @pages[cursor]}
+  end
+
+  setup do
+    path = Path.join(System.tmp_dir!(), "page_stream_#{System.unique_integer([:positive])}.csv")
+    on_exit(fn -> File.rm(path) end)
+    {:ok, path: path}
+  end
+
+  test "excludes test_mode transactions", %{path: path} do
+    written = Exporter.export(TxClient, path, limit: 100, min_amount: 0)
+    contents = File.read!(path)
+
+    assert written == 5
+    refute contents =~ "t3"
+  end
+
+  test "filters by minimum amount", %{path: path} do
+    written = Exporter.export(TxClient, path, limit: 100, min_amount: 100)
+
+    # t1 (100), t4 (500), t6 (1000) — three records
+    assert written == 3
+  end
+
+  test "respects the limit even when more records would match", %{path: path} do
+    written = Exporter.export(TxClient, path, limit: 2, min_amount: 0)
+    assert written == 2
+  end
+
+  test "produces a CSV with header and one row per record", %{path: path} do
+    Exporter.export(TxClient, path, limit: 10, min_amount: 0)
+    lines = path |> File.read!() |> String.split("\n", trim: true)
+
+    assert hd(lines) == "id,amount,currency,created_at"
+    assert length(lines) == 6
+  end
+end
+```
+
 ## Resources
 
 - [Stream module — HexDocs](https://hexdocs.pm/elixir/Stream.html)

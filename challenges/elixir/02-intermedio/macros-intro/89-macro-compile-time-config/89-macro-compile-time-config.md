@@ -391,6 +391,139 @@ generation shines only when the data is static at compile time.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule CompileTimeRoutes.Router do
+    @moduledoc """
+    A tiny Phoenix-style router DSL. Using this module:
+
+        defmodule MyRouter do
+          use CompileTimeRoutes.Router
+
+          get  "/users",     :list_users
+          get  "/users/:id", :show_user
+          post "/users",     :create_user
+        end
+
+    generates `MyRouter.match_route(method, path)` as a pattern-matched
+    function — one head per declared route.
+    """
+
+    @doc false
+    defmacro __using__(_opts) do
+      quote do
+        # accumulate: true turns @routes into a growing list.
+        Module.register_attribute(__MODULE__, :routes, accumulate: true)
+
+        import CompileTimeRoutes.Router, only: [get: 2, post: 2, match: 3]
+
+        @before_compile CompileTimeRoutes.Router
+      end
+    end
+
+    @doc "Declares a GET route."
+    defmacro get(path, handler), do: accumulate_route(:get, path, handler)
+
+    @doc "Declares a POST route."
+    defmacro post(path, handler), do: accumulate_route(:post, path, handler)
+
+    @doc "Declares a route with any method atom."
+    defmacro match(method, path, handler) do
+      quote do
+        @routes {unquote(method), unquote(path), unquote(handler)}
+      end
+    end
+
+    defp accumulate_route(method, path, handler) do
+      quote do
+        @routes {unquote(method), unquote(path), unquote(handler)}
+      end
+    end
+
+    @doc false
+    defmacro __before_compile__(env) do
+      # Read the final list of routes. Reverse so source order wins.
+      routes = Module.get_attribute(env.module, :routes) |> Enum.reverse()
+
+      # For each route, emit one `match_route/2` function head. The final
+      # catch-all clause returns `:no_match`.
+      clauses =
+        for {method, path, handler} <- routes do
+          quote do
+            def match_route(unquote(method), unquote(path)) do
+              {:ok, unquote(handler)}
+            end
+          end
+        end
+
+      quote do
+        unquote_splicing(clauses)
+
+        def match_route(_method, _path), do: :no_match
+      end
+    end
+  end
+
+  defmodule CompileTimeRoutes do
+    @moduledoc """
+    A sample router built with `CompileTimeRoutes.Router`. Exists to prove
+    the DSL compiles and dispatches as expected.
+    """
+
+    use CompileTimeRoutes.Router
+
+    get "/health", :health
+    get "/users", :list_users
+    post "/users", :create_user
+    match :delete, "/users", :delete_all_users
+  end
+
+  def main do
+    IO.puts("=== CompileTimeRoutes Demo ===\n")
+  
+    # Demo 1: Match GET /health
+    IO.puts("1. match_route(:get, '/health'):")
+    result = CompileTimeRoutes.match_route(:get, "/health")
+    IO.puts("   #{inspect(result)}")
+    assert result == {:ok, :health}
+  
+    # Demo 2: Match POST /users
+    IO.puts("\n2. match_route(:post, '/users'):")
+    result = CompileTimeRoutes.match_route(:post, "/users")
+    IO.puts("   #{inspect(result)}")
+    assert result == {:ok, :create_user}
+  
+    # Demo 3: Match DELETE /users
+    IO.puts("\n3. match_route(:delete, '/users'):")
+    result = CompileTimeRoutes.match_route(:delete, "/users")
+    IO.puts("   #{inspect(result)}")
+    assert result == {:ok, :delete_all_users}
+  
+    # Demo 4: No match
+    IO.puts("\n4. match_route(:get, '/nope'):")
+    result = CompileTimeRoutes.match_route(:get, "/nope")
+    IO.puts("   #{inspect(result)}")
+    assert result == :no_match
+  
+    # Demo 5: Wrong method
+    IO.puts("\n5. match_route(:post, '/health'):")
+    result = CompileTimeRoutes.match_route(:post, "/health")
+    IO.puts("   #{inspect(result)}")
+    assert result == :no_match
+  
+    IO.puts("\n✓ All CompileTimeRoutes demos passed!")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Phoenix.Router` source](https://github.com/phoenixframework/phoenix/blob/main/lib/phoenix/router.ex) — the real thing, same pattern at scale

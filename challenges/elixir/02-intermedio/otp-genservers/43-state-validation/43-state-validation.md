@@ -379,6 +379,141 @@ subtle invariants that would cause a production incident if violated.
 
 - Si agregás validación en cada transición y el cost pasa de 1µs a 10µs por call, ¿vale? Definí en qué cargas sí y en cuáles no.
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule ValidatedStateGs do
+    @moduledoc """
+    A bank-account-like GenServer that enforces two invariants:
+
+      1. `balance >= 0`
+      2. `version` strictly increases on every mutation
+
+    Validation happens in `init/1` (reject bad initial state) and in every
+    callback that produces a candidate new state (reject bad transitions).
+    """
+
+    use GenServer
+
+    defmodule State do
+      @moduledoc false
+      @enforce_keys [:balance, :version]
+      defstruct [:balance, :version]
+
+      @type t :: %__MODULE__{balance: integer(), version: non_neg_integer()}
+
+      @doc """
+      Single source of truth for state validity. Returns `:ok` or `{:error, reason}`.
+      Every boundary that constructs or mutates state must call this.
+      """
+      @spec validate(t()) :: :ok | {:error, atom()}
+      def validate(%__MODULE__{balance: b}) when not is_integer(b),
+        do: {:error, :balance_not_integer}
+
+      def validate(%__MODULE__{balance: b}) when b < 0,
+        do: {:error, :negative_balance}
+
+      def validate(%__MODULE__{version: v}) when not is_integer(v) or v < 0,
+        do: {:error, :invalid_version}
+
+      def validate(%__MODULE__{}), do: :ok
+    end
+
+    # ── Public API ──────────────────────────────────────────────────────────
+
+    @spec start_link(keyword()) :: GenServer.on_start()
+    def start_link(opts) do
+      {initial_balance, opts} = Keyword.pop(opts, :initial_balance, 0)
+      GenServer.start_link(__MODULE__, initial_balance, opts)
+    end
+
+    @spec deposit(GenServer.server(), pos_integer()) :: :ok | {:error, atom()}
+    def deposit(server, amount), do: GenServer.call(server, {:deposit, amount})
+
+    @spec withdraw(GenServer.server(), pos_integer()) :: :ok | {:error, atom()}
+    def withdraw(server, amount), do: GenServer.call(server, {:withdraw, amount})
+
+    @spec balance(GenServer.server()) :: integer()
+    def balance(server), do: GenServer.call(server, :balance)
+
+    @spec version(GenServer.server()) :: non_neg_integer()
+    def version(server), do: GenServer.call(server, :version)
+
+    # ── Callbacks ───────────────────────────────────────────────────────────
+
+    @impl true
+    def init(initial_balance) do
+      state = %State{balance: initial_balance, version: 0}
+
+      case State.validate(state) do
+        :ok -> {:ok, state}
+        {:error, reason} -> {:stop, {:invalid_initial_state, reason}}
+      end
+    end
+
+    @impl true
+    def handle_call({:deposit, amount}, _from, %State{} = state)
+        when is_integer(amount) and amount > 0 do
+      candidate = %{state | balance: state.balance + amount, version: state.version + 1}
+      commit_or_reject(candidate, state)
+    end
+
+    def handle_call({:deposit, _bad}, _from, state),
+      do: {:reply, {:error, :invalid_amount}, state}
+
+    def handle_call({:withdraw, amount}, _from, %State{} = state)
+        when is_integer(amount) and amount > 0 do
+      candidate = %{state | balance: state.balance - amount, version: state.version + 1}
+      commit_or_reject(candidate, state)
+    end
+
+    def handle_call({:withdraw, _bad}, _from, state),
+      do: {:reply, {:error, :invalid_amount}, state}
+
+    def handle_call(:balance, _from, %State{balance: b} = state),
+      do: {:reply, b, state}
+
+    def handle_call(:version, _from, %State{version: v} = state),
+      do: {:reply, v, state}
+
+    # ── Helpers ─────────────────────────────────────────────────────────────
+
+    # The heart of the pattern: validate the candidate, commit if ok, reject otherwise.
+    defp commit_or_reject(candidate, old_state) do
+      case State.validate(candidate) do
+        :ok -> {:reply, :ok, candidate}
+        {:error, reason} -> {:reply, {:error, reason}, old_state}
+      end
+    end
+  end
+
+  def main do
+    {:ok, pid} = ValidatedStateGs.start_link(initial_balance: 100)
+  
+    b1 = ValidatedStateGs.balance(pid)
+    IO.puts("Starting balance: #{b1}")
+  
+    :ok = ValidatedStateGs.deposit(pid, 50)
+    b2 = ValidatedStateGs.balance(pid)
+    IO.puts("After deposit: #{b2}")
+  
+    :ok = ValidatedStateGs.withdraw(pid, 30)
+    b3 = ValidatedStateGs.balance(pid)
+    v3 = ValidatedStateGs.version(pid)
+    IO.puts("After withdraw: balance=#{b3}, version=#{v3}")
+  
+    IO.puts("✓ ValidatedStateGs works correctly")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`GenServer.init/1` — return values and `{:stop, reason}`](https://hexdocs.pm/elixir/GenServer.html#c:init/1)

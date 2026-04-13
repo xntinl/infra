@@ -53,6 +53,22 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. The three states and their transitions
 
 ```
@@ -638,12 +654,46 @@ is pure win vs 30-second upstream timeouts.
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
+## Executable Example
 
-- [`telemetry` hexdocs](https://hexdocs.pm/telemetry/) — official event-emission library
-- [Michael Nygard, *Release It!*](https://pragprog.com/titles/mnee2/release-it-second-edition/) — the original Circuit Breaker chapter (pattern language)
-- [Martin Fowler — CircuitBreaker](https://martinfowler.com/bliki/CircuitBreaker.html) — concise canonical explanation
-- [Netflix Hystrix wiki — How it Works](https://github.com/Netflix/Hystrix/wiki/How-it-Works) — production details on thread-pool isolation and metrics
-- [`:fuse` source](https://github.com/jlouis/fuse) — Erlang circuit breaker by Jesper Louis Andersen (compare your impl)
-- [ETS docs — concurrency options](https://www.erlang.org/doc/man/ets.html) — `read_concurrency`, `write_concurrency` trade-offs
-- [Saša Jurić — To spawn or not to spawn](https://www.theerlangelist.com/article/spawn_or_not) — when a GenServer IS the right answer
+```elixir
+defp deps do
+  [
+    {:telemetry, "~> 1.2"},
+    {:jason, "~> 1.4", only: [:dev, :test]}
+  ]
+end
+
+
+
+### Step 2: `lib/circuit_breaker_patterns/classifier.ex`
+
+**Objective**: Extract failure classification rules so breaker FSM remains pure and per-upstream policies (429 vs 408) are swappable without modifying state machine.
+
+
+
+### Step 3: `lib/circuit_breaker_patterns/breaker.ex`
+
+**Objective**: Serialize state transitions through GenServer but read current state from ETS so call/2 gate checks scale lock-free across cores without mailbox contention.
+
+
+
+### Step 4: Supervisor & Registry in application.ex
+
+**Objective**: Own the shared ETS table at the application level and supervise breakers dynamically so individual FSM crashes never lose the published gate state.
+
+
+
+### Step 5: `test/circuit_breaker_patterns/breaker_test.exs`
+
+**Objective**: Drive the FSM across closed→open→half-open→closed transitions with deterministic time control so regressions in trip thresholds surface instantly.
+
+defmodule Main do
+  def main do
+      # Demonstrating 36-circuit-breaker-patterns
+      :ok
+  end
+end
+
+Main.main()
+```

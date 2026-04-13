@@ -43,6 +43,25 @@ leaderboard/
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Ecto-specific insight:**
+Ecto separates the query layer (building queries) from the execution layer (sending them). This separation allows for debugging, composability, and testing without a database. Never load all rows first and filter in-memory — write the filter into the query itself, or you've just built an N+1 problem.
 ### 1. Window functions compute per-row values without GROUP BY collapsing rows
 
 ```sql
@@ -513,19 +532,172 @@ maximum staleness your users tolerate before caching hurts the product more than
 
 ---
 
-## Resources
-
-- [Postgres — window functions](https://www.postgresql.org/docs/current/functions-window.html)
-- [Postgres — frame clause](https://www.postgresql.org/docs/current/sql-expressions.html#SYNTAX-WINDOW-FUNCTIONS)
-- [`Ecto.Query` — windows](https://hexdocs.pm/ecto/Ecto.Query.html#windows/3)
-- [`over/2` in Ecto](https://hexdocs.pm/ecto/Ecto.Query.API.html#over/2)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
 defp deps do
   [
-    # Add dependencies here
+    {:ecto_sql, "~> 3.12"},
+    {:postgrex, "~> 0.19"},
+    {:benchee, "~> 1.3", only: :dev}
   ]
 end
+
+# lib/leaderboard/schemas/score.ex
+defmodule Leaderboard.Schemas.Score do
+  use Ecto.Schema
+
+  schema "scores" do
+    field :user_id, :string
+    field :score, :integer
+    field :played_at, :utc_datetime
+
+    # populated by window functions — not in the table
+    field :rank, :integer, virtual: true
+    field :pct, :float, virtual: true
+    field :rolling_avg, :float, virtual: true
+
+    timestamps(updated_at: false)
+  end
+end
+
+# priv/repo/migrations/20260101000000_create_scores.exs
+defmodule Leaderboard.Repo.Migrations.CreateScores do
+  use Ecto.Migration
+
+  def change do
+    create table(:scores) do
+      add :user_id, :string, null: false
+      add :score, :integer, null: false
+      add :played_at, :utc_datetime, null: false
+      timestamps(updated_at: false)
+    end
+
+    create index(:scores, [:played_at])
+    create index(:scores, [:user_id, :played_at])
+    create index(:scores, [:score])
+  end
+end
+
+# lib/leaderboard/stats.ex
+defmodule Leaderboard.Stats do
+  end
+  @moduledoc """
+  Leaderboard queries using Postgres window functions.
+  """
+  import Ecto.Query
+
+  alias Leaderboard.Repo
+  alias Leaderboard.Schemas.Score
+
+  @doc """
+  Global leaderboard within a time window. Returns scores sorted by rank asc.
+
+  Each row carries `:rank` (1 = top) and `:pct` (0.0 = top, 1.0 = bottom).
+  """
+  @spec leaderboard(DateTime.t(), DateTime.t(), non_neg_integer()) :: [Score.t()]
+  def leaderboard(from_ts, to_ts, limit \\ 100) do
+    query =
+      from s in Score,
+        where: s.played_at >= ^from_ts and s.played_at < ^to_ts,
+        windows: [global: [order_by: [desc: s.score]]],
+        select: s,
+        select_merge: %{
+          rank: rank() |> over(:global),
+          pct: percent_rank() |> over(:global)
+        },
+        order_by: [desc: s.score],
+        limit: ^limit
+
+    Repo.all(query)
+  end
+
+  @doc """
+  Per-user history with a 7-row rolling average.
+
+  Uses a frame clause `ROWS BETWEEN 6 PRECEDING AND CURRENT ROW` so each row's
+  `rolling_avg` is the mean of the last 7 scores (including itself).
+  """
+  @spec user_history(String.t(), non_neg_integer()) :: [Score.t()]
+  def user_history(user_id, limit \\ 50) do
+    query =
+      from s in Score,
+        where: s.user_id == ^user_id,
+        order_by: [asc: s.played_at],
+        select: s,
+        select_merge: %{
+          rolling_avg:
+            fragment(
+              "AVG(?) OVER (ORDER BY ? ROWS BETWEEN 6 PRECEDING AND CURRENT ROW)",
+              s.score,
+              s.played_at
+            )
+        },
+        limit: ^limit
+
+    Repo.all(query)
+  end
+
+  @doc """
+  Rank of one user within a window — single-row response.
+
+  Computed as a subquery so we do not download the whole leaderboard.
+  """
+  @spec user_rank(String.t(), DateTime.t(), DateTime.t()) ::
+          %{score: integer(), rank: integer(), pct: float()} | nil
+  def user_rank(user_id, from_ts, to_ts) do
+    ranked =
+      from s in Score,
+        where: s.played_at >= ^from_ts and s.played_at < ^to_ts,
+        windows: [g: [order_by: [desc: s.score]]],
+        select: %{
+          user_id: s.user_id,
+          score: s.score,
+          rank: rank() |> over(:g),
+          pct: percent_rank() |> over(:g)
+        }
+
+    from(r in subquery(ranked),
+      where: r.user_id == ^user_id,
+      order_by: [asc: r.rank],
+      limit: 1,
+      select: %{score: r.score, rank: r.rank, pct: r.pct}
+    )
+    |> Repo.one()
+  end
+
+  @doc """
+  Top N per user (keeps personal bests).
+
+  Uses `row_number()` partitioned by user to tag rows, then keeps only those with
+  rn <= k. This is a classic top-N-per-group pattern.
+  """
+  @spec top_n_per_user(non_neg_integer()) :: [Score.t()]
+  def top_n_per_user(k) do
+    ranked =
+      from s in Score,
+        windows: [by_user: [partition_by: s.user_id, order_by: [desc: s.score]]],
+        select: %{
+          id: s.id,
+          rn: row_number() |> over(:by_user)
+        }
+
+    from(s in Score,
+      join: r in subquery(ranked),
+      on: r.id == s.id,
+      where: r.rn <= ^k,
+      order_by: [asc: s.user_id, desc: s.score]
+    )
+    |> Repo.all()
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrating 278-window-functions-select-merge
+      :ok
+  end
+end
+
+Main.main()
 ```

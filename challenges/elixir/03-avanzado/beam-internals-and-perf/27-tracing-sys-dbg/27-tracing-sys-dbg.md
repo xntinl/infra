@@ -51,6 +51,22 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Three levels of tracing
 
 ```
@@ -634,22 +650,74 @@ read the results, then widen the filter.
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
 
-- [`:sys` docs](https://www.erlang.org/doc/man/sys.html) — OTP system messages
-- [`:recon_trace`](https://ferd.github.io/recon/recon_trace.html) — Fred Hébert
-- [Erlang in Anger — chapter 6 Tracing](https://www.erlang-in-anger.com/)
-- [Tracing in Erlang — Stavros blog](https://www.stavros.io/posts/erlang-tracing/)
-- [`:dbg` User's Guide](https://www.erlang.org/doc/apps/runtime_tools/tracing_in_erlang.html)
-- [Saša Jurić: Debugging live systems](https://www.theerlangelist.com/) — The Erlang-elist blog
-- [`:erlang.trace/3` reference](https://www.erlang.org/doc/man/erlang.html#trace-3)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+defmodule TracingToolkit.Killswitch do
+  @moduledoc """
+  Centralized kill switch. Any tracing started through this toolkit is
+  registered here, so `panic/0` can unconditionally stop every trace.
+
+  Rationale: if a trace is melting the node, you may not have time to
+  remember which fun you called. `TracingToolkit.Killswitch.panic()` is
+  the only call you need to know at 3 AM.
+  """
+
+  use GenServer
+
+  @spec start_link(keyword()) :: GenServer.on_start()
+  def start_link(_opts \\ []), do: GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
+
+  @spec register(term()) :: :ok
+  def register(tag), do: GenServer.cast(__MODULE__, {:register, tag})
+
+  @spec unregister(term()) :: :ok
+  def unregister(tag), do: GenServer.cast(__MODULE__, {:unregister, tag})
+
+  @spec active() :: [term()]
+  def active, do: GenServer.call(__MODULE__, :active)
+
+  @doc "Stops every active trace unconditionally."
+  @spec panic() :: :ok
+  def panic do
+    :recon_trace.clear()
+
+    try do
+      :dbg.stop()
+    catch
+      _, _ -> :ok
+    end
+
+    GenServer.call(__MODULE__, :reset)
+  end
+
+  @impl true
+  def init(:ok), do: {:ok, %{active: MapSet.new()}}
+
+  @impl true
+  def handle_cast({:register, tag}, state),
+    do: {:noreply, update_in(state.active, &MapSet.put(&1, tag))}
+
+  def handle_cast({:unregister, tag}, state),
+    do: {:noreply, update_in(state.active, &MapSet.delete(&1, tag))}
+
+  @impl true
+  def handle_call(:active, _from, state), do: {:reply, MapSet.to_list(state.active), state}
+  def handle_call(:reset, _from, _state), do: {:reply, :ok, %{active: MapSet.new()}}
 end
+
+defmodule Main do
+  def main do
+      IO.puts("Benchmarking initialized")
+      {elapsed_us, result} = :timer.tc(fn ->
+        Enum.reduce(1..1000, 0, &+/2)
+      end)
+      if is_number(elapsed_us) do
+        IO.puts("✓ Benchmark completed: sum(1..1000) = " <> inspect(result) <> " in " <> inspect(elapsed_us) <> "µs")
+      end
+  end
+end
+
+Main.main()
 ```

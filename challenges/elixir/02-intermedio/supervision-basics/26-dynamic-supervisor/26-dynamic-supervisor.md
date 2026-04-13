@@ -336,6 +336,118 @@ not zero.
 
 - Diseñá la estrategia de naming (Registry via-tuple vs pid) para 10k children dinámicos. Justificá.
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule WorkerFactory.JobWorker do
+  @moduledoc """
+  Minimal job worker. Holds a job id and an arbitrary payload. Exposes
+  `describe/1` so callers can verify the worker is alive and has the right
+  state, and `crash/1` / `finish/1` to simulate the two termination paths.
+  """
+
+  # :transient = restart only on abnormal exit, not on :normal/:shutdown.
+  use GenServer, restart: :transient
+
+  @type job_id :: term()
+
+  @spec start_link(keyword()) :: GenServer.on_start()
+  def start_link(opts) do
+    id = Keyword.fetch!(opts, :id)
+    payload = Keyword.get(opts, :payload, %{})
+    GenServer.start_link(__MODULE__, {id, payload})
+  end
+
+  @spec describe(pid()) :: {job_id(), map()}
+  def describe(pid), do: GenServer.call(pid, :describe)
+
+  @spec crash(pid()) :: :ok
+  def crash(pid), do: GenServer.cast(pid, :crash)
+
+  @spec finish(pid()) :: :ok
+  def finish(pid), do: GenServer.cast(pid, :finish)
+
+  @impl true
+  def init({id, payload}), do: {:ok, %{id: id, payload: payload}}
+
+  @impl true
+  def handle_call(:describe, _from, %{id: id, payload: p} = s),
+    do: {:reply, {id, p}, s}
+
+  @impl true
+  def handle_cast(:crash, _state), do: raise("job blew up")
+  # :transient + :normal → supervisor will NOT restart.
+  def handle_cast(:finish, state), do: {:stop, :normal, state}
+end
+
+defmodule WorkerFactory.Supervisor do
+  @moduledoc """
+  Dynamic supervisor for job workers. Children are created on demand via
+  `start_job/2`, not declared up-front. The DynamicSupervisor scales to
+  thousands of children without recompiling.
+  """
+
+  use DynamicSupervisor
+
+  @spec start_link(keyword()) :: DynamicSupervisor.on_start()
+  def start_link(opts \\ []) do
+    DynamicSupervisor.start_link(__MODULE__, :ok, opts)
+  end
+
+  @impl true
+  def init(:ok) do
+    DynamicSupervisor.init(strategy: :one_for_one)
+  end
+
+  @spec start_job(term(), map()) :: DynamicSupervisor.on_start_child()
+  def start_job(id, payload \\ %{}) do
+    spec = {WorkerFactory.JobWorker, [id: id, payload: payload]}
+    DynamicSupervisor.start_child(__MODULE__, spec)
+  end
+
+  @spec children_count() :: non_neg_integer()
+  def children_count do
+    %{active: active} = DynamicSupervisor.count_children(__MODULE__)
+    active
+  end
+end
+
+# Demonstrate DynamicSupervisor with on-demand children
+IO.puts("=== DynamicSupervisor Demo ===")
+
+{:ok, _sup} = WorkerFactory.Supervisor.start_link()
+
+# Start with no children
+assert WorkerFactory.Supervisor.children_count() == 0
+IO.puts("Initial children: 0")
+
+# Start job workers on demand
+{:ok, pid1} = WorkerFactory.Supervisor.start_job(:job_1, %{n: 1})
+{:ok, pid2} = WorkerFactory.Supervisor.start_job(:job_2, %{n: 2})
+
+assert WorkerFactory.Supervisor.children_count() == 2
+assert {:job_1, %{n: 1}} == WorkerFactory.JobWorker.describe(pid1)
+assert {:job_2, %{n: 2}} == WorkerFactory.JobWorker.describe(pid2)
+
+IO.puts("Started 2 workers dynamically")
+IO.puts("Worker 1 describes: #{inspect(WorkerFactory.JobWorker.describe(pid1))}")
+IO.puts("Worker 2 describes: #{inspect(WorkerFactory.JobWorker.describe(pid2))}")
+
+# Verify siblings are independent
+ref_a = Process.monitor(pid1)
+WorkerFactory.JobWorker.crash(pid1)
+assert_receive {:DOWN, ^ref_a, :process, ^pid1, _reason}, 500
+
+# pid2 is untouched
+assert Process.alive?(pid2)
+IO.puts("Worker 1 crashed; Worker 2 still alive (independent)")
+
+IO.puts("All DynamicSupervisor assertions passed!")
+```
+
+
 ## Resources
 
 - [`DynamicSupervisor` — Elixir stdlib](https://hexdocs.pm/elixir/DynamicSupervisor.html)

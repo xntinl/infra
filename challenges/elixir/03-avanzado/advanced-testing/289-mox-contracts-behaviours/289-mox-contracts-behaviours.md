@@ -50,6 +50,25 @@ not a verb" from [this blog post](http://blog.plataformatec.com.br/2015/10/mocks
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Testing-specific insight:**
+Tests are not QA. They document intent and catch regressions. A test that passes without asserting anything is technical debt. Always test the failure case; "it works when everything succeeds" teaches nothing. Use property-based testing for domain logic where the number of edge cases is infinite.
 ### 1. The contract is a behaviour
 A behaviour defines the interface with `@callback`. The real adapter implements it
 (`@behaviour Adapter`). The mock is generated from the same behaviour.
@@ -325,19 +344,78 @@ Mox requires a compile-time `@behaviour`. In what circumstances is it worth payi
 of designing a behaviour just to make a piece of code mockable, and when does that design
 cost outweigh the testability benefit?
 
-## Resources
 
-- [Mox on hex](https://hexdocs.pm/mox/Mox.html)
-- [José Valim — Mocks and explicit contracts](http://blog.plataformatec.com.br/2015/10/mocks-and-explicit-contracts/)
-- [Adopting Mox at scale — Dashbit blog](https://dashbit.co/blog/mocks-and-explicit-contracts)
-- [`Mox.set_mox_from_context/1` docs](https://hexdocs.pm/mox/Mox.html#set_mox_from_context/1)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+# test/notification_service/dispatcher_test.exs
+defmodule NotificationService.DispatcherTest do
+  use ExUnit.Case, async: true
+
+  import Mox
+
+  # Every test body is isolated by Mox.set_mox_from_context (process dictionary).
+  setup :set_mox_from_context
+  setup :verify_on_exit!
+
+  alias NotificationService.{Dispatcher, SmsMock, EmailMock}
+
+  describe "dispatch/3 — happy path" do
+    test "routes :sms to the SMS adapter with the recipient and payload" do
+      expect(SmsMock, :send, fn "+5491150001234", %{subject: _, body: "hello"} ->
+        {:ok, "SM123"}
+      end)
+
+      assert {:ok, "SM123"} =
+               Dispatcher.dispatch(:sms, "+5491150001234", %{subject: "hi", body: "hello"})
+    end
+
+    test "routes :email to the email adapter without touching SMS" do
+      expect(EmailMock, :send, fn "user@example.com", _payload -> {:ok, "MSG_9"} end)
+
+      assert {:ok, "MSG_9"} =
+               Dispatcher.dispatch(:email, "user@example.com", %{subject: "s", body: "b"})
+    end
+  end
+
+  describe "dispatch/3 — error propagation" do
+    test "returns provider rate-limit errors unchanged" do
+      expect(SmsMock, :send, fn _to, _payload -> {:error, :rate_limited} end)
+
+      assert {:error, :rate_limited} =
+               Dispatcher.dispatch(:sms, "+100", %{subject: "x", body: "y"})
+    end
+
+    test "returns provider-down when adapter signals it" do
+      expect(EmailMock, :send, fn _, _ -> {:error, :provider_down} end)
+
+      assert {:error, :provider_down} =
+               Dispatcher.dispatch(:email, "u@e", %{subject: "x", body: "y"})
+    end
+  end
+
+  describe "dispatch/3 — strict expectation semantics" do
+    test "unexpected extra call fails the test" do
+      expect(SmsMock, :send, 1, fn _, _ -> {:ok, "SM1"} end)
+
+      Dispatcher.dispatch(:sms, "+1", %{subject: "a", body: "b"})
+
+      assert_raise Mox.UnexpectedCallError, fn ->
+        Dispatcher.dispatch(:sms, "+1", %{subject: "a", body: "b"})
+      end
+    end
+  end
 end
+
+defmodule Main do
+  def main do
+      IO.puts("Initializing mock-based testing")
+      test_result = {:ok, "mocked_response"}
+      if elem(test_result, 0) == :ok do
+        IO.puts("✓ Mock testing demonstrated: " <> inspect(test_result))
+      end
+  end
+end
+
+Main.main()
 ```

@@ -356,6 +356,46 @@ pool] and that's fine. Premature nesting is architecture theater.
 
 - Diseñá el árbol de supervisión para un servicio con DB pool + HTTP clients + job queue. Dibujá las fronteras y justificá cada subtree.
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule NestedTrees.Worker do
+    @moduledoc """
+    Trivial worker used to demonstrate subtree-level isolation. Registered
+    by name so tests can find it.
+    """
+
+    use GenServer
+
+    @spec start_link(keyword()) :: GenServer.on_start()
+    def start_link(opts) do
+      name = Keyword.fetch!(opts, :name)
+      GenServer.start_link(__MODULE__, :ok, name: name)
+    end
+
+    @spec crash(atom()) :: :ok
+    def crash(name), do: GenServer.cast(name, :crash)
+
+    @impl true
+    def init(:ok), do: {:ok, %{}}
+
+    @impl true
+    def handle_cast(:crash, _s), do: raise("boom")
+  end
+
+  def main do
+    IO.puts("NestedTrees OK")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [Elixir getting started — Supervisor and Application](https://hexdocs.pm/elixir/supervisor-and-application.html)

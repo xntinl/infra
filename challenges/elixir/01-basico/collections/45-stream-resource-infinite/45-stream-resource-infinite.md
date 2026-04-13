@@ -316,6 +316,70 @@ lazy stream — streams are strictly forward-only.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule LogTailer do
+  @moduledoc """
+  Lazy helpers around Stream.unfold/2 and Stream.resource/3.
+  """
+
+  @doc """
+  Infinite lazy Fibonacci sequence starting at 0, 1.
+
+  Nothing is computed until a terminal operation consumes values.
+  Pure function, no side effects — `Stream.unfold/2` is the right choice.
+  """
+  @spec fibonacci() :: Enumerable.t()
+  def fibonacci do
+    # unfold returns {value, next_state} to continue, or nil to halt.
+    # Here we never return nil — the sequence is infinite by design.
+    Stream.unfold({0, 1}, fn {a, b} -> {a, {b, a + b}} end)
+  end
+
+  @doc """
+  Tails a file like `tail -f`. Emits lines (without trailing `\\n`) as they appear.
+
+  * `path` — file to tail. Must exist when tailing starts.
+  * `poll_ms` — how long to sleep between EOF polls. Default 100ms.
+
+  Returns a lazy `Enumerable.t()`. The caller decides when to stop (`Enum.take/2`,
+  `Stream.take_while/2`, timeout, etc.). On halt the file handle is closed.
+  """
+  @spec tail(Path.t(), pos_integer()) :: Enumerable.t()
+  def tail(path, poll_ms \\ 100) do
+    Stream.resource(
+      # start_fun: open the file, return it as the initial accumulator.
+      # :raw + :read_ahead is the fastest combination for sequential reads.
+      fn -> File.open!(path, [:read, :raw, :read_ahead]) end,
+
+      # next_fun: read one line. On EOF, sleep and retry.
+      # We never return {:halt, _} ourselves — the consumer decides when to stop.
+      fn file ->
+        case IO.read(file, :line) do
+          :eof ->
+            Process.sleep(poll_ms)
+            {[], file}
+
+          {:error, reason} ->
+            # Fail fast: surface the real error instead of an empty stream.
+            raise File.Error, reason: reason, action: "read line from", path: path
+
+          line when is_binary(line) ->
+            {[String.trim_trailing(line, "\n")], file}
+        end
+      end,
+
+      # after_fun: always runs — on normal completion, halt, or exception.
+      # This is the whole reason we use Stream.resource over Stream.unfold here.
+      fn file -> File.close(file) end
+    )
+  end
+end
+```
+
 ## Resources
 
 - [`Stream.resource/3` docs](https://hexdocs.pm/elixir/Stream.html#resource/3)

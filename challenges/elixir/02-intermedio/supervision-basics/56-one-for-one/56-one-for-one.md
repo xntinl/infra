@@ -300,6 +300,108 @@ stages, or a parent-built lookup table that references pids. Use
 
 - Dá un caso donde `:one_for_one` parece correcto pero en realidad estás escondiendo un acoplamiento que debería romperse.
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule OneForOneDemo.Counter do
+  @moduledoc """
+  A named counter GenServer used to demonstrate sibling isolation under
+  :one_for_one. Crashing one counter must not reset the others.
+  """
+
+  use GenServer
+
+  @spec start_link(keyword()) :: GenServer.on_start()
+  def start_link(opts) do
+    name = Keyword.fetch!(opts, :name)
+    GenServer.start_link(__MODULE__, 0, name: name)
+  end
+
+  @spec bump(atom()) :: :ok
+  def bump(name), do: GenServer.cast(name, :bump)
+
+  @spec value(atom()) :: non_neg_integer()
+  def value(name), do: GenServer.call(name, :value)
+
+  @spec crash(atom()) :: :ok
+  def crash(name), do: GenServer.cast(name, :crash)
+
+  @impl true
+  def init(n), do: {:ok, n}
+
+  @impl true
+  def handle_cast(:bump, n), do: {:noreply, n + 1}
+  def handle_cast(:crash, _n), do: raise("kaboom")
+
+  @impl true
+  def handle_call(:value, _from, n), do: {:reply, n, n}
+end
+
+defmodule OneForOneDemo.Supervisor do
+  @moduledoc """
+  Static supervisor with three independent counters.
+  Uses `:one_for_one` strategy: only the crashed child is restarted.
+  """
+
+  use Supervisor
+
+  @spec start_link(keyword()) :: Supervisor.on_start()
+  def start_link(opts \\ []) do
+    Supervisor.start_link(__MODULE__, :ok, opts)
+  end
+
+  @impl true
+  def init(:ok) do
+    children = [
+      Supervisor.child_spec({OneForOneDemo.Counter, [name: :a]}, id: :a),
+      Supervisor.child_spec({OneForOneDemo.Counter, [name: :b]}, id: :b),
+      Supervisor.child_spec({OneForOneDemo.Counter, [name: :c]}, id: :c)
+    ]
+
+    Supervisor.init(children, strategy: :one_for_one)
+  end
+end
+
+# Demonstrate :one_for_one strategy
+IO.puts("=== OneForOne Strategy Demo ===")
+
+{:ok, _sup} = OneForOneDemo.Supervisor.start_link()
+
+# Bump counters
+OneForOneDemo.Counter.bump(:a)
+OneForOneDemo.Counter.bump(:a)
+OneForOneDemo.Counter.bump(:b)
+OneForOneDemo.Counter.bump(:b)
+OneForOneDemo.Counter.bump(:c)
+
+assert OneForOneDemo.Counter.value(:a) == 2
+assert OneForOneDemo.Counter.value(:b) == 2
+assert OneForOneDemo.Counter.value(:c) == 1
+
+IO.puts("Initial values: a=2, b=2, c=1")
+
+# Crash :a — siblings should be unaffected
+old_a = Process.whereis(:a)
+ref = Process.monitor(old_a)
+OneForOneDemo.Counter.crash(:a)
+assert_receive {:DOWN, ^ref, :process, ^old_a, _}, 500
+
+# Wait for restart
+Process.sleep(50)
+assert OneForOneDemo.Counter.value(:a) == 0
+assert OneForOneDemo.Counter.value(:b) == 2
+assert OneForOneDemo.Counter.value(:c) == 1
+
+IO.puts("After crashing :a:")
+IO.puts("  :a restarted (state reset to 0)")
+IO.puts("  :b unaffected (still 2)")
+IO.puts("  :c unaffected (still 1)")
+IO.puts("All :one_for_one assertions passed!")
+```
+
+
 ## Resources
 
 - [`Supervisor` strategies](https://hexdocs.pm/elixir/Supervisor.html#module-strategies)

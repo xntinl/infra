@@ -494,6 +494,104 @@ shine for *external* input: HTTP forms, JSON bodies, CSV rows.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule ChangesetLab do
+    @moduledoc """
+    Two worked examples of `Ecto.Changeset`:
+
+    * `SignUp` — a schema-backed changeset (embedded schema, no DB).
+    * `contact_form_changeset/1` — a schemaless changeset over a plain map.
+
+    Both illustrate the four-step pipeline: `cast` → `validate_required` →
+    `validate_format` → return. Neither touches a database — database persistence via
+    `Repo.insert` is beyond this exercise's scope.
+    """
+
+    import Ecto.Changeset
+
+    # --- Schema-backed changeset ---------------------------------------------
+
+    defmodule SignUp do
+      @moduledoc """
+      Uses `Ecto.Schema` in *embedded* mode: we get the struct, types, and
+      changeset metadata without declaring a table.
+      """
+      use Ecto.Schema
+
+      @primary_key false
+      embedded_schema do
+        field :email, :string
+        field :password, :string
+        field :age, :integer
+      end
+    end
+
+    @permitted [:email, :password, :age]
+    @required [:email, :password]
+
+    @doc """
+    Builds a changeset for the sign-up form. Validates:
+      * email and password are present,
+      * email looks like an email (has `@`),
+      * password is at least 8 characters,
+      * age, if present, is >= 13.
+    """
+    @spec signup_changeset(map()) :: Ecto.Changeset.t()
+    def signup_changeset(attrs) do
+      %SignUp{}
+      |> cast(attrs, @permitted)
+      |> validate_required(@required)
+      |> validate_format(:email, ~r/@/, message: "must contain @")
+      |> validate_length(:password, min: 8)
+      |> validate_number(:age, greater_than_or_equal_to: 13)
+    end
+
+    # --- Schemaless changeset -------------------------------------------------
+
+    @doc """
+    Schemaless changeset — no struct needed. Handy for one-off input forms
+    that don't correspond to a DB table.
+    """
+    @spec contact_form_changeset(map()) :: Ecto.Changeset.t()
+    def contact_form_changeset(attrs) do
+      types = %{name: :string, topic: :string, message: :string}
+
+      {%{}, types}
+      |> cast(attrs, Map.keys(types))
+      |> validate_required([:name, :message])
+      |> validate_length(:message, min: 10, max: 1_000)
+      |> validate_inclusion(:topic, ~w(bug feature question other))
+    end
+  end
+
+  def main do
+    IO.puts("=== User Demo ===
+  ")
+  
+    # Demo: Create and validate a changeset
+  changeset = User.changeset(%User{}, %{"name" => "Alice", "email" => "alice@example.com"})
+  IO.puts("1. Valid changeset: valid=#{changeset.valid?}")
+  assert changeset.valid?
+
+  changeset_bad = User.changeset(%User{}, %{"name" => ""})
+  IO.puts("2. Invalid changeset: valid=#{changeset_bad.valid?}")
+  assert not changeset_bad.valid?
+
+  IO.puts("
+  ✓ Ecto changesets demo completed!")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Ecto.Changeset` — hexdocs](https://hexdocs.pm/ecto/Ecto.Changeset.html)

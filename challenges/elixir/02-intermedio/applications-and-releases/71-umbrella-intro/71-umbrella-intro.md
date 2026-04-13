@@ -399,6 +399,56 @@ several apps share a domain core and get deployed together (e.g.
 
 - ¿Cuándo un umbrella es prematuro y un solo mix app es más honesto? Dá los 2 indicadores más fuertes.
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule TinyWeb.MixProject do
+    use Mix.Project
+
+    def project do
+      [
+        app: :tiny_web,
+        version: "0.1.0",
+        build_path: "../../_build",
+        config_path: "../../config/config.exs",
+        deps_path: "../../deps",
+        lockfile: "../../mix.lock",
+        elixir: "~> 1.17",
+        start_permanent: Mix.env() == :prod,
+        deps: deps()
+      ]
+    end
+
+    def application do
+      # Declare that tiny_web depends on tiny_core being started first.
+      [extra_applications: [:logger], mod: {TinyWeb.Application, []}]
+    end
+
+    # `in_umbrella: true` resolves to the sibling app — no version, no
+    # git, just the one in ../tiny_core.
+    defp deps, do: [{:tiny_core, in_umbrella: true}]
+  end
+
+  def main do
+    # Demo: proyectos umbrella con múltiples apps
+    {:ok, _} = Application.ensure_all_started(:tiny_core)
+    {:ok, _} = Application.ensure_all_started(:tiny_web)
+  
+    IO.puts("TinyWeb: demostración exitosa")
+    IO.puts("  ✓ tiny_core iniciada")
+    IO.puts("  ✓ tiny_web iniciada")
+    IO.puts("  Umbrellas permiten múltiples apps en un repositorio")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [Mix — Umbrella projects](https://hexdocs.pm/elixir/dependencies-and-umbrella-projects.html#umbrella-projects)

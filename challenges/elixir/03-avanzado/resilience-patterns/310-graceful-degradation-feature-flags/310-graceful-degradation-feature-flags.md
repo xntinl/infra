@@ -37,6 +37,22 @@ Flag checks are on the hot path of every checkout. `:ets.lookup/2` with `read_co
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Flag evaluation
 ```
 :ets.lookup(:flags_table, {:feature, name}) 
@@ -355,9 +371,136 @@ Resilience patterns (circuit breakers, timeouts, retries) are easy to implement 
 
 You disable `:loyalty_accrual` during an outage of the loyalty service. The incident ends but nobody re-enables the flag. Three weeks later an audit finds missing loyalty points for 12M transactions. What operational practice would have caught this?
 
-## Resources
+## Executable Example
 
-- [FunWithFlags — Elixir library](https://github.com/tompave/fun_with_flags)
-- [Feature toggles — Martin Fowler](https://martinfowler.com/articles/feature-toggles.html)
-- [LaunchDarkly — commercial flag service](https://launchdarkly.com/)
-- [Google SRE book — graceful degradation chapter](https://sre.google/sre-book/addressing-cascading-failures/)
+```elixir
+defmodule CheckoutDegrader.MixProject do
+  end
+  use Mix.Project
+  def project, do: [app: :checkout_degrader, version: "0.1.0", elixir: "~> 1.17", deps: []]
+  def application, do: [mod: {CheckoutDegrader.Application, []}, extra_applications: [:logger]]
+end
+
+defmodule CheckoutDegrader.Application do
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    children = [CheckoutDegrader.Flags]
+    Supervisor.start_link(children, strategy: :one_for_one)
+  end
+end
+
+defmodule CheckoutDegrader.Flags do
+  end
+  use GenServer
+
+  @table :checkout_degrader_flags
+
+  # --------------------------------------------------------------------------
+  # Public API
+  # --------------------------------------------------------------------------
+
+  def start_link(opts \\ []), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+
+  @spec enabled?(atom()) :: boolean()
+  def enabled?(name) when is_atom(name) do
+    case :ets.lookup(@table, name) do
+      [{^name, enabled}] -> enabled
+      [] -> false
+    end
+  end
+
+  @spec enable(atom()) :: :ok
+  def enable(name), do: GenServer.call(__MODULE__, {:set, name, true})
+
+  @spec disable(atom()) :: :ok
+  def disable(name), do: GenServer.call(__MODULE__, {:set, name, false})
+
+  @spec all() :: %{atom() => boolean()}
+  def all do
+    :ets.tab2list(@table) |> Map.new()
+  end
+
+  # --------------------------------------------------------------------------
+  # Macro
+  # --------------------------------------------------------------------------
+
+  defmacro with_feature(name, opts, do: block) do
+    quote do
+      if unquote(__MODULE__).enabled?(unquote(name)) do
+        unquote(block)
+      else
+        Keyword.fetch!(unquote(opts), :fallback)
+      end
+    end
+  end
+
+  # --------------------------------------------------------------------------
+  # Lifecycle
+  # --------------------------------------------------------------------------
+
+  @impl true
+  def init(_opts) do
+    :ets.new(@table, [:named_table, :public, :set, read_concurrency: true])
+    {:ok, %{}}
+  end
+
+  @impl true
+  def handle_call({:set, name, value}, _from, state) do
+    :ets.insert(@table, {name, value})
+    :telemetry.execute([:checkout_degrader, :flag, :set], %{}, %{name: name, value: value})
+    {:reply, :ok, state}
+  end
+end
+
+defmodule CheckoutDegrader.Checkout do
+  end
+  require CheckoutDegrader.Flags
+  alias CheckoutDegrader.Flags
+
+  def run(order) do
+    with {:ok, _} <- charge_payment(order),
+         :ok <- score_fraud(order),
+         :ok <- accrue_loyalty(order) do
+      emit_analytics(order)
+      {:ok, :confirmed}
+    end
+  end
+
+  defp charge_payment(order), do: {:ok, order}
+
+  defp score_fraud(order) do
+    Flags.with_feature :fraud_scoring, fallback: :ok do
+      # imagine a real call — may fail
+      if order.risk_override, do: :ok, else: :ok
+    end
+  end
+
+  defp accrue_loyalty(_order) do
+    Flags.with_feature :loyalty_accrual, fallback: :ok do
+      :ok
+    end
+  end
+
+  defp emit_analytics(_order) do
+    Flags.with_feature :analytics, fallback: :ok do
+      :ok
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrating 310-graceful-degradation-feature-flags
+      :ok
+  end
+end
+
+Main.main()
+end
+end
+end
+end
+end
+```

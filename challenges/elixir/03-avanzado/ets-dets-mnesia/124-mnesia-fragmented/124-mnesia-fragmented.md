@@ -51,6 +51,22 @@ A non-fragmented Mnesia table replicates in full to every participating node. Fr
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Fragments are real tables
 
 A "fragmented" `:events` table with 4 fragments becomes, under the hood:
@@ -577,11 +593,257 @@ the ability to add nodes.
 
 ---
 
-## Resources
+## Executable Example
 
-- [Mnesia Fragmented Tables — erlang.org](https://www.erlang.org/doc/apps/mnesia/mnesia_chap5.html#fragmented-tables)
-- [`:mnesia.change_table_frag/2`](https://www.erlang.org/doc/man/mnesia.html#change_table_frag-2)
-- [OTP source: mnesia_frag.erl](https://github.com/erlang/otp/blob/master/lib/mnesia/src/mnesia_frag.erl)
-- [Ulf Wiger — Mnesia at scale (slides)](http://erlang.org/workshop/2004/wiger.pdf) — historical but still useful
-- [Dashbit — Mnesia the Bad Parts](https://dashbit.co/blog/mnesia-the-bad-parts)
-- [Erlang Solutions — When to use Mnesia](https://www.erlang-solutions.com/blog/when-to-use-mnesia/) — decision matrix
+```elixir
+defmodule MnesiaFragmented.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :mnesia_fragmented, version: "0.1.0", elixir: "~> 1.16", deps: deps()]
+
+  def application do
+    [extra_applications: [:logger, :mnesia], mod: {MnesiaFragmented.Application, []}]
+
+  defp deps, do: [{:benchee, "~> 1.3", only: :dev}]
+
+
+defmodule MnesiaFragmented.Application do
+  @moduledoc false
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    Supervisor.start_link([MnesiaFragmented.Schema],
+      strategy: :one_for_one,
+      name: MnesiaFragmented.Supervisor
+    )
+
+
+defmodule MnesiaFragmented.Schema do
+  @moduledoc false
+  use GenServer
+  require Logger
+
+  @table :events
+  @initial_fragments 4
+
+  def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+
+  @impl true
+  def init(_opts) do
+    _ = :mnesia.stop()
+
+    case :mnesia.create_schema([node()]) do
+      :ok -> :ok
+      {:error, {_, {:already_exists, _}}} -> :ok
+      other -> throw({:schema_failed, other})
+
+    :ok = :mnesia.start()
+    :ok = ensure_table()
+    :ok = :mnesia.wait_for_tables([@table], 20_000)
+
+    log_frag_info()
+    {:ok, %{}}
+
+  defp ensure_table do
+    opts = [
+      attributes: [:id, :type, :payload, :inserted_at],
+      type: :set,
+      frag_properties: [
+        n_fragments: @initial_fragments,
+        node_pool: [node()],
+        n_ram_copies: 0,
+        n_disc_copies: 1
+      ]
+    ]
+
+    case :mnesia.create_table(@table, opts) do
+      {:atomic, :ok} -> :ok
+      {:aborted, {:already_exists, @table}} -> :ok
+      other -> throw({:create_failed, other})
+    end
+  end
+
+  defp log_frag_info do
+    info = :mnesia.table_info(@table, :frag_properties)
+    size = :mnesia.table_info(@table, :size)
+    Logger.info("Fragmented table #{@table}: #{inspect(info)} — size=#{size}")
+  end
+end
+
+
+defmodule MnesiaFragmented.Events do
+  @moduledoc """
+  API for the fragmented :events table.
+
+  Every call must use the :mnesia_frag access module — otherwise the
+  operation targets only the base fragment and silently returns incorrect
+  data for keys stored in other fragments.
+  """
+
+  @table :events
+
+  @type id :: String.t()
+  @type event :: %{id: id, type: atom(), payload: map(), inserted_at: integer}
+
+  @spec put(event()) :: :ok | {:error, term()}
+  def put(%{id: id, type: type, payload: payload}) do
+    ts = System.system_time(:millisecond)
+    record = {@table, id, type, payload, ts}
+
+    run_frag(fn -> :mnesia.write(record) end)
+  end
+
+  @spec get(id()) :: {:ok, event()} | :not_found
+  def get(id) do
+    result = run_frag(fn -> :mnesia.read({@table, id}) end)
+
+    case result do
+      [{@table, ^id, type, payload, ts}] ->
+        {:ok, %{id: id, type: type, payload: payload, inserted_at: ts}}
+
+      [] ->
+        :not_found
+    end
+  end
+
+  @spec delete(id()) :: :ok
+  def delete(id) do
+    run_frag(fn -> :mnesia.delete({@table, id}) end)
+    :ok
+  end
+
+  @doc """
+  Count events across ALL fragments. Uses `:mnesia.table_info/2` on each
+  underlying fragment — do not use `:mnesia.foldl/3` which iterates only
+  the base fragment in a single-node cluster.
+  """
+  @spec count_all() :: non_neg_integer()
+  def count_all do
+    :mnesia.table_info(@table, :frag_names)
+    |> Enum.map(fn frag -> :mnesia.table_info(frag, :size) end)
+    |> Enum.sum()
+  end
+
+  @doc """
+  Walk every fragment with a reducer. Useful for migrations, exports, and
+  full scans. Much more scalable than a single-fragment foldl because the
+  work spreads across the replicas holding each fragment.
+  """
+  @spec foldl_all((tuple(), acc -> acc), acc) :: acc when acc: term()
+  def foldl_all(fun, acc) do
+    run_frag(fn -> :mnesia.foldl(fun, acc, @table) end)
+  end
+
+  defp run_frag(inner) do
+    case :mnesia.activity(:transaction, inner, [], :mnesia_frag) do
+      {:atomic, result} -> result
+      result -> result
+    end
+  end
+end
+
+
+defmodule MnesiaFragmented.FragmentationInfo do
+  @moduledoc """
+  Inspection helpers for a running fragmented table.
+  """
+
+  @table :events
+
+  @spec summary() :: %{
+          total: non_neg_integer(),
+          fragments: [%{name: atom, size: non_neg_integer, nodes: [node]}]
+        }
+  def summary do
+    frag_names = :mnesia.table_info(@table, :frag_names)
+
+    per_frag =
+      Enum.map(frag_names, fn frag ->
+        %{
+          name: frag,
+          size: :mnesia.table_info(frag, :size),
+          nodes:
+            :mnesia.table_info(frag, :disc_copies) ++
+              :mnesia.table_info(frag, :ram_copies)
+        }
+      end)
+
+    %{total: Enum.sum(Enum.map(per_frag, & &1.size)), fragments: per_frag}
+  end
+
+  @spec fragment_for_key(term()) :: atom()
+  def fragment_for_key(key) do
+    # Replicate what mnesia_frag does internally to reveal the target fragment.
+    n = :mnesia.table_info(@table, :n_fragments)
+    hash = :erlang.phash2(key, n)
+
+    case hash do
+      0 -> @table
+      _ -> :"#{@table}_frag#{hash + 1}"
+    end
+  end
+
+  @spec add_fragment() :: :ok | {:error, term()}
+  def add_fragment do
+    case :mnesia.change_table_frag(@table, {:add_frag, [node()]}) do
+      {:atomic, :ok} -> :ok
+      other -> {:error, other}
+    end
+  end
+end
+
+
+defmodule MnesiaFragmented.EventsTest do
+  use ExUnit.Case, async: false
+
+  alias MnesiaFragmented.{Events, FragmentationInfo}
+
+    :ok
+  end
+
+      Enum.each(events, &Events.put/1)
+
+      assert Events.count_all() == 500
+
+      # Every event must be retrievable — if we were missing the frag access
+      # module, some keys in non-base fragments would come back :not_found.
+      Enum.each(events, fn %{id: id} ->
+        assert {:ok, %{id: ^id}} = Events.get(id)
+      end)
+    end
+
+    test "distribution across fragments is roughly uniform" do
+      for i <- 1..1_000, do: Events.put(%{id: "evt-#{i}", type: :x, payload: %{}})
+
+      sizes =
+        FragmentationInfo.summary().fragments
+        |> Enum.map(& &1.size)
+
+      # With phash2 + 4 fragments, expect each fragment to hold 250 ± 75 rows.
+      Enum.each(sizes, fn size ->
+        assert size > 150 and size < 350, "fragment imbalance: #{inspect(sizes)}"
+      end)
+    end
+
+    test "fragment_for_key/1 matches actual storage" do
+      id = "evt-placement"
+      Events.put(%{id: id, type: :x, payload: %{}})
+
+      frag = FragmentationInfo.fragment_for_key(id)
+      raw = :mnesia.dirty_read({frag, id})
+
+      assert [{_, ^id, _, _, _}] = raw
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+      :ok
+  end
+end
+
+Main.main()
+```

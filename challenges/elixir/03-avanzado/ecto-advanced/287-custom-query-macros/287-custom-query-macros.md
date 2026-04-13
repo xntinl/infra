@@ -46,6 +46,25 @@ geo_search/
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Ecto-specific insight:**
+Ecto separates the query layer (building queries) from the execution layer (sending them). This separation allows for debugging, composability, and testing without a database. Never load all rows first and filter in-memory — write the filter into the query itself, or you've just built an N+1 problem.
 ### 1. Ecto query macros are compile-time transformations
 
 When you write `from s in Store, where: s.x == 1`, the AST of the `where:` clause is
@@ -520,19 +539,108 @@ call site? Where does the break-even land when you have 5 orthogonal filters?
 
 ---
 
-## Resources
 
-- [`Ecto.Query.API`](https://hexdocs.pm/ecto/Ecto.Query.API.html) — all built-in query macros
-- [`fragment/2` documentation](https://hexdocs.pm/ecto/Ecto.Query.API.html#fragment/1)
-- [PostGIS reference](https://postgis.net/docs/reference.html)
-- [`geo_postgis`](https://github.com/bryanjos/geo_postgis) — production PostGIS types for Ecto
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+# lib/geo_search/query_api.ex
+defmodule GeoSearch.QueryApi do
+  @moduledoc """
+  Custom Ecto query macros for PostGIS and time-bucketing.
+
+  Importing this module lets you write `where: near(s.location, ...)` instead of
+  the equivalent `fragment` block.
+
+      from s in Store, where: near(s.location, ^lon, ^lat, ^meters)
+  """
+
+  import Ecto.Query
+
+  @doc """
+  Matches rows where `geom` is within `meters` of point (lon, lat).
+
+  Uses `ST_DWithin` with the `geography` cast — meters are spherical, not planar.
+  Leverages a GiST index on `geom` because the indexed column comes first.
+  """
+  defmacro near(geom, lon, lat, meters) do
+    quote do
+      fragment(
+        "ST_DWithin(?::geography, ST_SetSRID(ST_MakePoint(?, ?), 4326)::geography, ?)",
+        unquote(geom),
+        unquote(lon),
+        unquote(lat),
+        unquote(meters)
+      )
+    end
+  end
+
+  @doc """
+  Returns distance in meters from `geom` to (lon, lat).
+
+  Used in `select:` or `order_by:` — does not leverage the index, so pair with
+  `near/4` to prefilter candidates.
+  """
+  defmacro distance_m(geom, lon, lat) do
+    quote do
+      fragment(
+        "ST_Distance(?::geography, ST_SetSRID(ST_MakePoint(?, ?), 4326)::geography)",
+        unquote(geom),
+        unquote(lon),
+        unquote(lat)
+      )
+    end
+  end
+
+  @doc """
+  Matches rows whose geometry falls inside the axis-aligned bounding box.
+
+  Faster than `near/4` for rectangular regions (viewport queries in maps).
+  """
+  defmacro within_bbox(geom, min_lon, min_lat, max_lon, max_lat) do
+    quote do
+      fragment(
+        "? && ST_MakeEnvelope(?, ?, ?, ?, 4326)",
+        unquote(geom),
+        unquote(min_lon),
+        unquote(min_lat),
+        unquote(max_lon),
+        unquote(max_lat)
+      )
+    end
+  end
+
+  @doc """
+  Truncates a datetime to the given granularity using `date_trunc`.
+
+      select: time_bucket(s.opened_at, "day")
+  """
+  defmacro time_bucket(col, granularity) when is_binary(granularity) do
+    quote do
+      fragment("date_trunc(?, ?)", unquote(granularity), unquote(col))
+    end
+  end
+
+  @doc """
+  Selects only rows whose JSON field path matches a value.
+
+  `jsonb_eq(col, ["nested", "key"], value)`
+  """
+  defmacro jsonb_eq(col, path, value) when is_list(path) do
+    path_expr = Enum.join(path, ",")
+
+    quote do
+      fragment("?#>>? = ?", unquote(col), unquote("{" <> path_expr <> "}"), unquote(value))
+    end
+  end
 end
+
+defmodule Main do
+  def main do
+    IO.puts("✓ Custom Query Macros — Extending `Ecto.Query.API`")
+  - Custom query macros extending Ecto.Query
+    - Reusable query composition patterns
+  end
+end
+
+Main.main()
 ```

@@ -371,6 +371,66 @@ minor pipeline — sometimes a temporary variable is the right answer.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule KernelTools.Math do
+    @moduledoc "Low-level numeric helpers. `KernelTools` re-exports these."
+
+    @doc "Doubles a number."
+    @spec double(number()) :: number()
+    def double(n), do: n * 2
+
+    @doc "Halves an even integer."
+    @spec halve(integer()) :: integer()
+    def halve(n), do: div(n, 2)
+  end
+
+  def main do
+    require KernelTools
+    import ExUnit.CaptureIO
+  
+    IO.puts("=== KernelTools Demo ===\n")
+  
+    # Demo 1: defguard is_even/1
+    IO.puts("1. is_even(4): #{KernelTools.is_even(4)}")
+    assert KernelTools.is_even(4) == true
+    IO.puts("   is_even(5): #{KernelTools.is_even(5)}")
+    assert KernelTools.is_even(5) == false
+  
+    # Demo 2: Guard usage in function
+    IO.puts("\n2. safe_halve(10): #{inspect(KernelTools.safe_halve(10))}")
+    assert KernelTools.safe_halve(10) == {:ok, 5}
+    IO.puts("   safe_halve(7): #{inspect(KernelTools.safe_halve(7))}")
+    assert KernelTools.safe_halve(7) == {:error, :not_even}
+  
+    # Demo 3: defdelegate
+    IO.puts("\n3. double(21): #{KernelTools.double(21)}")
+    assert KernelTools.double(21) == 42
+    IO.puts("   halve(10): #{KernelTools.halve(10)}")
+    assert KernelTools.halve(10) == 5
+  
+    # Demo 4: then/2 and tap/2
+    IO.puts("\n4. shout('  hi there '):")
+    output = capture_io(fn ->
+      result = KernelTools.shout("  hi there ")
+      IO.puts("   Result: #{result}")
+      assert result == "HI_THERE"
+    end)
+    IO.write(output)
+  
+    IO.puts("\n✓ All KernelTools demos completed!")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Kernel.defguard/1`](https://hexdocs.pm/elixir/Kernel.html#defguard/1)

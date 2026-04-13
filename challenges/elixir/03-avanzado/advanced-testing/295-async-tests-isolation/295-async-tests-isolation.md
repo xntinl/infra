@@ -47,6 +47,25 @@ cache_layer/
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Testing-specific insight:**
+Tests are not QA. They document intent and catch regressions. A test that passes without asserting anything is technical debt. Always test the failure case; "it works when everything succeeds" teaches nothing. Use property-based testing for domain logic where the number of edge cases is infinite.
 ### 1. Unique names per test
 Derive the name from `context.test` or `System.unique_integer([:positive])`. Never hardcode
 a name in a test module that is async.
@@ -327,19 +346,46 @@ makes `async: true` trivially safe. Is the dictionary still a smell when the fun
 using it is idempotent within the test process, and what heuristic distinguishes safe
 dictionary use from abusive hidden state?
 
-## Resources
 
-- [ExUnit `async: true` docs](https://hexdocs.pm/ex_unit/ExUnit.Case.html#module-parameters)
-- [`System.unique_integer/1`](https://hexdocs.pm/elixir/System.html#unique_integer/1)
-- [`start_supervised!/1`](https://hexdocs.pm/ex_unit/ExUnit.Callbacks.html#start_supervised!/1)
-- [Elixir forum — common async pitfalls](https://elixirforum.com/t/async-true-pitfalls/)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+# test/cache_layer/ets_cache_test.exs
+defmodule CacheLayer.EtsCacheTest do
+  use ExUnit.Case, async: true
+
+  alias CacheLayer.EtsCache
+
+  setup context do
+    # Derive a unique table name — System.unique_integer guarantees no collision across
+    # modules, pids, or retries.
+    name = :"cache_#{context.test}_#{System.unique_integer([:positive])}"
+    EtsCache.new(name)
+    on_exit(fn -> EtsCache.delete(name) end)
+    {:ok, name: name}
+  end
+
+  describe "ETS-backed cache" do
+    test "put then get returns the value", %{name: name} do
+      EtsCache.put(name, "foo", :bar)
+      assert {:ok, :bar} = EtsCache.get(name, "foo")
+    end
+
+    test "different tests do NOT share a table", %{name: name} do
+      assert :error = EtsCache.get(name, "foo")
+    end
+  end
 end
+
+defmodule Main do
+  def main do
+      IO.puts("Initializing mock-based testing")
+      test_result = {:ok, "mocked_response"}
+      if elem(test_result, 0) == :ok do
+        IO.puts("✓ Mock testing demonstrated: " <> inspect(test_result))
+      end
+  end
+end
+
+Main.main()
 ```

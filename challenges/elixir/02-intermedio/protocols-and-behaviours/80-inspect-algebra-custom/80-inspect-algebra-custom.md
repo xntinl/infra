@@ -324,6 +324,72 @@ always fine.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule Order do
+    @moduledoc """
+    Order with id, customer, and a list of line items. The custom inspect
+    produces terminal-friendly output that collapses to one line for small
+    orders and wraps with indentation for larger ones.
+    """
+
+    @enforce_keys [:id, :customer, :items]
+    defstruct [:id, :customer, :items]
+
+    @type t :: %__MODULE__{id: term(), customer: String.t(), items: [LineItem.t()]}
+  end
+
+  defimpl Inspect, for: Order do
+    import Inspect.Algebra
+
+    def inspect(%Order{id: id, customer: customer, items: items}, opts) do
+      # Each field becomes a doc chunk separated by commas and soft breaks.
+      # `break("")` is an empty break: collapses to nothing when the group
+      # fits, becomes a newline when the group wraps.
+      body =
+        [
+          concat(["id: ", to_doc(id, opts)]),
+          concat(["customer: ", to_doc(customer, opts)]),
+          concat(["items: ", items_doc(items, opts)])
+        ]
+        |> Enum.reduce(fn chunk, acc ->
+          # "," + soft break so wrapping adds a newline, flat keeps a space.
+          concat([acc, ",", break(" "), chunk])
+        end)
+
+      concat(["#Order<", nest(concat([break(""), body]), 2), break(""), ">"])
+      |> group()
+    end
+
+    # Render the items list with its own group so it can wrap independently
+    # of the outer Order structure.
+    defp items_doc([], _opts), do: "[]"
+
+    defp items_doc(items, opts) do
+      rendered =
+        items
+        |> Enum.map(&to_doc(&1, opts))
+        |> Enum.reduce(fn item, acc -> concat([acc, ",", break(" "), item]) end)
+
+      concat(["[", nest(concat([break(""), rendered]), 2), break(""), "]"])
+      |> group()
+    end
+  end
+
+  def main do
+    IO.puts("Order OK")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Inspect.Algebra` — Elixir stdlib](https://hexdocs.pm/elixir/Inspect.Algebra.html)

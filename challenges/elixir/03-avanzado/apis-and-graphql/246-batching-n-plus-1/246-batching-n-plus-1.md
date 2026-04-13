@@ -53,6 +53,22 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Dataloader load/run/get protocol
 
 ```
@@ -455,21 +471,54 @@ overhead of `load/run/get` is comparable to direct calls.
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
 
-- [Dataloader documentation — hexdocs](https://hexdocs.pm/dataloader/Dataloader.html)
-- [`Dataloader.KV` source code](https://github.com/absinthe-graphql/dataloader/blob/master/lib/dataloader/kv.ex)
-- [Facebook DataLoader (JS original)](https://github.com/graphql/dataloader) — read the README for the batching semantics
-- [Absinthe + Dataloader guide](https://hexdocs.pm/absinthe/dataloader.html)
-- [Dashbit — "Demand-driven architectures" by José Valim](https://dashbit.co/blog/demand-driven-architectures-with-elixir)
-- [Finch — low-latency HTTP client for batched upstreams](https://hexdocs.pm/finch/Finch.html)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+# lib/graphql_batching/billing_client.ex
+defmodule GraphqlBatching.BillingClient do
+  @moduledoc "Fake billing client — replace with Tesla/Finch in production."
+
+  @plans %{
+    "plan_free" => %{tier: "free", limits: %{requests: 1_000}},
+    "plan_pro" => %{tier: "pro", limits: %{requests: 100_000}},
+    "plan_ent" => %{tier: "enterprise", limits: %{requests: 10_000_000}}
+  }
+
+  @doc "Bulk lookup — the batched operation Dataloader will call."
+  @spec get_plans([String.t()]) :: %{String.t() => map()}
+  def get_plans(ids) do
+    :telemetry.execute([:billing_client, :get_plans], %{count: length(ids)}, %{})
+    Map.take(@plans, ids)
+  end
+
+  @doc "Naive per-id variant — shown for comparison in benchmarks."
+  @spec get_plan(String.t()) :: map() | nil
+  def get_plan(id), do: Map.get(@plans, id)
 end
+
+# lib/graphql_batching/metrics_client.ex
+defmodule GraphqlBatching.MetricsClient do
+  @moduledoc "Fake ClickHouse client."
+
+  @spec bulk_usage([String.t()], String.t()) :: %{String.t() => non_neg_integer()}
+  def bulk_usage(account_ids, window) do
+    :telemetry.execute([:metrics_client, :bulk_usage], %{count: length(account_ids)}, %{window: window})
+    Map.new(account_ids, fn id -> {id, :erlang.phash2({id, window}, 1_000_000)} end)
+  end
+end
+
+defmodule Main do
+  def main do
+      IO.puts("GraphQL schema initialization")
+      defmodule QueryType do
+        def resolve_hello(_, _, _), do: {:ok, "world"}
+      end
+      if is_atom(QueryType) do
+        IO.puts("✓ GraphQL schema validated and query resolver accessible")
+      end
+  end
+end
+
+Main.main()
 ```

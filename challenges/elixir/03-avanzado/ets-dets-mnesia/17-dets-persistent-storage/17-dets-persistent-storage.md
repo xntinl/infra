@@ -44,6 +44,22 @@ SQLite is a fine database. DETS is not a database — it is persistent ETS. The 
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. DETS is ETS with a file, minus the concurrency
 
 DETS tables live on disk and are memory-mapped in small windows. The API is nearly identical to
@@ -487,11 +503,241 @@ Target: DETS write 20-100 us; read 10-50 us; both dominated by disk I/O and OS p
 
 ---
 
-## Resources
+## Executable Example
 
-- [`:dets` reference — erlang.org](https://www.erlang.org/doc/man/dets.html)
-- [Erlang `file` module and fsync semantics](https://www.erlang.org/doc/man/file.html#datasync-1)
-- [Mnesia internals — how `disc_copies` use DETS](https://www.erlang.org/doc/apps/mnesia/mnesia_chap7.html)
-- [Learn You Some Erlang — ETS and DETS chapter](https://learnyousomeerlang.com/ets)
-- [Phoenix.PubSub.DETS-style persistence discussion](https://elixirforum.com/t/using-dets-for-persistence/)
-- [Saša Jurić — "Soul of Erlang" talk on state persistence](https://www.youtube.com/watch?v=JvBT4XBdoUE)
+```elixir
+defmodule DetsStore.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :dets_store,
+      version: "0.1.0",
+      elixir: "~> 1.16",
+      start_permanent: Mix.env() == :prod,
+      deps: []
+    ]
+  end
+
+  def application do
+    [extra_applications: [:logger], mod: {DetsStore.Application, []}]
+  end
+end
+
+defmodule DetsStore.Application do
+  @moduledoc false
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    File.mkdir_p!("priv")
+
+    children = [
+      {DetsStore.Store, [file: Path.join("priv", "dets_store.dets")]}
+    ]
+
+    Supervisor.start_link(children, strategy: :one_for_one, name: DetsStore.Supervisor)
+  end
+end
+
+defmodule DetsStore.Store do
+  end
+  @moduledoc """
+  Durable key-value store backed by DETS.
+
+  The GenServer owns the DETS table. All writes go through the process; reads
+  can run either through the process (safe, serialized) or directly via
+  `:dets.lookup/2` from any process — DETS enforces its own lock internally.
+
+  Public API returns `{:ok, _}` / `{:error, reason}` so callers can handle I/O
+  failure explicitly. We do not raise on DETS errors because DETS can return
+  `{:error, {:file_error, ...}}` for transient disk issues that the caller may
+  want to retry.
+  """
+  use GenServer
+  require Logger
+
+  @name __MODULE__
+  @type key :: term()
+  @type value :: term()
+
+  # ---- Public API ---------------------------------------------------------
+
+  def start_link(opts) do
+    GenServer.start_link(__MODULE__, opts, name: @name)
+  end
+
+  @spec put(key(), value()) :: :ok | {:error, term()}
+  def put(key, value), do: GenServer.call(@name, {:put, key, value})
+
+  @spec get(key()) :: {:ok, value()} | :error
+  def get(key) do
+    case :dets.lookup(table(), key) do
+      [{^key, value}] -> {:ok, value}
+      [] -> :error
+      {:error, _} = err -> err
+    end
+  end
+
+  @spec delete(key()) :: :ok
+  def delete(key), do: GenServer.call(@name, {:delete, key})
+
+  @spec sync() :: :ok | {:error, term()}
+  def sync, do: GenServer.call(@name, :sync, 30_000)
+
+  @spec size() :: non_neg_integer()
+  def size, do: :dets.info(table(), :size)
+
+  defp table, do: @name
+
+  # ---- GenServer ----------------------------------------------------------
+
+  @impl true
+  def init(opts) do
+    Process.flag(:trap_exit, true)
+    file = Keyword.fetch!(opts, :file) |> to_charlist()
+
+    open_opts = [
+      type: :set,
+      access: :read_write,
+      file: file,
+      auto_save: 5_000,
+      repair: true
+    ]
+
+    case :dets.open_file(@name, open_opts) do
+      {:ok, @name} ->
+        Logger.info("dets_store opened #{file}, size=#{:dets.info(@name, :size)}")
+        {:ok, %{file: file}}
+
+      {:error, reason} ->
+        DetsStore.Repair.attempt_force_repair(@name, open_opts, reason)
+    end
+  end
+
+  @impl true
+  def handle_call({:put, key, value}, _from, state) do
+    {:reply, :dets.insert(@name, {key, value}), state}
+  end
+
+  @impl true
+  def handle_call({:delete, key}, _from, state) do
+    {:reply, :dets.delete(@name, key), state}
+  end
+
+  @impl true
+  def handle_call(:sync, _from, state) do
+    {:reply, :dets.sync(@name), state}
+  end
+
+  @impl true
+  def terminate(reason, _state) do
+    # Closing sets the "properly closed" flag; skip it and the next open repairs.
+    Logger.info("dets_store closing (reason=#{inspect(reason)})")
+    :dets.close(@name)
+    :ok
+  end
+end
+
+defmodule DetsStore.Repair do
+  @moduledoc """
+  Fallback path when `:dets.open_file/2` refuses to open a file. We log the
+  reason, then retry once with `repair: :force` which always rebuilds the
+  internal hash. If that still fails the node should not start — we return
+  the error and let the supervisor crash us.
+  """
+  require Logger
+
+  @spec attempt_force_repair(atom(), keyword(), term()) :: {:ok, map()} | {:stop, term()}
+  def attempt_force_repair(table, open_opts, reason) do
+    Logger.warning("dets_store open failed (#{inspect(reason)}); forcing repair")
+
+    forced = Keyword.put(open_opts, :repair, :force)
+
+    case :dets.open_file(table, forced) do
+      {:ok, ^table} ->
+        Logger.warning("dets_store forced repair succeeded, size=#{:dets.info(table, :size)}")
+        {:ok, %{file: Keyword.fetch!(forced, :file), repaired: true}}
+
+      {:error, reason2} ->
+        {:stop, {:dets_unrecoverable, reason2}}
+    end
+  end
+end
+
+defmodule DetsStoreTest do
+  use ExUnit.Case, async: false
+  # async: false — DETS file is a single shared resource
+  alias DetsStore.Store
+
+  @tmp_file "priv/dets_store_test.dets"
+
+  setup do
+    File.mkdir_p!("priv")
+    File.rm(@tmp_file)
+    {:ok, _pid} = start_supervised({Store, [file: @tmp_file]})
+    on_exit(fn -> File.rm(@tmp_file) end)
+    :ok
+  end
+
+  describe "basic CRUD" do
+    test "put/get round-trip" do
+      assert :ok = Store.put(:device_42, %{last_seen: 1_700_000_000})
+      assert {:ok, %{last_seen: 1_700_000_000}} = Store.get(:device_42)
+    end
+
+    test "missing key returns :error" do
+      assert :error = Store.get(:ghost)
+    end
+
+    test "delete removes entry" do
+      Store.put(:tmp, 1)
+      Store.delete(:tmp)
+      assert :error = Store.get(:tmp)
+    end
+  end
+
+  describe "durability" do
+    test "data survives a clean GenServer restart" do
+      Store.put(:persisted, "hello")
+      :ok = Store.sync()
+
+      stop_supervised!(Store)
+      {:ok, _} = start_supervised({Store, [file: @tmp_file]})
+
+      assert {:ok, "hello"} = Store.get(:persisted)
+    end
+
+    test "data survives an abrupt owner exit (simulates BEAM crash)" do
+      Store.put(:crash_survivor, 99)
+      :ok = Store.sync()
+
+      # Kill the owner without running terminate/2 — file is left "open".
+      pid = Process.whereis(Store)
+      ref = Process.monitor(pid)
+      Process.exit(pid, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^pid, :killed}, 1_000
+
+      # Force supervisor to restart it — auto-repair should kick in silently.
+      # start_supervised already re-starts; wait for it.
+      Process.sleep(50)
+      {:ok, _} = start_supervised({Store, [file: @tmp_file]}, restart: :permanent)
+
+      assert {:ok, 99} = Store.get(:crash_survivor)
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrating 17-dets-persistent-storage
+      :ok
+  end
+end
+
+Main.main()
+end
+end
+end
+end
+```

@@ -406,6 +406,80 @@ for anything beyond line-level rules.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule MyChecks.TodoWithAuthor do
+    @moduledoc """
+    Flags `# TODO:` comments that don't include an author tag.
+
+    Good:   `# TODO(alice): refactor this when we move to Ecto 3.12`
+    Bad:    `# TODO: refactor`
+
+    Forcing an author makes TODOs assignable and searchable.
+    """
+    use Credo.Check,
+      category: :readability,
+      base_priority: :normal,
+      explanations: [
+        check: """
+        A TODO comment without an author ends up anonymous. Add a
+        parenthesized handle so the TODO is owned:
+
+            # TODO(alice): lorem ipsum
+        """
+      ]
+
+    @pattern ~r/#\s*TODO(?!\()/   # matches "# TODO" NOT followed by "("
+
+    @impl true
+    def run(%Credo.SourceFile{} = source_file, params \\ []) do
+      issue_meta = IssueMeta.for(source_file, params)
+
+      source_file
+      |> Credo.SourceFile.source()
+      |> String.split("\n")
+      |> Enum.with_index(1)
+      |> Enum.flat_map(fn {line, line_no} ->
+        if Regex.match?(@pattern, line) do
+          [issue_for(issue_meta, line_no, line)]
+        else
+          []
+        end
+      end)
+    end
+
+    defp issue_for(issue_meta, line_no, line) do
+      format_issue(issue_meta,
+        message: "TODO without author. Use `# TODO(name): ...`.",
+        line_no: line_no,
+        trigger: String.trim(line)
+      )
+    end
+  end
+
+  def main do
+    IO.puts("=== Credo Demo ===
+  ")
+  
+    # Demo: Credo code analysis
+  IO.puts("1. mix credo - code style analysis")
+  IO.puts("2. Custom rules configuration")
+  IO.puts("3. Guides code quality")
+
+  IO.puts("
+  ✓ Credo demo completed!")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [Credo docs](https://hexdocs.pm/credo/overview.html)

@@ -64,6 +64,25 @@ ON CONFLICT (device_id, minute) DO UPDATE
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Ecto-specific insight:**
+Ecto separates the query layer (building queries) from the execution layer (sending them). This separation allows for debugging, composability, and testing without a database. Never load all rows first and filter in-memory — write the filter into the query itself, or you've just built an N+1 problem.
 ### 1. `on_conflict` variants in Ecto
 
 | Value | Meaning |
@@ -567,19 +586,211 @@ monotonicity — and what is the cost of correctness vs. promptness?
 
 ---
 
-## Resources
-
-- [Postgres `INSERT ... ON CONFLICT`](https://www.postgresql.org/docs/current/sql-insert.html#SQL-ON-CONFLICT)
-- [Ecto — "Upsert" guide](https://hexdocs.pm/ecto/constraints-and-upserts.html)
-- [Dashbit blog — "Ecto upserts"](https://dashbit.co/blog)
-- [pg_stat_statements](https://www.postgresql.org/docs/current/pgstatstatements.html) for measuring conflict rates
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
 defp deps do
   [
-    # Add dependencies here
+    {:ecto_sql, "~> 3.12"},
+    {:postgrex, "~> 0.19"},
+    {:benchee, "~> 1.3", only: :dev}
   ]
 end
+
+
+# priv/repo/migrations/20260101000000_create_minute_aggregates.exs
+defmodule MetricsIngest.Repo.Migrations.CreateMinuteAggregates do
+  use Ecto.Migration
+
+  def change do
+    create table(:minute_aggregates) do
+      add :device_id, :string, null: false
+      add :minute, :utc_datetime, null: false
+      add :count, :integer, null: false, default: 0
+      add :sum, :float, null: false, default: 0.0
+      add :min, :float, null: false
+      add :max, :float, null: false
+      timestamps()
+    end
+
+    create unique_index(:minute_aggregates, [:device_id, :minute],
+             name: :minute_aggregates_device_minute_key)
+  end
+end
+
+
+# lib/metrics_ingest/schemas/minute_aggregate.ex
+defmodule MetricsIngest.Schemas.MinuteAggregate do
+  use Ecto.Schema
+
+  schema "minute_aggregates" do
+    field :device_id, :string
+    field :minute, :utc_datetime
+    field :count, :integer, default: 0
+    field :sum, :float, default: 0.0
+    field :min, :float
+    field :max, :float
+    timestamps()
+  end
+end
+
+
+# lib/metrics_ingest/ingest.ex
+defmodule MetricsIngest.Ingest do
+  @moduledoc """
+  Batch upsert of per-minute aggregates.
+
+  Input: list of readings `%{device_id, ts, value}`.
+  Output: `{:ok, affected_count}`.
+  """
+  import Ecto.Query
+
+  alias MetricsIngest.Repo
+  alias MetricsIngest.Schemas.MinuteAggregate
+
+  @doc """
+  Upserts aggregates from a batch of raw readings.
+
+  Coalesces readings for the same (device_id, minute) into a single row locally before
+  hitting the DB — reduces conflict resolution pressure in Postgres.
+  """
+  @spec upsert([%{device_id: String.t(), ts: DateTime.t(), value: float()}]) ::
+          {:ok, non_neg_integer()}
+  def upsert([]), do: {:ok, 0}
+
+  def upsert(readings) do
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
+
+    rows =
+      readings
+      |> coalesce_locally()
+      |> Enum.map(fn {{device_id, minute}, agg} ->
+        %{
+          device_id: device_id,
+          minute: minute,
+          count: agg.count,
+          sum: agg.sum,
+          min: agg.min,
+          max: agg.max,
+          inserted_at: now,
+          updated_at: now
+        }
+      end)
+
+    {n, _} =
+      Repo.insert_all(
+        MinuteAggregate,
+        rows,
+        on_conflict: upsert_query(),
+        conflict_target: [:device_id, :minute]
+      )
+
+    {:ok, n}
+  end
+
+  # --------------------------------------------------------------------------
+  # Local coalescing before the DB call
+  # --------------------------------------------------------------------------
+
+  defp coalesce_locally(readings) do
+    Enum.reduce(readings, %{}, fn %{device_id: d, ts: ts, value: v}, acc ->
+      key = {d, minute_bucket(ts)}
+
+      Map.update(
+        acc,
+        key,
+        %{count: 1, sum: v, min: v, max: v},
+        fn a ->
+          %{count: a.count + 1, sum: a.sum + v, min: min(a.min, v), max: max(a.max, v)}
+        end
+      )
+    end)
+  end
+
+  defp minute_bucket(%DateTime{} = dt) do
+    dt
+    |> DateTime.to_unix()
+    |> div(60)
+    |> Kernel.*(60)
+    |> DateTime.from_unix!()
+    |> DateTime.truncate(:second)
+  end
+
+  # --------------------------------------------------------------------------
+  # The update expression
+  #
+  # We cannot use `[inc: ...]` because we need LEAST/GREATEST for min/max.
+  # The fragment uses EXCLUDED to reference the row we attempted to insert.
+  # --------------------------------------------------------------------------
+
+  defp upsert_query do
+    from(m in MinuteAggregate,
+      update: [
+        set: [
+          count: fragment("? + EXCLUDED.count", m.count),
+          sum: fragment("? + EXCLUDED.sum", m.sum),
+          min: fragment("LEAST(?, EXCLUDED.min)", m.min),
+          max: fragment("GREATEST(?, EXCLUDED.max)", m.max),
+          updated_at: fragment("EXCLUDED.updated_at")
+        ]
+      ]
+    )
+  end
+end
+
+
+# lib/metrics_ingest/buffer.ex
+defmodule MetricsIngest.Buffer do
+  use GenServer
+
+  @flush_ms 100
+  @max_batch 1_000
+
+  def start_link(opts \ []), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+
+  def push(reading), do: GenServer.cast(__MODULE__, {:push, reading})
+
+  @impl true
+  def init(_) do
+    schedule_flush()
+    {:ok, %{buffer: [], count: 0}}
+  end
+
+  @impl true
+  def handle_cast({:push, reading}, %{buffer: buf, count: c} = state) do
+    state = %{state | buffer: [reading | buf], count: c + 1}
+
+    if state.count >= @max_batch do
+      {:noreply, flush(state)}
+    else
+      {:noreply, state}
+    end
+  end
+
+  @impl true
+  def handle_info(:flush, state) do
+    state = flush(state)
+    schedule_flush()
+    {:noreply, state}
+  end
+
+  defp flush(%{buffer: []} = state), do: state
+
+  defp flush(%{buffer: buf} = state) do
+    {:ok, _n} = MetricsIngest.Ingest.upsert(buf)
+    %{state | buffer: [], count: 0}
+  end
+
+  defp schedule_flush, do: Process.send_after(self(), :flush, @flush_ms)
+end
+end
+end
+
+defmodule Main do
+  def main do
+      :ok
+  end
+end
+
+Main.main()
 ```

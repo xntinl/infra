@@ -312,9 +312,67 @@ mix test
 
 The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
 
+---
 
+## Executable Example
+
+Create a file `lib/fx_converter.ex` with the module above, then test in `iex`:
+
+```elixir
+defmodule FXConverter do
+  @rates %{
+    "USD" => 1.0,
+    "EUR" => 0.85,
+    "GBP" => 0.73,
+    "JPY" => 110.0
+  }
+
+  def rates, do: @rates
+
+  def exchange(amount_cents, from_currency, to_currency) do
+    from_rate = Map.get(@rates, from_currency)
+    to_rate = Map.get(@rates, to_currency)
+
+    if from_rate && to_rate do
+      scaled_rate = to_rate / from_rate
+      converted = round(amount_cents * scaled_rate)
+      {:ok, converted}
+    else
+      {:error, :unknown_currency}
+    end
+  end
+
+  def display(amount_cents, currency) do
+    dollars = amount_cents / 100
+    symbol = currency_symbol(currency)
+    "#{symbol}#{Float.round(dollars, 2)}"
+  end
+
+  defp currency_symbol("USD"), do: "$"
+  defp currency_symbol("EUR"), do: "€"
+  defp currency_symbol("GBP"), do: "£"
+  defp currency_symbol("JPY"), do: "¥"
+  defp currency_symbol(other), do: "#{other} "
+end
+
+# Demonstrate precision issues and solutions
+{:ok, converted} = FXConverter.exchange(10000, "USD", "EUR")  # 10000 cents USD -> EUR
+IO.inspect(converted)  # 8500 cents (10000 * 0.85)
+
+# Display with rounding
+IO.puts(FXConverter.display(converted, "EUR"))  # €85.00
+
+# Show IEEE 754 problem
+result = 0.1 + 0.2
+IO.puts("0.1 + 0.2 = #{result}")  # 0.30000000000000004
+
+# But integer arithmetic is exact
+result_cents = 10 + 20
+IO.puts("10 cents + 20 cents = #{result_cents} cents")  # 30 (exact)
+```
 
 ---
+
 ## Key Concepts
 
 ### 1. Floats Are IEEE 754, Not Decimal

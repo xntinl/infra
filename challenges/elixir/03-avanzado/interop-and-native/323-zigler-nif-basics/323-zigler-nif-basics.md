@@ -53,6 +53,22 @@ For larger Zig codebases, Zigler also supports importing external `.zig` files.
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. The `~Z` sigil
 
 ### Dependencies (mix.exs)
@@ -382,9 +398,73 @@ pre-allocate a larger buffer and slice inside Elixir, or batch multiple infos in
 NIF call) would reduce allocation pressure without compromising the one-call-per-key
 clarity?
 
-## Resources
 
-- [Zigler hex docs](https://hexdocs.pm/zigler/)
-- [Zig language reference](https://ziglang.org/documentation/master/)
-- [RFC 5869 — HKDF](https://datatracker.ietf.org/doc/html/rfc5869)
-- [Timing-safe comparison — Go's `subtle.ConstantTimeCompare`](https://pkg.go.dev/crypto/subtle#ConstantTimeCompare)
+## Executable Example
+
+```elixir
+defmodule CryptoPrimitives.Zig do
+  @moduledoc """
+  Inline Zig NIFs for cryptographic primitives.
+
+  All functions are pure: they read from input binaries (zero-copy views) and
+  return freshly-allocated BEAM binaries. No shared mutable state.
+  """
+  use Zig, otp_app: :crypto_primitives
+
+  ~Z"""
+  const std = @import("std");
+  const beam = @import("beam");
+
+  /// Constant-time compare: returns true iff a and b are equal.
+  /// Running time depends only on max(len(a), len(b)), not on the contents.
+  /// MUST be used for MAC / signature verification.
+  pub fn ct_equal(a: []const u8, b: []const u8) bool {
+      if (a.len != b.len) return false;
+      var diff: u8 = 0;
+      var i: usize = 0;
+      while (i < a.len) : (i += 1) {
+          diff |= a[i] ^ b[i];
+      }
+      return diff == 0;
+  }
+
+  /// XOR two equal-length byte strings into a new binary.
+  /// Used for stream-cipher masking and one-time pads.
+  pub fn xor_bytes(env: beam.env, a: []const u8, b: []const u8) !beam.term {
+      if (a.len != b.len) return error.UnequalLengths;
+      var out = try beam.allocator.alloc(u8, a.len);
+      defer beam.allocator.free(out);
+      var i: usize = 0;
+      while (i < a.len) : (i += 1) {
+          out[i] = a[i] ^ b[i];
+      }
+      return beam.make_binary(env, out);
+  }
+
+  /// HKDF-Expand (RFC 5869, section 2.3) using SHA-256.
+  /// prk: pseudorandom key (output of HKDF-Extract).
+  /// info: context and application-specific info.
+  /// length: desired output length in bytes (1..8160).
+  pub fn hkdf_expand_sha256(env: beam.env,
+                            prk:  []const u8,
+                            info: []const u8,
+                            length: u32) !beam.term {
+      if (length == 0 or length > 8160) return error.InvalidLength;
+      var out = try beam.allocator.alloc(u8, length);
+      defer beam.allocator.free(out);
+      std.crypto.kdf.hkdf.HkdfSha256.expand(out, info, prk[0..32].*);
+      return beam.make_binary(env, out);
+  }
+  """
+end
+
+defmodule Main do
+  def main do
+    IO.puts("✓ Zigler — NIFs Written in Zig")
+  - Zig NIFs via Zigler
+    - Zero-cost abstractions
+  end
+end
+
+Main.main()
+```

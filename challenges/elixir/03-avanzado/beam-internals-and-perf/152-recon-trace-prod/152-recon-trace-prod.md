@@ -60,6 +60,22 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Why `:dbg` is unsafe in production
 
 `:dbg` is the OTP tracing facility used by `:sys.trace/2`, `Process.info/2`,
@@ -655,21 +671,135 @@ irrelevant. Above 10k/s, every filter-clause you add in the match spec matters.
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
 
-- [`recon` library documentation](https://ferd.github.io/recon/recon_trace.html) — the authoritative API reference
-- [Erlang in Anger — Fred Hébert](https://www.erlang-in-anger.com/) — chapters 5 and 9 cover tracing and runtime debugging in production
-- [`:dbg` reference](https://www.erlang.org/doc/man/dbg.html) — understand what `:recon_trace` wraps
-- [Match specifications](https://www.erlang.org/doc/apps/erts/match_spec.html) — the compiled guard language
-- [Discord's engineering blog — scaling Elixir](https://discord.com/blog/how-discord-scaled-elixir-to-5-000-000-concurrent-users) — real-world tracing stories at scale
-- [Dashbit — observability in Elixir](https://dashbit.co/blog/observability-and-elixir) — José Valim on runtime introspection strategy
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+defmodule ReconTraceProd.Safe do
+  @moduledoc """
+  Named GenServer that owns a single active trace. Survives caller disconnects.
+
+  Only one trace at a time — `:recon_trace` is global per node and overlapping
+  traces produce interleaved output that is nearly impossible to correlate.
+  """
+
+  use GenServer
+  require Logger
+
+  alias ReconTraceProd.{Guardrails, Sink}
+
+  @type spec :: Guardrails.mfa_spec()
+  @type rate :: Guardrails.rate()
+
+  # ---------------------------------------------------------------------------
+  # Public API
+  # ---------------------------------------------------------------------------
+
+  @spec start_link(keyword()) :: GenServer.on_start()
+  def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+
+  @doc """
+  Start a trace. Refuses if another trace is active or guardrails fail.
+  Output is written to `path`. Call `stop/0` to end early.
+  """
+  @spec trace(spec(), rate(), Path.t()) :: :ok | {:error, term()}
+  def trace(mfa_spec, rate, path) do
+    GenServer.call(__MODULE__, {:trace, mfa_spec, rate, path})
+  end
+
+  @spec stop() :: :ok
+  def stop, do: GenServer.call(__MODULE__, :stop)
+
+  @spec status() :: :idle | {:active, map()}
+  def status, do: GenServer.call(__MODULE__, :status)
+
+  # ---------------------------------------------------------------------------
+  # GenServer callbacks
+  # ---------------------------------------------------------------------------
+
+  @impl true
+  def init(_opts), do: {:ok, %{state: :idle}}
+
+  @impl true
+  def handle_call({:trace, mfa_spec, rate, path}, _from, %{state: :idle} = state) do
+    with :ok <- Guardrails.validate(mfa_spec, rate),
+         {:ok, io} <- Sink.open(path) do
+      parent = self()
+
+      formatter = fn trace_msg ->
+        send(parent, {:trace_line, format(trace_msg)})
+      end
+
+      count = :recon_trace.calls(mfa_spec, rate, formatter: formatter)
+
+      active = %{
+        spec: mfa_spec,
+        rate: rate,
+        path: path,
+        io: io,
+        started_at: System.system_time(:second),
+        matched_procs: count
+      }
+
+      Logger.info("trace started: #{inspect(mfa_spec)} rate=#{inspect(rate)} path=#{path}")
+      {:reply, :ok, %{state: :active, trace: active}}
+    else
+      {:error, reason} ->
+        Logger.warning("trace refused: #{inspect(reason)}")
+        {:reply, {:error, reason}, state}
+    end
+  end
+
+  def handle_call({:trace, _, _, _}, _from, state),
+    do: {:reply, {:error, :already_active}, state}
+
+  def handle_call(:stop, _from, %{state: :active, trace: %{io: io}} = state) do
+    :recon_trace.clear()
+    Sink.close(io)
+    Logger.info("trace stopped")
+    {:reply, :ok, %{state: :idle}}
+  end
+
+  def handle_call(:stop, _from, state), do: {:reply, :ok, state}
+
+  def handle_call(:status, _from, %{state: :idle} = s), do: {:reply, :idle, s}
+
+  def handle_call(:status, _from, %{state: :active, trace: t} = s) do
+    {:reply, {:active, Map.take(t, [:spec, :rate, :path, :started_at, :matched_procs])}, s}
+  end
+
+  @impl true
+  def handle_info({:trace_line, line}, %{state: :active, trace: %{io: io}} = state) do
+    Sink.write(io, line)
+    {:noreply, state}
+  end
+
+  def handle_info({:trace_line, _}, state), do: {:noreply, state}
+
+  # ---------------------------------------------------------------------------
+  # Helpers
+  # ---------------------------------------------------------------------------
+
+  defp format({:trace, pid, :call, {m, f, args}}),
+    do: "CALL  #{inspect(pid)} #{inspect(m)}.#{f}/#{length(args)} args=#{inspect(args, limit: 8)}"
+
+  defp format({:trace, pid, :return_from, {m, f, arity}, result}),
+    do: "RET   #{inspect(pid)} #{inspect(m)}.#{f}/#{arity} -> #{inspect(result, limit: 8)}"
+
+  defp format(other), do: inspect(other, limit: 16)
 end
+
+defmodule Main do
+  def main do
+      IO.puts("Benchmarking initialized")
+      {elapsed_us, result} = :timer.tc(fn ->
+        Enum.reduce(1..1000, 0, &+/2)
+      end)
+      if is_number(elapsed_us) do
+        IO.puts("✓ Benchmark completed: sum(1..1000) = " <> inspect(result) <> " in " <> inspect(elapsed_us) <> "µs")
+      end
+  end
+end
+
+Main.main()
 ```

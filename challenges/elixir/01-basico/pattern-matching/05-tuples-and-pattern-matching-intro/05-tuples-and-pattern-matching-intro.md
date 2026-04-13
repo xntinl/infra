@@ -441,7 +441,75 @@ mix test --trace
 
 The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
 
+---
 
+## Executable Example
+
+Create the module files and test them in `iex`:
+
+```elixir
+defmodule Response do
+  def process({status, headers, body}) when status in 200..299 do
+    case parse_json(body) do
+      {:ok, data} -> {:ok, data}
+      :error -> {:error, :invalid_json}
+    end
+  end
+
+  def process({status, _headers, body}) when status in 300..399 do
+    {:error, {:redirect, status, body}}
+  end
+
+  def process({status, _headers, body}) when status in 400..499 do
+    {:error, {:client_error, status, body}}
+  end
+
+  def process({status, _headers, body}) when status >= 500 do
+    {:error, {:server_error, status, body}}
+  end
+
+  def get_header(headers, name) do
+    found = Enum.find(headers, fn {key, _value} ->
+      String.downcase(key) == String.downcase(name)
+    end)
+    case found do
+      {_key, value} -> {:ok, value}
+      nil -> :error
+    end
+  end
+
+  def retryable?({429, _, _}), do: true
+  def retryable?({status, _, _}) when status >= 500, do: true
+  def retryable?(_), do: false
+
+  defp parse_json(json_str) do
+    try do
+      case Jason.decode(json_str) do
+        {:ok, data} -> {:ok, data}
+        {:error, _} -> :error
+      end
+    rescue
+      _ -> :error
+    end
+  end
+end
+
+# Test responses
+ok_response = {200, [{"content-type", "application/json"}], ~s({"id": 42})}
+{:ok, data} = Response.process(ok_response)
+IO.inspect(data)  # %{"id" => 42}
+
+error_response = {500, [], "Server Error"}
+{:error, {:server_error, 500, _}} = Response.process(error_response)
+IO.puts("Error response matched")
+
+IO.inspect(Response.retryable?({429, [], "Rate Limited"}))  # true
+IO.inspect(Response.retryable?({200, [], "OK"}))  # false
+
+headers = [{"Content-Type", "application/json"}, {"X-Request-Id", "abc"}]
+{:ok, ct} = Response.get_header(headers, "content-type")
+IO.inspect(ct)  # "application/json"
+```
 
 ---
 ## Key Concepts

@@ -377,6 +377,100 @@ time (which is usually nothing useful).
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule SafeInject do
+    @moduledoc """
+    Two versions of the same macro, `log_twice/1`, contrasting raw
+    `unquote` with `bind_quoted`.
+
+    The macro logs the argument twice. With `unquote`, the argument's
+    expression is spliced twice and therefore evaluated twice — a bug if
+    the argument has side effects. With `bind_quoted`, the argument is
+    evaluated once and bound to a local variable, eliminating the bug.
+    """
+
+    @doc """
+    **Unsafe** version. Each reference to `unquote(expr)` duplicates the AST,
+    so side effects in `expr` fire twice at runtime.
+    """
+    defmacro log_twice_unsafe(expr) do
+      quote do
+        IO.puts("[1] " <> inspect(unquote(expr)))
+        IO.puts("[2] " <> inspect(unquote(expr)))
+      end
+    end
+
+    @doc """
+    **Safe** version. `bind_quoted` evaluates `expr` once at runtime (via
+    the implicit binding), assigns the result to `value`, and the quoted
+    body references `value` instead of re-splicing the original AST.
+    """
+    defmacro log_twice_safe(expr) do
+      quote bind_quoted: [value: expr] do
+        IO.puts("[1] " <> inspect(value))
+        IO.puts("[2] " <> inspect(value))
+      end
+    end
+  end
+
+  def main do
+    require SafeInject
+    import ExUnit.CaptureIO
+  
+    IO.puts("=== SafeInject Demo ===\n")
+  
+    # Demo 1: Unsafe version (evaluates twice)
+    IO.puts("1. log_twice_unsafe(42):")
+    output1 = capture_io(fn ->
+      SafeInject.log_twice_unsafe(42)
+    end)
+    IO.write(output1)
+    assert output1 =~ "[1] 42"
+    assert output1 =~ "[2] 42"
+  
+    # Demo 2: Safe version (evaluates once)
+    IO.puts("\n2. log_twice_safe(42):")
+    output2 = capture_io(fn ->
+      SafeInject.log_twice_safe(42)
+    end)
+    IO.write(output2)
+    assert output2 =~ "[1] 42"
+    assert output2 =~ "[2] 42"
+  
+    # Demo 3: Show the difference with side-effects
+    IO.puts("\n3. Side-effect demonstration:")
+    {:ok, agent} = Agent.start_link(fn -> 0 end)
+  
+    counter_fn = fn ->
+      Agent.update(agent, &(&1 + 1))
+      :value
+    end
+  
+    IO.puts("   log_twice_unsafe(counter_fn) - expect 2 calls:")
+    capture_io(fn -> SafeInject.log_twice_unsafe(counter_fn.()) end)
+    unsafe_count = Agent.get(agent, & &1)
+    IO.puts("   Counter after unsafe: #{unsafe_count}")
+  
+    IO.puts("\n   log_twice_safe(counter_fn) - expect 1 call:")
+    Agent.put(agent, 0)
+    capture_io(fn -> SafeInject.log_twice_safe(counter_fn.()) end)
+    safe_count = Agent.get(agent, & &1)
+    IO.puts("   Counter after safe: #{safe_count}")
+  
+    IO.puts("\n✓ SafeInject demo completed!")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Kernel.SpecialForms.quote/2` — `:bind_quoted` option](https://hexdocs.pm/elixir/Kernel.SpecialForms.html#quote/2-binding-and-unquote-fragments)

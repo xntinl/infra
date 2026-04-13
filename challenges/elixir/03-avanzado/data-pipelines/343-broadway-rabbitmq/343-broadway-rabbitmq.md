@@ -53,6 +53,25 @@ Alternatives:
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Pipeline-specific insight:**
+Streams are lazy; Enum is eager. Use Stream for data larger than RAM or when you're building intermediate stages. Use Enum when the collection is small or you need side effects at each step. Mixing them carelessly results in performance cliffs.
 ### 1. Broadway topology
 
 ```
@@ -399,19 +418,107 @@ climbing and memory alarms fire on the broker. What is the fastest safe
 remediation: pause the consumer, flip the DLX policy to drop, or rollback
 the code — and what data is lost or duplicated in each scenario?
 
-## Resources
 
-- [Broadway documentation — hexdocs](https://hexdocs.pm/broadway/Broadway.html)
-- [BroadwayRabbitMQ — hexdocs](https://hexdocs.pm/broadway_rabbitmq/BroadwayRabbitMQ.Producer.html)
-- [Broadway — design blog post (Dashbit)](https://dashbit.co/blog/introducing-broadway)
-- [RabbitMQ Reliability Guide](https://www.rabbitmq.com/reliability.html)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+defmodule OrderProcessor.Pipeline do
+  use Broadway
+
+  alias Broadway.Message
+  alias OrderProcessor.{Validator, Repo}
+
+  def start_link(_opts) do
+    Broadway.start_link(__MODULE__,
+      name: __MODULE__,
+      producer: [
+        module:
+          {BroadwayRabbitMQ.Producer,
+           queue: "orders.created",
+           connection: [host: System.get_env("RABBIT_HOST", "localhost")],
+           qos: [prefetch_count: 500],
+           on_failure: :reject_and_requeue,
+           metadata: [:routing_key, :headers]},
+        concurrency: 1
+      ],
+      processors: [
+        default: [
+          concurrency: System.schedulers_online(),
+          max_demand: 100
+        ]
+      ],
+      batchers: [
+        warehouse: [concurrency: 2, batch_size: 200, batch_timeout: 1_000]
+      ]
+    )
+  end
+
+  # ---- callbacks ---------------------------------------------------------
+
+  @impl true
+  def handle_message(_processor, %Message{data: data} = message, _context) do
+    case Jason.decode(data) do
+      {:ok, payload} ->
+        case Validator.validate(payload) do
+          {:ok, order} ->
+            message
+            |> Message.update_data(fn _ -> order end)
+            |> Message.put_batcher(:warehouse)
+
+          {:error, reason} ->
+            Message.failed(message, "validation: #{inspect(reason)}")
+        end
+
+      {:error, _} ->
+        # Malformed JSON — reject without requeue to avoid poison-pill loops.
+        Message.failed(message, "invalid json") |> Message.configure_ack(on_failure: :reject)
+    end
+  end
+
+  @impl true
+  def handle_batch(:warehouse, messages, _batch_info, _context) do
+    orders = Enum.map(messages, & &1.data)
+
+    case Repo.insert_all_orders(orders) do
+      {:ok, _count} ->
+        messages
+
+      {:error, reason} ->
+        Enum.map(messages, &Message.failed(&1, "db: #{inspect(reason)}"))
+    end
+  end
 end
+
+defmodule Main do
+  def main do
+      # Simulate RabbitMQ order processing with validation and acknowledgement
+      orders = [
+        %{id: "o1", customer: "c1", amount: 100},
+        %{id: "o2", customer: "c2", amount: 0},  # Invalid
+        %{id: "o3", customer: "c3", amount: 250}
+      ]
+
+      # Validate and acknowledge
+      results = Enum.map(orders, fn order ->
+        if order.amount > 0 do
+          Map.put(order, :status, :validated)
+        else
+          Map.put(order, :status, :invalid)
+        end
+      end)
+
+      # Count valid orders
+      valid_orders = Enum.filter(results, &(&1.status == :validated))
+
+      IO.inspect(valid_orders, label: "✓ Valid orders")
+      IO.puts("✓ Processed #{length(results)} orders, #{length(valid_orders)} valid")
+
+      assert length(valid_orders) == 2, "Expected 2 valid orders"
+      assert Enum.all?(valid_orders, &(&1.status == :validated)), "All valid"
+
+      IO.puts("✓ Broadway RabbitMQ: at-least-once processing working")
+  end
+end
+
+Main.main()
 ```

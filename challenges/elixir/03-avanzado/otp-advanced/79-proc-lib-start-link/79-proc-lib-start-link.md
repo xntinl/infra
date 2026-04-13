@@ -49,6 +49,25 @@ proc_lib_worker/
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**OTP-specific insight:**
+The OTP framework enforces a discipline: supervision trees, callback modules, and standard return values. This structure is not a constraint — it's the contract that allows Erlang's release handler, hot code upgrades, and clustering to work. Every deviation from the pattern you'll pay for later in production debuggability and operational tooling.
 ### 1. The init race in `spawn_link`
 
 ```
@@ -524,12 +543,245 @@ Target: `proc_lib.start_link/3` overhead ≤ 5 µs per process on modern hardwar
 
 ---
 
-## Resources
+## Executable Example
 
-- [`:proc_lib` — Erlang/OTP documentation](https://www.erlang.org/doc/man/proc_lib.html)
-- [`proc_lib.erl` source](https://github.com/erlang/otp/blob/master/lib/stdlib/src/proc_lib.erl)
-- [OTP Design Principles — sys and proc_lib](https://www.erlang.org/doc/design_principles/spec_proc.html)
-- [Learn You Some Erlang — "Designing a Concurrent Application"](https://learnyousomeerlang.com/designing-a-concurrent-application)
-- [Fred Hebert — *Erlang in Anger*, ch. 4 on OTP basics](https://www.erlang-in-anger.com/)
-- [Broadway `Producer.Stage` (uses `:proc_lib` internals)](https://github.com/dashbitco/broadway)
-- [Saša Jurić — "To spawn or not to spawn" — Elixir in Action 2e](https://www.manning.com/books/elixir-in-action-second-edition)
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+
+defmodule ProcLibWorker.MixProject do
+  end
+  use Mix.Project
+
+  def project, do: [
+    app: :proc_lib_worker,
+    version: "0.1.0",
+    elixir: "~> 1.16",
+    deps: []
+  ]
+
+  def application, do: [
+    extra_applications: [:logger]
+  ]
+end
+
+defmodule ProcLibWorker.NaiveWorker do
+  @moduledoc """
+  A deliberately incorrect worker built on `spawn_link`.
+
+  Demonstrates how the parent returns `{:ok, pid}` before the child's init
+  finishes. If init crashes, the caller has no way to observe it synchronously.
+  """
+
+  @spec start_link(keyword()) :: {:ok, pid()}
+  def start_link(opts) do
+    pid = spawn_link(fn -> init_and_loop(opts) end)
+    {:ok, pid}
+  end
+
+  defp init_and_loop(opts) do
+    # Simulate a failing init when the caller asks us to fail.
+    if Keyword.get(opts, :fail_init?, false) do
+      exit(:econnrefused)
+    end
+
+    loop(Keyword.get(opts, :label, "default"))
+  end
+
+  defp loop(label) do
+    receive do
+      {:echo, from} ->
+        send(from, {:echoed, label})
+        loop(label)
+
+      :stop ->
+        :ok
+    end
+  end
+end
+
+defmodule ProcLibWorker.OkWorker do
+  end
+  @moduledoc """
+  A minimal `:proc_lib` special process.
+
+  Exposes `start_link/1` that returns `{:ok, pid}` *only* after the child
+  has successfully acknowledged init. On init failure, the caller receives
+  `{:error, reason}` synchronously.
+
+  Also handles system messages so it can be inspected via `:sys.get_state/1`,
+  traced with `:sys.trace/2`, and suspended with `:sys.suspend/1`.
+  """
+
+  @type state :: %{label: String.t(), count: non_neg_integer()}
+
+  @spec start_link(keyword()) :: {:ok, pid()} | {:error, term()}
+  def start_link(opts) do
+    :proc_lib.start_link(__MODULE__, :init, [self(), opts])
+  end
+
+  @doc false
+  def init(parent, opts) do
+    debug = :sys.debug_options([])
+
+    if Keyword.get(opts, :fail_init?, false) do
+      # Report the init failure synchronously to the parent.
+      reason = :econnrefused
+      :proc_lib.init_fail(parent, {:error, reason}, {:exit, reason})
+    else
+      state = %{label: Keyword.get(opts, :label, "default"), count: 0}
+      :proc_lib.init_ack(parent, {:ok, self()})
+      loop(parent, debug, state)
+    end
+  end
+
+  @spec echo(pid()) :: String.t()
+  def echo(pid) do
+    send(pid, {:echo, self()})
+
+    receive do
+      {:echoed, label} -> label
+    after
+      1_000 -> exit(:timeout)
+    end
+  end
+
+  # ---- main loop -----------------------------------------------------------
+
+  defp loop(parent, debug, state) do
+    receive do
+      {:system, from, request} ->
+        :sys.handle_system_msg(request, from, parent, __MODULE__, debug, state)
+
+      {:EXIT, ^parent, reason} ->
+        exit(reason)
+
+      {:echo, from} ->
+        send(from, {:echoed, state.label})
+        new_debug = :sys.handle_debug(debug, &write_debug/3, __MODULE__, {:echo, state.label})
+        loop(parent, new_debug, %{state | count: state.count + 1})
+
+      :stop ->
+        :ok
+    end
+  end
+
+  defp write_debug(dev, event, name) do
+    IO.write(dev, "*DBG* #{inspect(name)} event: #{inspect(event)}\n")
+  end
+
+  # ---- sys callbacks -------------------------------------------------------
+
+  @doc false
+  def system_continue(parent, debug, state), do: loop(parent, debug, state)
+
+  @doc false
+  def system_terminate(reason, _parent, _debug, _state), do: exit(reason)
+
+  @doc false
+  def system_get_state(state), do: {:ok, state}
+
+  @doc false
+  def system_replace_state(fun, state) do
+    new_state = fun.(state)
+    {:ok, new_state, new_state}
+  end
+end
+
+defmodule ProcLibWorker.Application do
+  @moduledoc false
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    Supervisor.start_link([], strategy: :one_for_one, name: ProcLibWorker.Supervisor)
+  end
+end
+
+defmodule ProcLibWorker.NaiveWorkerTest do
+  use ExUnit.Case, async: true
+
+  alias ProcLibWorker.NaiveWorker
+
+  describe "ProcLibWorker.NaiveWorker" do
+    test "spawn_link returns {:ok, pid} even if init will crash" do
+      Process.flag(:trap_exit, true)
+      assert {:ok, pid} = NaiveWorker.start_link(fail_init?: true)
+      # We got {:ok, pid} synchronously. The crash arrives asynchronously.
+      assert_receive {:EXIT, ^pid, :econnrefused}, 500
+    end
+
+    test "echo works when init does not fail" do
+      Process.flag(:trap_exit, true)
+      {:ok, pid} = NaiveWorker.start_link(label: "foo")
+      send(pid, {:echo, self()})
+      assert_receive {:echoed, "foo"}, 200
+      send(pid, :stop)
+    end
+  end
+end
+
+defmodule ProcLibWorker.OkWorkerTest do
+  use ExUnit.Case, async: true
+
+  alias ProcLibWorker.OkWorker
+
+  describe "ProcLibWorker.OkWorker" do
+    test "init failure surfaces synchronously as {:error, reason}" do
+      Process.flag(:trap_exit, true)
+      assert {:error, :econnrefused} = OkWorker.start_link(fail_init?: true)
+      # No pid was ever exposed; no orphan exit to handle.
+      refute_receive {:EXIT, _, _}, 100
+    end
+
+    test "happy path returns a live, echo-capable pid" do
+      {:ok, pid} = OkWorker.start_link(label: "hello")
+      assert OkWorker.echo(pid) == "hello"
+      send(pid, :stop)
+    end
+
+    test "sys protocol works (get_state / replace_state)" do
+      {:ok, pid} = OkWorker.start_link(label: "inspected")
+
+      state = :sys.get_state(pid)
+      assert state.label == "inspected"
+      assert state.count == 0
+
+      _ = OkWorker.echo(pid)
+      assert :sys.get_state(pid).count == 1
+
+      :sys.replace_state(pid, fn s -> %{s | label: "patched"} end)
+      assert OkWorker.echo(pid) == "patched"
+      send(pid, :stop)
+    end
+
+    test "supervisor-friendly: can be supervised" do
+      children = [
+        %{
+          id: :ok_worker,
+          start: {OkWorker, :start_link, [[label: "sup"]]},
+          restart: :temporary
+        }
+      ]
+
+      {:ok, sup} = Supervisor.start_link(children, strategy: :one_for_one)
+      [{:ok_worker, worker, :worker, [OkWorker]}] = Supervisor.which_children(sup)
+      assert OkWorker.echo(worker) == "sup"
+      Supervisor.stop(sup)
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrating 79-proc-lib-start-link
+      :ok
+  end
+end
+
+Main.main()
+end
+```

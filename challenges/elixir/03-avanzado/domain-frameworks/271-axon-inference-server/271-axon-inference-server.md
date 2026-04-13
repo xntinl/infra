@@ -49,6 +49,22 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. `Nx.Serving`: batching as a library
 
 `Nx.Serving` wraps a function that takes a batched tensor and returns a batched tensor. Callers submit individual inputs; the serving process collects up to `batch_size` inputs, pads if necessary, runs the batch, and routes results back. Two knobs matter:
@@ -521,21 +537,79 @@ The knee of the curve is between batch 32 and 64. Setting `batch_size: 32, batch
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
 
-- [`Nx.Serving` hexdocs](https://hexdocs.pm/nx/Nx.Serving.html) — batching, distribution, client hooks.
-- [Sean Moriarity — "Serving ML Models in Elixir"](https://dockyard.com/blog/2023/04/12/llama-2-and-elixir) — LLM-scale walkthrough of the patterns used here.
-- [José Valim — "Bumblebee: GPT-2 and more in Elixir"](https://dashbit.co/blog/bumblebee-a-year-in) — production Serving deployments.
-- [Axon inference guide](https://hexdocs.pm/axon/onnx_to_axon.html) — building servings from ONNX-imported graphs.
-- [`telemetry_metrics_prometheus` hexdocs](https://hexdocs.pm/telemetry_metrics_prometheus/) — exporting the metrics emitted here.
-- [TorchServe design doc](https://docs.pytorch.org/serve) — useful contrast for dynamic-batching semantics.
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+defmodule AxonInference.Serving do
+  @moduledoc """
+  Builds the `Nx.Serving` that handles batched inference.
+
+  Design decisions:
+    * `batch_size: 32`    → matches GPU sweet spot on most models
+    * `batch_timeout: 10` → 10 ms worst-case wait when traffic is low
+    * `partitions: true`  → one serving per GPU (`EXLA.Client.get_default().device_count`)
+  """
+
+  alias AxonInference.Model
+
+  @spec build() :: Nx.Serving.t()
+  def build do
+    model = Model.build()
+    params = Model.params()
+    {_init_fn, pred_fn} = Axon.build(model, mode: :inference)
+
+    Nx.Serving.new(fn batch_size, defn_opts ->
+      # One-time compilation for this batch size.
+      # EXLA caches by {function_hash, shapes} — each unique batch size compiles once.
+      template = Nx.template({batch_size, Model.input_size()}, :f32)
+
+      Nx.Defn.compile(
+        fn input -> pred_fn.(params, input) end,
+        [template],
+        defn_opts
+      )
+    end)
+    |> Nx.Serving.process_options(batch_size: 32, batch_timeout: 10)
+    |> Nx.Serving.client_preprocessing(&preprocess/1)
+    |> Nx.Serving.client_postprocessing(&postprocess/2)
+  end
+
+  # Accepts a list of inputs or a single tensor; returns a batch tensor + metadata.
+  defp preprocess(inputs) when is_list(inputs) do
+    tensor = inputs |> Enum.map(&to_input_tensor/1) |> Nx.stack()
+    {Nx.Batch.concatenate([tensor]), %{count: length(inputs)}}
+  end
+
+  defp preprocess(%Nx.Tensor{} = t) do
+    {Nx.Batch.concatenate([t]), %{count: 1}}
+  end
+
+  defp to_input_tensor(list) when is_list(list), do: Nx.tensor(list, type: :f32)
+  defp to_input_tensor(%Nx.Tensor{} = t), do: t
+
+  defp postprocess({batched, _}, %{count: count}) do
+    # Slice the valid rows back out (serving may have padded).
+    batched |> Nx.slice([0, 0], [count, Model.num_classes()]) |> Nx.to_list()
+  end
+
+  def child_spec(_opts) do
+    %{
+      id: __MODULE__,
+      start:
+        {Nx.Serving, :start_link,
+         [[serving: build(), name: __MODULE__, batch_size: 32, batch_timeout: 10]]}
+    }
+  end
 end
+
+defmodule Main do
+  def main do
+    IO.puts("✓ Axon Inference Server with Nx.Serving and a GenServer Pool")
+  - Axon neural network inference
+    - Nx.Serving with GenServer pooling
+  end
+end
+
+Main.main()
 ```

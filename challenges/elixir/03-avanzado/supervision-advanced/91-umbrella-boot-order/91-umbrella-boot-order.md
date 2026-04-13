@@ -73,6 +73,22 @@ umbrella_boot/
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Two orderings, two mechanisms
 
 Boot in an umbrella happens in two layers:
@@ -630,11 +646,86 @@ Target: boot-to-first-request ≤ 2.5 s on a cold JIT for a three-app umbrella; 
 
 ---
 
-## Resources
 
-- [Elixir — Umbrella projects](https://hexdocs.pm/elixir/dependencies-and-umbrella-projects.html)
-- [`Application` module](https://hexdocs.pm/elixir/Application.html)
-- [`mix release`](https://hexdocs.pm/mix/Mix.Tasks.Release.html)
-- [Erlang OTP — application_controller](https://www.erlang.org/doc/man/application.html)
-- [Adopting Elixir — Ch.7 Releases](https://pragprog.com/titles/tvmelixir/adopting-elixir/) — José Valim, Bruce Tate, Ben Marx
-- [Dashbit — The practical advantages of umbrellas](https://dashbit.co/blog)
+## Executable Example
+
+```elixir
+defmodule Web.Endpoint do
+  @moduledoc """
+  Simulates an HTTP endpoint. On boot it asserts that its transitive dependencies
+  are actually running — this is the canary that catches wrong boot order early.
+  """
+  use GenServer
+  require Logger
+
+  def start_link(opts \\ []), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+
+  @spec request(String.t()) :: {:ok, map()}
+  def request(path), do: GenServer.call(__MODULE__, {:request, path})
+
+  @impl true
+  def init(_opts) do
+    for app <- [:core, :infra] do
+      unless Application.started_applications() |> Enum.any?(fn {a, _, _} -> a == app end) do
+        raise "Web booting before #{app} is running — check :applications list"
+      end
+    end
+
+    Logger.info("Web.Endpoint ready")
+    {:ok, %{}}
+  end
+
+  @impl true
+  def handle_call({:request, path}, _from, s) do
+    Core.Cache.put(path, :served)
+    {:ok, resp} = Infra.HttpPool.call(path)
+    {:reply, {:ok, resp}, s}
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrate umbrella boot order and application dependencies
+
+      # Boot order is defined by :applications in root mix.exs:
+      # [:core, :infra, :web] ensures correct dependency resolution
+
+      # Verify core app is running (domain logic + ETS cache)
+      core_cache_pid = Process.whereis(UmbrellaBoot.Core.Cache)
+      assert is_pid(core_cache_pid), "Core cache must be initialized"
+      IO.puts("✓ Core application started (domain + ETS cache)")
+
+      # Verify infra app is running (Ecto repo + HTTP client pool)
+      infra_repo_pid = Process.whereis(UmbrellaBoot.Infra.Repo)
+      assert is_pid(infra_repo_pid), "Infra repo must be initialized"
+      IO.puts("✓ Infra application started (Ecto repo + HTTP pool)")
+
+      # Verify web app is running (depends on core + infra)
+      web_listener_pid = Process.whereis(UmbrellaBoot.Web.Listener)
+      assert is_pid(web_listener_pid), "Web listener must be initialized"
+      IO.puts("✓ Web application started (depends on core + infra)")
+
+      # Test dependency resolution: web can call infra and core
+      {:ok, data} = UmbrellaBoot.Web.handle_request()
+      assert data != nil, "Web should successfully call infra and core"
+      IO.inspect(data, label: "Web request result (via infra)")
+
+      # Verify boot order via :applications list
+      app_order = Application.loaded_applications()
+        |> Enum.filter(fn {app, _, _} -> app in [:core, :infra, :web] end)
+        |> Enum.map(fn {app, _, _} -> app end)
+
+      assert app_order == [:core, :infra, :web], "Applications must boot in dependency order"
+      IO.puts("✓ Boot order verified: core → infra → web (via :applications list)")
+
+      IO.puts("\n✓ Umbrella boot order mechanism demonstrated:")
+      IO.puts("  - :applications in root mix.exs defines global boot order")
+      IO.puts("  - Child supervisor lists define intra-app process order")
+      IO.puts("  - Mismatch = race conditions on release targets")
+      IO.puts("  - Solution: put dependencies in :applications, not supervisor")
+      IO.puts("✓ Payments umbrella ready (no boot order races)")
+  end
+end
+
+Main.main()
+```

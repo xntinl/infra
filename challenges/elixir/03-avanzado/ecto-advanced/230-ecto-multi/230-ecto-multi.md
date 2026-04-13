@@ -60,6 +60,25 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Ecto-specific insight:**
+Ecto separates the query layer (building queries) from the execution layer (sending them). This separation allows for debugging, composability, and testing without a database. Never load all rows first and filter in-memory — write the filter into the query itself, or you've just built an N+1 problem.
 ### 1. `Multi` is data
 
 `Ecto.Multi.new() |> Multi.insert(:order, changeset)` returns a `%Multi{}` struct that
@@ -566,20 +585,286 @@ One statement instead of N.
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
-
-- [`Ecto.Multi` — hexdocs](https://hexdocs.pm/ecto/Ecto.Multi.html) — every function with examples.
-- [Dashbit: "Composable transactions with Ecto.Multi"](https://dashbit.co/blog/composable-transactions-with-ecto-multi) — José's canonical write-up.
-- [Hex.pm source — `Hexpm.Accounts.User`](https://github.com/hexpm/hexpm) — real Multi pipelines in production.
-- [Postgres: Transaction Isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — understand what your Multi actually commits.
-- [Saša Jurić: "Towards Maintainable Elixir"](https://www.theerlangelist.com/article/spawn_or_not) — context functions returning Multis.
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+defmodule EctoMultiDeep.Schemas.Product do
+  use Ecto.Schema
+
+  schema "products" do
+    field :sku, :string
+    field :price_cents, :integer
+    field :stock, :integer
+    timestamps()
+
+defmodule EctoMultiDeep.Schemas.Order do
+  use Ecto.Schema
+  import Ecto.Changeset
+
+  schema "orders" do
+    field :customer_email, :string
+    field :total_cents, :integer
+    field :status, :string, default: "pending"
+    has_many :line_items, EctoMultiDeep.Schemas.LineItem
+    timestamps()
+
+  def changeset(order, attrs) do
+    order
+    |> cast(attrs, [:customer_email, :total_cents, :status])
+    |> validate_required([:customer_email, :total_cents])
+
+defmodule EctoMultiDeep.Schemas.LineItem do
+  use Ecto.Schema
+  import Ecto.Changeset
+
+  schema "line_items" do
+    field :sku, :string
+    field :quantity, :integer
+    field :unit_price_cents, :integer
+    belongs_to :order, EctoMultiDeep.Schemas.Order
+
+  def changeset(item, attrs) do
+    item
+    |> cast(attrs, [:sku, :quantity, :unit_price_cents, :order_id])
+    |> validate_required([:sku, :quantity, :unit_price_cents])
+    |> validate_number(:quantity, greater_than: 0)
 end
+
+defmodule EctoMultiDeep.Schemas.Payment do
+  use Ecto.Schema
+  import Ecto.Changeset
+
+  schema "payments" do
+    field :amount_cents, :integer
+    field :gateway_reference, :string
+    field :status, :string
+    belongs_to :order, EctoMultiDeep.Schemas.Order
+    timestamps()
+  end
+
+  def changeset(payment, attrs) do
+    payment
+    |> cast(attrs, [:amount_cents, :gateway_reference, :status, :order_id])
+    |> validate_required([:amount_cents, :gateway_reference, :status, :order_id])
+  end
+end
+
+defmodule EctoMultiDeep.Schemas.AuditLog do
+  use Ecto.Schema
+  import Ecto.Changeset
+
+  schema "audit_logs" do
+    field :action, :string
+    field :payload, :map
+    timestamps(updated_at: false)
+  end
+
+  def changeset(log, attrs) do
+    log
+    |> cast(attrs, [:action, :payload])
+    |> validate_required([:action, :payload])
+  end
+end
+
+
+defmodule EctoMultiDeep.Orders.PaymentGateway do
+  @moduledoc "Simulated gateway. In production replace with Stripe/MP HTTP client."
+
+  @spec charge(pos_integer(), String.t()) ::
+          {:ok, %{reference: String.t()}} | {:error, :declined | :network}
+  def charge(amount_cents, card_token) when is_integer(amount_cents) and amount_cents > 0 do
+    cond do
+      card_token == "declined" -> {:error, :declined}
+      card_token == "network_error" -> {:error, :network}
+      true -> {:ok, %{reference: "ch_" <> Base.encode16(:crypto.strong_rand_bytes(6))}}
+    end
+  end
+end
+
+
+defmodule EctoMultiDeep.Orders.PlaceOrder do
+  @moduledoc """
+  Places an order atomically. Uses Ecto.Multi to chain stock decrement, order creation,
+  line items, payment, and audit log into a single transaction.
+  """
+
+  alias Ecto.Multi
+  alias EctoMultiDeep.Repo
+  alias EctoMultiDeep.Orders.PaymentGateway
+  alias EctoMultiDeep.Schemas.{AuditLog, LineItem, Order, Payment, Product}
+
+  @type line_params :: %{sku: String.t(), quantity: pos_integer()}
+  @type params :: %{
+          customer_email: String.t(),
+          card_token: String.t(),
+          lines: [line_params()]
+        }
+
+  @spec run(params()) ::
+          {:ok, map()}
+          | {:error, atom(), term(), map()}
+          | {:error, :payment_failed, atom()}
+  def run(params) do
+    # Charge the gateway OUTSIDE the transaction to avoid holding DB locks during network I/O.
+    total = compute_total(params.lines)
+
+    case PaymentGateway.charge(total, params.card_token) do
+      {:error, reason} ->
+        {:error, :payment_failed, reason}
+
+      {:ok, %{reference: reference}} ->
+        params
+        |> build_multi(total, reference)
+        |> Repo.transaction()
+    end
+  end
+
+  defp build_multi(params, total, reference) do
+    Multi.new()
+    |> Multi.run(:validate_stock, fn repo, _ -> validate_stock(repo, params.lines) end)
+    |> Multi.run(:decrement_stock, fn repo, %{validate_stock: products} ->
+      decrement_stock(repo, products, params.lines)
+    end)
+    |> Multi.insert(
+      :order,
+      Order.changeset(%Order{}, %{
+        customer_email: params.customer_email,
+        total_cents: total,
+        status: "confirmed"
+      })
+    )
+    |> Multi.merge(fn %{order: order} -> insert_line_items_multi(order, params.lines) end)
+    |> Multi.insert(:payment, fn %{order: order} ->
+      Payment.changeset(%Payment{}, %{
+        amount_cents: total,
+        gateway_reference: reference,
+        status: "captured",
+        order_id: order.id
+      })
+    end)
+    |> Multi.insert(:audit, fn %{order: order} ->
+      AuditLog.changeset(%AuditLog{}, %{
+        action: "order.placed",
+        payload: %{order_id: order.id, total_cents: total}
+      })
+    end)
+  end
+
+  defp validate_stock(repo, lines) do
+    skus = Enum.map(lines, & &1.sku)
+
+    products =
+      repo.all(
+        from p in Product,
+          where: p.sku in ^skus,
+          lock: "FOR UPDATE"
+      )
+
+    missing = skus -- Enum.map(products, & &1.sku)
+    if missing != [], do: {:error, {:missing_skus, missing}}, else: {:ok, products}
+  end
+
+  defp decrement_stock(repo, products, lines) do
+    by_sku = Map.new(products, &{&1.sku, &1})
+
+    Enum.reduce_while(lines, {:ok, %{}}, fn line, {:ok, acc} ->
+      case Map.get(by_sku, line.sku) do
+        nil ->
+          {:halt, {:error, {:unknown_sku, line.sku}}}
+
+        %Product{stock: stock} when stock < line.quantity ->
+          {:halt, {:error, {:insufficient_stock, line.sku}}}
+
+        product ->
+          {:ok, updated} =
+            product
+            |> Ecto.Changeset.change(stock: product.stock - line.quantity)
+            |> repo.update()
+
+          {:cont, {:ok, Map.put(acc, product.sku, updated)}}
+      end
+    end)
+  end
+
+  defp insert_line_items_multi(order, lines) do
+    Enum.reduce(lines, Multi.new(), fn line, multi ->
+      Multi.insert(
+        multi,
+        {:line_item, line.sku},
+        LineItem.changeset(%LineItem{}, %{
+          sku: line.sku,
+          quantity: line.quantity,
+          unit_price_cents: line.unit_price_cents,
+          order_id: order.id
+        })
+      )
+    end)
+  end
+
+  defp compute_total(lines),
+    do: Enum.reduce(lines, 0, fn l, acc -> acc + l.quantity * l.unit_price_cents end)
+
+  import Ecto.Query, only: [from: 2]
+end
+
+
+defmodule EctoMultiDeep.Repo.Migrations.CreateTables do
+  use Ecto.Migration
+
+  def change do
+    create table(:products) do
+      add :sku, :string, null: false
+      add :price_cents, :integer, null: false
+      add :stock, :integer, null: false, default: 0
+      timestamps()
+    end
+    create unique_index(:products, [:sku])
+
+    create table(:orders) do
+      add :customer_email, :string, null: false
+      add :total_cents, :integer, null: false
+      add :status, :string, null: false
+      timestamps()
+    end
+
+    create table(:line_items) do
+      add :sku, :string, null: false
+      add :quantity, :integer, null: false
+      add :unit_price_cents, :integer, null: false
+      add :order_id, references(:orders, on_delete: :delete_all), null: false
+    end
+
+    create table(:payments) do
+      add :amount_cents, :integer, null: false
+      add :gateway_reference, :string, null: false
+      add :status, :string, null: false
+      add :order_id, references(:orders, on_delete: :restrict), null: false
+      timestamps()
+    end
+
+    create table(:audit_logs) do
+      add :action, :string, null: false
+      add :payload, :map, null: false
+      timestamps(updated_at: false)
+    end
+  end
+end
+
+
+defmodule EctoMultiDeep.Orders.PlaceOrderTest do
+  use ExUnit.Case, async: false
+
+  alias EctoMultiDeep.Repo
+  alias EctoMultiDeep.Orders.PlaceOrder
+  alias EctoMultiDeep.Schemas.{Order, Product}
+  end
+end
+
+defmodule Main do
+  def main do
+      :ok
+  end
+end
+
+Main.main()
 ```

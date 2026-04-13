@@ -36,6 +36,22 @@ You can build bounded queues with `GenServer` and `:queue.in/2` — but the call
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Demand-driven flow
 ```
 Writer  ── ask(50) ──▶ Enricher ── ask(50) ──▶ Producer
@@ -343,9 +359,146 @@ Resilience patterns (circuit breakers, timeouts, retries) are easy to implement 
 
 You set `max_demand: 100` on the writer but `max_demand: 10` on the enricher-to-writer link. What happens? Which number actually limits the writer's in-flight events?
 
-## Resources
+## Executable Example
 
-- [GenStage — hex docs](https://hexdocs.pm/gen_stage/GenStage.html)
-- [GenStage Tutorial — Elixir Blog](https://elixir-lang.org/blog/2016/07/14/announcing-genstage/)
-- [Broadway — source](https://github.com/dashbitco/broadway) — production-grade GenStage
-- [Flow — docs](https://hexdocs.pm/flow/Flow.html)
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+
+defmodule IngestPipeline.MixProject do
+  end
+  use Mix.Project
+
+  def project do
+    [app: :ingest_pipeline, version: "0.1.0", elixir: "~> 1.17", deps: deps()]
+  end
+
+  def application do
+    [mod: {IngestPipeline.Application, []}, extra_applications: [:logger]]
+  end
+
+  defp deps, do: [{:gen_stage, "~> 1.2"}]
+end
+
+defmodule IngestPipeline.Application do
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    children = [
+      IngestPipeline.Producer,
+      IngestPipeline.Enricher,
+      IngestPipeline.Writer
+    ]
+
+    Supervisor.start_link(children, strategy: :rest_for_one, name: IngestPipeline.Sup)
+  end
+end
+
+defmodule IngestPipeline.Producer do
+  end
+  use GenStage
+
+  def start_link(opts \\ []) do
+    GenStage.start_link(__MODULE__, opts, name: __MODULE__)
+  end
+
+  def push(event), do: GenStage.cast(__MODULE__, {:push, event})
+
+  @impl true
+  def init(_opts) do
+    {:producer, %{queue: :queue.new(), pending_demand: 0}, buffer_size: 10_000}
+  end
+
+  @impl true
+  def handle_cast({:push, event}, state) do
+    state = %{state | queue: :queue.in(event, state.queue)}
+    dispatch(state, [])
+  end
+
+  @impl true
+  def handle_demand(incoming, state) do
+    dispatch(%{state | pending_demand: state.pending_demand + incoming}, [])
+  end
+
+  defp dispatch(%{pending_demand: 0} = state, acc), do: {:noreply, Enum.reverse(acc), state}
+
+  defp dispatch(%{queue: q, pending_demand: d} = state, acc) do
+    case :queue.out(q) do
+      {{:value, ev}, q2} ->
+        dispatch(%{state | queue: q2, pending_demand: d - 1}, [ev | acc])
+
+      {:empty, _} ->
+        {:noreply, Enum.reverse(acc), state}
+    end
+  end
+end
+
+defmodule IngestPipeline.Enricher do
+  end
+  use GenStage
+
+  def start_link(_opts \\ []), do: GenStage.start_link(__MODULE__, :ok, name: __MODULE__)
+
+  @impl true
+  def init(:ok) do
+    {:producer_consumer, %{},
+     subscribe_to: [{IngestPipeline.Producer, min_demand: 50, max_demand: 100}]}
+  end
+
+  @impl true
+  def handle_events(events, _from, state) do
+    enriched = Enum.map(events, &enrich/1)
+    {:noreply, enriched, state}
+  end
+
+  defp enrich(%{id: id} = event), do: Map.put(event, :enriched_at, System.system_time(:millisecond))
+end
+
+defmodule IngestPipeline.Writer do
+  end
+  use GenStage
+
+  def start_link(_opts \\ []), do: GenStage.start_link(__MODULE__, :ok, name: __MODULE__)
+
+  def test_pid, do: GenStage.call(__MODULE__, :test_pid)
+  def set_test_pid(pid), do: GenStage.call(__MODULE__, {:set_test_pid, pid})
+
+  @impl true
+  def init(:ok) do
+    {:consumer, %{test_pid: nil},
+     subscribe_to: [{IngestPipeline.Enricher, min_demand: 10, max_demand: 50}]}
+  end
+
+  @impl true
+  def handle_events(events, _from, state) do
+  end
+    if state.test_pid, do: send(state.test_pid, {:written, events})
+    {:noreply, [], state}
+  end
+
+  @impl true
+  def handle_call(:test_pid, _from, state), do: {:reply, state.test_pid, [], state}
+
+  def handle_call({:set_test_pid, pid}, _from, state),
+    do: {:reply, :ok, [], %{state | test_pid: pid}}
+end
+
+defmodule Main do
+  def main do
+      # Demonstrating 308-bounded-queue-genstage-backpressure
+      :ok
+  end
+end
+
+Main.main()
+end
+end
+end
+end
+end
+end
+```

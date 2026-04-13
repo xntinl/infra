@@ -33,6 +33,25 @@ docs_search/
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Ecto-specific insight:**
+Ecto separates the query layer (building queries) from the execution layer (sending them). This separation allows for debugging, composability, and testing without a database. Never load all rows first and filter in-memory — write the filter into the query itself, or you've just built an N+1 problem.
 ### 1. `tsvector` — the indexed form of a document
 
 Postgres converts a text string into a normalized `tsvector`:
@@ -494,19 +513,110 @@ QPS across 5 languages?
 
 ---
 
-## Resources
 
-- [Postgres — textsearch](https://www.postgresql.org/docs/current/textsearch.html)
-- [Postgres — GIN indexes](https://www.postgresql.org/docs/current/gin.html)
-- [`websearch_to_tsquery`](https://www.postgresql.org/docs/current/textsearch-controls.html)
-- [`pg_trgm`](https://www.postgresql.org/docs/current/pgtrgm.html) — trigram similarity for autocomplete
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+# test/docs_search/search_test.exs
+defmodule DocsSearch.SearchTest do
+  use ExUnit.Case, async: false
+  alias DocsSearch.{Repo, Search}
+  alias DocsSearch.Schemas.Article
+
+  setup do
+    Ecto.Adapters.SQL.Sandbox.checkout(Repo)
+    Ecto.Adapters.SQL.Sandbox.mode(Repo, {:shared, self()})
+    Repo.delete_all(Article)
+
+    {:ok, _} =
+      Repo.insert(%Article{
+        title: "Deploying Phoenix on Kubernetes",
+        body: "A guide to running Phoenix apps on Kubernetes clusters with libcluster."
+      })
+
+    {:ok, _} =
+      Repo.insert(%Article{
+        title: "OTP GenServer basics",
+        body: "Introduction to GenServer callbacks and supervision trees."
+      })
+
+    {:ok, _} =
+      Repo.insert(%Article{
+        title: "Distributed Elixir clusters",
+        body: "Patterns for distributing work across nodes in a Phoenix cluster."
+      })
+
+    :ok
+  end
+
+  describe "run/2 basics" do
+    test "matches title terms" do
+      results = Search.run("kubernetes")
+      assert length(results) == 1
+      assert hd(results).title =~ "Kubernetes"
+    end
+
+    test "AND semantics via multiple terms" do
+      results = Search.run("phoenix cluster")
+      assert length(results) == 2
+      assert Enum.all?(results, &(String.contains?(&1.title, "Phoenix") or String.contains?(&1.title, "cluster") or String.contains?(&1.body, "cluster")))
+    end
+
+    test "OR with websearch syntax" do
+      results = Search.run("kubernetes OR genserver")
+      assert length(results) == 2
+    end
+
+    test "exclusion with minus" do
+      results = Search.run("phoenix -kubernetes")
+      assert Enum.all?(results, &(not String.contains?(&1.title, "Kubernetes")))
+    end
+
+    test "phrase search" do
+      results = Search.run(~s("Phoenix cluster"))
+      assert Enum.any?(results, &String.contains?(&1.body, "Phoenix cluster"))
+    end
+
+    test "empty query returns empty list" do
+      assert [] = Search.run("")
+    end
+  end
+
+  describe "ranking" do
+    test "title match outranks body match" do
+      results = Search.run("phoenix")
+      [top | _] = results
+      # Title containing "Phoenix" should rank above one where it only appears in body
+      assert String.contains?(top.title, "Phoenix")
+    end
+
+    test "rank is populated in the struct" do
+      [hit | _] = Search.run("kubernetes")
+      assert is_float(hit.rank)
+      assert hit.rank > 0
+    end
+
+    test "headline contains the matched term wrapped in mark" do
+      [hit | _] = Search.run("kubernetes")
+      assert hit.headline =~ "<mark>Kubernetes</mark>"
+    end
+  end
+
+  describe "count/1" do
+    test "returns number of matching articles" do
+      assert Search.count("phoenix") == 2
+      assert Search.count("nonsense_word_zyx") == 0
+    end
+  end
 end
+
+defmodule Main do
+  def main do
+    IO.puts("✓ Full-Text Search with `tsvector`")
+  - Full-text search with tsvector
+    - Ranking and relevance scoring
+  end
+end
+
+Main.main()
 ```

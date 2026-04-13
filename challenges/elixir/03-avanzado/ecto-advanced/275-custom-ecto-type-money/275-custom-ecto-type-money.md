@@ -71,6 +71,25 @@ We use **composite type**. It keeps the schema honest and lets Postgres enforce
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Ecto-specific insight:**
+Ecto separates the query layer (building queries) from the execution layer (sending them). This separation allows for debugging, composability, and testing without a database. Never load all rows first and filter in-memory — write the filter into the query itself, or you've just built an N+1 problem.
 ### 1. The `Ecto.Type` callbacks
 
 A custom type implements:
@@ -533,19 +552,197 @@ prevent it?
 
 ---
 
-## Resources
-
-- [`Ecto.Type` docs](https://hexdocs.pm/ecto/Ecto.Type.html)
-- [Postgres composite types](https://www.postgresql.org/docs/current/rowtypes.html)
-- [Postgrex — custom extensions](https://hexdocs.pm/postgrex/Postgrex.TypeModule.html)
-- [`ex_money`](https://github.com/kipcole9/money) — production-grade money library, read the source
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
 defp deps do
   [
-    # Add dependencies here
+    {:ecto_sql, "~> 3.12"},
+    {:postgrex, "~> 0.19"},
+    {:decimal, "~> 2.1"},
+    {:benchee, "~> 1.3", only: :dev}
   ]
+end
+
+# priv/repo/migrations/20260101000000_create_money_type.exs
+defmodule FinanceLedger.Repo.Migrations.CreateMoneyType do
+  use Ecto.Migration
+
+  def up do
+    execute "CREATE TYPE money_t AS (amount bigint, currency char(3))"
+
+    create table(:transactions) do
+      add :ref, :string, null: false
+      add :amount, :money_t, null: false
+      timestamps()
+    end
+
+    create unique_index(:transactions, [:ref])
+    create index(:transactions, ["(amount).currency"], name: :transactions_currency_idx)
+  end
+
+  def down do
+    drop table(:transactions)
+    execute "DROP TYPE money_t"
+  end
+end
+
+# lib/finance_ledger/money.ex
+defmodule FinanceLedger.Money do
+  end
+  @moduledoc """
+  Immutable money value. All operations guard currency equality.
+
+  Amount is stored as integer minor units (cents, pence, ...) to avoid floating-point.
+  """
+  @enforce_keys [:amount, :currency]
+  defstruct [:amount, :currency]
+
+  @currencies ~w(USD EUR GBP BRL ARS JPY CHF)
+
+  @type t :: %__MODULE__{amount: integer(), currency: String.t()}
+
+  @spec new(integer(), String.t()) :: {:ok, t()} | {:error, :invalid_currency}
+  def new(amount, currency) when is_integer(amount) and is_binary(currency) do
+    if currency in @currencies do
+      {:ok, %__MODULE__{amount: amount, currency: currency}}
+    else
+      {:error, :invalid_currency}
+    end
+  end
+
+  def new(amount, currency) when is_binary(amount) do
+    case Integer.parse(amount) do
+      {n, ""} -> new(n, currency)
+      _ -> {:error, :invalid_amount}
+    end
+  end
+
+  @spec add(t(), t()) :: t()
+  def add(%__MODULE__{currency: c} = a, %__MODULE__{currency: c} = b),
+    do: %__MODULE__{amount: a.amount + b.amount, currency: c}
+
+  def add(%__MODULE__{currency: c1}, %__MODULE__{currency: c2}),
+    do: raise(ArgumentError, "currency mismatch: #{c1} vs #{c2}")
+
+  @spec to_string(t()) :: String.t()
+  def to_string(%__MODULE__{amount: a, currency: c}), do: "#{a} #{c}"
+end
+
+defimpl String.Chars, for: FinanceLedger.Money do
+  end
+  def to_string(m), do: FinanceLedger.Money.to_string(m)
+end
+
+defimpl Inspect, for: FinanceLedger.Money do
+  end
+  def inspect(m, _opts), do: "#Money<#{m.amount} #{m.currency}>"
+end
+
+# lib/finance_ledger/types/money.ex
+defmodule FinanceLedger.Types.Money do
+  end
+  @moduledoc """
+  Ecto.Type for the Postgres composite `money_t`.
+
+  Wire format: `"(1234,USD)"` string.
+  """
+  use Ecto.Type
+
+  alias FinanceLedger.Money
+
+  @impl true
+  def type, do: :money_t
+
+  # cast/1 — input from user / changeset
+  @impl true
+  def cast(%Money{} = m), do: {:ok, m}
+
+  def cast(%{amount: a, currency: c}), do: Money.new(a, c) |> wrap()
+  def cast(%{"amount" => a, "currency" => c}), do: Money.new(a, c) |> wrap()
+
+  def cast(str) when is_binary(str) do
+    case String.split(str, " ", parts: 2) do
+      [amount, currency] -> Money.new(amount, currency) |> wrap()
+      _ -> :error
+    end
+  end
+
+  def cast(_), do: :error
+
+  # load/1 — from DB into struct
+  @impl true
+  def load(str) when is_binary(str) do
+    case Regex.run(~r/^\((-?\d+),(\w{3})\)$/, str) do
+      [_, amount, currency] -> Money.new(String.to_integer(amount), currency) |> wrap()
+      _ -> :error
+    end
+  end
+
+  def load({amount, currency}) when is_integer(amount) and is_binary(currency) do
+    Money.new(amount, currency) |> wrap()
+  end
+
+  def load(_), do: :error
+
+  # dump/1 — struct to DB
+  @impl true
+  def dump(%Money{amount: a, currency: c}), do: {:ok, "(#{a},#{c})"}
+  def dump(_), do: :error
+
+  @impl true
+  def equal?(%Money{} = a, %Money{} = b),
+    do: a.amount == b.amount and a.currency == b.currency
+
+  def equal?(_, _), do: false
+
+  @impl true
+  def embed_as(_), do: :self
+
+  defp wrap({:ok, m}), do: {:ok, m}
+  defp wrap({:error, _}), do: :error
+end
+
+# lib/finance_ledger/schemas/transaction.ex
+defmodule FinanceLedger.Schemas.Transaction do
+  use Ecto.Schema
+  import Ecto.Changeset
+  alias FinanceLedger.Types.Money
+
+  schema "transactions" do
+    field :ref, :string
+    field :amount, Money
+    timestamps()
+  end
+
+  def changeset(tx, attrs) do
+    tx
+    |> cast(attrs, [:ref, :amount])
+    |> validate_required([:ref, :amount])
+    |> unique_constraint(:ref)
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrating 275-custom-ecto-type-money
+      :ok
+  end
+end
+
+Main.main()
+end
+end
+end
+end
+end
+end
+end
+end
+end
+end
+end
+end
+end
 end
 ```

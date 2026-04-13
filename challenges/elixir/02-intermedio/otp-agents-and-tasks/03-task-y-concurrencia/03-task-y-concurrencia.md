@@ -311,6 +311,50 @@ what's ready by the deadline", use `Task.yield_many`.
 
 - Aplicá lo aprendido sobre task y concurrencia: describí un caso de tu trabajo donde este patrón cambiaría tu diseño, y qué medirías para validar la mejora.
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule ParallelScraper do
+    def fetch_serial(urls) do
+      Enum.map(urls, &fetch_one/1)
+    end
+
+    def fetch_parallel(urls, timeout: timeout) do
+      tasks = Enum.map(urls, &Task.async(fn -> fetch_one(&1) end))
+      Enum.map(tasks, &Task.await(&1, timeout))
+    end
+
+    def fetch_parallel(urls) do
+      fetch_parallel(urls, timeout: 5000)
+    end
+
+    defp fetch_one(url) do
+      Process.sleep(10)
+      %{url: url, status: 200, body: "mocked"}
+    end
+  end
+
+  def main do
+    urls = ["https://a.example", "https://b.example", "https://c.example"]
+  
+    results = ParallelScraper.fetch_parallel(urls)
+    IO.puts("Fetched #{length(results)} URLs")
+  
+    results
+    |> Enum.each(fn r -> IO.puts("  #{r.url}: #{r.status}") end)
+  
+    IO.puts("✓ ParallelScraper works correctly")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Task` — Elixir stdlib](https://hexdocs.pm/elixir/Task.html)

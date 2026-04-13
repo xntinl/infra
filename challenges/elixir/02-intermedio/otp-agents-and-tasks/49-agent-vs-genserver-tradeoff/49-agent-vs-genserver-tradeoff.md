@@ -401,6 +401,129 @@ embedded/telecom systems), `GenServer` is the safer home.
 
 - Escribí una regla de un párrafo que un dev junior pueda aplicar para decidir Agent vs GenServer sin preguntar.
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule CounterGs do
+    @moduledoc """
+    The same counter as `CounterAgent`, plus three things `Agent` cannot
+    express:
+
+      * Periodic auto-reset on a `Process.send_after/3` tick.
+      * Monitoring a client pid and auto-decrementing when it exits.
+      * Structured `Logger` lifecycle events from `init/1` / `terminate/2`.
+    """
+
+    use GenServer
+    require Logger
+
+    defmodule State do
+      @moduledoc false
+      defstruct count: 0, reset_ms: nil, timer: nil, watched: %{}
+    end
+
+    # ── Public API ──────────────────────────────────────────────────────────
+
+    @spec start_link(keyword()) :: GenServer.on_start()
+    def start_link(opts \\ []) do
+      GenServer.start_link(__MODULE__, opts, Keyword.take(opts, [:name]))
+    end
+
+    @spec value(GenServer.server()) :: integer()
+    def value(server), do: GenServer.call(server, :value)
+
+    @spec inc(GenServer.server(), integer()) :: :ok
+    def inc(server, by \\ 1), do: GenServer.cast(server, {:inc, by})
+
+    @spec dec(GenServer.server(), integer()) :: :ok
+    def dec(server, by \\ 1), do: GenServer.cast(server, {:dec, by})
+
+    @spec reset(GenServer.server()) :: :ok
+    def reset(server), do: GenServer.cast(server, :reset)
+
+    @doc """
+    Registers a client pid. When that pid exits, the counter decrements
+    by 1 automatically — something impossible with `Agent`.
+    """
+    @spec watch(GenServer.server(), pid()) :: :ok
+    def watch(server, pid), do: GenServer.call(server, {:watch, pid})
+
+    # ── Callbacks ───────────────────────────────────────────────────────────
+
+    @impl true
+    def init(opts) do
+      initial = Keyword.get(opts, :initial, 0)
+      reset_ms = Keyword.get(opts, :reset_ms)
+      Logger.debug("CounterGs start initial=#{initial} reset_ms=#{inspect(reset_ms)}")
+      state = schedule_reset(%State{count: initial, reset_ms: reset_ms})
+      {:ok, state}
+    end
+
+    @impl true
+    def handle_call(:value, _from, state), do: {:reply, state.count, state}
+
+    def handle_call({:watch, pid}, _from, state) do
+      ref = Process.monitor(pid)
+      {:reply, :ok, %{state | watched: Map.put(state.watched, ref, pid)}}
+    end
+
+    @impl true
+    def handle_cast({:inc, by}, state), do: {:noreply, %{state | count: state.count + by}}
+    def handle_cast({:dec, by}, state), do: {:noreply, %{state | count: state.count - by}}
+    def handle_cast(:reset, state), do: {:noreply, %{state | count: 0}}
+
+    @impl true
+    def handle_info(:auto_reset, state) do
+      Logger.debug("CounterGs auto_reset")
+      {:noreply, schedule_reset(%{state | count: 0})}
+    end
+
+    def handle_info({:DOWN, ref, :process, _pid, _reason}, state) do
+      case Map.pop(state.watched, ref) do
+        {nil, _} -> {:noreply, state}
+        {_pid, rest} -> {:noreply, %{state | count: state.count - 1, watched: rest}}
+      end
+    end
+
+    def handle_info(_other, state), do: {:noreply, state}
+
+    @impl true
+    def terminate(reason, _state) do
+      Logger.debug("CounterGs terminate reason=#{inspect(reason)}")
+      :ok
+    end
+
+    # ── Helpers ─────────────────────────────────────────────────────────────
+
+    defp schedule_reset(%State{reset_ms: nil} = state), do: state
+
+    defp schedule_reset(%State{reset_ms: ms} = state) when is_integer(ms) do
+      ref = Process.send_after(self(), :auto_reset, ms)
+      %{state | timer: ref}
+    end
+  end
+
+  def main do
+    {:ok, counter} = CounterGs.start_link(initial: 5)
+    v1 = CounterGs.value(counter)
+    IO.puts("Initial value: #{v1}")
+  
+    :ok = CounterGs.inc(counter, 3)
+    v2 = CounterGs.value(counter)
+    IO.puts("After inc(3): #{v2}")
+  
+    IO.puts("✓ CounterGs works correctly")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Agent` — Elixir stdlib](https://hexdocs.pm/elixir/Agent.html)

@@ -404,7 +404,94 @@ The BEAM gives each process its own mailbox and its own heap — no shared memor
 
 ---
 
+## Executable Example
 
+Create `lib/chat_relay.ex` and test in `iex`:
+
+```elixir
+defmodule ChatRelay.Worker do
+  def start do
+    spawn(fn -> loop([]) end)
+  end
+
+  def send_message(pid, message) do
+    send(pid, {:message, message})
+  end
+
+  defp loop(messages) do
+    receive do
+      {:message, msg} ->
+        loop([msg | messages])
+      {:fetch, caller_pid, ref} ->
+        send(caller_pid, {:reply, ref, Enum.reverse(messages)})
+        loop(messages)
+      :stop ->
+        :ok
+    end
+  end
+end
+
+defmodule ChatRelay.Coordinator do
+  def start do
+    spawn(fn -> loop(%{}) end)
+  end
+
+  def register(coord_pid, name, worker_pid) do
+    ref = make_ref()
+    send(coord_pid, {:register, name, worker_pid, self(), ref})
+    receive do
+      {:registered, ^ref} -> :ok
+    after
+      5000 -> {:error, :timeout}
+    end
+  end
+
+  def relay(coord_pid, from, to, message) do
+    send(coord_pid, {:relay, from, to, message})
+  end
+
+  defp loop(registry) do
+    receive do
+      {:register, name, worker_pid, caller, ref} ->
+        Monitor.monitor(worker_pid)
+        new_registry = Map.put(registry, name, worker_pid)
+        send(caller, {:registered, ref})
+        loop(new_registry)
+
+      {:relay, from, to, message} ->
+        case Map.get(registry, to) do
+          nil -> :ok
+          target_pid -> ChatRelay.Worker.send_message(target_pid, "#{from}: #{message}")
+        end
+        loop(registry)
+
+      {:DOWN, _ref, :process, pid, _reason} ->
+        new_registry = Enum.filter(registry, fn {_k, v} -> v != pid end) |> Enum.into(%{})
+        loop(new_registry)
+    end
+  end
+end
+
+defmodule Monitor do
+  def monitor(pid) do
+    Process.monitor(pid)
+  end
+end
+
+# Test it
+coord = ChatRelay.Coordinator.start()
+a = ChatRelay.Worker.start()
+b = ChatRelay.Worker.start()
+
+:ok = ChatRelay.Coordinator.register(coord, :alice, a)
+:ok = ChatRelay.Coordinator.register(coord, :bob, b)
+
+ChatRelay.Coordinator.relay(coord, "alice", "bob", "Hello Bob!")
+IO.puts("Message relayed from Alice to Bob")
+
+ChatRelay.Coordinator.relay(coord, "bob", "alice", "Hi Alice!")
+IO.puts("Message relayed from Bob to Alice")
+```
 
 ---
 ## Key Concepts

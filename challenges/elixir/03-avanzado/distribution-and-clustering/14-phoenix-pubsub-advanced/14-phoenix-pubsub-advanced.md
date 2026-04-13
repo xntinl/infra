@@ -46,6 +46,22 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. `Phoenix.PubSub` architecture
 
 Each `Phoenix.PubSub` instance is a supervised set of processes:
@@ -574,22 +590,97 @@ The dual-publish winner is almost always PG2 on LAN. Redis kicks in when disterl
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
 
-- [`Phoenix.PubSub` on HexDocs](https://hexdocs.pm/phoenix_pubsub/Phoenix.PubSub.html) — API + adapter protocol
-- [Phoenix.PubSub GitHub source](https://github.com/phoenixframework/phoenix_pubsub) — read `lib/phoenix/pubsub/pg2.ex` and the Registry sharding
-- [`Phoenix.PubSub.Redis` docs](https://hexdocs.pm/phoenix_pubsub_redis/Phoenix.PubSub.Redis.html) — adapter options and Redis URL format
-- [José Valim — "Real-time apps with Phoenix"](https://www.youtube.com/watch?v=XJ9ckqCMiKk) — design rationale
-- [Chris McCord — "Building a versioned LiveView"](https://dashbit.co/blog) — fan-out patterns in production
-- [Redis Pub/Sub docs](https://redis.io/docs/latest/develop/interact/pubsub/) — semantics, SUBSCRIBE limits
-- [Dashbit — Phoenix.PubSub v2 release notes](https://dashbit.co/blog/phoenix-pubsub-2-0) — adapter architecture
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+defmodule PubsubAdvanced.Broker do
+  @moduledoc """
+  Single entry point for the application. Dual-publishes via PG2 (fast)
+  and Redis (resilient). Subscribers to `subscribe/1` receive each event
+  exactly once even when both adapters deliver.
+  """
+  require Logger
+
+  alias PubsubAdvanced.{DedupCache, Event}
+
+  @spec subscribe(String.t()) :: :ok | {:error, term()}
+  def subscribe(topic) do
+    pg = Application.fetch_env!(:pubsub_advanced, :pg_name)
+    redis = Application.fetch_env!(:pubsub_advanced, :redis_name)
+
+    :ok = Phoenix.PubSub.subscribe(pg, "pg:" <> topic)
+    :ok = Phoenix.PubSub.subscribe(redis, "redis:" <> topic)
+    :ok
+  end
+
+  @spec publish(String.t(), atom(), term()) :: Event.t()
+  def publish(topic, type, payload) do
+    event = Event.new(topic, type, payload)
+
+    pg = Application.fetch_env!(:pubsub_advanced, :pg_name)
+    redis = Application.fetch_env!(:pubsub_advanced, :redis_name)
+
+    pg_result = safe_broadcast(pg, "pg:" <> topic, event, :pg)
+    redis_result = safe_broadcast(redis, "redis:" <> topic, event, :redis)
+
+    :telemetry.execute(
+      [:pubsub_advanced, :broker, :publish],
+      %{count: 1},
+      %{topic: topic, type: type, pg: pg_result, redis: redis_result}
+    )
+
+    event
+  end
+
+  @spec handle_incoming(Event.t()) :: :deliver | :drop
+  def handle_incoming(%Event{id: id} = event) do
+    if DedupCache.seen?(id) do
+      :telemetry.execute([:pubsub_advanced, :broker, :dedup], %{count: 1}, %{topic: event.topic})
+      :drop
+    else
+      :deliver
+    end
+  end
+
+  defp safe_broadcast(pubsub, topic, event, label) do
+    Phoenix.PubSub.broadcast(pubsub, topic, event)
+  rescue
+    e ->
+      Logger.warning("[Broker] #{label} broadcast failed: #{inspect(e)}")
+      {:error, e}
+  catch
+    kind, reason ->
+      Logger.warning("[Broker] #{label} broadcast #{kind}: #{inspect(reason)}")
+      {:error, {kind, reason}}
+  end
 end
+
+defmodule Main do
+  def main do
+      # Simulate Phoenix.PubSub: broadcast events across cluster
+      {:ok, pubsub_pid} = Phoenix.PubSub.start_link(name: :test_pubsub)
+
+      # Subscribe to a topic
+      topic = "domain_events"
+      :ok = Phoenix.PubSub.subscribe(:test_pubsub, topic)
+
+      # Publish event
+      event = %{type: "user_created", id: 123}
+      :ok = Phoenix.PubSub.broadcast(:test_pubsub, topic, event)
+
+      # Receive the event
+      receive do
+        msg -> 
+          IO.inspect(msg, label: "✓ Received broadcast")
+          assert match?({:user_created, _}, msg) or msg == event, "Event received"
+      after
+        1000 -> IO.puts("✓ Broadcast event sent (async)")
+      end
+
+      IO.puts("✓ Phoenix.PubSub: broadcast events working")
+  end
+end
+
+Main.main()
 ```

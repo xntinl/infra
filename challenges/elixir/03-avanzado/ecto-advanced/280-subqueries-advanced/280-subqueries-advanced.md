@@ -35,6 +35,25 @@ product_catalog/
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Ecto-specific insight:**
+Ecto separates the query layer (building queries) from the execution layer (sending them). This separation allows for debugging, composability, and testing without a database. Never load all rows first and filter in-memory — write the filter into the query itself, or you've just built an N+1 problem.
 ### 1. `subquery/2` — use a query as a source
 
 ```elixir
@@ -455,19 +474,98 @@ business?
 
 ---
 
-## Resources
 
-- [`Ecto.Query.subquery/2`](https://hexdocs.pm/ecto/Ecto.Query.html#subquery/2)
-- [`parent_as/1` and `as:` bindings](https://hexdocs.pm/ecto/Ecto.Query.html#module-bindings)
-- [Postgres — LATERAL subqueries](https://www.postgresql.org/docs/current/queries-table-expressions.html#QUERIES-LATERAL)
-- [Postgres — DISTINCT ON](https://www.postgresql.org/docs/current/sql-select.html#SQL-DISTINCT)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+# lib/product_catalog/catalog.ex
+defmodule ProductCatalog.Catalog do
+  import Ecto.Query
+
+  alias ProductCatalog.Repo
+  alias ProductCatalog.Schemas.{Price, Product, Review, WarehouseStock}
+
+  @doc """
+  Catalog listing with:
+    - current price (latest by effective_at)
+    - last review timestamp (or nil)
+    - in_stock flag (any warehouse has qty > 0)
+  """
+  @spec list_with_derived() :: [map()]
+  def list_with_derived do
+    latest_price =
+      from p in Price,
+        distinct: p.product_id,
+        order_by: [asc: p.product_id, desc: p.effective_at],
+        select: %{product_id: p.product_id, amount_cents: p.amount_cents}
+
+    from(p in Product, as: :p)
+    |> join(:left, [p: p], lp in subquery(latest_price), on: lp.product_id == p.id)
+    |> join(:left_lateral, [p: p], r in fragment(
+         "(SELECT r.inserted_at FROM reviews r WHERE r.product_id = ? ORDER BY r.inserted_at DESC LIMIT 1)",
+         p.id
+       ), on: true)
+    |> select([p: p, lp: lp, r: r], %{
+      id: p.id,
+      sku: p.sku,
+      name: p.name,
+      price_cents: lp.amount_cents,
+      last_review_at: r,
+      in_stock:
+        exists(
+          from ws in WarehouseStock,
+            where: ws.product_id == parent_as(:p).id and ws.qty > 0
+        )
+    })
+    |> order_by([p: p], asc: p.id)
+    |> Repo.all()
+  end
+
+  @doc """
+  Products that have zero reviews. Anti-join pattern.
+  """
+  @spec products_without_reviews() :: [Product.t()]
+  def products_without_reviews do
+    from(p in Product, as: :p,
+      where: not exists(from r in Review, where: r.product_id == parent_as(:p).id)
+    )
+    |> Repo.all()
+  end
+
+  @doc """
+  Products whose latest price dropped vs. the previous price.
+  """
+  @spec price_drops() :: [%{id: integer(), name: String.t(), old: integer(), new: integer()}]
+  def price_drops do
+    ranked =
+      from p in Price,
+        windows: [w: [partition_by: p.product_id, order_by: [desc: p.effective_at]]],
+        select: %{
+          product_id: p.product_id,
+          amount_cents: p.amount_cents,
+          rn: row_number() |> over(:w)
+        }
+
+    latest = from r in subquery(ranked), where: r.rn == 1, select: %{product_id: r.product_id, amount: r.amount_cents}
+    previous = from r in subquery(ranked), where: r.rn == 2, select: %{product_id: r.product_id, amount: r.amount_cents}
+
+    from(p in Product,
+      join: l in subquery(latest), on: l.product_id == p.id,
+      join: pr in subquery(previous), on: pr.product_id == p.id,
+      where: l.amount < pr.amount,
+      select: %{id: p.id, name: p.name, old: pr.amount, new: l.amount}
+    )
+    |> Repo.all()
+  end
 end
+
+defmodule Main do
+  def main do
+    IO.puts("✓ Advanced Subqueries — `subquery/2`, Lateral Joins, EXISTS")
+  - Subquery composition
+    - Lateral joins and EXISTS clauses
+  end
+end
+
+Main.main()
 ```

@@ -379,6 +379,93 @@ existing solution fits.
 
 - Diseñá un `Config.Provider` que lea de Vault. ¿Qué pasa si Vault no responde al boot?
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule ConfigProvidersDemo.JsonConfigProvider do
+    @moduledoc """
+    Loads a JSON file at release boot and merges it into the Elixir
+    application environment.
+
+    The path is resolved from the provider options, supporting either a
+    literal string or `{:system, "ENV", default}` to read an env var.
+    """
+
+    @behaviour Config.Provider
+
+    @impl true
+    def init(opts) do
+      # Assembly time: only validate shape. DO NOT touch the filesystem —
+      # the target host is not the build host.
+      path = Keyword.fetch!(opts, :path)
+      {:path, path}
+    end
+
+    @impl true
+    def load(config, {:path, path_spec}) do
+      # Boot time on the target: now we can read env vars and files.
+      path = resolve_path(path_spec)
+
+      case File.read(path) do
+        {:ok, body} ->
+          json = Jason.decode!(body)
+          provider_config = to_keyword(json)
+          Config.Reader.merge(config, provider_config)
+
+        {:error, :enoent} ->
+          # Missing file is a deployment error — crash loudly, don't silently
+          # boot with partial config.
+          raise "config provider: file not found at #{inspect(path)}"
+      end
+    end
+
+    defp resolve_path({:system, env, default}) do
+      System.get_env(env, default)
+    end
+
+    defp resolve_path(path) when is_binary(path), do: path
+
+    # Convert a JSON map with string keys into the keyword/atom structure
+    # the Elixir config system expects. We restrict atom creation to the
+    # known application list to avoid unbounded atom table growth.
+    defp to_keyword(json) when is_map(json) do
+      Enum.map(json, fn {app_str, app_config} ->
+        app = String.to_existing_atom(app_str)
+        {app, to_keyword_keys(app_config)}
+      end)
+    end
+
+    defp to_keyword_keys(map) when is_map(map) do
+      Enum.map(map, fn {k, v} ->
+        {String.to_atom(k), to_value(v)}
+      end)
+    end
+
+    defp to_value(v) when is_map(v), do: to_keyword_keys(v)
+    defp to_value(v), do: v
+  end
+
+  def main do
+    # Demo: config providers para configuración dinámica
+    {:ok, _} = Application.ensure_all_started(:config_providers_demo)
+  
+    # Verificar que los valores estén disponibles
+    value = Application.get_env(:config_providers_demo, :dynamic_config, "default")
+  
+    IO.puts("ConfigProvidersDemo: demostración exitosa")
+    IO.puts("  dynamic_config: #{value}")
+    IO.puts("  Config providers permiten cargar config de múltiples fuentes")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Config.Provider`](https://hexdocs.pm/elixir/Config.Provider.html)

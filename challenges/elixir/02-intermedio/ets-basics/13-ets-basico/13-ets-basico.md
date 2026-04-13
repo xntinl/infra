@@ -415,6 +415,100 @@ worth reading before you build anything serious on top of ETS.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule EtsIntro do
+    @moduledoc """
+    Minimal ETS playground. Creates an owned table, exposes insert/lookup/delete,
+    and demonstrates the lifecycle rule: when the owner dies, the table dies.
+
+    The owner is the process that calls `open/1`. In a real system this would be
+    a GenServer; here it's just the calling process to keep the concepts bare.
+    """
+
+    @type table :: :ets.tid() | atom()
+
+    @doc """
+    Creates a new ETS table owned by the calling process.
+
+    Options forwarded to `:ets.new/2`. Defaults to `[:set, :protected]`.
+    The caller is the owner — if it dies, this table is destroyed.
+    """
+    @spec open(atom(), keyword()) :: table()
+    def open(name, opts \\ [:set, :protected]) do
+      :ets.new(name, opts)
+    end
+
+    @doc "Inserts a `{key, value}` tuple. Overwrites on a `:set` table."
+    @spec put(table(), any(), any()) :: true
+    def put(table, key, value) do
+      :ets.insert(table, {key, value})
+    end
+
+    @doc """
+    Looks up a key. Returns `{:ok, value}` or `:error`.
+
+    `:ets.lookup/2` returns a list — we unwrap it to a more idiomatic shape for
+    the common `:set` case. For `:bag` tables, you'd want the raw list.
+    """
+    @spec get(table(), any()) :: {:ok, any()} | :error
+    def get(table, key) do
+      case :ets.lookup(table, key) do
+        [{^key, value}] -> {:ok, value}
+        [] -> :error
+      end
+    end
+
+    @doc "Deletes a single key from the table."
+    @spec delete(table(), any()) :: true
+    def delete(table, key), do: :ets.delete(table, key)
+
+    @doc "Destroys the entire table. After this call the reference is invalid."
+    @spec close(table()) :: true
+    def close(table), do: :ets.delete(table)
+
+    @doc "Returns how many tuples the table holds."
+    @spec size(table()) :: non_neg_integer()
+    def size(table), do: :ets.info(table, :size)
+  end
+
+  def main do
+    # Demo: crear tabla, insertar datos, leer, verificar con assert
+    table = EtsIntro.open(:demo_table, [:set, :protected])
+  
+    # Insertar datos
+    EtsIntro.put(table, :alice, 30)
+    EtsIntro.put(table, :bob, 25)
+  
+    # Leer y verificar
+    assert EtsIntro.get(table, :alice) == {:ok, 30}
+    assert EtsIntro.get(table, :bob) == {:ok, 25}
+    assert EtsIntro.get(table, :nobody) == :error
+  
+    # Tamaño
+    assert EtsIntro.size(table) == 2
+  
+    # Eliminar una clave
+    EtsIntro.delete(table, :alice)
+    assert EtsIntro.get(table, :alice) == :error
+    assert EtsIntro.size(table) == 1
+  
+    # Cerrar tabla
+    EtsIntro.close(table)
+  
+    IO.puts("EtsIntro: todos los tests pasaron correctamente")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [Erlang `ets` module — official docs](https://www.erlang.org/doc/man/ets.html)

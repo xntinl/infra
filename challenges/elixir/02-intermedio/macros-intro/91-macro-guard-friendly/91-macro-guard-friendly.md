@@ -411,6 +411,91 @@ for two separate macros (or a macro + a function) with clearer names.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule MyMacros do
+    defmacro unless(condition, do: block) do
+      quote do
+        if not unquote(condition) do
+          unquote(block)
+        end
+      end
+    end
+  
+    defmacro trace(expr) do
+      quote do
+        result = unquote(expr)
+        IO.puts("[TRACE] " <> inspect(unquote(expr)) <> " = " <> inspect(result))
+        result
+      end
+    end
+  end
+
+  defmodule Solution do
+    require MyMacros
+
+    def main do
+      v = 5
+    
+      IO.puts("=== Unless Macro ===")
+      MyMacros.unless(v > 10) do
+        IO.puts("Value " <> inspect(v) <> " is not greater than 10")
+      end
+    
+      IO.puts("\n=== Trace Macro ===")
+      x = MyMacros.trace(1 + 2)
+      y = MyMacros.trace(x * 3)
+    end
+  end
+
+  def main do
+    require GuardMacros
+    import GuardMacros
+  
+    IO.puts("=== GuardMacros Demo ===\n")
+  
+    # Demo 1: is_nat/1 guard
+    IO.puts("1. is_nat/1 as boolean:")
+    IO.puts("   is_nat(5): #{is_nat(5)}")
+    assert is_nat(5) == true
+    IO.puts("   is_nat(-1): #{is_nat(-1)}")
+    assert is_nat(-1) == false
+  
+    # Demo 2: is_nonempty_binary/1
+    IO.puts("\n2. is_nonempty_binary/1:")
+    IO.puts("   is_nonempty_binary('hello'): #{is_nonempty_binary("hello")}")
+    assert is_nonempty_binary("hello") == true
+    IO.puts("   is_nonempty_binary(''): #{is_nonempty_binary("")}")
+    assert is_nonempty_binary("") == false
+  
+    # Demo 3: validate/1 using is_user_id/1 guard
+    IO.puts("\n3. validate/1 (uses is_user_id guard):")
+    IO.puts("   validate(42): #{GuardMacros.validate(42)}")
+    assert GuardMacros.validate(42) == :ok
+    IO.puts("   validate('user1'): #{GuardMacros.validate("user1")}")
+    assert GuardMacros.validate("user1") == :ok
+    IO.puts("   validate(0): #{GuardMacros.validate(0)}")
+    assert GuardMacros.validate(0) == :error
+  
+    # Demo 4: count_nats/1 using is_nat guard
+    IO.puts("\n4. count_nats/1 (counts naturals in list):")
+    count = GuardMacros.count_nats([0, 1, 2, -1, 3, 4])
+    IO.puts("   count_nats([0, 1, 2, -1, 3, 4]): #{count}")
+    assert count == 5
+  
+    IO.puts("\n✓ All GuardMacros demos passed!")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Kernel.defguard/1`](https://hexdocs.pm/elixir/Kernel.html#defguard/1)

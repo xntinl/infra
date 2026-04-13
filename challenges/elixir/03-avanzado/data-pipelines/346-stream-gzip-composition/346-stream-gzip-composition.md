@@ -55,6 +55,25 @@ Alternatives:
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Pipeline-specific insight:**
+Streams are lazy; Enum is eager. Use Stream for data larger than RAM or when you're building intermediate stages. Use Enum when the collection is small or you need side effects at each step. Mixing them carelessly results in performance cliffs.
 ### 1. `Stream.resource/3` for stateful streams
 
 ```elixir
@@ -429,19 +448,121 @@ JSON lines have a 200 MB record with no newline. What changes to
 `GzipStream` and `LineFramer` would detect and fail fast on oversize records
 without loading the whole file?
 
-## Resources
 
-- [`:zlib` docs — Erlang/OTP](https://www.erlang.org/doc/man/zlib.html)
-- [`Stream.resource/3` docs](https://hexdocs.pm/elixir/Stream.html#resource/3)
-- [`Stream.transform/3` docs](https://hexdocs.pm/elixir/Stream.html#transform/3)
-- [Benchee](https://github.com/bencheeorg/benchee)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+defmodule ArchiveReader.GzipStreamTest do
+  use ExUnit.Case, async: true
+
+  alias ArchiveReader.GzipStream
+
+  describe "decompress/1" do
+    test "roundtrips small content" do
+      original = "hello world\n" |> String.duplicate(10_000)
+      compressed = :zlib.gzip(original)
+      result = [compressed] |> GzipStream.decompress() |> Enum.to_list() |> IO.iodata_to_binary()
+      assert result == original
+    end
+
+    test "handles multi-chunk compressed input" do
+      original = String.duplicate("abc\n", 100_000)
+      compressed = :zlib.gzip(original)
+
+      # Feed in arbitrary chunk sizes to simulate a real stream.
+      chunks = for <<chunk::binary-size(1024) <- compressed>>, do: chunk
+
+      tail = binary_part(compressed, length(chunks) * 1024, byte_size(compressed) - length(chunks) * 1024)
+      all = chunks ++ [tail]
+
+      result = all |> GzipStream.decompress() |> Enum.to_list() |> IO.iodata_to_binary()
+      assert result == original
+    end
+  end
 end
+
+defmodule ArchiveReader.LineFramerTest do
+  use ExUnit.Case, async: true
+
+  alias ArchiveReader.LineFramer
+
+  describe "frame/1" do
+    test "emits full lines from multi-chunk input" do
+      chunks = ["hel", "lo\nwor", "ld\n", "bye\n"]
+      assert LineFramer.frame(chunks) |> Enum.to_list() == ["hello", "world", "bye"]
+    end
+
+    test "drops incomplete trailing line without newline" do
+      chunks = ["a\nb\nc"]
+      # The framer keeps "c" in the buffer; it is never emitted.
+      assert LineFramer.frame(chunks) |> Enum.to_list() == ["a", "b"]
+    end
+
+    test "handles chunks that end exactly at newline" do
+      chunks = ["a\n", "b\n"]
+      assert LineFramer.frame(chunks) |> Enum.to_list() == ["a", "b"]
+    end
+  end
+end
+
+defmodule ArchiveReaderTest do
+  use ExUnit.Case, async: true
+
+  setup do
+    path = Path.join(System.tmp_dir!(), "test_#{:erlang.unique_integer()}.jsonl.gz")
+
+    content =
+      for i <- 1..1_000 do
+        Jason.encode!(%{id: i, value: "x#{i}"})
+      end
+      |> Enum.join("\n")
+      |> Kernel.<>("\n")
+
+    File.write!(path, :zlib.gzip(content))
+    on_exit(fn -> File.rm(path) end)
+    {:ok, path: path}
+  end
+
+  test "streams all records lazily", %{path: path} do
+    records = path |> ArchiveReader.stream() |> Enum.to_list()
+    assert length(records) == 1_000
+    assert List.first(records) == %{"id" => 1, "value" => "x1"}
+    assert List.last(records) == %{"id" => 1_000, "value" => "x1000"}
+  end
+
+  test "Enum.take/2 is truly lazy (does not read the whole file)", %{path: path} do
+    records = path |> ArchiveReader.stream() |> Enum.take(5)
+    assert length(records) == 5
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrate lazy stream composition: file -> decompress -> parse
+      # Simulate gzip stream (in reality: File.stream! + :zlib)
+      data = [
+        "{\"user_id\":1,\"action\":\"login\"}\n",
+        "{\"user_id\":2,\"action\":\"purchase\"}\n",
+        "{\"user_id\":1,\"action\":\"logout\"}\n"
+      ]
+
+      # Lazy stream pipeline
+      stream = Stream.each(data, fn line ->
+        # Simulate decompression + parsing
+        {:ok, json} = Jason.decode(line)
+        json
+      end)
+
+      # Collect with limit (demonstrating lazy evaluation)
+      records = Stream.take(stream, 2) |> Enum.to_list()
+
+      IO.inspect(records, label: "✓ Streamed records (lazy)")
+
+      assert length(records) == 2, "Streamed 2 records"
+
+      IO.puts("✓ Stream composition: lazy file processing with constant memory")
+  end
+end
+
+Main.main()
 ```

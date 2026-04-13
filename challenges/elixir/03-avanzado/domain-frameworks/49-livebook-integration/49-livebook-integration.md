@@ -67,6 +67,22 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Livebook runtimes — the three flavors
 
 | Runtime | When to use | Security |
@@ -559,22 +575,43 @@ middle ground.
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
-
-- [Livebook — hexdocs.pm](https://hexdocs.pm/livebook/readme.html)
-- [Livebook home — livebook.dev](https://livebook.dev)
-- [Kino — hexdocs.pm](https://hexdocs.pm/kino/Kino.html)
-- [José Valim — Livebook announcement (Dashbit)](https://dashbit.co/blog/announcing-livebook)
-- [Bumblebee notebooks in Livebook](https://hexdocs.pm/bumblebee/examples.html)
-- [VegaLite grammar reference](https://vega.github.io/vega-lite/docs/)
-- [Livebook security model](https://github.com/livebook-dev/livebook/blob/main/SECURITY.md)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+`mix.exs`:
+
+
+
+### Step 2: `lib/livebook_demo/gateway.ex`
+
+**Objective**: Build ETS-backed rate limiter that Livebook notebooks query remotely for dashboard inspection.
+
+
+
+### Step 3: `lib/livebook_demo/metrics.ex`
+
+**Objective**: Store rolling metric time-series in a bounded memory buffer for Livebook charting and analysis.
+
+
+
+### Step 4: `lib/livebook_demo/application.ex`
+
+**Objective**: Start Gateway and Metrics under supervision so Livebook attaches to a live system.
+
+
+
+### Step 5: `livebooks/operational/rate_limiter_inspector.livemd`
+
+**Objective**: Create interactive Kino charts and forms that connect via `:rpc` to query live system metrics and state.
+
+Create the notebook file with this content:
+
+defmodule Main do
+  def main do
+      # Demonstrating 49-livebook-integration
+      :ok
+  end
 end
+
+Main.main()
 ```

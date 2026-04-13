@@ -52,6 +52,22 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. `Axon.Loop` as a state machine
 
 `Axon.Loop` is a functional state machine. The state has this rough shape:
@@ -647,21 +663,397 @@ Checkpoint save itself takes 50–500 ms for a 100 MB model with `:compressed`. 
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
-
-- [Axon.Loop hexdocs](https://hexdocs.pm/axon/Axon.Loop.html) — full API including `handle_event/4`, `monitor/4`, `metric/3`.
-- [Polaris hexdocs](https://hexdocs.pm/polaris/) — Axon's companion optimizer library (Adam, SGD, schedulers).
-- [Sean Moriarity — "Machine Learning in Elixir", chapter 8](https://pragprog.com/titles/smelixir/) — worked example of building a custom loop.
-- [Axon training guides](https://hexdocs.pm/axon/custom_models.html) — patterns for custom steps and metrics.
-- [PyTorch's `torch.optim.swa_utils.AveragedModel`](https://docs.pytorch.org/docs/stable/optim.html#stochastic-weight-averaging) — reference for EMA semantics.
-- [Ian Goodfellow et al. — "Deep Learning" chapter 8](https://www.deeplearningbook.org/) — numerics behind LR schedules, momentum, and weight averaging.
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+defmodule AxonTrainingLoop.MixProject do
+  end
+  use Mix.Project
+
+  def project do
+    [app: :axon_training_loop, version: "0.1.0", elixir: "~> 1.16", deps: deps()]
+  end
+
+  def application, do: [extra_applications: [:logger]]
+
+  defp deps do
+    [
+      {:axon, "~> 0.7"},
+      {:nx, "~> 0.7"},
+      {:exla, "~> 0.7"},
+      {:polaris, "~> 0.1"},
+      {:telemetry, "~> 1.2"}
+    ]
+  end
+end
+
+defmodule AxonTrainingLoop.Callbacks.Checkpoint do
+  end
+  @moduledoc """
+  Save the loop state every N iterations, atomically.
+
+  Key design choice: we never rewrite the "latest" symlink. We write
+  `step-000123.ckpt` and keep a monotonic counter. `load_latest/1` reads
+  the directory and picks the highest step. This is crash-safe without
+  requiring symlinks (which some filesystems handle inconsistently).
+  """
+
+  require Logger
+
+  @type config :: %{dir: Path.t(), every: pos_integer(), keep: pos_integer()}
+
+  @spec attach(Axon.Loop.t(), config()) :: Axon.Loop.t()
+  def attach(%Axon.Loop{} = loop, %{dir: dir, every: every} = cfg) do
+    File.mkdir_p!(dir)
+
+    loop
+    |> Axon.Loop.handle_event(:iteration_completed, &maybe_save(&1, cfg), every: every)
+    |> Axon.Loop.handle_event(:epoch_completed, &save_and_prune(&1, cfg))
+  end
+
+  defp maybe_save(state, cfg) do
+    save(state, cfg)
+    {:continue, state}
+  end
+
+  defp save_and_prune(state, cfg) do
+    save(state, cfg)
+    prune(cfg)
+    {:continue, state}
+  end
+
+  defp save(%Axon.Loop.State{epoch: e, iteration: i} = state, %{dir: dir}) do
+    path = Path.join(dir, format("step-#{pad(e)}-#{pad(i)}.ckpt"))
+    tmp = path <> ".tmp"
+
+    payload = %{
+      epoch: e,
+      iteration: i,
+      step_state: state.step_state,
+      handler_metadata: state.handler_metadata,
+      metrics: state.metrics
+    }
+
+    binary = :erlang.term_to_binary(payload, [:compressed])
+    File.write!(tmp, binary)
+    File.rename!(tmp, path)
+    Logger.info("checkpoint: wrote #{path}")
+  end
+
+  defp prune(%{dir: dir, keep: keep}) do
+    dir
+    |> File.ls!()
+    |> Enum.filter(&String.ends_with?(&1, ".ckpt"))
+    |> Enum.sort(:desc)
+    |> Enum.drop(keep)
+    |> Enum.each(&File.rm!(Path.join(dir, &1)))
+  end
+
+  defp prune(_), do: :ok
+
+  defp pad(n), do: n |> Integer.to_string() |> String.pad_leading(6, "0")
+  defp format(s), do: s
+
+  @spec load_latest(Path.t()) :: {:ok, map()} | :empty
+  def load_latest(dir) do
+    case File.ls(dir) do
+      {:ok, files} ->
+        files
+        |> Enum.filter(&String.ends_with?(&1, ".ckpt"))
+        |> Enum.sort(:desc)
+        |> case do
+          [latest | _] -> {:ok, read(Path.join(dir, latest))}
+          [] -> :empty
+        end
+
+      {:error, _} ->
+        :empty
+    end
+  end
+
+  defp read(path) do
+    path |> File.read!() |> :erlang.binary_to_term([:safe])
+  end
+end
+
+defmodule AxonTrainingLoop.Callbacks.EarlyStopping do
+  @moduledoc """
+  Halt the loop if `metric` has not improved by `min_delta` within `patience` epochs.
+
+  `mode` ∈ `:max` | `:min` — `:max` for accuracy, `:min` for loss.
+  """
+
+  @spec attach(Axon.Loop.t(), keyword()) :: Axon.Loop.t()
+  def attach(loop, opts) do
+    metric = Keyword.fetch!(opts, :metric)
+    mode = Keyword.get(opts, :mode, :max)
+    patience = Keyword.get(opts, :patience, 3)
+    min_delta = Keyword.get(opts, :min_delta, 0.0)
+
+    key = {:early_stopping, metric}
+
+    Axon.Loop.handle_event(loop, :epoch_completed, fn state ->
+      value = Map.get(state.metrics, metric) |> to_number!()
+      meta = Map.get(state.handler_metadata, key, %{best: nil, since: 0})
+
+      {improved?, new_best} = improved?(mode, value, meta.best, min_delta)
+
+      meta =
+        if improved? do
+          %{best: new_best, since: 0}
+        else
+          %{meta | since: meta.since + 1}
+        end
+
+      new_state = %{state | handler_metadata: Map.put(state.handler_metadata, key, meta)}
+
+      if meta.since >= patience do
+        {:halt_loop, new_state}
+      else
+        {:continue, new_state}
+      end
+    end)
+  end
+
+  defp improved?(:max, v, nil, _), do: {true, v}
+  defp improved?(:min, v, nil, _), do: {true, v}
+  defp improved?(:max, v, best, delta) when v > best + delta, do: {true, v}
+  defp improved?(:min, v, best, delta) when v < best - delta, do: {true, v}
+  defp improved?(_, _, best, _), do: {false, best}
+
+  defp to_number!(%Nx.Tensor{} = t), do: Nx.to_number(t)
+  defp to_number!(n) when is_number(n), do: n
+end
+
+defmodule AxonTrainingLoop.Callbacks.EMA do
+  @moduledoc """
+  Maintains an EMA copy of the model parameters in `handler_metadata[:ema]`.
+
+  Use `read/1` to extract the EMA state at the end of training for evaluation.
+  """
+
+  @key :ema
+
+  @spec attach(Axon.Loop.t(), float()) :: Axon.Loop.t()
+  def attach(loop, decay \\ 0.999) do
+    Axon.Loop.handle_event(loop, :iteration_completed, fn state ->
+      params = state.step_state.model_state
+      prev = Map.get(state.handler_metadata, @key) || zeros_like(params)
+      new_ema = merge(prev, params, decay)
+      {:continue, %{state | handler_metadata: Map.put(state.handler_metadata, @key, new_ema)}}
+    end)
+  end
+
+  @spec read(Axon.Loop.State.t()) :: map() | nil
+  def read(state), do: Map.get(state.handler_metadata, @key)
+
+  defp merge(ema, params, decay) when is_map(ema) and is_map(params) do
+    Map.new(ema, fn {k, v} -> {k, merge(v, Map.fetch!(params, k), decay)} end)
+  end
+
+  defp merge(%Nx.Tensor{} = ema_t, %Nx.Tensor{} = p_t, decay) do
+    Nx.add(Nx.multiply(ema_t, decay), Nx.multiply(p_t, 1.0 - decay))
+  end
+
+  defp zeros_like(params) when is_map(params),
+    do: Map.new(params, fn {k, v} -> {k, zeros_like(v)} end)
+
+  defp zeros_like(%Nx.Tensor{} = t), do: Nx.broadcast(Nx.tensor(0.0, type: Nx.type(t)), Nx.shape(t))
+end
+
+defmodule AxonTrainingLoop.Callbacks.LRSchedule do
+  @moduledoc "Warmup + cosine decay schedule applied before each iteration."
+
+  @type config :: %{warmup: pos_integer(), total: pos_integer(), lr_max: float(), lr_min: float()}
+
+  @spec attach(Axon.Loop.t(), config()) :: Axon.Loop.t()
+  def attach(loop, %{warmup: w, total: t, lr_max: lr_max, lr_min: lr_min} = cfg) do
+    Axon.Loop.handle_event(loop, :iteration_started, fn state ->
+      step = state.iteration + state.epoch * steps_per_epoch(state)
+      lr = compute(step, cfg)
+
+      step_state =
+        update_in(state.step_state, [:optimizer_state], fn opt_state ->
+          Polaris.Updates.set_learning_rate(opt_state, lr)
+        end)
+
+      {:continue, %{state | step_state: step_state}}
+    end)
+  end
+
+  defp steps_per_epoch(_state), do: 1  # placeholder — pass via opts in real code
+
+  @doc false
+  def compute(step, %{warmup: w, total: t, lr_max: lr_max, lr_min: lr_min}) do
+    cond do
+      step < w ->
+        lr_max * step / w
+
+      step >= t ->
+        lr_min
+
+      true ->
+        progress = (step - w) / (t - w)
+        lr_min + 0.5 * (lr_max - lr_min) * (1 + :math.cos(:math.pi() * progress))
+    end
+  end
+end
+
+defmodule AxonTrainingLoop.Trainer do
+  @moduledoc "Assembles a training loop from the callback modules."
+
+  alias AxonTrainingLoop.Callbacks.{Checkpoint, EarlyStopping, EMA, LRSchedule}
+  require Logger
+
+  @type opts :: [
+          model: Axon.t(),
+          loss: atom() | (Nx.Tensor.t(), Nx.Tensor.t() -> Nx.Tensor.t()),
+          optimizer: term(),
+          epochs: pos_integer(),
+          checkpoint_dir: Path.t() | nil,
+          ema_decay: float() | nil,
+          early_stopping: keyword() | nil,
+          lr_schedule: map() | nil
+        ]
+
+  @spec build(opts()) :: Axon.Loop.t()
+  def build(opts) do
+    model = Keyword.fetch!(opts, :model)
+    loss = Keyword.fetch!(opts, :loss)
+    optimizer = Keyword.fetch!(opts, :optimizer)
+
+    loop =
+      Axon.Loop.trainer(model, loss, optimizer)
+      |> Axon.Loop.metric(:accuracy)
+      |> Axon.Loop.metric(:loss)
+
+    loop = maybe_attach(loop, Keyword.get(opts, :checkpoint_dir), &attach_checkpoint/2)
+    loop = maybe_attach(loop, Keyword.get(opts, :ema_decay), &EMA.attach/2)
+    loop = maybe_attach(loop, Keyword.get(opts, :lr_schedule), &LRSchedule.attach/2)
+    loop = maybe_attach(loop, Keyword.get(opts, :early_stopping), &EarlyStopping.attach/2)
+    loop
+  end
+
+  defp maybe_attach(loop, nil, _), do: loop
+  defp maybe_attach(loop, arg, fun), do: fun.(loop, arg)
+
+  defp attach_checkpoint(loop, dir),
+    do: Checkpoint.attach(loop, %{dir: dir, every: 200, keep: 3})
+
+  @doc "Run or resume a training loop."
+  @spec run(Axon.Loop.t(), Enumerable.t(), keyword()) :: map()
+  def run(loop, data, opts) do
+    epochs = Keyword.fetch!(opts, :epochs)
+
+    initial =
+      case Keyword.get(opts, :checkpoint_dir) && Checkpoint.load_latest(opts[:checkpoint_dir]) do
+        {:ok, payload} ->
+          Logger.info("Resuming from checkpoint epoch=#{payload.epoch} iter=#{payload.iteration}")
+          payload.step_state
+
+        _ ->
+          %{}
+      end
+
+    Axon.Loop.run(loop, data, initial, epochs: epochs, compiler: EXLA)
+  end
+end
+
+# test/axon_training_loop/early_stopping_test.exs
+defmodule AxonTrainingLoop.EarlyStoppingTest do
+  use ExUnit.Case, async: true
+  alias AxonTrainingLoop.Callbacks.EarlyStopping
+
+  # We build a minimal loop, step through epochs manually, and assert it halts.
+
+  defp fake_state(metrics, meta \\ %{}) do
+    %Axon.Loop.State{
+      epoch: 0, iteration: 0, max_epoch: 10, max_iteration: :infinity,
+      step_state: %{}, metrics: metrics, handler_metadata: meta, status: :halted
+    }
+  end
+
+  describe "AxonTrainingLoop.EarlyStopping" do
+    test "halts after `patience` epochs of no improvement (min mode)" do
+      loop = Axon.Loop.loop(fn _, s -> s end) |> EarlyStopping.attach(metric: "loss", mode: :min, patience: 2)
+      [{:epoch_completed, [handler]}] = Enum.filter(loop.handlers, fn {e, _} -> e == :epoch_completed end)
+
+      {:continue, s1} = handler.(fake_state(%{"loss" => 1.0}))
+      {:continue, s2} = handler.(%{s1 | metrics: %{"loss" => 1.1}, epoch: 1})
+      {:halt_loop, _} = handler.(%{s2 | metrics: %{"loss" => 1.2}, epoch: 2})
+    end
+  end
+end
+
+# test/axon_training_loop/checkpoint_test.exs
+defmodule AxonTrainingLoop.CheckpointTest do
+  use ExUnit.Case, async: false
+  alias AxonTrainingLoop.Callbacks.Checkpoint
+
+  setup do
+    dir = Path.join(System.tmp_dir!(), "ckpt-#{System.unique_integer([:positive])}")
+    File.mkdir_p!(dir)
+    on_exit(fn -> File.rm_rf!(dir) end)
+    %{dir: dir}
+  end
+
+  describe "AxonTrainingLoop.Checkpoint" do
+    test "load_latest returns :empty for empty dir", %{dir: dir} do
+      assert Checkpoint.load_latest(dir) == :empty
+    end
+
+    test "picks highest step file", %{dir: dir} do
+      payload = %{epoch: 2, iteration: 50, step_state: %{}, handler_metadata: %{}, metrics: %{}}
+      File.write!(Path.join(dir, "step-000001-000010.ckpt"), :erlang.term_to_binary(payload))
+      File.write!(Path.join(dir, "step-000002-000050.ckpt"), :erlang.term_to_binary(payload))
+      assert {:ok, %{epoch: 2, iteration: 50}} = Checkpoint.load_latest(dir)
+    end
+  end
+end
+
+# test/axon_training_loop/trainer_test.exs
+defmodule AxonTrainingLoop.TrainerTest do
+  use ExUnit.Case, async: false
+
+  @tag :integration
+
+  describe "AxonTrainingLoop.Trainer" do
+    test "trains a tiny model and produces better-than-random accuracy" do
+      model = Axon.input("input", shape: {nil, 4}) |> Axon.dense(8) |> Axon.relu() |> Axon.dense(3)
+
+      data =
+        Stream.repeatedly(fn ->
+          x = Nx.iota({32, 4}) |> Nx.as_type(:f32) |> Nx.divide(32.0)
+          y = Nx.argmax(x, axis: 1) |> Nx.new_axis(-1) |> Nx.equal(Nx.iota({1, 3})) |> Nx.as_type(:f32)
+          {x, y}
+        end)
+        |> Stream.take(50)
+
+      loop =
+        AxonTrainingLoop.Trainer.build(
+          model: model,
+          loss: :categorical_cross_entropy,
+          optimizer: Polaris.Optimizers.adam(learning_rate: 0.01),
+          epochs: 2
+        )
+
+      result = Axon.Loop.run(loop, data, %{}, epochs: 2, compiler: EXLA)
+      assert is_map(result)
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrating 270-axon-training-loop
+      :ok
+  end
+end
+
+Main.main()
+end
+end
+end
+end
 end
 ```

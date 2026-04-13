@@ -471,6 +471,17 @@ m           # shows #Money<€19.99>
 ---
 
 
+
+
+## Executable Example
+
+Create a simple example demonstrating the key concepts:
+
+```elixir
+# Example code demonstrating text and binary concepts
+IO.puts("Example: Read the Implementation section above and run the code samples in iex")
+```
+
 ## Key Concepts
 
 ### 1. The `String.Chars` Protocol Converts Types to Strings

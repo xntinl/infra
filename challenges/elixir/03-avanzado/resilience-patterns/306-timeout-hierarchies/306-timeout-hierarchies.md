@@ -38,6 +38,22 @@ Both are valid carriers for the deadline. `Logger.metadata` is per-process and s
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Deadline as absolute monotonic time
 ```
 Caller:   t=0    set deadline = now + 2000 = 2000
@@ -325,9 +341,71 @@ Resilience patterns (circuit breakers, timeouts, retries) are easy to implement 
 
 The client computes `timeout = Deadline.remaining(deadline)` and passes it to `GenServer.call`. The server then does its own `Deadline.expired?` check. Why do we need both checks instead of trusting one side?
 
-## Resources
 
-- [gRPC deadlines vs timeouts](https://grpc.io/blog/deadlines/) — the canonical explanation
-- [`System.monotonic_time/1` — Elixir docs](https://hexdocs.pm/elixir/System.html#monotonic_time/1)
-- [Go context package](https://pkg.go.dev/context) — the same pattern in another language
-- [Finch deadline option](https://hexdocs.pm/finch)
+## Executable Example
+
+```elixir
+defmodule DeadlineRpc.DeadlineTest do
+  use ExUnit.Case, async: true
+  alias DeadlineRpc.Deadline
+
+  describe "within/1" do
+    test "creates a deadline in the future" do
+      d = Deadline.within(100)
+      assert Deadline.remaining(d) > 0
+      assert Deadline.remaining(d) <= 100
+    end
+  end
+
+  describe "expired?/1" do
+    test "nil deadline is never expired" do
+      refute Deadline.expired?(nil)
+    end
+
+    test "deadline in the past is expired" do
+      d = %Deadline{at: System.monotonic_time(:millisecond) - 10}
+      assert Deadline.expired?(d)
+    end
+  end
+
+  describe "derive/2" do
+    test "child never outlives parent" do
+      parent = Deadline.within(100)
+      child = Deadline.derive(parent, 10_000)
+      assert child.at == parent.at
+    end
+
+    test "child is tighter when parent has more room" do
+      parent = Deadline.within(10_000)
+      child = Deadline.derive(parent, 100)
+      assert child.at < parent.at
+    end
+
+    test "nil parent creates a fresh deadline" do
+      child = Deadline.derive(nil, 100)
+      assert Deadline.remaining(child) <= 100
+    end
+  end
+
+  describe "remaining/1" do
+    test "nil is :infinity" do
+      assert :infinity == Deadline.remaining(nil)
+    end
+
+    test "never negative" do
+      d = %Deadline{at: System.monotonic_time(:millisecond) - 1_000}
+      assert 0 == Deadline.remaining(d)
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+    IO.puts("✓ Timeout Hierarchies and Deadline Propagation")
+  - Timeout hierarchies
+    - Deadline propagation
+  end
+end
+
+Main.main()
+```

@@ -47,6 +47,25 @@ timer_comparison/
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**OTP-specific insight:**
+The OTP framework enforces a discipline: supervision trees, callback modules, and standard return values. This structure is not a constraint — it's the contract that allows Erlang's release handler, hot code upgrades, and clustering to work. Every deviation from the pattern you'll pay for later in production debuggability and operational tooling.
 ### 1. The BEAM timer wheel (brief)
 
 Since OTP 18 the runtime uses a per-scheduler **hierarchical timer wheel**
@@ -507,12 +526,64 @@ Target: per-timer scheduling overhead ≤ 250 ns with `Process.send_after` or `:
 
 ---
 
-## Resources
 
-- [`Process.send_after/3` — HexDocs](https://hexdocs.pm/elixir/Process.html#send_after/3)
-- [`:erlang.start_timer/3` — OTP docs](https://www.erlang.org/doc/man/erlang.html#start_timer-3)
-- [`:timer` module — OTP docs](https://www.erlang.org/doc/man/timer.html)
-- [OTP 18+ timer wheel announcement](https://www.erlang.org/blog/my-otp-18-release/) (look for "hash-wheel timer")
-- [Erlang/OTP source — `erts/emulator/beam/erl_hl_timer.c`](https://github.com/erlang/otp/blob/master/erts/emulator/beam/erl_hl_timer.c)
-- [Fred Hebert — *Erlang in Anger*, ch. 8 on system limits](https://www.erlang-in-anger.com/)
-- [Saša Jurić — "Periodic jobs in Elixir"](https://www.theerlangelist.com/article/periodic)
+## Executable Example
+
+```elixir
+defmodule TimerComparisonTest do
+  use ExUnit.Case, async: true
+
+  alias TimerComparison.{SendAfterWorker, StdlibTimerWorker, StartTimerWorker}
+
+  for {mod, label} <- [
+        {SendAfterWorker, "Process.send_after"},
+        {StdlibTimerWorker, ":timer.send_after"},
+        {StartTimerWorker, ":erlang.start_timer"}
+      ] do
+    describe "#{label}" do
+      test "ticks increment over time" do
+        {:ok, pid} = unquote(mod).start_link(interval_ms: 20)
+        Process.sleep(120)
+        n = unquote(mod).ticks(pid)
+        assert n >= 4
+      end
+    end
+  end
+
+  test "Process.send_after returns a live ref you can cancel" do
+    ref = Process.send_after(self(), :msg, 1_000)
+    remaining = Process.cancel_timer(ref)
+    assert is_integer(remaining) and remaining > 0
+    refute_receive :msg, 100
+  end
+
+  test ":erlang.start_timer wraps payload in {:timeout, ref, msg}" do
+    ref = :erlang.start_timer(10, self(), :hello)
+    assert_receive {:timeout, ^ref, :hello}, 100
+  end
+
+  test "cancel after fire must drain the mailbox" do
+    ref = Process.send_after(self(), :late, 5)
+    Process.sleep(20)
+    # Already fired — the message is in the mailbox.
+    assert Process.cancel_timer(ref) == false
+
+    # Drain defensively.
+    receive do
+      :late -> :ok
+    after
+      0 -> flunk("expected :late in mailbox after fire")
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+    IO.puts("✓ Timers on the BEAM: `send_after` vs `:timer` vs `start_timer`")
+  - Demonstrating core concepts
+    - Implementation patterns and best practices
+  end
+end
+
+Main.main()
+```

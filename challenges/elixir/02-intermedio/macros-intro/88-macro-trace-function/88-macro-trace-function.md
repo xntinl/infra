@@ -370,6 +370,77 @@ macro is a development-time shim, not infrastructure.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule TraceMacro do
+    @moduledoc """
+    A `trace do ... end` block macro that logs every *remote* function call
+    inside it, with its source form and return value.
+
+    Deliberately scoped to remote calls (`Mod.fun(args)`) so that pattern
+    matching, guards, and local helpers are left untouched.
+    """
+
+    @doc """
+    Wraps a block, rewriting every remote call to log its invocation and
+    return value.
+
+        trace do
+          String.upcase("hi")
+          Enum.sum([1, 2, 3])
+        end
+
+    Produces output like:
+
+        [trace] String.upcase("hi") => "HI"
+        [trace] Enum.sum([1, 2, 3]) => 6
+    """
+    defmacro trace(do: block) do
+      Macro.prewalk(block, &rewrite_node/1)
+    end
+
+    # Match remote calls only: `Module.function(args)`.
+    # The head `{:., _, [_mod, _fun]}` is the "dot call" form in the AST.
+    defp rewrite_node({{:., _, [_mod, _fun]}, _meta, args} = call) when is_list(args) do
+      source = Macro.to_string(call)
+
+      quote do
+        result = unquote(call)
+        IO.puts("[trace] " <> unquote(source) <> " => " <> inspect(result))
+        result
+      end
+    end
+
+    # Everything else — literals, variables, pattern matches, local calls,
+    # control flow — passes through untouched.
+    defp rewrite_node(node), do: node
+  end
+
+  def main do
+    require TraceMacro
+  
+    IO.puts("=== TraceMacro Demo ===\n")
+  
+    # Trace a block of function calls
+    TraceMacro.trace do
+      String.upcase("hello")
+      Enum.sum([1, 2, 3, 4])
+      String.length("test")
+    end
+  
+    IO.puts("\n✓ TraceMacro executed all traced calls!")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Macro.prewalk/2` and friends](https://hexdocs.pm/elixir/Macro.html#prewalk/2)

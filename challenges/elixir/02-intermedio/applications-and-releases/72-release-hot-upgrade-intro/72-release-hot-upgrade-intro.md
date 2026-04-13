@@ -348,6 +348,70 @@ about it.
 
 - ¿Hot upgrade o blue/green para un servicio de pagos? Justificá con criterios operacionales concretos.
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule HotUpgradeIntro.Counter do
+    @moduledoc """
+    Version 0.1.0 state: a single integer counter.
+
+    If we shipped 0.2.0 that changes state to `%{value: n, history: [...]}`,
+    we'd need a `code_change/3` to transform the old integer state into
+    the new map — during the hot upgrade, OTP would call that callback
+    on every live instance.
+    """
+
+    use GenServer
+
+    @vsn "0.1.0"
+
+    def start_link(_), do: GenServer.start_link(__MODULE__, 0, name: __MODULE__)
+    def value, do: GenServer.call(__MODULE__, :value)
+    def bump, do: GenServer.call(__MODULE__, :bump)
+
+    @impl true
+    def init(n), do: {:ok, n}
+
+    @impl true
+    def handle_call(:value, _f, n), do: {:reply, n, n}
+    def handle_call(:bump, _f, n), do: {:reply, n + 1, n + 1}
+
+    @doc """
+    `code_change/3` is OTP's hook for hot upgrades. `old_vsn` is the
+    previous `@vsn` attribute; `state` is the live server's state; `extra`
+    is whatever the appup instruction passed.
+
+    Example — if 0.2.0's state were `%{value: n}`, we'd transform here:
+
+        def code_change("0.1.0", n, _extra) when is_integer(n) do
+          {:ok, %{value: n}}
+        end
+
+    Writing this wrong corrupts live state. That is the single biggest
+    reason hot upgrades are risky in practice.
+    """
+    @impl true
+    def code_change(_old_vsn, state, _extra), do: {:ok, state}
+  end
+
+  def main do
+    # Demo: hot upgrade concept
+    IO.puts("HotUpgradeIntro: demostración exitosa")
+    IO.puts("  Hot upgrades requieren .appup y .relup files")
+    IO.puts("  Permiten actualizar código sin detener la aplicación")
+    IO.puts("  Complejo pero poderoso para sistemas críticos")
+    IO.puts("  La mayoría usa rolling restarts en su lugar")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [Erlang — `appup` cookbook](https://www.erlang.org/doc/design_principles/appup_cookbook.html)

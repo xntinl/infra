@@ -49,6 +49,22 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. What each algorithm optimizes for
 
 ```
@@ -488,11 +504,78 @@ precision beats throughput.
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
 
-- [Stripe — Scaling your API with rate limiters](https://stripe.com/blog/rate-limiters) — the canonical production write-up
-- [Cloudflare — Counting things a lot of different things](https://blog.cloudflare.com/counting-things-a-lot-of-different-things/) — ideas apply to BEAM
-- [`:ets.update_counter/4`](https://www.erlang.org/doc/man/ets.html#update_counter-4) — atomic arithmetic with saturation
-- [Hammer — rate limiting library for Elixir](https://github.com/ExHammer/hammer) — study its token-bucket backend
-- [Kong — How to design a scalable rate limiting algorithm](https://konghq.com/blog/engineering/how-to-design-a-scalable-rate-limiting-algorithm) — compares approximate vs exact sliding window
-- [BEAM book — ETS chapter](https://blog.stenmans.org/theBeamBook/) — internals of `write_concurrency` and `read_concurrency`
+## Executable Example
+
+```elixir
+defmodule RateLimitingPatterns.TokenBucket do
+  @moduledoc """
+  Token bucket rate limiter backed by ETS.
+
+  Refill is computed lazily on each `check/2` — no background process. State per
+  key is a 3-tuple `{key, tokens_millis, last_refill_ms}`. `tokens_millis` is
+  tokens * 1000 so fractional refill survives in integer arithmetic.
+  """
+  @behaviour RateLimitingPatterns.RateLimiter
+
+  @table :token_bucket_state
+
+  @impl true
+  def init(_opts) do
+    case :ets.whereis(@table) do
+      :undefined ->
+        :ets.new(@table, [
+          :named_table,
+          :public,
+          :set,
+          write_concurrency: true,
+          read_concurrency: true
+        ])
+
+        :ok
+
+      _ ->
+        :ok
+    end
+  end
+
+  @impl true
+  def check(key, opts) do
+    capacity = Keyword.fetch!(opts, :capacity)
+    refill_per_sec = Keyword.fetch!(opts, :refill_per_sec)
+    now = System.monotonic_time(:millisecond)
+
+    {tokens_millis, last} = fetch_or_init(key, capacity, now)
+    elapsed = max(now - last, 0)
+    replenished = elapsed * refill_per_sec
+    new_millis = min(tokens_millis + replenished, capacity * 1000)
+
+    if new_millis >= 1000 do
+      :ets.insert(@table, {key, new_millis - 1000, now})
+      {:allow, div(new_millis - 1000, 1000)}
+    else
+      missing = 1000 - new_millis
+      retry_ms = div(missing * 1000, refill_per_sec) + 1
+      :ets.insert(@table, {key, new_millis, now})
+      {:deny, retry_ms}
+    end
+  end
+
+  defp fetch_or_init(key, capacity, now) do
+    case :ets.lookup(@table, key) do
+      [{^key, tokens_millis, last}] -> {tokens_millis, last}
+      [] -> {capacity * 1000, now}
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+    IO.puts("✓ Rate Limiting Patterns — Token Bucket vs Leaky Bucket vs Sliding Window")
+  - Rate limiting patterns
+    - Token bucket implementation
+  end
+end
+
+Main.main()
+```

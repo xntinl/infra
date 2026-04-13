@@ -64,6 +64,25 @@ Hand wrappers work for five functions; past that they rot. A macro emits identic
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Metaprogramming-specific insight:**
+Code generation is powerful and dangerous. Every macro you write is a place where intent is hidden. Use macros sparingly, only when they eliminate genuine boilerplate. If your macro is more than 10 lines, you probably need a function or data structure instead. Future maintainers will thank you.
 ### 1. Stdlib `defdelegate` is just a macro
 
 Looking at `Kernel.defdelegate/2` source: it parses the function head, expands
@@ -385,11 +404,117 @@ Expect ~100–200 ns overhead for the proxy when no handlers are attached.
 
 ---
 
-## Resources
 
-- [`Kernel.defdelegate/2` source](https://github.com/elixir-lang/elixir/blob/main/lib/elixir/lib/kernel.ex) — reference
-- [`:telemetry.span/3` docs](https://hexdocs.pm/telemetry/telemetry.html#span-3)
-- [Decorator library](https://github.com/arjan/decorator) — similar approach for arbitrary decoration
-- [Dashbit blog on `:telemetry`](https://dashbit.co/blog/getting-started-with-telemetry)
-- [Phoenix instrumentation](https://github.com/phoenixframework/phoenix/blob/main/lib/phoenix/logger.ex)
-- [Erlang docs — tracing overview](https://www.erlang.org/doc/man/dbg.html)
+## Executable Example
+
+```elixir
+defmodule DefdelegateCustom.ProxyMacroTest do
+  use ExUnit.Case, async: false
+
+  alias DefdelegateCustom.Sample.API
+
+  setup do
+    parent = self()
+
+    :telemetry.attach_many(
+      :proxy_test,
+      [
+        [:defdelegate_custom, :sample, :api, :create_user, :start],
+        [:defdelegate_custom, :sample, :api, :create_user, :stop],
+        [:defdelegate_custom, :sample, :api, :create_user, :exception],
+        [:defdelegate_custom, :sample, :api, :find_user, :start],
+        [:defdelegate_custom, :sample, :api, :find_user, :stop]
+      ],
+      fn event, meas, meta, _ -> send(parent, {event, meas, meta}) end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(:proxy_test) end)
+    :ok
+  end
+
+  describe "proxied calls" do
+    test "forwards arguments and returns the target result" do
+      assert {:ok, %{valid: true}} = API.create_user(%{valid: true})
+    end
+
+    test "emits start and stop spans" do
+      API.find_user(42)
+      assert_receive {[_, _, _, :find_user, :start], _, %{target: _}}
+      assert_receive {[_, _, _, :find_user, :stop], %{duration: d}, _} when is_integer(d)
+    end
+
+    test "stop includes result tag" do
+      API.create_user(%{valid: true})
+      assert_receive {[_, _, _, :create_user, :stop], _, %{result_tag: :ok}}
+
+      API.create_user(%{valid: false})
+      assert_receive {[_, _, _, :create_user, :stop], _, %{result_tag: :error}}
+    end
+
+    test "emits :exception on raise" do
+      defmodule Boom do
+        def kaboom(_), do: raise("boom")
+      end
+
+      defmodule BoomAPI do
+        use DefdelegateCustom.ProxyMacro
+        defproxy kaboom(x), to: Boom
+      end
+
+      :telemetry.attach(
+        :boom_test,
+        [:defdelegate_custom, :proxy_macro_test, :boom_api, :kaboom, :exception],
+        fn event, meas, meta, _ -> send(self(), {event, meas, meta}) end,
+        nil
+      )
+
+      assert_raise RuntimeError, "boom", fn -> BoomAPI.kaboom(1) end
+    after
+      :telemetry.detach(:boom_test)
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrate custom defdelegate with telemetry
+      defmodule Upstream do
+        def process(data), do: {:ok, String.upcase(data)}
+      end
+
+      defmodule Proxy do
+        # Custom defproxy: delegate + emit telemetry
+        defmacro defproxy(name, opts) do
+          quote do
+            def unquote(name)(data) do
+              # Emit telemetry start
+              :telemetry.execute([:proxy, :call, :start], %{}, %{func: unquote(name)})
+
+              # Call upstream
+              result = Upstream.unquote(name)(data)
+
+              # Emit telemetry stop
+              :telemetry.execute([:proxy, :call, :stop], %{}, %{func: unquote(name)})
+
+              result
+            end
+          end
+        end
+
+        require Proxy
+        defproxy(:process, to: Upstream)
+      end
+
+      # Test proxy
+      result = Proxy.process("hello")
+
+      IO.inspect(result, label: "✓ Proxied function result")
+      assert match?({:ok, "HELLO"}, result), "Delegation works"
+
+      IO.puts("✓ Custom defdelegate: telemetry-enabled proxying working")
+  end
+end
+
+Main.main()
+```

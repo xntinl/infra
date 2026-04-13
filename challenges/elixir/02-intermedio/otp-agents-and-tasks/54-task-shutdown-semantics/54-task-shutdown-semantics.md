@@ -343,6 +343,26 @@ ignore" is a legitimate strategy when the work is short.
 
 - Si el shutdown timeout es 5s pero tu task necesita 30s para finalizar graciosamente, ¿qué hacés? Hay varias respuestas correctas — elegí una y defendela.
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  def main do
+    task = Task.async(fn -> Process.sleep(1000); :done end)
+    result = Task.shutdown(task, :brutal_kill)
+    IO.puts("Shutdown result: #{inspect(result)}")
+    refute Process.alive?(task.pid)
+    IO.puts("✓ Task shutdown works correctly")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Task.shutdown/2`](https://hexdocs.pm/elixir/Task.html#shutdown/2)

@@ -323,6 +323,96 @@ a list result is often faster in practice because it uses bulk insert.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule ComprAdvanced do
+    @moduledoc """
+    A tour of `for` comprehensions in Elixir beyond the one-generator basics:
+    multiple generators, pattern-matching generators, boolean filters,
+    `:into`, and `:uniq`.
+    """
+
+    @doc """
+    Returns the cartesian product of two enumerables as a list of tuples.
+    Demonstrates multiple generators in a single comprehension.
+    """
+    @spec cartesian(Enumerable.t(), Enumerable.t()) :: [tuple()]
+    def cartesian(xs, ys) do
+      for x <- xs, y <- ys, do: {x, y}
+    end
+
+    @doc """
+    Returns all *unique* unordered pairs `{a, b}` from `enum` where `a < b`.
+    The `a < b` filter both avoids duplicates like `{1,2}`/`{2,1}` and is far
+    cheaper than generating the full product and deduping afterwards.
+    """
+    @spec unordered_pairs(Enumerable.t()) :: [{any(), any()}]
+    def unordered_pairs(enum) do
+      list = Enum.to_list(enum)
+      for a <- list, b <- list, a < b, do: {a, b}
+    end
+
+    @doc """
+    Given a list of tagged results, keep only successful values.
+
+    Uses a *pattern-matching generator*: entries that don't match `{:ok, v}`
+    are silently skipped — much cleaner than an explicit filter + map.
+    """
+    @spec oks([{:ok, any()} | {:error, any()}]) :: [any()]
+    def oks(results) do
+      for {:ok, v} <- results, do: v
+    end
+
+    @doc """
+    Builds a map of `word => length` from a list of words.
+    Demonstrates `:into` targeting a Collectable other than a list.
+    """
+    @spec length_map([String.t()]) :: %{String.t() => non_neg_integer()}
+    def length_map(words) do
+      for w <- words, into: %{}, do: {w, String.length(w)}
+    end
+
+    @doc """
+    Returns the unique products of pairs drawn from two lists.
+
+    `:uniq: true` deduplicates results as they are produced — no extra
+    `Enum.uniq/1` pass, and duplicates don't even accumulate in memory.
+    """
+    @spec unique_products([integer()], [integer()]) :: [integer()]
+    def unique_products(xs, ys) do
+      for x <- xs, y <- ys, uniq: true, do: x * y
+    end
+
+    @doc """
+    Produces every pythagorean triple `{a, b, c}` with `a <= b` and `c <= max`.
+
+    Three generators + two filters — a one-liner that would be a triple-nested
+    loop in most other languages.
+    """
+    @spec pythagorean_triples(pos_integer()) :: [{pos_integer(), pos_integer(), pos_integer()}]
+    def pythagorean_triples(max) when is_integer(max) and max > 0 do
+      for a <- 1..max,
+          b <- a..max,
+          c <- b..max,
+          a * a + b * b == c * c,
+          do: {a, b, c}
+    end
+  end
+
+  def main do
+    IO.puts("ComprAdvanced OK")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Kernel.SpecialForms.for/1` — the comprehension spec](https://hexdocs.pm/elixir/Kernel.SpecialForms.html#for/1)

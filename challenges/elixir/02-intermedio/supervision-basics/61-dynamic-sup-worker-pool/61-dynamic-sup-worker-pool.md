@@ -351,6 +351,67 @@ id) that creates and retires naturally.
 
 - ¿Cómo evitás que un burst de clientes cree 100k workers? Diseñá el backpressure.
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule DynamicWorkerPool.Supervisor do
+    @moduledoc """
+    Top-level supervisor: Registry + DynamicSupervisor side by side.
+    Registry must start before the DynamicSupervisor so children can
+    register at init time.
+    """
+
+    use Supervisor
+
+    @spec start_link(keyword()) :: Supervisor.on_start()
+    def start_link(opts \\ []), do: Supervisor.start_link(__MODULE__, :ok, opts)
+
+    @impl true
+    def init(:ok) do
+      children = [
+        {Registry, keys: :unique, name: DynamicWorkerPool.Registry},
+        {DynamicSupervisor, name: DynamicWorkerPool.DynSup, strategy: :one_for_one}
+      ]
+
+      # :rest_for_one so if the Registry crashes, the DynamicSupervisor and
+      # all its workers are also restarted — they were registered in the
+      # dead Registry and their via-tuples would be dangling.
+      Supervisor.init(children, strategy: :rest_for_one)
+    end
+
+    @doc """
+    Starts a Session for `key` under the DynamicSupervisor. Returns the pid
+    or `{:error, {:already_started, pid}}` if one already exists.
+    """
+    @spec start_session(term()) :: DynamicSupervisor.on_start_child()
+    def start_session(key) do
+      spec = {DynamicWorkerPool.Session, [key: key]}
+      DynamicSupervisor.start_child(DynamicWorkerPool.DynSup, spec)
+    end
+
+    @doc "Looks up a Session pid by key, or `nil` if not running."
+    @spec lookup(term()) :: pid() | nil
+    def lookup(key) do
+      case Registry.lookup(DynamicWorkerPool.Registry, {:session, key}) do
+        [{pid, _meta}] -> pid
+        [] -> nil
+      end
+    end
+  end
+
+  def main do
+    IO.puts("DynamicWorkerPool OK")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Registry` — Elixir stdlib](https://hexdocs.pm/elixir/Registry.html)

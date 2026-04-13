@@ -515,7 +515,57 @@ mix format
 
 ---
 
+## Executable Example
 
+Create `lib/named_processes.ex` and test in `iex`:
+
+```elixir
+defmodule NamedProcesses do
+  def start_registry do
+    {:ok, _} = Registry.start_link(keys: :unique, name: :my_registry)
+  end
+
+  def start_worker(name) do
+    pid = spawn(fn -> worker_loop() end)
+    Registry.register(:my_registry, name, :metadata)
+    pid
+  end
+
+  def send_message(name, msg) do
+    case Registry.lookup(:my_registry, name) do
+      [{pid, _metadata}] -> send(pid, msg); :ok
+      [] -> {:error, :not_found}
+    end
+  end
+
+  def get_all do
+    Registry.select(:my_registry, [{{{:_, :"$1"}, :"$2", :_}, [], [{:"$1", :"$2"}]}])
+  end
+
+  defp worker_loop do
+    receive do
+      msg -> IO.inspect(msg); worker_loop()
+      :stop -> :ok
+    after
+      5000 -> worker_loop()
+    end
+  end
+end
+
+# Test it
+NamedProcesses.start_registry()
+
+pid1 = NamedProcesses.start_worker(:alice)
+pid2 = NamedProcesses.start_worker(:bob)
+
+:ok = NamedProcesses.send_message(:alice, "Hello Alice")
+:ok = NamedProcesses.send_message(:bob, "Hello Bob")
+
+all = NamedProcesses.get_all()
+IO.inspect(length(all))  # 2
+```
+
+---
 ## Key Concepts
 
 ### 1. The Registry Allows Looking Up Processes by Name

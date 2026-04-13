@@ -311,6 +311,72 @@ Your team has a style rule: `unless` is banned except for single-line statements
 
 Compound guards combine `and`/`or`/`not`. What's the BEAM-level difference between `and` and `&&`, and when does it matter for a feature-gate hot path?
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule FeatureGateTest do
+  use ExUnit.Case, async: true
+
+  alias FeatureGate.Gate
+
+  describe "privileged roles always pass (compound guard)" do
+    test "admin in prod at 0% rollout still sees the feature" do
+      assert Gate.enabled?(%{id: 999, role: :admin}, :prod, 0) == true
+    end
+
+    test "owner in prod at 0% rollout still sees the feature" do
+      assert Gate.enabled?(%{id: 999, role: :owner}, :prod, 0) == true
+    end
+  end
+
+  describe "non-prod is permissive (env guard)" do
+    test "member in dev is always enabled" do
+      assert Gate.enabled?(%{id: 50, role: :member}, :dev, 0) == true
+    end
+
+    test "guest in staging is always enabled" do
+      assert Gate.enabled?(%{id: 50, role: :guest}, :staging, 0) == true
+    end
+  end
+
+  describe "prod rollout percentage (unless + hash bucket)" do
+    test "user_id 10 at 20% rollout is IN the bucket (10 < 20)" do
+      assert Gate.enabled?(%{id: 10, role: :member}, :prod, 20) == true
+    end
+
+    test "user_id 50 at 20% rollout is OUT of the bucket (50 >= 20)" do
+      assert Gate.enabled?(%{id: 50, role: :member}, :prod, 20) == false
+    end
+
+    test "user_id 0 at 1% rollout is in" do
+      assert Gate.enabled?(%{id: 0, role: :member}, :prod, 1) == true
+    end
+
+    test "everyone included at 100%" do
+      assert Gate.enabled?(%{id: 99, role: :guest}, :prod, 100) == true
+    end
+
+    test "nobody included at 0%" do
+      assert Gate.enabled?(%{id: 0, role: :guest}, :prod, 0) == false
+    end
+  end
+
+  describe "guard rejects invalid rollout values" do
+    test "raises on negative rollout_percent" do
+      assert_raise FunctionClauseError, fn ->
+        Gate.enabled?(%{id: 1, role: :member}, :prod, -1)
+      end
+    end
+
+    test "raises on rollout_percent > 100" do
+      assert_raise FunctionClauseError, fn ->
+        Gate.enabled?(%{id: 1, role: :member}, :prod, 150)
+      end
+    end
+```
+
 ## Resources
 
 - [Kernel.unless/2](https://hexdocs.pm/elixir/Kernel.html#unless/2)

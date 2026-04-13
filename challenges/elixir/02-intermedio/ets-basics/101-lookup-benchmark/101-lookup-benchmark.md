@@ -432,6 +432,114 @@ access pattern (shared? mutable?) and code clarity, not by nanoseconds.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule EtsBenchmark do
+    @moduledoc """
+    Builds three equivalent in-memory stores (`Keyword`, `Map`, ETS `:set`)
+    populated with `{i, i * 2}` for i in `1..n`, and exposes a lookup function
+    for each. The benches and tests compare them.
+    """
+
+    @doc "Builds a Keyword list of `{i, i*2}` for i in 1..n."
+    @spec build_keyword(pos_integer()) :: [{integer(), integer()}]
+    def build_keyword(n), do: for(i <- 1..n, do: {i, i * 2})
+
+    @doc "Builds a Map of `i => i*2` for i in 1..n."
+    @spec build_map(pos_integer()) :: %{integer() => integer()}
+    def build_map(n), do: Map.new(1..n, &{&1, &1 * 2})
+
+    @doc """
+    Builds a populated `:set` ETS table. Caller owns the table; destroy it with
+    `:ets.delete/1` when done. `read_concurrency: true` reflects the common
+    "many readers" deployment — not fair to turn it off just to make ETS look
+    bad on a read bench.
+    """
+    @spec build_ets(pos_integer()) :: :ets.tid()
+    def build_ets(n) do
+      t = :ets.new(:bench, [:set, :public, read_concurrency: true])
+      for i <- 1..n, do: :ets.insert(t, {i, i * 2})
+      t
+    end
+
+    # ── Lookups ────────────────────────────────────────────────────────────
+
+    @spec lookup_keyword([{integer(), integer()}], integer()) :: integer() | nil
+    def lookup_keyword(kw, key), do: Keyword.get(kw, key)
+
+    @spec lookup_map(map(), integer()) :: integer() | nil
+    def lookup_map(m, key), do: Map.get(m, key)
+
+    @spec lookup_ets(:ets.tid(), integer()) :: integer() | nil
+    def lookup_ets(t, key) do
+      case :ets.lookup(t, key) do
+        [{^key, v}] -> v
+        [] -> nil
+      end
+    end
+
+    # ── One-shot timing for the unit tests ─────────────────────────────────
+
+    @doc "Runs a zero-arg fun N times and returns total microseconds."
+    @spec time_many(non_neg_integer(), (-> any())) :: integer()
+    def time_many(iterations, fun) do
+      {micros, _} = :timer.tc(fn -> Enum.each(1..iterations, fn _ -> fun.() end) end)
+      micros
+    end
+  end
+
+  def main do
+    # Demo: benchmark de Keyword, Map vs ETS
+    n = 100
+  
+    # Construir tres estructuras equivalentes
+    kw = EtsBenchmark.build_keyword(n)
+    m = EtsBenchmark.build_map(n)
+    t = EtsBenchmark.build_ets(n)
+  
+    # Verificar que todos retornan el mismo valor
+    test_key = 50
+    kw_val = EtsBenchmark.lookup_keyword(kw, test_key)
+    map_val = EtsBenchmark.lookup_map(m, test_key)
+    ets_val = EtsBenchmark.lookup_ets(t, test_key)
+  
+    assert kw_val == test_key * 2
+    assert map_val == test_key * 2
+    assert ets_val == test_key * 2
+  
+    # Verificar que claves ausentes retornan nil
+    assert EtsBenchmark.lookup_keyword(kw, 9999) == nil
+    assert EtsBenchmark.lookup_map(m, 9999) == nil
+    assert EtsBenchmark.lookup_ets(t, 9999) == nil
+  
+    # Benchmark coarse: Keyword debería ser significativamente más lento
+    iters = 1000
+    key = div(n, 2)
+  
+    t_kw = EtsBenchmark.time_many(iters, fn -> EtsBenchmark.lookup_keyword(kw, key) end)
+    t_m = EtsBenchmark.time_many(iters, fn -> EtsBenchmark.lookup_map(m, key) end)
+    t_e = EtsBenchmark.time_many(iters, fn -> EtsBenchmark.lookup_ets(t, key) end)
+  
+    :ets.delete(t)
+  
+    IO.puts("EtsBenchmark: comparativa de estructuras (N=#{n}, #{iters} iteraciones)")
+    IO.puts("  Keyword: #{t_kw} µs")
+    IO.puts("  Map:     #{t_m} µs")
+    IO.puts("  ETS:     #{t_e} µs")
+    IO.puts("  Ratio Keyword/Map: #{Float.round(t_kw / t_m, 1)}x")
+    IO.puts("  Ratio Keyword/ETS: #{Float.round(t_kw / t_e, 1)}x")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [Benchee — official docs](https://hexdocs.pm/benchee/readme.html)

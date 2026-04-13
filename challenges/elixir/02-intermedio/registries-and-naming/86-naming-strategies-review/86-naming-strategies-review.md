@@ -424,6 +424,79 @@ test-isolation pain; don't pay for it unless you need the address.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule NamingReview do
+    @moduledoc """
+    One API, five naming strategies. Each starter returns the "address"
+    the caller should use to reach the counter — a pid for the unnamed
+    case, an atom or via-tuple for the named cases, and a group atom for
+    the `:pg` case (which is membership-based, so it also returns the pid).
+    """
+
+    alias NamingReview.Counter
+
+    @registry NamingReview.Registry
+    @scope NamingReview.Scope
+
+    # 1. Unnamed pid ─ simplest, most flexible.
+    @spec start_unnamed() :: pid()
+    def start_unnamed do
+      {:ok, pid} = Counter.start_link([])
+      pid
+    end
+
+    # 2. Atom name ─ singleton, compile-time known.
+    @spec start_atom(atom()) :: atom()
+    def start_atom(name) when is_atom(name) do
+      {:ok, _pid} = Counter.start_link(name: name)
+      name
+    end
+
+    # 3. Via Registry ─ dynamic, local, auto-cleanup.
+    @spec start_via(term()) :: {:via, module(), term()}
+    def start_via(key) do
+      name = {:via, Registry, {@registry, key}}
+      {:ok, _pid} = Counter.start_link(name: name)
+      name
+    end
+
+    # 4. :global ─ cluster-wide singleton.
+    @spec start_global(term()) :: {:global, term()}
+    def start_global(name) do
+      {:ok, _pid} = Counter.start_link(name: {:global, name})
+      {:global, name}
+    end
+
+    # 5. :pg group ─ cluster-wide multi-member.
+    @spec start_in_group(atom()) :: pid()
+    def start_in_group(group) do
+      {:ok, pid} = Counter.start_link([])
+      :ok = :pg.join(@scope, group, pid)
+      pid
+    end
+
+    @doc "Send :bump to every pid in `group`, returning their new values."
+    @spec bump_group(atom()) :: [integer()]
+    def bump_group(group) do
+      for pid <- :pg.get_members(@scope, group), do: Counter.bump(pid)
+    end
+  end
+
+  def main do
+    IO.puts("NamingReview OK")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Registry` — Elixir stdlib](https://hexdocs.pm/elixir/Registry.html)

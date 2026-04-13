@@ -53,6 +53,22 @@ your cores and hurt throughput.
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Dirty scheduler count
 
 Set at VM start via `erl +SDcpu <N>` and `+SDio <N>`. Default for `SDcpu` is the core count.
@@ -457,9 +473,62 @@ are 5ms, others 500ms), a simple FIFO queue treats both equally — short work b
 long work. What changes to the gate (hint: two queues, two caps) would let short work
 bypass long work without violating the dirty pool bound?
 
-## Resources
+## Executable Example
 
-- [Dirty Schedulers (EEP 7) — Erlang proposal](https://www.erlang.org/eeps/eep-0007)
-- [`rustler::nif` attribute docs](https://docs.rs/rustler/latest/rustler/attr.nif.html)
-- [`image` crate on crates.io](https://crates.io/crates/image)
-- [Discord's perceptual hash pipeline blog post](https://discord.com/blog/)
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+
+defmodule ImagePipeline.MixProject do
+  end
+  use Mix.Project
+
+  def project do
+    [
+      app: :image_pipeline,
+      version: "0.1.0",
+      elixir: "~> 1.17",
+      compilers: [:rustler] ++ Mix.compilers(),
+      rustler_crates: [
+        imgnif: [path: "native/imgnif", mode: :release]
+      ],
+      deps: [
+        {:rustler, "~> 0.34"},
+        {:benchee, "~> 1.3", only: :dev}
+      ]
+    ]
+  end
+
+  def application,
+    do: [extra_applications: [:logger], mod: {ImagePipeline.Application, []}]
+end
+
+
+### Step 2: Rust NIF (`native/imgnif/src/lib.rs`)
+
+**Objective**: Schedule JPEG decode/resize/hash on DirtyCpu so image work never blocks regular BEAM schedulers.
+
+
+
+### Step 3: Elixir wrapper with bounded concurrency
+
+**Objective**: Cap concurrent NIF calls at dirty scheduler count so queue depth becomes measurable instead of hidden.
+
+
+
+### Step 4: Supervision (`lib/image_pipeline/application.ex`)
+
+**Objective**: Boot the concurrency gate so dirty NIF calls remain visible to monitoring and backpressure mechanisms.
+
+defmodule Main do
+  def main do
+      # Demonstrating 319-dirty-nif-cpu-bound
+      :ok
+  end
+end
+
+Main.main()
+```

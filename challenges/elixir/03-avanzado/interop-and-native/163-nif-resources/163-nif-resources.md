@@ -44,6 +44,22 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. The resource lifecycle
 
 ```
@@ -435,11 +451,47 @@ An ETS equivalent (`ets:insert/2` on a `:set`) does ~5 M/sec — NIF resources w
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
+## Executable Example
 
-- https://docs.rs/rustler/latest/rustler/resource/struct.ResourceArc.html — `ResourceArc`
-- https://docs.rs/rustler/latest/rustler/macro.resource.html — `rustler::resource!`
-- https://www.erlang.org/doc/man/erl_nif.html#enif_alloc_resource — C API
-- https://github.com/rusty-ferris-club/tokenizers-elixir — resource pattern for ML models
-- https://github.com/elixir-nx/explorer — large refcounted DataFrames as resources
-- https://docs.rs/parking_lot — non-poisoning, faster locks for NIFs
+```elixir
+### Step 2: `native/nif_resources_nif/src/lib.rs`
+
+**Objective**: Register opaque ResourceArc<Store> so BEAM refcounts the backing HashMap across processes and avoids GC race conditions.
+
+
+
+### Step 3: `lib/nif_resources/native.ex`
+
+**Objective**: Provide opaque resource type so callers never inspect or serialize the backing BEAM reference directly.
+
+### Dependencies (mix.exs)
+
+
+
+
+
+### Step 4: `lib/nif_resources/store.ex`
+
+**Objective**: Normalize raw NIF atoms to typed tuples so application code never pattern-matches on foreign NIF result shapes.
+
+
+
+### Step 5: `mix.exs`
+
+**Objective**: Configure Rustler crates for release mode so optimized dylib rebuilds automatically when Rust sources change.
+
+
+
+### Step 6: `test/nif_resources_test.exs`
+
+**Objective**: Verify resource opaqueness, cross-process reference identity, concurrent write safety, and GC-driven resource cleanup.
+
+defmodule Main do
+  def main do
+      # Demonstrating 163-nif-resources
+      :ok
+  end
+end
+
+Main.main()
+```

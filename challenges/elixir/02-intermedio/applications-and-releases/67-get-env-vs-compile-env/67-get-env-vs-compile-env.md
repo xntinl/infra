@@ -297,6 +297,78 @@ flags you might toggle without a rebuild) — always `get_env` /
 
 - Si `compile_env` cambia en runtime, ¿qué warning ves y cuándo? Describí el flujo exacto.
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule EnvVsCompile do
+    @moduledoc """
+    Demonstrates the compile-time vs runtime asymmetry between
+    `Application.compile_env/2` and `Application.get_env/2`.
+    """
+
+    # Evaluated NOW (at compile time). Frozen into the .beam.
+    # If runtime.exs later sets :build_flavor to something else, THIS constant
+    # will not notice — you'd need to recompile.
+    @build_flavor Application.compile_env(:env_vs_compile, :build_flavor)
+
+    @doc """
+    Returns the `:build_flavor` as seen at compile time.
+    Always `:vanilla` in this project because that's what `config.exs` set
+    when `mix compile` ran.
+    """
+    @spec compile_time_build_flavor() :: atom()
+    def compile_time_build_flavor, do: @build_flavor
+
+    @doc """
+    Returns the `:build_flavor` as seen right now.
+    Reflects `runtime.exs` and any subsequent `Application.put_env/3`.
+    """
+    @spec runtime_build_flavor() :: atom()
+    def runtime_build_flavor, do: Application.get_env(:env_vs_compile, :build_flavor)
+
+    @doc """
+    Endpoint — canonical runtime read. Use this pattern for anything that
+    can differ per environment.
+    """
+    @spec endpoint() :: String.t()
+    def endpoint, do: Application.fetch_env!(:env_vs_compile, :endpoint)
+
+    @doc """
+    Demonstrates compile-time specialization: the `case` is reduced to a
+    constant branch at compile time because the value is known.
+    """
+    @spec describe_build() :: String.t()
+    def describe_build do
+      case @build_flavor do
+        :vanilla -> "standard build — no feature overrides"
+        :enterprise -> "enterprise build — premium features enabled"
+        other -> "unknown flavor: #{inspect(other)}"
+      end
+    end
+  end
+
+  def main do
+    # Demo: get_env (runtime) vs compile_env (compile-time)
+    {:ok, _} = Application.ensure_all_started(:env_vs_compile)
+  
+    # compile_env es evaluado en tiempo de compilación
+    compiled = Application.get_env(:env_vs_compile, :compiled_value)
+    runtime = Application.get_env(:env_vs_compile, :runtime_value)
+  
+    IO.puts("EnvVsCompile: demostración exitosa")
+    IO.puts("  compiled_value: #{inspect(compiled)} (congelado)")
+    IO.puts("  runtime_value: #{inspect(runtime)} (dinámico)")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Application.compile_env/2`](https://hexdocs.pm/elixir/Application.html#compile_env/2)

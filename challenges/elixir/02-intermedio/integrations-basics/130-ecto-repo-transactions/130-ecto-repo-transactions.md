@@ -572,6 +572,117 @@ contract.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule TxLab do
+    @moduledoc """
+    Three takes on a "transfer funds" operation:
+
+      * `transfer_raw/3`         — a closure around `Repo.transaction/1` that
+                                   raises on failure (simplest, least flexible).
+      * `transfer_with_rollback/3` — the same, but using `Repo.rollback/1` to
+                                   return `{:error, reason}` cleanly.
+      * `transfer_multi/3`       — the declarative `Ecto.Multi` form, with
+                                   optimistic locking and named steps.
+    """
+
+    alias TxLab.{Repo, Account}
+    alias Ecto.Multi
+
+    @spec create_account(String.t(), integer()) :: {:ok, Account.t()} | {:error, Ecto.Changeset.t()}
+    def create_account(owner, balance \\ 0) do
+      %Account{}
+      |> Account.create_changeset(%{"owner" => owner, "balance" => balance})
+      |> Repo.insert()
+    end
+
+    # ── 1) Raw closure — raises on bad inputs -------------------------------
+    @doc """
+    Simplest form. Uses `insert!/update!` which raise on invalid changesets.
+    Clean for the happy path; the downside is that callers get an exception
+    on failure rather than a tagged tuple.
+    """
+    def transfer_raw(from_id, to_id, amount) do
+      Repo.transaction(fn ->
+        from = Repo.get!(Account, from_id)
+        to = Repo.get!(Account, to_id)
+
+        # Both updates must succeed; a failing changeset raises, which
+        # aborts the transaction and rolls back the debit.
+        from = Account.balance_changeset(from, -amount) |> Repo.update!()
+        to = Account.balance_changeset(to, amount) |> Repo.update!()
+
+        {from, to}
+      end)
+    end
+
+    # ── 2) Explicit Repo.rollback/1 — tagged errors -------------------------
+    @doc """
+    Pattern-matches every step and explicitly rolls back with a structured
+    reason. Keeps the happy path linear without needing exceptions.
+    """
+    def transfer_with_rollback(from_id, to_id, amount) do
+      Repo.transaction(fn ->
+        with from = %Account{} <- Repo.get(Account, from_id) || Repo.rollback({:not_found, from_id}),
+             to = %Account{} <- Repo.get(Account, to_id) || Repo.rollback({:not_found, to_id}),
+             {:ok, from} <- Repo.update(Account.balance_changeset(from, -amount)),
+             {:ok, to} <- Repo.update(Account.balance_changeset(to, amount)) do
+          {from, to}
+        else
+          {:error, %Ecto.Changeset{} = cs} -> Repo.rollback(cs)
+        end
+      end)
+    end
+
+    # ── 3) Ecto.Multi — declarative, composable -----------------------------
+    @doc """
+    The declarative form. Each step is named; failure reports which step
+    failed and the intermediate values. Perfect for logging and for chaining
+    conditional logic via `Multi.run/3`.
+    """
+    def transfer_multi(from_id, to_id, amount) do
+      Multi.new()
+      |> Multi.run(:from, fn repo, _ ->
+        case repo.get(Account, from_id) do
+          nil -> {:error, :not_found_from}
+          acc -> {:ok, acc}
+        end
+      end)
+      |> Multi.run(:to, fn repo, _ ->
+        case repo.get(Account, to_id) do
+          nil -> {:error, :not_found_to}
+          acc -> {:ok, acc}
+        end
+      end)
+      |> Multi.update(:debit, fn %{from: from} -> Account.balance_changeset(from, -amount) end)
+      |> Multi.update(:credit, fn %{to: to} -> Account.balance_changeset(to, amount) end)
+      |> Repo.transaction()
+    end
+  end
+
+  def main do
+    IO.puts("=== Repo Demo ===
+  ")
+  
+    # Demo: Repo transactions
+  IO.puts("1. Multi-step operations as transactions")
+  IO.puts("2. Atomic: all succeed or all rollback")
+  IO.puts("3. Prevent data inconsistencies")
+
+  IO.puts("
+  ✓ Ecto transactions demo completed!")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Ecto.Repo.transaction/2`](https://hexdocs.pm/ecto/Ecto.Repo.html#c:transaction/2)

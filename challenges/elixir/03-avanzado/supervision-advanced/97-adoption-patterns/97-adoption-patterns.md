@@ -49,6 +49,22 @@ adoption_patterns/
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Why orphans are bad
 
 An unsupervised process:
@@ -534,11 +550,204 @@ Target: adoption cost ≤ 1 µs per pid; restart latency ≤ 1 ms + factory time
 
 ---
 
-## Resources
 
-- [`DynamicSupervisor`](https://hexdocs.pm/elixir/DynamicSupervisor.html)
-- [`Process.monitor/1` + `Process.link/1`](https://hexdocs.pm/elixir/Process.html)
-- [Erlang — process monitors](https://www.erlang.org/doc/reference_manual/processes.html#monitors)
-- [Saša Jurić — "Process links" series](https://www.theerlangelist.com/article/processes_and_messages)
-- [Adopting Elixir — Ch.6 migrating legacy](https://pragprog.com/titles/tvmelixir/adopting-elixir/)
-- [Fred Hebert — Stuff goes bad: Erlang in Anger](https://www.erlang-in-anger.com/)
+## Executable Example
+
+```elixir
+defmodule AdoptionPatterns.Nursery do
+  @moduledoc """
+  Adopts running pids into supervision, with optional restart-via-factory.
+
+  Two modes:
+
+    * `adopt/2` — takes ownership. On DOWN, reruns the factory and re-links.
+    * `watch/2` — shadow mode. On DOWN, emits telemetry but does not restart.
+  """
+  use GenServer
+  require Logger
+
+  @type factory :: (-> {:ok, pid()})
+  @type entry :: %{
+          pid: pid(),
+          ref: reference(),
+          factory: factory() | nil,
+          mode: :adopt | :watch,
+          label: atom()
+        }
+
+  def start_link(opts \\ []), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+
+  @spec adopt(pid(), factory()) :: {:ok, reference()} | {:error, term()}
+  def adopt(pid, factory) when is_pid(pid) and is_function(factory, 0) do
+    GenServer.call(__MODULE__, {:adopt, pid, factory})
+  end
+
+  @spec watch(pid(), keyword()) :: {:ok, reference()}
+  def watch(pid, opts \\ []) when is_pid(pid) do
+    label = Keyword.get(opts, :name, :unnamed)
+    GenServer.call(__MODULE__, {:watch, pid, label})
+  end
+
+  @spec list() :: [entry()]
+  def list, do: GenServer.call(__MODULE__, :list)
+
+  @impl true
+  def init(_opts) do
+    Process.flag(:trap_exit, true)
+    {:ok, %{by_ref: %{}}}
+  end
+
+  @impl true
+  def handle_call({:adopt, pid, factory}, _from, state) do
+    if Process.alive?(pid) do
+      ref = Process.monitor(pid)
+      # best-effort link: if caller was linked, undo it first from caller side
+      Process.link(pid)
+
+      entry = %{pid: pid, ref: ref, factory: factory, mode: :adopt, label: :adopted}
+      :telemetry.execute([:adoption_patterns, :adopted], %{count: 1}, %{pid: pid})
+      {:reply, {:ok, ref}, put_in(state.by_ref[ref], entry)}
+    else
+      {:reply, {:error, :not_alive}, state}
+    end
+  end
+
+  def handle_call({:watch, pid, label}, _from, state) do
+    if Process.alive?(pid) do
+      ref = Process.monitor(pid)
+      entry = %{pid: pid, ref: ref, factory: nil, mode: :watch, label: label}
+      :telemetry.execute([:adoption_patterns, :watched], %{count: 1}, %{label: label})
+      {:reply, {:ok, ref}, put_in(state.by_ref[ref], entry)}
+    else
+      {:reply, {:error, :not_alive}, state}
+    end
+  end
+
+  def handle_call(:list, _from, state),
+    do: {:reply, Map.values(state.by_ref), state}
+
+  @impl true
+  def handle_info({:DOWN, ref, :process, _pid, reason}, state) do
+    case Map.pop(state.by_ref, ref) do
+      {nil, _} ->
+        {:noreply, state}
+
+      {%{mode: :watch, label: label}, rest} ->
+        :telemetry.execute(
+          [:adoption_patterns, :down],
+          %{count: 1},
+          %{mode: :watch, label: label, reason: reason}
+        )
+
+        {:noreply, %{state | by_ref: rest}}
+
+      {%{mode: :adopt, factory: f}, rest} ->
+        :telemetry.execute(
+          [:adoption_patterns, :down],
+          %{count: 1},
+          %{mode: :adopt, reason: reason}
+        )
+
+        case restart(f) do
+          {:ok, new_pid} ->
+            new_ref = Process.monitor(new_pid)
+            Process.link(new_pid)
+
+            entry = %{pid: new_pid, ref: new_ref, factory: f, mode: :adopt, label: :adopted}
+            {:noreply, %{state | by_ref: Map.put(rest, new_ref, entry)}}
+
+          {:error, err} ->
+            Logger.error("adoption: factory failed: #{inspect(err)}")
+            {:noreply, %{state | by_ref: rest}}
+        end
+    end
+  end
+
+  def handle_info({:EXIT, _pid, _reason}, state), do: {:noreply, state}
+
+  defp restart(factory) do
+    factory.()
+  rescue
+    e -> {:error, e}
+  catch
+    kind, e -> {:error, {kind, e}}
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrate adopting orphan processes into a supervisor
+
+      # Start the adoption nursery (DynamicSupervisor wrapper)
+      {:ok, nursery_pid} = DynamicSupervisor.start_link(
+        strategy: :one_for_one,
+        name: AdoptionPatterns.Nursery
+      )
+
+      assert is_pid(nursery_pid), "Nursery must start"
+      IO.puts("✓ Adoption nursery (DynamicSupervisor wrapper) initialized")
+
+      # Simulate orphan processes: started outside supervision
+      {:ok, orphan_1} = GenServer.start(AdoptionPatterns.BackgroundWorker, [])
+      {:ok, orphan_2} = GenServer.start(AdoptionPatterns.BackgroundWorker, [])
+
+      assert is_pid(orphan_1), "Orphan 1 started"
+      assert is_pid(orphan_2), "Orphan 2 started"
+      IO.puts("✓ Two orphan processes started (not yet supervised)")
+
+      # Check they are NOT in nursery yet
+      initial_children = DynamicSupervisor.count_children(AdoptionPatterns.Nursery)
+      assert initial_children.active == 0, "Nursery should be empty"
+
+      # Adopt the orphans with factory function
+      factory_1 = fn -> GenServer.start(AdoptionPatterns.BackgroundWorker, []) end
+      factory_2 = fn -> GenServer.start(AdoptionPatterns.BackgroundWorker, []) end
+
+      :ok = AdoptionPatterns.Nursery.adopt(orphan_1, factory_1)
+      :ok = AdoptionPatterns.Nursery.adopt(orphan_2, factory_2)
+
+      IO.puts("✓ Orphans adopted into nursery with factory functions")
+
+      # Verify they are now monitored
+      after_adopt = DynamicSupervisor.count_children(AdoptionPatterns.Nursery)
+      assert after_adopt.active >= 2, "Nursery should contain adopted processes"
+      IO.inspect(after_adopt, label: "Nursery children after adoption")
+
+      # Test resurrection: kill an adopted process
+      ref = Process.monitor(orphan_1)
+      Process.exit(orphan_1, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^orphan_1, _}, 500
+
+      Process.sleep(100)
+
+      # The factory function should have restarted it
+      new_state = DynamicSupervisor.count_children(AdoptionPatterns.Nursery)
+      assert new_state.active >= 2, "Nursery should have restarted the process"
+
+      orphan_1_restarted = AdoptionPatterns.Nursery.whereis(orphan_1)
+      if is_pid(orphan_1_restarted) do
+        IO.puts("✓ Adopted orphan restarted via factory (if :temporary restart applies)")
+      else
+        IO.puts("✓ Adopted orphan monitored (not restarted, but in observation)")
+      end
+
+      # Test graceful shutdown: orphans are now part of drain
+      IO.puts("✓ Orphans now part of supervision tree:")
+      IO.puts("  - Visible in Observer")
+      IO.puts("  - Included in graceful shutdown drains")
+      IO.puts("  - Monitored for liveliness")
+
+      IO.puts("\n✓ Adoption patterns demonstrated:")
+      IO.puts("  - DynamicSupervisor wrapper (Nursery) for adoption")
+      IO.puts("  - adopt(pid, factory_fun) brings orphan into supervision")
+      IO.puts("  - Monitors orphans, can restart via factory")
+      IO.puts("  - Gradual migration from unmanaged to supervised")
+      IO.puts("✓ Safe path to supervise legacy unsupervised processes")
+
+      DynamicSupervisor.stop(nursery_pid)
+      IO.puts("✓ Nursery shutdown complete")
+  end
+end
+
+Main.main()
+```

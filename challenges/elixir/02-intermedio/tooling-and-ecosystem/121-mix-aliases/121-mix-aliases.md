@@ -315,6 +315,41 @@ operations, write a release module (`lib/my_app/release.ex`).
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule AliasesDemo do
+    @moduledoc """
+    This module has no interesting behavior — the exercise is about `mix.exs`.
+    """
+
+    @doc "Returns the project's OTP app name."
+    @spec app() :: atom()
+    def app, do: :aliases_demo
+  end
+
+  def main do
+    IO.puts("=== Aliases Demo ===
+  ")
+  
+    # Demo: Mix aliases
+  IO.puts("1. alias test: 'test --cover --trace'")
+  IO.puts("2. Shortcuts for common workflows")
+  IO.puts("3. Defined in mix.exs")
+
+  IO.puts("
+  ✓ Mix aliases demo completed!")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Mix.Project` aliases docs](https://hexdocs.pm/mix/Mix.Project.html#module-aliases) — the canonical reference

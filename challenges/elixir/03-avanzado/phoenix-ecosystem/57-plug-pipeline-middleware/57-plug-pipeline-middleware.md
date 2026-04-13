@@ -52,6 +52,22 @@ Cross-cutting concerns in controllers duplicate per controller and drift. A pipe
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. The Plug specification — two callbacks
 
 A Plug is a module that exports:
@@ -824,11 +840,69 @@ Target: each plug adds 1-10 us; 10-plug pipeline stays under 100 us overhead.
 
 ---
 
-## Resources
 
-- [`Plug` specification](https://hexdocs.pm/plug/Plug.html) — the whole spec in one page
-- [`Plug.Builder`](https://hexdocs.pm/plug/Plug.Builder.html) — how pipelines are composed
-- [`Plug.Conn`](https://hexdocs.pm/plug/Plug.Conn.html) — the full conn API
-- [Plug source](https://github.com/elixir-plug/plug) — read `Plug.Logger` and `Plug.RequestId` for reference plugs
-- [Bandit HTTP adapter](https://github.com/mtrudel/bandit) — modern Elixir-native HTTP server
-- [José Valim — "Mastering Elixir's Plug" (hex.pm blog)](https://dashbit.co/blog) — search for Plug posts
+## Executable Example
+
+```elixir
+defmodule PlugPipeline.Plugs.ApiKey do
+  @moduledoc """
+  Verifies the `X-API-Key` header against an allow-list. Halts the pipeline
+  with a 401 on failure. Runs AFTER RequestId and Timing so the rejected
+  request is still logged with its id and duration.
+  """
+  @behaviour Plug
+  import Plug.Conn
+
+  @header "x-api-key"
+
+  @impl true
+  def init(opts) do
+    %{
+      allowed: Keyword.fetch!(opts, :allowed) |> MapSet.new(),
+      skip_paths: Keyword.get(opts, :skip_paths, []) |> MapSet.new()
+    }
+  end
+
+  @impl true
+  def call(%Plug.Conn{request_path: path} = conn, %{skip_paths: skip} = cfg) do
+    if MapSet.member?(skip, path) do
+      conn
+    else
+      check(conn, cfg)
+    end
+  end
+
+  defp check(conn, %{allowed: allowed}) do
+    case get_req_header(conn, @header) do
+      [key | _] ->
+        if MapSet.member?(allowed, key) do
+          assign(conn, :api_key_valid, true)
+        else
+          reject(conn, "invalid_api_key")
+        end
+
+      [] ->
+        reject(conn, "missing_api_key")
+    end
+  end
+
+  defp reject(conn, reason) do
+    body = Jason.encode!(%{error: reason, request_id: conn.assigns[:request_id]})
+
+    conn
+    |> put_resp_content_type("application/json")
+    |> send_resp(401, body)
+    |> halt()
+  end
+end
+
+defmodule Main do
+  def main do
+    IO.puts("✓ Plug Pipeline and Middleware — Composable Request Transforms")
+  - Plug pipeline composition
+    - Middleware ordering and error handling
+  end
+end
+
+Main.main()
+```

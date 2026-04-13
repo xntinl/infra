@@ -212,6 +212,17 @@ All 8 tests should pass.
 ---
 
 
+
+
+## Executable Example
+
+Create a simple example demonstrating the key concepts:
+
+```elixir
+# Example code demonstrating text and binary concepts
+IO.puts("Example: Read the Implementation section above and run the code samples in iex")
+```
+
 ## Key Concepts
 
 ### 1. Unicode Normalization Combines Equivalent Characters

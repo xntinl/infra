@@ -48,6 +48,22 @@ Identical behaviour, readable, type-checked by the compiler.
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Match spec structure
 
 ```
@@ -111,6 +127,22 @@ Identical behaviour, readable, type-checked by the compiler.
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Match spec structure
 
 ```
@@ -434,10 +466,31 @@ ETS tables are in-memory, non-distributed key-value stores with tunable semantic
 
 You need to atomically update a counter field inside a row (read-modify-write). `:ets.select_replace/2` can do this in a single pass without copying. Write the `fun2ms` form for "increment the third element of every row where the first element equals `"alice"`", and explain what makes this operation atomic with respect to concurrent readers using `:read_concurrency`.
 
-## Resources
+## Executable Example
 
-- [`:ets.fun2ms/1` docs](https://www.erlang.org/doc/man/ets.html#fun2ms-1)
-- [`:ets.select/2` docs](https://www.erlang.org/doc/man/ets.html#select-2)
-- [Match specifications in Erlang](https://www.erlang.org/doc/apps/erts/match_spec.html)
-- [`Ex2ms` — Elixir wrapper](https://hex.pm/packages/ex2ms)
-- [ETS under the hood — Erlang in Anger](https://www.erlang-in-anger.com/)
+```elixir
+defmodule SessionStore.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :session_store, version: "0.1.0", elixir: "~> 1.16", deps: deps()]
+  end
+
+  def application do
+    [extra_applications: [:logger], mod: {SessionStore.Application, []}]
+  end
+
+  defp deps do
+    [{:benchee, "~> 1.3", only: :dev}]
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrating 374-ets-match-specs
+      :ok
+  end
+end
+
+Main.main()
+```

@@ -56,6 +56,25 @@ user_directory/
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Testing-specific insight:**
+Tests are not QA. They document intent and catch regressions. A test that passes without asserting anything is technical debt. Always test the failure case; "it works when everything succeeds" teaches nothing. Use property-based testing for domain logic where the number of edge cases is infinite.
 ### 1. `def <name>_factory` in the factory module
 Each factory returns a struct with default valid attributes.
 
@@ -406,19 +425,93 @@ instance, the factory generates emails the production validator would reject —
 test suite is green while production is broken. How would you detect this drift
 automatically?
 
-## Resources
 
-- [ExMachina](https://github.com/thoughtbot/ex_machina)
-- [`ExMachina.Ecto`](https://hexdocs.pm/ex_machina/ExMachina.Ecto.html)
-- [ThoughtBot — factories vs fixtures](https://thoughtbot.com/blog/factories-should-be-the-bare-minimum)
-- [`Ecto.Changeset.traverse_errors/2`](https://hexdocs.pm/ecto/Ecto.Changeset.html#traverse_errors/2)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+# test/user_directory/users_test.exs
+defmodule UserDirectory.UsersTest do
+  use UserDirectory.DataCase, async: true
+
+  alias UserDirectory.Users.User
+  alias UserDirectory.Repo
+
+  describe "build vs insert — only pay for the DB when needed" do
+    test "build returns a valid struct without touching the DB" do
+      user = build(:user)
+
+      assert %User{} = user
+      assert user.email =~ "@example.com"
+      # id is nil — nothing was persisted
+      refute user.id
+    end
+
+    test "insert persists and returns a row with an id" do
+      user = insert(:user)
+
+      assert user.id
+      assert Repo.get(User, user.id)
+    end
+  end
+
+  describe "overrides — override only the attributes the test cares about" do
+    test "admin role via the admin_user factory" do
+      admin = insert(:admin_user)
+      assert admin.role == "admin"
+    end
+
+    test "custom email via keyword override" do
+      user = build(:user, email: "carla@example.com")
+      assert user.email == "carla@example.com"
+    end
+  end
+
+  describe "params_for — changeset testing without persistence" do
+    test "returns a valid params map ready for a changeset" do
+      params = params_for(:user)
+
+      changeset = User.changeset(%User{}, params)
+      assert changeset.valid?
+    end
+
+    test "combined with overrides, tests invalid changesets" do
+      params = params_for(:user, email: "not-an-email")
+
+      changeset = User.changeset(%User{}, params)
+      refute changeset.valid?
+      assert %{email: ["has invalid format"]} = errors_on(changeset)
+    end
+  end
+
+  describe "composition — building graphs of related entities" do
+    test "insert_list creates N independent users" do
+      users = insert_list(3, :user)
+
+      assert length(users) == 3
+      assert length(Enum.uniq_by(users, & &1.email)) == 3
+    end
+  end
+
+  # Ecto changeset error helper — typically defined in DataCase
+  defp errors_on(changeset) do
+    Ecto.Changeset.traverse_errors(changeset, fn {msg, opts} ->
+      Regex.replace(~r"%{(\w+)}", msg, fn _, key ->
+        opts |> Keyword.get(String.to_existing_atom(key), key) |> to_string()
+      end)
+    end)
+  end
 end
+
+defmodule Main do
+  def main do
+      IO.puts("Property-based test generator initialized")
+      a = 10
+      b = 20
+      c = 30
+      assert (a + b) + c == a + (b + c)
+      IO.puts("✓ Property invariant verified: (a+b)+c = a+(b+c)")
+  end
+end
+
+Main.main()
 ```

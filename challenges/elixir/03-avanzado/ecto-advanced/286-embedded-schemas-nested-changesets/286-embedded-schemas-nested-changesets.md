@@ -36,6 +36,25 @@ form_builder/
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Ecto-specific insight:**
+Ecto separates the query layer (building queries) from the execution layer (sending them). This separation allows for debugging, composability, and testing without a database. Never load all rows first and filter in-memory — write the filter into the query itself, or you've just built an N+1 problem.
 ### 1. `embeds_one` and `embeds_many`
 
 ```elixir
@@ -543,19 +562,128 @@ and readers must handle both shapes?
 
 ---
 
-## Resources
 
-- [`Ecto.Schema.embedded_schema/2`](https://hexdocs.pm/ecto/Ecto.Schema.html#embedded_schema/2)
-- [`Ecto.Changeset.cast_embed/3`](https://hexdocs.pm/ecto/Ecto.Changeset.html#cast_embed/3)
-- [Dashbit — "Working with JSON and embeds in Ecto"](https://dashbit.co/blog)
-- [Postgres JSONB operators](https://www.postgresql.org/docs/current/functions-json.html)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+# test/form_builder/customers_test.exs
+defmodule FormBuilder.CustomersTest do
+  use ExUnit.Case, async: false
+  alias FormBuilder.{Customers, Repo}
+  alias FormBuilder.Schemas.Customer
+
+  setup do
+    Ecto.Adapters.SQL.Sandbox.checkout(Repo)
+    Ecto.Adapters.SQL.Sandbox.mode(Repo, {:shared, self()})
+    Repo.delete_all(Customer)
+    :ok
+  end
+
+  defp valid_attrs do
+    %{
+      "name" => "Acme",
+      "billing_address" => %{
+        "street" => "1 Main",
+        "city" => "SF",
+        "postal_code" => "94111",
+        "country" => "US"
+      },
+      "contact_methods" => [
+        %{"kind" => "email", "value" => "a@b.com", "primary" => true}
+      ]
+    }
+  end
+
+  describe "create/1 happy path" do
+    test "inserts customer with embeds" do
+      assert {:ok, c} = Customers.create(valid_attrs())
+      assert c.billing_address.country == "US"
+      assert [%{kind: "email"}] = c.contact_methods
+    end
+  end
+
+  describe "nested validation" do
+    test "surfaces nested errors from billing_address" do
+      attrs = put_in(valid_attrs(), ["billing_address", "country"], "USA")
+
+      {:error, cs} = Customers.create(attrs)
+      assert cs.changes.billing_address.errors != []
+    end
+
+    test "requires at least one contact method" do
+      attrs = Map.put(valid_attrs(), "contact_methods", [])
+      {:error, cs} = Customers.create(attrs)
+      assert [contact_methods: {"must have at least one contact method", _}] = cs.errors
+    end
+
+    test "rejects multiple primary contacts" do
+      attrs =
+        put_in(valid_attrs(), ["contact_methods"], [
+          %{"kind" => "email", "value" => "a@b.com", "primary" => true},
+          %{"kind" => "phone", "value" => "+123456789", "primary" => true}
+        ])
+
+      {:error, cs} = Customers.create(attrs)
+      assert [contact_methods: {"only one contact method can be primary", _}] = cs.errors
+    end
+
+    test "rejects invalid email format in contact method" do
+      attrs =
+        put_in(valid_attrs(), ["contact_methods"], [
+          %{"kind" => "email", "value" => "not-an-email", "primary" => true}
+        ])
+
+      {:error, cs} = Customers.create(attrs)
+      assert cs.valid? == false
+    end
+  end
+
+  describe "update with on_replace: :update" do
+    test "partial update to billing_address keeps untouched fields" do
+      {:ok, c} = Customers.create(valid_attrs())
+
+      {:ok, updated} =
+        Customers.update(c, %{"billing_address" => %{"city" => "NYC"}})
+
+      assert updated.billing_address.city == "NYC"
+      assert updated.billing_address.street == "1 Main"
+    end
+  end
+
+  describe "update with on_replace: :delete" do
+    test "replacing contact_methods deletes the old ones" do
+      {:ok, c} = Customers.create(valid_attrs())
+
+      {:ok, updated} =
+        Customers.update(c, %{
+          "contact_methods" => [
+            %{"kind" => "phone", "value" => "+19998887777", "primary" => true}
+          ]
+        })
+
+      assert [%{kind: "phone"}] = updated.contact_methods
+    end
+  end
+
+  describe "JSONB queries" do
+    test "by_country/1 filters via JSONB path" do
+      {:ok, _} = Customers.create(valid_attrs())
+
+      attrs = put_in(valid_attrs(), ["billing_address", "country"], "DE")
+      {:ok, _} = Customers.create(attrs)
+
+      assert [%{billing_address: %{country: "US"}}] = Customers.by_country("US")
+    end
+  end
 end
+
+defmodule Main do
+  def main do
+    IO.puts("✓ Embedded Schemas and Nested Changesets")
+  - Nested changesets and embedded schemas
+    - Error propagation from nested structures
+  end
+end
+
+Main.main()
 ```

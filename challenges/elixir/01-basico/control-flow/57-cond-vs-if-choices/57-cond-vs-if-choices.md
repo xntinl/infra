@@ -304,6 +304,69 @@ If your pricing rules come from a database (sales team changes them weekly), is 
 
 How does the ordering of `cond` clauses affect performance when the first clause is expensive? Where should short-circuit cheap-but-decisive checks sit?
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule PricingRuleEngine.Pricing do
+  @moduledoc """
+  Computes final price = subtotal - tier_discount - bulk_discount + tax.
+
+  Tier discount (picks ONE, first match wins — that is why cond fits):
+    subtotal >= 1000 -> 15%
+    subtotal >= 500  -> 10%
+    subtotal >= 100  ->  5%
+    otherwise        ->  0%
+
+  Bulk discount: extra 2% if qty > 20 (independent of tier).
+
+  Tax: 21% on the discounted subtotal, unless the customer is tax_exempt.
+  """
+
+  @type cart :: %{
+          required(:subtotal) => number(),
+          required(:qty) => non_neg_integer(),
+          required(:tax_exempt) => boolean()
+        }
+
+  @spec total(cart()) :: float()
+  def total(%{subtotal: subtotal, qty: qty, tax_exempt: tax_exempt}) do
+    tier = tier_discount(subtotal)
+    bulk = bulk_discount(qty)
+
+    discounted = subtotal * (1 - tier) * (1 - bulk)
+
+    # Single yes/no → if fits better than cond here.
+    # Using `if` signals "exactly two branches" to the reader.
+    taxed =
+      if tax_exempt do
+        discounted
+      else
+        discounted * 1.21
+      end
+
+    Float.round(taxed, 2)
+  end
+
+  # Cascading thresholds — cond is the canonical shape.
+  # Each branch is an independent boolean, not pattern matching on shape.
+  defp tier_discount(subtotal) do
+    cond do
+      subtotal >= 1000 -> 0.15
+      subtotal >= 500  -> 0.10
+      subtotal >= 100  -> 0.05
+      true             -> 0.0
+    end
+  end
+
+  # A single boolean condition — if is clearer than cond here.
+  defp bulk_discount(qty) do
+    if qty > 20, do: 0.02, else: 0.0
+  end
+end
+```
+
 ## Resources
 
 - [Elixir — Case, cond, and if](https://hexdocs.pm/elixir/case-cond-and-if.html)

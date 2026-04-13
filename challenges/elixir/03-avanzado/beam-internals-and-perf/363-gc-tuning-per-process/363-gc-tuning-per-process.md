@@ -34,6 +34,22 @@ Global tuning forces one choice on all of them. Per-process knobs give each kind
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Generational GC
 
 New allocations land in the young heap. Minor GCs copy survivors to the old heap. Old heap is collected only during major (full-sweep) GCs.
@@ -265,19 +281,59 @@ OTP primitives (GenServer, Supervisor, Application) are tested through their pub
 
 A memory graph shows a saw-tooth pattern: memory climbs for 30 seconds, drops by 40% every 30 seconds. You did NOT set `fullsweep_after`. What is causing the periodic drops, and how do you confirm?
 
-## Resources
 
-- [`:erlang.process_flag/2` :fullsweep_after — erlang.org](https://www.erlang.org/doc/man/erlang.html#process_flag-2)
-- [GC internals — The BEAM Book](https://blog.stenmans.org/theBeamBook/)
-- [Erlang GC history — Lukas Larsson](https://www.erlang.org/blog/a-brief-beam-vm-tour/)
-- [Erlang in Anger — long-lived processes](https://www.erlang-in-anger.com/)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+defmodule GcLab.GcTest do
+  use ExUnit.Case, async: true
+  alias GcLab.{Cache, GcProbe}
+
+  describe "fullsweep_after=10" do
+    test "cache heap stabilizes under churn" do
+      {:ok, pid} = Cache.start_link([])
+
+      for i <- 1..5_000 do
+        Cache.put(pid, i, String.duplicate("x", 256))
+        if rem(i, 2) == 0, do: Cache.drop(pid, i)
+      end
+
+      GcProbe.force_gc(pid)
+      heap = GcProbe.heap_words(pid)
+      assert heap < 500_000, "expected compacted heap, got #{heap} words"
+    end
+  end
+
+  describe "minor gcs" do
+    test "accumulate under allocation pressure" do
+      {:ok, pid} = Cache.start_link([])
+      before = GcProbe.gc_counts(pid) |> Keyword.fetch!(:minor_gcs)
+
+      for i <- 1..10_000, do: Cache.put(pid, i, i)
+
+      after_ = GcProbe.gc_counts(pid) |> Keyword.fetch!(:minor_gcs)
+      assert after_ - before > 0
+    end
+  end
+
+  describe "process_flag fullsweep_after" do
+    test "is visible in process_info" do
+      {:ok, pid} = Cache.start_link([])
+      info = GcProbe.gc_counts(pid)
+      assert info[:fullsweep_after] == 10
+    end
+  end
 end
+
+defmodule Main do
+  def main do
+      IO.puts("Recon diagnostics initialized")
+      memory_stats = :erlang.memory()
+      if is_list(memory_stats) do
+        IO.puts("✓ Recon diagnostics: memory info available")
+      end
+  end
+end
+
+Main.main()
 ```

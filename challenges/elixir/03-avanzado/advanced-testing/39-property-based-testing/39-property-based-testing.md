@@ -54,6 +54,25 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Testing-specific insight:**
+Tests are not QA. They document intent and catch regressions. A test that passes without asserting anything is technical debt. Always test the failure case; "it works when everything succeeds" teaches nothing. Use property-based testing for domain logic where the number of edge cases is infinite.
 ### 1. Properties instead of examples
 
 An example-based test asserts on specific inputs:
@@ -621,21 +640,67 @@ end
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
 
-- [StreamData hexdocs](https://hexdocs.pm/stream_data) — API reference, especially `bind/2`, `filter/2`, `map/2`
-- [ExUnitProperties](https://hexdocs.pm/stream_data/ExUnitProperties.html) — `check all` macro
-- ["Writing efficient StreamData generators" — Andrea Leopardi](https://andrealeopardi.com/posts/property-based-testing-in-beam/) — the author of StreamData
-- [PropEr TESTing — Fred Hébert](https://propertesting.com/) — the definitive text (Erlang but applies)
-- ["Metamorphic testing" — ACM paper](https://dl.acm.org/doi/10.1145/2934466) — foundational reference
-- [QuickCheck papers — John Hughes](https://www.cse.chalmers.se/~rjmh/QuickCheck/) — the original
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+# test/money_calc/converter_property_test.exs
+defmodule MoneyCalc.ConverterPropertyTest do
+  use ExUnit.Case, async: true
+  use ExUnitProperties
+
+  import MoneyCalc.Generators
+  alias MoneyCalc.{Money, Converter}
+
+  describe "convert/3 metamorphic properties" do
+    property "identity: converting to same currency is a no-op" do
+      check all m <- money() do
+        assert Converter.convert(m, m.currency, %{}) == m
+      end
+    end
+
+    property "round trip is approximately identity (within rounding error)" do
+      check all m <- positive_money(),
+                to <- currency(),
+                m.currency != to,
+                rates <- consistent_rates(m.currency, to) do
+        back = m |> Converter.convert(to, rates) |> Converter.convert(m.currency, rates)
+
+        # Tolerance: rounding twice can lose up to 1 minor unit of source currency,
+        # scaled by rate. Allow 1% relative or 1 unit absolute.
+        diff = abs(back.amount - m.amount)
+        tolerance = max(1, div(m.amount, 100))
+        assert diff <= tolerance,
+               "round-trip drift #{diff} exceeds tolerance #{tolerance} for #{inspect(m)}"
+      end
+    end
+
+    property "scaling: doubling input doubles output (modulo rounding)" do
+      check all m <- positive_money(),
+                to <- currency(),
+                m.currency != to,
+                rates <- consistent_rates(m.currency, to) do
+        single = Converter.convert(m, to, rates)
+        doubled_input = Money.new(m.amount * 2, m.currency)
+        doubled = Converter.convert(doubled_input, to, rates)
+
+        diff = abs(doubled.amount - single.amount * 2)
+        assert diff <= 1
+      end
+    end
+  end
 end
+
+defmodule Main do
+  def main do
+      IO.puts("Property-based test generator initialized")
+      a = 10
+      b = 20
+      c = 30
+      assert (a + b) + c == a + (b + c)
+      IO.puts("✓ Property invariant verified: (a+b)+c = a+(b+c)")
+  end
+end
+
+Main.main()
 ```

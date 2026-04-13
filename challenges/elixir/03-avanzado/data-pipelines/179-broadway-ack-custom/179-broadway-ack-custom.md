@@ -48,6 +48,25 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Pipeline-specific insight:**
+Streams are lazy; Enum is eager. Use Stream for data larger than RAM or when you're building intermediate stages. Use Enum when the collection is small or you need side effects at each step. Mixing them carelessly results in performance cliffs.
 ### 1. The Acknowledger contract
 
 ```elixir
@@ -412,20 +431,114 @@ effects tied to ack outcome.
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
 
-- [`Broadway.Acknowledger` behaviour — HexDocs](https://hexdocs.pm/broadway/Broadway.Acknowledger.html)
-- [Broadway source — `broadway/acknowledger.ex`](https://github.com/dashbitco/broadway/blob/main/lib/broadway/acknowledger.ex)
-- [BroadwaySQS.ExAwsClient source — reference implementation](https://github.com/dashbitco/broadway_sqs/blob/main/lib/broadway_sqs/ex_aws_client.ex)
-- [Telemetry — HexDocs](https://hexdocs.pm/telemetry/)
-- [Oban acknowledger-style job lifecycle](https://hexdocs.pm/oban/Oban.html)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+defmodule BroadwayAckCustom.AuditAcknowledger do
+  @moduledoc """
+  Broadway acknowledger that:
+
+    1. Writes an audit row per message (batched)
+    2. Emits telemetry for observability
+    3. Notifies an external status API (best-effort)
+    4. Delegates to the wrapped broker acknowledger
+
+  Must be referenced as:
+
+      Message.configure_ack_ref(msg, {__MODULE__, ref, opts})
+
+  Where `ref` is whatever data the delegate needs.
+  """
+  @behaviour Broadway.Acknowledger
+
+  alias BroadwayAckCustom.{AuditRepo, StatusApi}
+
+  @impl true
+  def ack({__MODULE__, delegate_ref, opts}, successful, failed) do
+    all = successful ++ failed
+    audit(all, successful, failed)
+    emit_telemetry(successful, failed)
+    maybe_notify(all, opts)
+
+    case Keyword.get(opts, :delegate) do
+      nil -> :ok
+      {mod, _opts} -> mod.ack(delegate_ref, successful, failed)
+    end
+  end
+
+  defp audit(all, successful, failed) do
+    rows =
+      Enum.map(all, fn msg ->
+        status = if msg in successful, do: "ok", else: "failed"
+
+        %{
+          event_id: msg.metadata[:event_id] || msg.data[:id],
+          status: status,
+          attempts: Map.get(msg.metadata, :attempts, 1),
+          last_error: status == "failed" && inspect(msg.status) || nil,
+          finished_at: DateTime.utc_now()
+        }
+      end)
+
+    # best-effort; a DB down must not kill the ack
+    try do
+      AuditRepo.insert_all(rows)
+    catch
+      kind, reason ->
+        :logger.error("audit insert failed #{inspect({kind, reason})}")
+    end
+
+    _ = successful
+    _ = failed
+    :ok
+  end
+
+  defp emit_telemetry(successful, failed) do
+    :telemetry.execute(
+      [:broadway_ack_custom, :ack],
+      %{successful: length(successful), failed: length(failed)},
+      %{}
+    )
+  end
+
+  defp maybe_notify(messages, opts) do
+    if Keyword.get(opts, :notify_api?, false) do
+      Enum.each(messages, fn msg ->
+        _ = StatusApi.notify(msg.metadata[:event_id] || msg.data[:id], msg.status)
+      end)
+    end
+  end
 end
+
+defmodule Main do
+  def main do
+      # Demonstrate custom acknowledger: emit telemetry, audit to DB
+      jobs = [
+        %{id: 1, status: :pending},
+        %{id: 2, status: :pending},
+        %{id: 3, status: :pending}
+      ]
+
+      # Simulate telemetry emission
+      telemetry_events = Enum.map(jobs, fn job ->
+        {job.id, {:telemetry, :ack, job}}
+      end)
+
+      # Simulate audit log
+      audit_log = Enum.map(jobs, fn job ->
+        Map.put(job, :status, :acknowledged)
+      end)
+
+      IO.inspect(audit_log, label: "✓ Audit log")
+      IO.inspect(telemetry_events, label: "✓ Telemetry events")
+
+      assert length(audit_log) == 3, "All jobs audited"
+      assert Enum.all?(audit_log, &(&1.status == :acknowledged)), "All acknowledged"
+
+      IO.puts("✓ Custom acknowledger: telemetry and audit working")
+  end
+end
+
+Main.main()
 ```

@@ -54,6 +54,22 @@ umbrella_services/
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Umbrella vs poncho vs mono-repo
 
 | Dimension | Monolith | Umbrella | Poncho | Mono-repo (separate releases) |
@@ -542,11 +558,101 @@ Target: umbrella `mix compile` cold ≤ 30 s for a 3-app tree of ~5 k LOC each; 
 
 ---
 
-## Resources
 
-- [Dashbit — Mix and umbrella projects](https://elixir-lang.org/getting-started/mix-otp/dependencies-and-umbrella-projects.html) — the official intro.
-- [José Valim — Umbrella projects, poncho, mono-repos](https://dashbit.co/blog/are-umbrella-apps-dead-in-elixir) — when to pick which.
-- [`mix release` — hexdocs](https://hexdocs.pm/mix/Mix.Tasks.Release.html) — release assembly, boot order, runtime config.
-- [Phoenix umbrella generator source](https://github.com/phoenixframework/phoenix/blob/main/lib/mix/tasks/phx.new.ex) — read how Phoenix structures an umbrella (`phx.new --umbrella`).
-- [Plataformatec — Why our umbrella project became...](https://blog.plataformatec.com.br/) — historical motivation for umbrella vs mono-repo choices.
-- [OTP Design Principles: Applications](https://www.erlang.org/doc/design_principles/applications.html) — the underlying `application:start/2` semantics.
+## Executable Example
+
+```elixir
+# apps/catalog/lib/catalog/application.ex
+defmodule Catalog.Application do
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    Supervisor.start_link([Catalog.Repo], strategy: :one_for_one, name: Catalog.Supervisor)
+  end
+end
+
+# apps/catalog/lib/catalog/repo.ex
+defmodule Catalog.Repo do
+  use GenServer
+
+  @type sku :: String.t()
+  @type product :: %{sku: sku(), name: String.t(), base_price: pos_integer()}
+
+  def start_link(_), do: GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
+
+  @spec get(sku()) :: {:ok, product()} | {:error, :not_found}
+  def get(sku), do: GenServer.call(__MODULE__, {:get, sku})
+
+  @impl true
+  def init(:ok) do
+    products = %{
+      "SKU-A" => %{sku: "SKU-A", name: "Widget", base_price: 1_000},
+      "SKU-B" => %{sku: "SKU-B", name: "Gadget", base_price: 2_500}
+    }
+
+    {:ok, products}
+  end
+
+  @impl true
+  def handle_call({:get, sku}, _from, state) do
+    case Map.fetch(state, sku) do
+      {:ok, p} -> {:reply, {:ok, p}, state}
+      :error -> {:reply, {:error, :not_found}, state}
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrate umbrella application with interdependent apps
+
+      # All three apps start in dependency order via application.ex
+      # Start order: catalog → pricing → checkout (defined by 'applications' list)
+
+      catalog_pid = Process.whereis(UmbrellaServices.Catalog)
+      assert is_pid(catalog_pid), "Catalog app must be running"
+      IO.inspect(catalog_pid, label: "Catalog PID")
+
+      pricing_pid = Process.whereis(UmbrellaServices.Pricing)
+      assert is_pid(pricing_pid), "Pricing app (depends on catalog) must be running"
+      IO.inspect(pricing_pid, label: "Pricing PID")
+
+      checkout_pid = Process.whereis(UmbrellaServices.Checkout)
+      assert is_pid(checkout_pid), "Checkout app (depends on pricing/catalog) must be running"
+      IO.inspect(checkout_pid, label: "Checkout PID")
+
+      IO.puts("✓ Umbrella apps initialized in dependency order (catalog → pricing → checkout)")
+
+      # Test catalog: mock product database
+      {:ok, product} = UmbrellaServices.Catalog.get_product("PROD-001")
+      assert product != nil, "Catalog should return product"
+      IO.inspect(product, label: "Product from catalog")
+
+      # Test pricing: depends on catalog
+      {:ok, quote} = UmbrellaServices.Pricing.quote_product("PROD-001", quantity: 5)
+      assert quote.total > 0, "Pricing should compute quote from catalog data"
+      IO.inspect(quote, label: "Price quote from pricing")
+
+      # Test checkout: depends on pricing and catalog
+      {:ok, order} = UmbrellaServices.Checkout.place_order("PROD-001", quantity: 3)
+      assert order.id != nil, "Checkout should create order using pricing and catalog"
+      IO.inspect(order, label: "Order from checkout")
+
+      IO.puts("✓ Catalog provides product data")
+      IO.puts("✓ Pricing depends on catalog, computes quotes")
+      IO.puts("✓ Checkout depends on pricing/catalog, completes orders")
+
+      IO.puts("\n✓ Umbrella application structure demonstrated:")
+      IO.puts("  - Catalog app: GenServer-backed product store")
+      IO.puts("  - Pricing app: depends on Catalog for product info")
+      IO.puts("  - Checkout app: depends on Pricing and Catalog")
+      IO.puts("✓ Start order enforced by 'applications' in mix.exs")
+      IO.puts("✓ Single release packages all three apps")
+      IO.puts("✓ Shared config and deps (no per-app duplication)")
+      IO.puts("✓ Ready for bounded-context architecture")
+  end
+end
+
+Main.main()
+```

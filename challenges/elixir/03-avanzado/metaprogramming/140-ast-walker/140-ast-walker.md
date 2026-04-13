@@ -38,6 +38,25 @@ Source text is a lossy view of Elixir. The AST has the information the compiler 
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Metaprogramming-specific insight:**
+Code generation is powerful and dangerous. Every macro you write is a place where intent is hidden. Use macros sparingly, only when they eliminate genuine boilerplate. If your macro is more than 10 lines, you probably need a function or data structure instead. Future maintainers will thank you.
 ### 1. `Code.string_to_quoted/2`
 
 Parses source into an AST without executing it:
@@ -465,11 +484,152 @@ Expect parallel to be 4–8× faster on modern hardware.
 
 ---
 
-## Resources
 
-- [`Code.string_to_quoted/2`](https://hexdocs.pm/elixir/Code.html#string_to_quoted/2)
-- [Credo — custom checks](https://github.com/rrrene/credo/blob/master/lib/credo/check.ex)
-- [Sobelow — security linter built on AST walks](https://github.com/nccgroup/sobelow)
-- [*Metaprogramming Elixir* — ch. 6](https://pragprog.com/titles/cmelixir/metaprogramming-elixir/)
-- [Elixir Formatter source](https://github.com/elixir-lang/elixir/blob/main/lib/elixir/lib/code/formatter.ex) — AST-to-string pretty-printer
-- [Macro.prewalk vs traverse](https://hexdocs.pm/elixir/Macro.html)
+## Executable Example
+
+```elixir
+defmodule AstWalker.Rules do
+  @moduledoc "Individual lint rule implementations."
+
+  alias AstWalker.Issue
+
+  @banned_calls [
+    {{:crypto, :rand_bytes}, ":crypto.rand_bytes/1 is deprecated, use strong_rand_bytes/1"}
+  ]
+
+  @debug_calls [
+    {{IO, :inspect}, "IO.inspect/2 left in non-test source"}
+  ]
+
+  @spec check_deprecated(Macro.t(), String.t()) :: [Issue.t()]
+  def check_deprecated(ast, file) do
+    collect_remote_calls(ast, file, @banned_calls, :deprecated_function, :warning)
+  end
+
+  @spec check_debug_calls(Macro.t(), String.t()) :: [Issue.t()]
+  def check_debug_calls(ast, file) do
+    collect_remote_calls(ast, file, @debug_calls, :debug_call_left, :warning)
+  end
+
+  @spec check_moduledoc(Macro.t(), String.t()) :: [Issue.t()]
+  def check_moduledoc({:defmodule, meta, [_alias, [do: body]]}, file) do
+    if has_moduledoc?(body) do
+      []
+    else
+      [
+        %Issue{
+          file: file,
+          line: Keyword.get(meta, :line, 1),
+          column: Keyword.get(meta, :column),
+          rule: :missing_moduledoc,
+          severity: :warning,
+          message: "module missing @moduledoc"
+        }
+      ]
+    end
+  end
+
+  def check_moduledoc(_, _), do: []
+
+  defp has_moduledoc?({:__block__, _, stmts}), do: Enum.any?(stmts, &moduledoc_node?/1)
+  defp has_moduledoc?(single), do: moduledoc_node?(single)
+
+  defp moduledoc_node?({:@, _, [{:moduledoc, _, [content]}]}) when content != false, do: true
+  defp moduledoc_node?(_), do: false
+
+  defp collect_remote_calls(ast, file, list, rule, severity) do
+    {_ast, acc} =
+      Macro.prewalk(ast, [], fn node, acc ->
+        case match_remote(node, list) do
+          {:match, msg, meta} ->
+            issue = %Issue{
+              file: file,
+              line: Keyword.get(meta, :line, 0),
+              column: Keyword.get(meta, :column),
+              rule: rule,
+              severity: severity,
+              message: msg
+            }
+
+            {node, [issue | acc]}
+
+          :nomatch ->
+            {node, acc}
+        end
+      end)
+
+    Enum.reverse(acc)
+  end
+
+  defp match_remote({{:., _, [{:__aliases__, _, parts}, fun]}, meta, _args}, list) do
+    check_tuple({Module.concat(parts), fun}, meta, list)
+  end
+
+  defp match_remote({{:., _, [mod, fun]}, meta, _args}, list) when is_atom(mod) do
+    check_tuple({mod, fun}, meta, list)
+  end
+
+  defp match_remote(_, _), do: :nomatch
+
+  defp check_tuple({mod, fun}, meta, list) do
+    case Enum.find(list, fn {{m, f}, _} -> m == mod and f == fun end) do
+      {_, msg} -> {:match, msg, meta}
+      nil -> :nomatch
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrate AST walker for custom linting
+      code = """
+      defmodule MyModule do
+        def process(data) do
+          HTTPoison.get("url")
+          Enum.map(data, &(&1 * 2))
+        end
+      end
+      """
+
+      # Parse code to AST
+      {:ok, ast} = Code.string_to_quoted(code)
+
+      # Walk AST and find banned modules
+      banned = [:HTTPoison]
+      violations = []
+
+      Macro.prewalk(ast, fn node ->
+        case node do
+          {:__aliases__, _, mod_parts} ->
+            mod_atom = Module.concat(mod_parts)
+            if mod_atom in banned do
+              violations = [mod_atom | violations]
+            end
+          _ -> nil
+        end
+        node
+      end)
+
+      IO.puts("✓ Banned module calls found: #{inspect(violations)}")
+
+      # Find function calls
+      calls = []
+      Macro.prewalk(ast, fn node ->
+        case node do
+          {func, _, _} when is_atom(func) and func != :defmodule ->
+            calls = [func | calls]
+          _ -> nil
+        end
+        node
+      end)
+
+      IO.puts("✓ Function calls found: #{inspect(Enum.uniq(calls))}")
+
+      assert Enum.any?(violations, &(&1 == HTTPoison)), "Banned module detected"
+
+      IO.puts("✓ AST walker: custom linter working")
+  end
+end
+
+Main.main()
+```

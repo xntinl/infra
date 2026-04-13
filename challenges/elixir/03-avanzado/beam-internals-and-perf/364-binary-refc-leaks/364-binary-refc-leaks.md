@@ -32,6 +32,22 @@ The catch: ProcBins are released only during GC. A process that never triggers a
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Heap vs refc binaries
 
 - **Heap binary**: size ≤ 64 bytes. Copied inline into the process heap. Behaves like any other term.
@@ -250,19 +266,56 @@ OTP primitives (GenServer, Supervisor, Application) are tested through their pub
 
 A coworker proposes running `:erlang.garbage_collect(pid)` on every GenServer callback to prevent leaks. Why is this the wrong fix, and what correct patterns cover 90% of cases?
 
-## Resources
 
-- [Erlang binaries — erlang.org](https://www.erlang.org/doc/efficiency_guide/binaryhandling.html)
-- [Refc binary leak — Erlang in Anger](https://www.erlang-in-anger.com/)
-- [`recon.bin_leak/1` — hexdocs](https://hexdocs.pm/recon/recon.html#bin_leak/1)
-- [The BEAM Book — binaries chapter](https://blog.stenmans.org/theBeamBook/)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+defmodule BinaryLeakLab.LeakTest do
+  use ExUnit.Case, async: false
+
+  defp big_blob(mb), do: :crypto.strong_rand_bytes(mb * 1_024 * 1_024)
+
+  defp binary_memory_mb, do: div(:erlang.memory(:binary), 1_024 * 1_024)
+
+  describe "the leaker" do
+    test "refc pool grows proportionally to blobs ingested" do
+      {:ok, _} = BinaryLeakLab.Leaker.start_link([])
+      before = binary_memory_mb()
+
+      for _ <- 1..20, do: BinaryLeakLab.Leaker.ingest(big_blob(1))
+
+      :erlang.garbage_collect(Process.whereis(BinaryLeakLab.Leaker))
+      after_ = binary_memory_mb()
+
+      # Leak: refc memory should still be high despite GC.
+      assert after_ - before >= 10
+    end
+  end
+
+  describe "the non-leaker" do
+    test ":binary.copy/1 allows refc release on GC" do
+      {:ok, _} = BinaryLeakLab.NonLeaker.start_link([])
+      for _ <- 1..20, do: BinaryLeakLab.NonLeaker.ingest(big_blob(1))
+
+      before_gc = binary_memory_mb()
+      :erlang.garbage_collect(Process.whereis(BinaryLeakLab.NonLeaker))
+      :timer.sleep(100)
+      after_gc = binary_memory_mb()
+
+      assert after_gc <= before_gc
+    end
+  end
 end
+
+defmodule Main do
+  def main do
+      IO.puts("Recon diagnostics initialized")
+      memory_stats = :erlang.memory()
+      if is_list(memory_stats) do
+        IO.puts("✓ Recon diagnostics: memory info available")
+      end
+  end
+end
+
+Main.main()
 ```

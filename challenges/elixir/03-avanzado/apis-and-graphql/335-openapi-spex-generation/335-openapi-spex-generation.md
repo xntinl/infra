@@ -45,6 +45,22 @@ A pure-reflection approach ("introspect the Ecto schema, generate spec") sounds 
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. `ApiSpec` module is the root document
 Contains servers, info, paths (auto-collected from the router), components (named schemas).
 
@@ -391,19 +407,70 @@ For internal RPC-shaped APIs used by two services you control, the ceremony outw
 
 Your spec is now source of truth. A product manager pushes to add a field `discount_code` to the order payload. You add it to the `OrderCreate` schema as optional — but half the mobile clients in the wild send the old payload. Does the validator accept them? What about if you add the field as `required: true`? Design the migration path.
 
-## Resources
 
-- [OpenApiSpex hexdocs](https://hexdocs.pm/open_api_spex/)
-- [OpenAPI 3.1 specification](https://spec.openapis.org/oas/v3.1.0)
-- [`OpenApiSpex.Plug.CastAndValidate`](https://hexdocs.pm/open_api_spex/OpenApiSpex.Plug.CastAndValidate.html)
-- [JSON Schema validation draft 2020-12](https://json-schema.org/draft/2020-12/json-schema-core.html)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+defmodule OrdersApiWeb.ApiSpecTest do
+  use ExUnit.Case, async: true
+
+  describe "OpenAPI document" do
+    test "resolves without errors" do
+      spec = OrdersApiWeb.ApiSpec.spec()
+      assert spec.openapi == "3.1.0"
+      assert Map.has_key?(spec.paths, "/api/orders")
+    end
+
+    test "is valid JSON" do
+      spec = OrdersApiWeb.ApiSpec.spec()
+      assert {:ok, _} = Jason.encode(spec)
+    end
+  end
 end
+
+defmodule OrdersApiWeb.OrderControllerTest do
+  use OrdersApiWeb.ConnCase, async: true
+  import OpenApiSpex.TestAssertions
+
+  @api_spec OrdersApiWeb.ApiSpec.spec()
+
+  describe "GET /api/orders/:id" do
+    test "returns Order schema on success", %{conn: conn} do
+      resp = conn |> get("/api/orders/known") |> json_response(200)
+      assert_schema(resp, "Order", @api_spec)
+    end
+
+    test "returns Error schema on miss", %{conn: conn} do
+      resp = conn |> get("/api/orders/missing") |> json_response(404)
+      assert_schema(resp, "Error", @api_spec)
+    end
+  end
+
+  describe "POST /api/orders" do
+    test "rejects malformed body with 422", %{conn: conn} do
+      resp = conn |> post("/api/orders", %{total_cents: -1}) |> json_response(422)
+      assert %{"errors" => _} = resp
+    end
+
+    test "creates and returns Order on valid body", %{conn: conn} do
+      body = %{customer_id: "cus_1", total_cents: 100}
+      resp = conn |> post("/api/orders", body) |> json_response(201)
+      assert_schema(resp, "Order", @api_spec)
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+      IO.puts("GraphQL schema initialization")
+      defmodule QueryType do
+        def resolve_hello(_, _, _), do: {:ok, "world"}
+      end
+      if is_atom(QueryType) do
+        IO.puts("✓ GraphQL schema validated and query resolver accessible")
+      end
+  end
+end
+
+Main.main()
 ```

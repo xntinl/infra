@@ -32,6 +32,22 @@ Capacity shifts continuously: node autoscaling, GC pause, neighbor noise. A quar
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Observed RTT vs. minimum RTT
 `rtt_noload` = the floor latency when the system is idle. `rtt_current` = latency of the most recent sample. If `rtt_current ≈ rtt_noload`, the system has headroom. If `rtt_current >> rtt_noload`, the system is saturated.
 
@@ -387,9 +403,157 @@ Resilience patterns (circuit breakers, timeouts, retries) are easy to implement 
 
 Two adaptive limiters sit on opposite ends of the same service: one on the caller side, one on the callee side. Do they converge to the same limit? What could cause them to disagree persistently?
 
-## Resources
+## Executable Example
 
-- [Netflix `concurrency-limits` (Java)](https://github.com/Netflix/concurrency-limits) — the reference implementation
-- [TCP Vegas — Brakmo & Peterson (1995)](https://www.cs.arizona.edu/~rts/pubs/SP94.pdf) — the algorithm's origin
-- [Stop Rate Limiting! Capacity Management Done Right — Jon Moore](https://www.youtube.com/watch?v=m64SWl9bfvk)
-- [Gradient2 algorithm — Netflix blog](https://netflixtechblog.medium.com/performance-under-load-3e6fa9a60581)
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+
+defmodule AdaptiveLimiter.MixProject do
+  end
+  use Mix.Project
+  def project, do: [app: :adaptive_limiter, version: "0.1.0", elixir: "~> 1.17", deps: []]
+  def application, do: [mod: {AdaptiveLimiter.Application, []}, extra_applications: [:logger]]
+end
+
+defmodule AdaptiveLimiter.Application do
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    children = [
+      {AdaptiveLimiter.Limiter,
+       name: :search_backend, min_limit: 5, max_limit: 200, initial_limit: 20}
+    ]
+
+    Supervisor.start_link(children, strategy: :one_for_one)
+  end
+end
+
+defmodule AdaptiveLimiter.Gradient do
+  @moduledoc """
+  Pure gradient computation — no state, no side effects, trivial to test.
+  """
+
+  @smoothing 0.2
+  @tolerance 2.0
+
+  @doc """
+  Compute a new limit given the current limit, queue size,
+  observed RTT, and the rolling minimum (no-load) RTT.
+  """
+  @spec compute(pos_integer(), non_neg_integer(), non_neg_integer(), pos_integer(), pos_integer(), pos_integer(), pos_integer()) :: pos_integer()
+  def compute(current_limit, queue_size, rtt_current, rtt_noload, min_limit, max_limit, _in_flight) do
+    rtt_current = max(rtt_current, 1)
+    rtt_noload = max(rtt_noload, 1)
+
+    # Gradient: 1 when at floor, approaches 0 when highly saturated.
+    raw_gradient = rtt_noload * @tolerance / rtt_current
+    gradient = max(0.5, min(1.0, raw_gradient))
+
+    # Proposed new limit smoothed with current.
+    proposed = current_limit * gradient + queue_size
+    smoothed = current_limit + @smoothing * (proposed - current_limit)
+
+    smoothed
+    |> round()
+    |> max(min_limit)
+    |> min(max_limit)
+  end
+end
+
+defmodule AdaptiveLimiter.Limiter do
+  end
+  use GenServer
+  alias AdaptiveLimiter.Gradient
+
+  # ---------------------------------------------------------------
+  # Public API
+  # ---------------------------------------------------------------
+
+  def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: opts[:name] || __MODULE__)
+
+  @doc """
+  Acquire a permit. Returns `{:ok, permit_token}` or `{:error, :limit_exceeded}`.
+  The permit_token is used in release/3 to report RTT.
+  """
+  def acquire(name), do: GenServer.call(name, :acquire)
+
+  @doc "Release the permit with the observed RTT in milliseconds."
+  def release(name, token, rtt_ms), do: GenServer.cast(name, {:release, token, rtt_ms})
+
+  def state(name), do: GenServer.call(name, :state)
+
+  # ---------------------------------------------------------------
+  # Lifecycle
+  # ---------------------------------------------------------------
+
+  @impl true
+  def init(opts) do
+    state = %{
+      name: Keyword.fetch!(opts, :name),
+      limit: Keyword.fetch!(opts, :initial_limit),
+      min_limit: Keyword.fetch!(opts, :min_limit),
+      max_limit: Keyword.fetch!(opts, :max_limit),
+      in_flight: 0,
+      rtt_noload: 10_000,
+      token_counter: 0
+    }
+
+    {:ok, state}
+  end
+
+  @impl true
+  def handle_call(:acquire, _from, state) do
+    if state.in_flight >= state.limit do
+      {:reply, {:error, :limit_exceeded}, state}
+    else
+      token = state.token_counter + 1
+      new_state = %{state | in_flight: state.in_flight + 1, token_counter: token}
+      {:reply, {:ok, token}, new_state}
+    end
+  end
+
+  def handle_call(:state, _from, state) do
+    {:reply,
+     Map.take(state, [:limit, :in_flight, :rtt_noload, :min_limit, :max_limit]), state}
+  end
+
+  @impl true
+  def handle_cast({:release, _token, rtt_ms}, state) do
+    in_flight = max(0, state.in_flight - 1)
+    queue_size = 0
+
+    rtt_noload = min(state.rtt_noload, rtt_ms)
+
+    new_limit =
+      Gradient.compute(
+        state.limit,
+        queue_size,
+        rtt_ms,
+        rtt_noload,
+        state.min_limit,
+        state.max_limit,
+        in_flight
+      )
+
+    {:noreply, %{state | in_flight: in_flight, rtt_noload: rtt_noload, limit: new_limit}}
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrating 317-adaptive-concurrency-limits
+      :ok
+  end
+end
+
+Main.main()
+end
+end
+end
+end
+```

@@ -53,6 +53,22 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. `proc_count` vs `proc_window`
 
 They answer two different questions:
@@ -529,21 +545,90 @@ on the fly.
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
 
-- [`:recon` API docs](https://ferd.github.io/recon/recon.html) — the canonical reference
-- [Erlang in Anger — Fred Hébert, chapter 7](https://www.erlang-in-anger.com/) — production diagnostics playbook
-- [`Process.info/2`](https://hexdocs.pm/elixir/Process.html#info/2) — the attribute list expanded
-- [Scott Lystig Fritchie — Troubleshooting the BEAM](https://youtu.be/wfSbINnIvw0) — talk covering proc_count in an incident walkthrough
-- [Bleacher Report engineering — Elixir memory debugging](https://medium.com/bleacher-report-labs) — real-world memory forensics with recon
-- [`:observer` vs `:recon`](https://dashbit.co/blog/observability-and-elixir) — when each tool helps
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+defmodule ReconInfoTop.TopTest do
+  use ExUnit.Case, async: false
+
+  alias ReconInfoTop.{Top, Watcher}
+
+  describe "count/2" do
+    test "returns at most N rows" do
+      rows = Top.count(:memory, 5)
+      assert length(rows) <= 5
+    end
+
+    test "each row has expected fields" do
+      [row | _] = Top.count(:memory, 3)
+      assert is_pid(row.pid)
+      assert is_integer(row.value) and row.value >= 0
+      assert Map.has_key?(row, :name)
+      assert Map.has_key?(row, :current_function)
+    end
+
+    test "results are sorted descending" do
+      rows = Top.count(:memory, 10)
+      values = Enum.map(rows, & &1.value)
+      assert values == Enum.sort(values, :desc)
+    end
+  end
+
+  describe "window/3" do
+    test "detects reduction growth in a busy process" do
+      busy =
+        spawn(fn ->
+          Stream.iterate(0, &(&1 + 1)) |> Stream.take(10_000_000) |> Stream.run()
+        end)
+
+      Process.sleep(50)
+
+      rows = Top.window(:reductions, 5, 500)
+      pids = Enum.map(rows, & &1.pid)
+
+      # The busy process should appear in the top 5 reduction-burners
+      assert busy in pids
+    after
+      :ok
+    end
+  end
+
+  describe "Watcher" do
+    test "streams frames at the requested interval" do
+      {:ok, pid} = Watcher.start(subscriber: self(), attribute: :memory, n: 3, interval_ms: 100)
+
+      assert_receive {:top, :memory, rows1}, 500
+      assert_receive {:top, :memory, rows2}, 500
+
+      assert length(rows1) <= 3
+      assert length(rows2) <= 3
+
+      :ok = Watcher.stop(pid)
+    end
+
+    test "stops when subscriber exits" do
+      subscriber = spawn(fn -> Process.sleep(:infinity) end)
+      {:ok, pid} = Watcher.start(subscriber: subscriber, attribute: :memory, interval_ms: 50)
+      ref = Process.monitor(pid)
+
+      Process.exit(subscriber, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 1_000
+    end
+  end
 end
+
+defmodule Main do
+  def main do
+      IO.puts("Benchmarking initialized")
+      {elapsed_us, result} = :timer.tc(fn ->
+        Enum.reduce(1..1000, 0, &+/2)
+      end)
+      if is_number(elapsed_us) do
+        IO.puts("✓ Benchmark completed: sum(1..1000) = " <> inspect(result) <> " in " <> inspect(elapsed_us) <> "µs")
+      end
+  end
+end
+
+Main.main()
 ```

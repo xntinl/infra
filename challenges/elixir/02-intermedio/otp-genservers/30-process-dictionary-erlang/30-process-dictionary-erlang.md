@@ -366,6 +366,67 @@ first approximation — everywhere you were about to reach for it.
 
 - Describí un caso real donde el process dictionary sigue siendo la herramienta correcta en 2026.
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule ProcessDictLab.Implicit do
+    @moduledoc """
+    Logger-metadata-style API. `set_context/1` attaches a request_id to
+    the current process; `log/1` reads it implicitly. This is the one
+    shape where the process dictionary is the least-bad option.
+    """
+
+    @key :__pd_lab_request_id__
+
+    @doc "Attach `request_id` to the current process. Survives until the process dies or you clear it."
+    @spec set_context(String.t()) :: :ok
+    def set_context(request_id) when is_binary(request_id) do
+      Process.put(@key, request_id)
+      :ok
+    end
+
+    @doc "Clears the current context."
+    @spec clear_context() :: :ok
+    def clear_context do
+      Process.delete(@key)
+      :ok
+    end
+
+    @doc """
+    Returns a log line with the current context prefixed. Notice that the
+    function signature does NOT mention request_id — it's an invisible input.
+    That is exactly the readability cost: convenient here, lethal in business logic.
+    """
+    @spec log(String.t()) :: String.t()
+    def log(message) when is_binary(message) do
+      case Process.get(@key) do
+        nil -> "[no-ctx] " <> message
+        id  -> "[req=#{id}] " <> message
+      end
+    end
+  end
+
+  def main do
+    ProcessDictLab.Implicit.set_context("req-123")
+    msg = ProcessDictLab.Implicit.log("User logged in")
+    IO.puts(msg)
+  
+    ProcessDictLab.Implicit.clear_context()
+    msg2 = ProcessDictLab.Implicit.log("After clear")
+    IO.puts(msg2)
+  
+    IO.puts("✓ ProcessDictLab demonstrated successfully")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Process.put/2` & `Process.get/1` — Elixir stdlib](https://hexdocs.pm/elixir/Process.html#put/2)

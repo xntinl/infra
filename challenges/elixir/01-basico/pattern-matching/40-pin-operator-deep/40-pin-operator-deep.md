@@ -269,6 +269,63 @@ mix test
 
 ---
 
+## Executable Example
+
+Create `lib/dispatcher.ex` and test in `iex`:
+
+```elixir
+defmodule Dispatcher do
+  def dispatch(%{type: expected_type, user_id: expected_user} = event, ^expected_type, ^expected_user) do
+    :match
+  end
+
+  def dispatch(_event, _type, _user) do
+    :skip
+  end
+
+  def dispatch_buggy(%{type: target_type, user_id: target_user} = event, target_type, target_user) do
+    :match
+  end
+
+  def dispatch_buggy(_event, _type, _user) do
+    :skip
+  end
+
+  def filter_by_type(events, pinned_type) do
+    Enum.filter(events, fn %{type: ^pinned_type} -> true
+                             _ -> false end)
+  end
+
+  def find_by_trace(events, trace_id) do
+    Enum.find(events, fn %{payload: %{trace_id: ^trace_id}} -> true
+                            _ -> false end)
+  end
+
+  def extract_user(%{user_id: user_id}), do: {:ok, user_id}
+  def extract_user(_), do: :error
+end
+
+# Test it
+event = %{type: :click, user_id: "u-1", payload: %{trace_id: "t-1"}}
+
+IO.inspect(Dispatcher.dispatch(event, :click, "u-1"))  # :match
+IO.inspect(Dispatcher.dispatch(event, :scroll, "u-1"))  # :skip (type differs)
+
+events = [
+  %{type: :click, user_id: "a", payload: %{}},
+  %{type: :scroll, user_id: "b", payload: %{}},
+  %{type: :click, user_id: "c", payload: %{}}
+]
+
+filtered = Dispatcher.filter_by_type(events, :click)
+IO.inspect(length(filtered))  # 2 (two :click events)
+
+{:ok, user} = Dispatcher.extract_user(event)
+IO.inspect(user)  # "u-1"
+```
+
+---
+
 ### Why this works
 
 The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.

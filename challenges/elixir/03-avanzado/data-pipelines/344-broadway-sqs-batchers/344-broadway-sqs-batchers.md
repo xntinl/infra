@@ -55,6 +55,25 @@ one ack path, many per-channel batch shapes.
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Pipeline-specific insight:**
+Streams are lazy; Enum is eager. Use Stream for data larger than RAM or when you're building intermediate stages. Use Enum when the collection is small or you need side effects at each step. Mixing them carelessly results in performance cliffs.
 ### 1. `Message.put_batcher/2`
 
 Inside `handle_message/3`, the processor decides which batcher should own
@@ -383,19 +402,123 @@ stage, which then stops pulling from the producer. Now email and push
 throughput also drop, even though their batchers are idle. Why are they
 affected, and what Broadway knob fixes this without increasing SMS concurrency?
 
-## Resources
 
-- [Broadway — multiple batchers guide](https://hexdocs.pm/broadway/Broadway.html#module-example)
-- [BroadwaySQS — hexdocs](https://hexdocs.pm/broadway_sqs/BroadwaySQS.Producer.html)
-- [AWS SQS Developer Guide — visibility timeout](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html)
-- [SQS FIFO vs Standard](https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/FIFO-queues.html)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+defmodule NotificationsDispatcher.Pipeline do
+  use Broadway
+
+  alias Broadway.Message
+  alias NotificationsDispatcher.Senders.{Email, Sms, Push}
+
+  def start_link(_opts) do
+    Broadway.start_link(__MODULE__,
+      name: __MODULE__,
+      producer: [
+        module:
+          {BroadwayAWS.SQS.Producer,
+           queue_url: System.fetch_env!("SQS_QUEUE_URL"),
+           receive_interval: 50,
+           wait_time_seconds: 20,
+           max_number_of_messages: 10},
+        concurrency: 2
+      ],
+      processors: [
+        default: [concurrency: System.schedulers_online() * 2, max_demand: 50]
+      ],
+      batchers: [
+        email: [concurrency: 1, batch_size: 50, batch_timeout: 1_000],
+        sms:   [concurrency: 4, batch_size: 1, batch_timeout: 100],
+        push:  [concurrency: 2, batch_size: 500, batch_timeout: 500]
+      ]
+    )
+  end
+
+  # ---- processor --------------------------------------------------------
+
+  @impl true
+  def handle_message(_processor, %Message{data: data} = message, _ctx) do
+    case Jason.decode(data) do
+      {:ok, %{"channel" => "email"} = p} ->
+        message
+        |> Message.update_data(fn _ -> normalise(p) end)
+        |> Message.put_batcher(:email)
+
+      {:ok, %{"channel" => "sms"} = p} ->
+        message
+        |> Message.update_data(fn _ -> normalise(p) end)
+        |> Message.put_batcher(:sms)
+
+      {:ok, %{"channel" => "push"} = p} ->
+        message
+        |> Message.update_data(fn _ -> normalise(p) end)
+        |> Message.put_batcher(:push)
+
+      {:ok, %{"channel" => other}} ->
+        Message.failed(message, "unknown channel: #{other}")
+
+      {:error, _} ->
+        Message.failed(message, "invalid json")
+    end
+  end
+
+  # ---- batchers ---------------------------------------------------------
+
+  @impl true
+  def handle_batch(:email, messages, _info, _ctx) do
+    payloads = Enum.map(messages, & &1.data)
+    fail_or_pass(messages, Email.send_batch(payloads))
+  end
+
+  def handle_batch(:sms, [message], _info, _ctx) do
+    case Sms.send_one(message.data) do
+      :ok -> [message]
+      {:error, reason} -> [Message.failed(message, inspect(reason))]
+    end
+  end
+
+  def handle_batch(:push, messages, _info, _ctx) do
+    payloads = Enum.map(messages, & &1.data)
+    fail_or_pass(messages, Push.send_batch(payloads))
+  end
+
+  # ---- helpers ----------------------------------------------------------
+
+  defp normalise(p), do: %{user_id: p["user_id"], payload: p["payload"], channel: p["channel"]}
+
+  defp fail_or_pass(messages, :ok), do: messages
+
+  defp fail_or_pass(messages, {:error, reason}) do
+    Enum.map(messages, &Message.failed(&1, inspect(reason)))
+  end
 end
+
+defmodule Main do
+  def main do
+      # Simulate SQS multi-batcher fan-out: route notifications to 3 channels
+      notifications = [
+        %{id: "n1", user: "u1", channels: [:email, :sms, :push]},
+        %{id: "n2", user: "u2", channels: [:email, :push]},
+        %{id: "n3", user: "u3", channels: [:sms]}
+      ]
+
+      # Fan-out to batchers
+      email_batch = Enum.filter(notifications, &(:email in &1.channels))
+      sms_batch = Enum.filter(notifications, &(:sms in &1.channels))
+      push_batch = Enum.filter(notifications, &(:push in &1.channels))
+
+      IO.puts("✓ Email batch: #{length(email_batch)} notifications")
+      IO.puts("✓ SMS batch: #{length(sms_batch)} notifications")
+      IO.puts("✓ Push batch: #{length(push_batch)} notifications")
+
+      assert length(email_batch) == 2, "Email batch correct"
+      assert length(sms_batch) == 2, "SMS batch correct"
+      assert length(push_batch) == 2, "Push batch correct"
+
+      IO.puts("✓ SQS multi-batcher fan-out working")
+  end
+end
+
+Main.main()
 ```

@@ -374,6 +374,76 @@ cheap (sums, merges, list-cons) and do heavy post-processing after
 
 - Si una de las tareas en el fan-out falla, ¿cancelás todas o juntás los resultados parciales? Justificá según el dominio.
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule FanoutAggregator do
+    @moduledoc """
+    Generic fan-out / fan-in helper: runs a function against a list of
+    sources concurrently, then reduces the results with a user-supplied
+    combiner. Partial failures are surfaced in the return value so the
+    caller can decide whether to treat them as fatal.
+    """
+
+    @type source :: term()
+    @type result :: term()
+
+    @type aggregate_response :: %{
+            value: term(),
+            ok: non_neg_integer(),
+            failed: non_neg_integer(),
+            failures: [{source(), term()}]
+          }
+
+    @doc """
+    Runs `fun` against every element of `sources` concurrently, then
+    folds successful results through `combiner` starting from `initial`.
+
+    Options:
+      * `:max_concurrency` — default `System.schedulers_online() * 2`.
+      * `:timeout` — per-task deadline in ms, default `5_000`.
+    """
+    @spec aggregate([source()], (source() -> result()), term(), (result(), term() -> term()), keyword()) ::
+            aggregate_response()
+    def aggregate(sources, fun, initial, combiner, opts \\ [])
+        when is_list(sources) and is_function(fun, 1) and is_function(combiner, 2) do
+      max_concurrency = Keyword.get(opts, :max_concurrency, System.schedulers_online() * 2)
+      timeout = Keyword.get(opts, :timeout, 5_000)
+
+      sources
+      |> Task.async_stream(fun,
+        max_concurrency: max_concurrency,
+        timeout: timeout,
+        on_timeout: :kill_task,
+        ordered: false
+      )
+      |> Enum.zip(sources)
+      |> Enum.reduce(%{value: initial, ok: 0, failed: 0, failures: []}, fn
+        {{:ok, value}, _source}, acc ->
+          %{acc | value: combiner.(value, acc.value), ok: acc.ok + 1}
+
+        {{:exit, reason}, source}, acc ->
+          %{acc | failed: acc.failed + 1, failures: [{source, reason} | acc.failures]}
+      end)
+    end
+  end
+
+  def main do
+    sources = [1, 2, 3, 4, 5]
+    result = FanoutAggregator.aggregate(sources, &(&1 * 10), 0, &Kernel.+/2)
+    IO.puts("Aggregated: #{result.value}, OK: #{result.ok}, Failed: #{result.failed}")
+    IO.puts("✓ FanoutAggregator works correctly")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Task.async_stream/3`](https://hexdocs.pm/elixir/Task.html#async_stream/3)

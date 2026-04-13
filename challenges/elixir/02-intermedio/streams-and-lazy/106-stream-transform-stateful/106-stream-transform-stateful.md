@@ -303,6 +303,88 @@ order. You can rely on total ordering downstream.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule TransformStateful do
+    @moduledoc """
+    Stateful stream transformations built on `Stream.transform/3`.
+    Each function keeps constant additional memory relative to the acc it
+    uses — `running_sum/1` is O(1); `dedup/1` is O(n_unique).
+    """
+
+    @doc """
+    Removes duplicates lazily. Equivalent to `Stream.uniq/1`, reimplemented
+    to show the mechanism: the acc is a `MapSet` of values seen so far.
+    """
+    @spec dedup(Enumerable.t()) :: Enumerable.t()
+    def dedup(stream) do
+      Stream.transform(stream, MapSet.new(), fn element, seen ->
+        if MapSet.member?(seen, element) do
+          {[], seen}
+        else
+          {[element], MapSet.put(seen, element)}
+        end
+      end)
+    end
+
+    @doc """
+    Running sum: emits the cumulative total at each step.
+
+      running_sum([1, 2, 3, 4]) => [1, 3, 6, 10]
+    """
+    @spec running_sum(Enumerable.t()) :: Enumerable.t()
+    def running_sum(stream) do
+      Stream.transform(stream, 0, fn x, total ->
+        new_total = total + x
+        {[new_total], new_total}
+      end)
+    end
+
+    @doc """
+    Takes elements from the stream while `pred.(element, acc)` is truthy,
+    threading an acc so the predicate can change behaviour based on past
+    inputs.
+
+    Example: take while the running sum is under a cap.
+    """
+    @spec take_while_running(Enumerable.t(), any(), (any(), any() -> {boolean(), any()})) ::
+            Enumerable.t()
+    def take_while_running(stream, initial_acc, fun) do
+      Stream.transform(stream, initial_acc, fn element, acc ->
+        case fun.(element, acc) do
+          {true, new_acc} -> {[element], new_acc}
+          {false, _} -> {:halt, acc}
+        end
+      end)
+    end
+
+    @doc """
+    Expands each element into N copies. Demonstrates the *one-to-many*
+    variant of `Stream.transform/3` — the events list has more than one
+    entry, but the stream stays lazy and is driven by downstream demand.
+    """
+    @spec replicate_each(Enumerable.t(), pos_integer()) :: Enumerable.t()
+    def replicate_each(stream, n) when is_integer(n) and n > 0 do
+      Stream.transform(stream, nil, fn element, _acc ->
+        {List.duplicate(element, n), nil}
+      end)
+    end
+  end
+
+  def main do
+    IO.puts("TransformStateful OK")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Stream.transform/3` — hexdocs](https://hexdocs.pm/elixir/Stream.html#transform/3)

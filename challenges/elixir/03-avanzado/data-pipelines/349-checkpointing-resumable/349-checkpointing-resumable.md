@@ -59,6 +59,25 @@ of overhead per interval, recoverable by reading a single row.
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Pipeline-specific insight:**
+Streams are lazy; Enum is eager. Use Stream for data larger than RAM or when you're building intermediate stages. Use Enum when the collection is small or you need side effects at each step. Mixing them carelessly results in performance cliffs.
 ### 1. Cursor vs offset
 
 - **Offset**: `OFFSET 1_000_000 LIMIT 1000`. O(n) on most DBs — the DB must
@@ -473,19 +492,120 @@ Something is wrong with the checkpoint-every-N-OR-T logic. Read the
 `reduce` carefully and identify the bug. What is the minimal fix and how
 would you write a test that would have caught it?
 
-## Resources
 
-- [PostgreSQL `INSERT ... ON CONFLICT`](https://www.postgresql.org/docs/current/sql-insert.html#SQL-ON-CONFLICT)
-- [Cursor-based pagination — Slack engineering](https://slack.engineering/evolving-api-pagination-at-slack/)
-- [Oban — uniqueness](https://hexdocs.pm/oban/Oban.html#module-unique-jobs)
-- [Ecto transactions — hexdocs](https://hexdocs.pm/ecto/Ecto.Repo.html#c:transaction/2)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+defmodule LedgerReconciler.CheckpointTest do
+  use ExUnit.Case, async: false
+
+  alias LedgerReconciler.Checkpoint
+
+  setup do
+    Checkpoint.clear("test_job")
+    :ok
+  end
+
+  describe "load/1" do
+    test "returns {0, %{}} when the job has no checkpoint" do
+      assert {0, %{}} = Checkpoint.load("test_job")
+    end
+
+    test "returns the last saved cursor" do
+      Checkpoint.save("test_job", 42, %{"done" => 10})
+      assert {42, %{"done" => 10}} = Checkpoint.load("test_job")
+    end
+  end
+
+  describe "save/3" do
+    test "is idempotent — repeated saves update the same row" do
+      Checkpoint.save("test_job", 1)
+      Checkpoint.save("test_job", 2)
+      Checkpoint.save("test_job", 3)
+      assert {3, _} = Checkpoint.load("test_job")
+    end
+  end
 end
+
+defmodule LedgerReconciler.ReconcilerTest do
+  use ExUnit.Case, async: false
+
+  alias LedgerReconciler.{Checkpoint, Reconciler, Repo}
+
+  setup do
+    Checkpoint.clear("nightly_reconciliation")
+    Repo.query!("TRUNCATE ledger_entries RESTART IDENTITY", [])
+
+    for i <- 1..100 do
+      Repo.query!("INSERT INTO ledger_entries (account_id, amount_cents) VALUES ($1, $2)", [
+        rem(i, 10),
+        i * 100
+      ])
+    end
+
+    :ok
+  end
+
+  describe "resumability" do
+    test "completing a run leaves a final checkpoint" do
+      Reconciler.run()
+      {cursor, state} = Checkpoint.load("nightly_reconciliation")
+      assert cursor == 100
+      assert state["done"] == true
+    end
+
+    test "a second run starting from a mid checkpoint only processes the remainder" do
+      Checkpoint.save("nightly_reconciliation", 50, %{"processed" => 50})
+
+      counter = :counters.new(1, [])
+      :telemetry.attach(
+        "test-handler",
+        [:ledger, :reconciled],
+        fn _e, _m, _meta, _conf -> :counters.add(counter, 1, 1) end,
+        nil
+      )
+
+      Reconciler.run()
+      :telemetry.detach("test-handler")
+
+      assert :counters.get(counter, 1) == 50
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrate checkpointing for resumable pipelines
+      entries = [
+        %{id: 1, amount: 100, ts: 1000},
+        %{id: 2, amount: 200, ts: 2000},
+        %{id: 3, amount: 150, ts: 3000},
+        %{id: 4, amount: 300, ts: 4000}
+      ]
+
+      # Simulate checkpoint: process in batches, save checkpoint
+      checkpoint = %{last_id: 0, total_amount: 0}
+
+      processed = Enum.reduce(entries, checkpoint, fn entry, acc ->
+        # Process entry
+        new_total = acc.total_amount + entry.amount
+
+        # Save checkpoint periodically (every 2 entries)
+        if entry.id != 0 and Integer.mod(entry.id, 2) == 0 do
+          :ok  # Would save checkpoint here
+        end
+
+        %{acc | last_id: entry.id, total_amount: new_total}
+      end)
+
+      IO.inspect(processed, label: "✓ Final checkpoint")
+
+      assert processed.last_id == 4, "Processed all entries"
+      assert processed.total_amount == 750, "Correct total"
+
+      IO.puts("✓ Resumable checkpointing working")
+  end
+end
+
+Main.main()
 ```

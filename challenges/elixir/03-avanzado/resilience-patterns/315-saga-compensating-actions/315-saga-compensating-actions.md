@@ -33,6 +33,22 @@ XA / 2PC requires a coordinator, prepared state, and all participants to hold lo
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Forward path
 ```
 [flight] → [hotel] → [car] → success
@@ -409,9 +425,79 @@ Resilience patterns (circuit breakers, timeouts, retries) are easy to implement 
 
 Hotel booking succeeded but the saga crashed before hotel_ref was written to the saga's state. When an operator tries to recover, how do they know the hotel is booked? What mechanism guarantees exactly-once compensation?
 
-## Resources
 
-- [Sagas — Hector Garcia-Molina & Kenneth Salem (1987)](https://www.cs.cornell.edu/andru/cs711/2002fa/reading/sagas.pdf) — the original paper
-- [Saga pattern — microservices.io](https://microservices.io/patterns/data/saga.html)
-- [Commanded — Elixir saga library](https://hexdocs.pm/commanded)
-- [Pattern: orchestration-based saga — Chris Richardson](https://microservices.io/patterns/data/saga.html)
+## Executable Example
+
+```elixir
+defmodule BookingSaga.SagaTest do
+  use ExUnit.Case, async: false
+  alias BookingSaga.TripSaga
+
+  setup do
+    Process.put(:flight_result, :ok)
+    Process.put(:hotel_result, :ok)
+    Process.put(:car_result, :ok)
+    Process.delete(:flight_cancelled)
+    Process.delete(:hotel_cancelled)
+    Process.delete(:car_cancelled)
+    :ok
+  end
+
+  describe "happy path" do
+    test "all three steps succeed" do
+      assert {:ok, state} = TripSaga.book_trip("u1")
+      assert Map.has_key?(state, :flight_ref)
+      assert Map.has_key?(state, :hotel_ref)
+      assert Map.has_key?(state, :car_ref)
+
+      refute Process.get(:flight_cancelled)
+      refute Process.get(:hotel_cancelled)
+      refute Process.get(:car_cancelled)
+    end
+  end
+
+  describe "compensation on failure" do
+    test "hotel fails → flight is cancelled, car is not attempted" do
+      Process.put(:hotel_result, {:error, :no_rooms})
+
+      assert {:error, {:hotel, :no_rooms}, state, log} = TripSaga.book_trip("u1")
+
+      assert Map.has_key?(state, :flight_ref)
+      refute Map.has_key?(state, :hotel_ref)
+      refute Map.has_key?(state, :car_ref)
+
+      assert {:flight, :ok} in log
+      assert Process.get(:flight_cancelled) == state.flight_ref
+    end
+
+    test "car fails → hotel and flight are cancelled in that order" do
+      Process.put(:car_result, {:error, :unavailable})
+
+      assert {:error, {:car, :unavailable}, state, log} = TripSaga.book_trip("u1")
+
+      # hotel compensated first, then flight
+      assert [{:hotel, :ok}, {:flight, :ok}] = log
+      assert Process.get(:hotel_cancelled) == state.hotel_ref
+      assert Process.get(:flight_cancelled) == state.flight_ref
+    end
+  end
+
+  describe "first-step failure" do
+    test "no compensations to run" do
+      Process.put(:flight_result, {:error, :sold_out})
+
+      assert {:error, {:flight, :sold_out}, _state, []} = TripSaga.book_trip("u1")
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+    IO.puts("✓ Saga Pattern with Compensating Actions")
+  - Saga pattern with compensating actions
+    - Distributed transaction handling
+  end
+end
+
+Main.main()
+```

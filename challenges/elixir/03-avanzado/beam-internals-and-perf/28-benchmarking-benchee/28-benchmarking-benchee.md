@@ -51,6 +51,22 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Why `:timer.tc/1` is not enough
 
 `:timer.tc(fn -> do_work() end)` runs the function once and measures
@@ -549,22 +565,56 @@ Take-aways:
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
 
-- [Benchee README](https://github.com/bencheeorg/benchee) — Tobi Pfeiffer
-- ["Elixir benchmarking — a survey" — Tobi Pfeiffer](https://pragtob.wordpress.com/2016/12/20/elixir-benchmarking-a-first-look-at-benchee/)
-- [`Benchee.Formatters.HTML`](https://github.com/bencheeorg/benchee_html)
-- [Erlang JIT — Lukas Larsson](https://www.erlang.org/blog/a-first-look-at-the-jit/) — OTP 24 release post
-- ["Benchmarking correctly is hard" — Aleksandar Prokopec](https://aleksandar-prokopec.com/resources/docs/lcpc-beyond-benchmarking.pdf)
-- [`mix profile.fprof`](https://hexdocs.pm/mix/Mix.Tasks.Profile.Fprof.html) — complement Benchee with flamegraphs
-- [eprof for function-level profiling](https://www.erlang.org/doc/man/eprof.html)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+defmodule BencheeDeep.Runner do
+  @moduledoc """
+  Programmatic wrapper around Benchee that enforces a house style:
+  warmup 2s, measurement 5s, memory+reductions always on, HTML output.
+  """
+
+  @type scenario :: (term() -> term())
+
+  @spec run(%{String.t() => scenario()}, keyword()) :: map()
+  def run(scenarios, opts \\ []) do
+    inputs = Keyword.get(opts, :inputs, nil)
+    parallel = Keyword.get(opts, :parallel, 1)
+    time = Keyword.get(opts, :time, 5)
+    warmup = Keyword.get(opts, :warmup, 2)
+    title = Keyword.get(opts, :title, "benchmark")
+
+    Benchee.run(
+      scenarios,
+      warmup: warmup,
+      time: time,
+      memory_time: 2,
+      reduction_time: 2,
+      parallel: parallel,
+      inputs: inputs,
+      formatters: [
+        Benchee.Formatters.Console,
+        {Benchee.Formatters.HTML, file: "bench/output/#{safe(title)}.html", auto_open: false}
+      ],
+      title: title
+    )
+  end
+
+  defp safe(str), do: str |> String.downcase() |> String.replace(~r/[^a-z0-9]+/, "_")
 end
+
+defmodule Main do
+  def main do
+      IO.puts("Benchmarking initialized")
+      {elapsed_us, result} = :timer.tc(fn ->
+        Enum.reduce(1..1000, 0, &+/2)
+      end)
+      if is_number(elapsed_us) do
+        IO.puts("✓ Benchmark completed: sum(1..1000) = " <> inspect(result) <> " in " <> inspect(elapsed_us) <> "µs")
+      end
+  end
+end
+
+Main.main()
 ```

@@ -390,6 +390,143 @@ passed). Those are code, not values — `unquote` is the right tool.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule BindQuotedDemo do
+    @moduledoc """
+    Side-by-side patterns showing where `bind_quoted` is the right choice
+    and where `unquote` remains necessary.
+    """
+
+    @doc """
+    Use case 1 — shared sub-expression.
+
+    `expr` is a runtime expression we want to log twice. With
+    `bind_quoted`, the expression is evaluated once and bound to `value`,
+    which is then referenced in both log lines.
+    """
+    defmacro log_twice(expr) do
+      quote bind_quoted: [value: expr] do
+        IO.puts("[1] " <> inspect(value))
+        IO.puts("[2] " <> inspect(value))
+        value
+      end
+    end
+
+    @doc """
+    Use case 2 — compile-time loop over a list, generating function heads.
+
+    Each element `code` becomes a `def reason_for(code), do: "..."` pattern
+    clause. Note: `unquote(code)` appears in the pattern position inside
+    `def` — `bind_quoted` is not used for pattern positions, only for body
+    values. Here we don't need `bind_quoted` at all — but we *do* need
+    `Macro.escape` when the value is a complex term.
+    """
+    defmacro defcodes(pairs) do
+      for {code, message} <- pairs do
+        quote do
+          def reason_for(unquote(code)), do: unquote(message)
+        end
+      end
+    end
+
+    @doc """
+    Use case 3 — `bind_quoted` for body values inside a compile-time loop.
+
+    `for {name, value} <- pairs, do: quote bind_quoted: [n: name, v: value] do ... end`
+    generates one block per iteration, with `n` and `v` bound hygienically
+    in the body. This is the common Phoenix/Ecto pattern when a macro
+    iterates over schema fields.
+    """
+    defmacro defkv(pairs) do
+      for {name, value} <- pairs do
+        quote bind_quoted: [n: name, v: value] do
+          # Each `n` here is a compile-time-known atom; `v` is the value.
+          # We emit a getter per pair.
+          def unquote(n)(), do: unquote(v)
+        end
+      end
+    end
+  end
+
+  defmodule BindQuotedDemo.Codes do
+    @moduledoc "Generated error-code lookup."
+    require BindQuotedDemo
+
+    BindQuotedDemo.defcodes(
+      e404: "not found",
+      e500: "server error",
+      e429: "rate limited"
+    )
+
+    def reason_for(_), do: "unknown"
+  end
+
+  defmodule BindQuotedDemo.Config do
+    @moduledoc "Generated getters."
+    require BindQuotedDemo
+
+    BindQuotedDemo.defkv(
+      version: "1.0.0",
+      service: :auth,
+      max_retries: 3
+    )
+  end
+
+  def main do
+    require BindQuotedDemo
+    import ExUnit.CaptureIO
+  
+    IO.puts("=== BindQuotedDemo ===\n")
+  
+    # Demo 1: log_twice with side-effect (should fire once)
+    IO.puts("1. log_twice/1 (bind_quoted evaluates once):")
+    {:ok, agent} = Agent.start_link(fn -> 0 end)
+    counter_fn = fn ->
+      Agent.update(agent, &(&1 + 1))
+      42
+    end
+  
+    output = capture_io(fn ->
+      result = BindQuotedDemo.log_twice(counter_fn.())
+      IO.puts("   Result: #{result}")
+    end)
+    IO.write(output)
+    calls = Agent.get(agent, & &1)
+    IO.puts("   Side-effects: #{calls} (expected 1)")
+    assert calls == 1
+  
+    # Demo 2: Generated error code lookup
+    IO.puts("\n2. defcodes/1 - Generated function heads:")
+    IO.puts("   reason_for(:e404) = '#{BindQuotedDemo.Codes.reason_for(:e404)}'")
+    assert BindQuotedDemo.Codes.reason_for(:e404) == "not found"
+    IO.puts("   reason_for(:e500) = '#{BindQuotedDemo.Codes.reason_for(:e500)}'")
+    assert BindQuotedDemo.Codes.reason_for(:e500) == "server error"
+    IO.puts("   reason_for(:unknown) = '#{BindQuotedDemo.Codes.reason_for(:unknown)}'")
+    assert BindQuotedDemo.Codes.reason_for(:unknown) == "unknown"
+  
+    # Demo 3: Generated key-value getters
+    IO.puts("\n3. defkv/1 - Generated getters:")
+    IO.puts("   version() = '#{BindQuotedDemo.Config.version()}'")
+    assert BindQuotedDemo.Config.version() == "1.0.0"
+    IO.puts("   service() = #{inspect(BindQuotedDemo.Config.service())}")
+    assert BindQuotedDemo.Config.service() == :auth
+    IO.puts("   max_retries() = #{BindQuotedDemo.Config.max_retries()}")
+    assert BindQuotedDemo.Config.max_retries() == 3
+  
+    IO.puts("\n✓ All BindQuotedDemo demos passed!")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Kernel.SpecialForms.quote/2` — `:bind_quoted` option](https://hexdocs.pm/elixir/Kernel.SpecialForms.html#quote/2-binding-and-unquote-fragments)

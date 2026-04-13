@@ -48,6 +48,22 @@ An external DB is another service to run, monitor, and reach over the network. M
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Lock types
 
 Mnesia offers four lock levels on records. Picking the wrong one is the
@@ -664,11 +680,61 @@ or move to `mnesia_frag`.
 
 ---
 
-## Resources
+## Executable Example
 
-- [Mnesia transactions — erlang.org](https://www.erlang.org/doc/apps/mnesia/mnesia_chap4.html)
-- [`:mnesia.sync_transaction/1` docs](https://www.erlang.org/doc/man/mnesia.html#sync_transaction-1)
-- [Saša Jurić — Elixir in Action, 2nd ed, ch. "Complex processes"](https://pragprog.com/titles/sjelixir2/elixir-in-action-second-edition/) — transaction patterns
-- [Ferd — Troubleshooting Mnesia deadlocks](https://ferd.ca/) — general distributed systems insight
-- [OTP source: mnesia_tm.erl](https://github.com/erlang/otp/blob/master/lib/mnesia/src/mnesia_tm.erl) — the transaction manager
-- [Designing for Scalability with Erlang/OTP — Cesarini & Vinoski, ch. 15](https://www.oreilly.com/library/view/designing-for-scalability/9781449361556/) — Mnesia in production
+```elixir
+defmodule MnesiaDiscTx.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :mnesia_disc_tx, version: "0.1.0", elixir: "~> 1.16", deps: deps()]
+  end
+
+  def application do
+    [extra_applications: [:logger, :mnesia], mod: {MnesiaDiscTx.Application, []}]
+  end
+
+  defp deps do
+    [{:benchee, "~> 1.3", only: :dev}]
+  end
+end
+
+
+
+If you use `:read` here, you have a TOCTOU bug. Mnesia will not warn you —
+both transactions commit successfully with corrupt balances.
+
+### 3. Deadlocks and the restart mechanism
+
+Two transactions acquire locks in opposite order:
+
+
+
+Mnesia detects this, aborts one transaction with `{:aborted, {:cyclic, ...}}`,
+and **automatically retries the function**. Your transaction body can therefore
+execute multiple times — it must be idempotent. Never perform side effects
+(HTTP calls, file writes, sending messages to non-transactional processes)
+inside a `:mnesia.transaction/1`.
+
+### 4. `transaction/1` vs `sync_transaction/1`
+
+
+
+For financial transfers `sync_transaction/1` is the correct default.
+
+### 5. Transaction log compaction
+
+`disc_copies` appends every committed transaction to `LATEST.LOG`. Mnesia
+periodically dumps the log into the table file and truncates it, but this
+only happens on clean shutdown by default. In long-running production
+systems you need to trigger compaction explicitly:
+
+defmodule Main do
+  def main do
+      # Demonstrating 122-mnesia-disc-transactions
+      :ok
+  end
+end
+
+Main.main()
+```

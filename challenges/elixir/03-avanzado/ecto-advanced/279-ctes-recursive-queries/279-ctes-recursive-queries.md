@@ -68,6 +68,25 @@ is the lightest.
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Ecto-specific insight:**
+Ecto separates the query layer (building queries) from the execution layer (sending them). This separation allows for debugging, composability, and testing without a database. Never load all rows first and filter in-memory — write the filter into the query itself, or you've just built an N+1 problem.
 ### 1. `WITH RECURSIVE` structure
 
 ```sql
@@ -507,19 +526,99 @@ VP Sales org — how many rows change?
 
 ---
 
-## Resources
 
-- [Postgres — WITH queries (CTEs)](https://www.postgresql.org/docs/current/queries-with.html)
-- [`Ecto.Query.recursive_ctes/2`](https://hexdocs.pm/ecto/Ecto.Query.html#recursive_ctes/2)
-- [`Ecto.Query.with_cte/3`](https://hexdocs.pm/ecto/Ecto.Query.html#with_cte/3)
-- [Joe Celko — "Trees and Hierarchies in SQL for Smarties"](https://www.elsevier.com/books/joe-celkos-trees-and-hierarchies-in-sql-for-smarties/celko/978-0-12-387733-8)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+# test/org_chart/org_test.exs
+defmodule OrgChart.OrgTest do
+  use ExUnit.Case, async: false
+  alias OrgChart.{Org, Repo}
+  alias OrgChart.Schemas.Employee
+
+  setup do
+    Ecto.Adapters.SQL.Sandbox.checkout(Repo)
+    Ecto.Adapters.SQL.Sandbox.mode(Repo, {:shared, self()})
+    Repo.delete_all(Employee)
+    :ok
+  end
+
+  defp seed_tree do
+    {:ok, ceo} = Repo.insert(%Employee{name: "CEO"})
+    {:ok, vp1} = Repo.insert(%Employee{name: "VP Eng", manager_id: ceo.id})
+    {:ok, vp2} = Repo.insert(%Employee{name: "VP Sales", manager_id: ceo.id})
+    {:ok, dir} = Repo.insert(%Employee{name: "Director", manager_id: vp1.id})
+    {:ok, eng} = Repo.insert(%Employee{name: "Engineer", manager_id: dir.id})
+    {ceo, vp1, vp2, dir, eng}
+  end
+
+  describe "ancestry/1" do
+    test "returns chain from leaf to root" do
+      {ceo, vp1, _, dir, eng} = seed_tree()
+
+      chain = Org.ancestry(eng.id)
+      ids = Enum.map(chain, & &1.id)
+
+      assert ids == [eng.id, dir.id, vp1.id, ceo.id]
+    end
+
+    test "returns only the employee when they have no manager" do
+      {:ok, orphan} = Repo.insert(%Employee{name: "Lone"})
+      assert [only] = Org.ancestry(orphan.id)
+      assert only.id == orphan.id
+    end
+  end
+
+  describe "descendants/1" do
+    test "returns all transitive reports" do
+      {ceo, vp1, vp2, dir, eng} = seed_tree()
+
+      reports = Org.descendants(ceo.id)
+      ids = Enum.map(reports, & &1.id) |> Enum.sort()
+
+      assert ids == Enum.sort([vp1.id, vp2.id, dir.id, eng.id])
+    end
+
+    test "direct report depth is 1, grandchild is 2" do
+      {ceo, vp1, _, dir, _} = seed_tree()
+      reports = Org.descendants(ceo.id)
+      assert Enum.find(reports, &(&1.id == vp1.id)).depth == 1
+      assert Enum.find(reports, &(&1.id == dir.id)).depth == 2
+    end
+  end
+
+  describe "subordinate?/2" do
+    test "detects deep subordinate" do
+      {ceo, _, _, _, eng} = seed_tree()
+      assert Org.subordinate?(ceo.id, eng.id)
+    end
+
+    test "returns false for unrelated pair" do
+      {_, _, vp2, _, eng} = seed_tree()
+      refute Org.subordinate?(vp2.id, eng.id)
+    end
+  end
+
+  describe "cycle protection" do
+    test "depth guard terminates on a cyclic graph" do
+      # Build an artificial cycle A ↔ B
+      {:ok, a} = Repo.insert(%Employee{name: "A"})
+      {:ok, b} = Repo.insert(%Employee{name: "B", manager_id: a.id})
+      Ecto.Adapters.SQL.query!(Repo, "UPDATE employees SET manager_id = $1 WHERE id = $2", [b.id, a.id])
+
+      # Should not infinite-loop; depth guard caps iterations.
+      assert length(Org.ancestry(a.id)) <= 101
+    end
+  end
 end
+
+defmodule Main do
+  def main do
+    IO.puts("✓ CTEs and Recursive Queries")
+  - Common Table Expressions (CTEs)
+    - Recursive query patterns
+  end
+end
+
+Main.main()
 ```

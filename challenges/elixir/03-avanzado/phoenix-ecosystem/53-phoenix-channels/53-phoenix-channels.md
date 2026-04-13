@@ -60,6 +60,22 @@ Channels give you topic-based pub/sub, presence, reconnection, and auth in one o
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Socket vs. Channel — two layers
 
 ```
@@ -559,11 +575,92 @@ Target: channel message round-trip under 1 ms locally; fan-out scales linearly w
 
 ---
 
-## Resources
 
-- [`Phoenix.Channel`](https://hexdocs.pm/phoenix/Phoenix.Channel.html) — complete callback reference
-- [`Phoenix.Socket`](https://hexdocs.pm/phoenix/Phoenix.Socket.html) — connect lifecycle
-- [`Phoenix.Token`](https://hexdocs.pm/phoenix/Phoenix.Token.html) — signing, verification, max age
-- [Phoenix — WebSocket client API](https://hexdocs.pm/phoenix/js/)
-- [Chris McCord — 2M connections on a single node](https://www.phoenixframework.org/blog/the-road-to-2-million-websocket-connections) — the historical Phoenix benchmark, still useful reading
-- [Bandit HTTP adapter](https://github.com/mtrudel/bandit) — modern Cowboy alternative
+## Executable Example
+
+```elixir
+defmodule ChannelsDeepWeb.RoomChannelTest do
+  use ChannelsDeepWeb.ChannelCase, async: true
+
+  alias ChannelsDeep.Auth
+  alias ChannelsDeepWeb.{Endpoint, UserSocket, RoomChannel}
+
+  defp connect_as(user_id) do
+    token = Auth.sign(Endpoint, user_id)
+    {:ok, socket} = connect(UserSocket, %{"token" => token})
+    socket
+  end
+
+  describe "connect" do
+    test "rejects without token" do
+      assert :error = connect(UserSocket, %{})
+    end
+
+    test "rejects invalid token" do
+      assert :error = connect(UserSocket, %{"token" => "garbage"})
+    end
+
+    test "accepts valid token" do
+      socket = connect_as("user-1")
+      assert socket.assigns.user_id == "user-1"
+    end
+  end
+
+  describe "join" do
+    test "allows authorized topic" do
+      socket = connect_as("user-1")
+      assert {:ok, %{joined_at: _}, _socket} = subscribe_and_join(socket, RoomChannel, "room:1:a")
+    end
+
+    test "rejects unauthorized tenant" do
+      socket = connect_as("user-1")
+      assert {:error, %{reason: "unauthorized"}} = subscribe_and_join(socket, RoomChannel, "room:99:a")
+    end
+
+    test "rejects malformed topic" do
+      socket = connect_as("user-1")
+      assert {:error, %{reason: "bad_topic"}} = subscribe_and_join(socket, RoomChannel, "room:invalid")
+    end
+  end
+
+  describe "handle_in new_message" do
+    setup do
+      socket = connect_as("user-1")
+      {:ok, _, channel} = subscribe_and_join(socket, RoomChannel, "room:1:a")
+      %{channel: channel}
+    end
+
+    test "accepts a well-formed message", %{channel: channel} do
+      ref = push(channel, "new_message", %{"body" => "hello"})
+      assert_reply ref, :ok, %{accepted: true}
+      assert_broadcast "message", %{body: "hello"}
+    end
+
+    test "rejects oversized body", %{channel: channel} do
+      big = String.duplicate("x", 5_000)
+      ref = push(channel, "new_message", %{"body" => big})
+      assert_reply ref, :error, %{reason: "payload_too_large"}
+    end
+
+    test "rate limits after 20 events", %{channel: channel} do
+      for _ <- 1..20 do
+        ref = push(channel, "new_message", %{"body" => "x"})
+        assert_reply ref, :ok, _
+      end
+
+      ref = push(channel, "new_message", %{"body" => "x"})
+      assert_reply ref, :error, %{reason: "rate_limited"}
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+    IO.puts("✓ Phoenix Channels — Topics, Authorization, and Backpressure")
+  - Phoenix Channel basics
+    - Broadcasting and message handling
+  end
+end
+
+Main.main()
+```

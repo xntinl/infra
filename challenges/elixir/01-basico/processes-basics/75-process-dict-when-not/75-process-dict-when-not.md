@@ -291,7 +291,50 @@ mix test
 
 ---
 
+## Executable Example
 
+Create `lib/request_context.ex` and test in `iex`:
+
+```elixir
+defmodule RequestContext do
+  def set_request_id(id) do
+    Process.put(:request_id, id)
+  end
+
+  def get_request_id do
+    Process.get(:request_id, "no-id")
+  end
+
+  def with_context(id, func) do
+    old_id = Process.get(:request_id)
+    Process.put(:request_id, id)
+    try do
+      func.()
+    after
+      if old_id, do: Process.put(:request_id, old_id), else: Process.delete(:request_id)
+    end
+  end
+
+  def log_with_context(msg) do
+    id = get_request_id()
+    IO.puts("[#{id}] #{msg}")
+  end
+end
+
+# Test it
+RequestContext.set_request_id("req-123")
+IO.puts(RequestContext.get_request_id())  # "req-123"
+
+RequestContext.log_with_context("Processing")  # [req-123] Processing
+
+RequestContext.with_context("req-456", fn ->
+  RequestContext.log_with_context("In context")  # [req-456] In context
+end)
+
+RequestContext.log_with_context("Back")  # [req-123] Back
+```
+
+---
 ## Key Concepts
 
 ### 1. Process Dictionary: Process-Local Storage

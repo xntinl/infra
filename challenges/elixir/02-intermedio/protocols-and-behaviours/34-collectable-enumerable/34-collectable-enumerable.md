@@ -350,6 +350,138 @@ explicit traversal functions (`walk_bfs/1`, `walk_dfs/1`) instead.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Bag do
+  @moduledoc """
+  A multiset: each element is stored with a positive integer count. Order is
+  not preserved. Iteration yields one copy of each element per count.
+
+  Implements `Enumerable` and `Collectable`, so all `Enum` functions work.
+  """
+
+  defstruct counts: %{}
+
+  @type t :: %__MODULE__{counts: %{optional(term()) => pos_integer()}}
+
+  @doc "An empty bag."
+  @spec new() :: t
+  def new, do: %__MODULE__{}
+
+  @doc "Add `element` to the bag (increments its count by 1)."
+  @spec put(t, term()) :: t
+  def put(%__MODULE__{counts: counts} = bag, element) do
+    %{bag | counts: Map.update(counts, element, 1, &(&1 + 1))}
+  end
+
+  @doc "Total number of elements (counting duplicates)."
+  @spec size(t) :: non_neg_integer()
+  def size(%__MODULE__{counts: counts}) do
+    counts |> Map.values() |> Enum.sum()
+  end
+end
+
+defimpl Enumerable, for: Bag do
+  # ── count/member?/slice — cheap metadata hooks ──────────────────────────
+  def count(%Bag{} = bag), do: {:ok, Bag.size(bag)}
+
+  def member?(%Bag{counts: counts}, element) do
+    {:ok, Map.has_key?(counts, element)}
+  end
+
+  # Opt out: Bag has no meaningful random-access slice.
+  def slice(_bag), do: {:error, __MODULE__}
+
+  # ── reduce/3 — the iteration engine ─────────────────────────────────────
+  #
+  # We materialize the bag as a list of elements (duplicated by count) and
+  # reuse the standard list reduction. For a real collection with millions
+  # of entries you would stream counts without allocating a list.
+  def reduce(%Bag{counts: counts}, acc, fun) do
+    counts
+    |> Enum.flat_map(fn {element, n} -> List.duplicate(element, n) end)
+    |> do_reduce(acc, fun)
+  end
+
+  # Canonical reduce loop — honor :cont, :halt, and :suspend exactly.
+  defp do_reduce(_list, {:halt, acc}, _fun), do: {:halted, acc}
+
+  defp do_reduce(list, {:suspend, acc}, fun) do
+    # Suspend: return a continuation the caller can resume later.
+    {:suspended, acc, &do_reduce(list, &1, fun)}
+  end
+
+  defp do_reduce([], {:cont, acc}, _fun), do: {:done, acc}
+
+  defp do_reduce([head | tail], {:cont, acc}, fun) do
+    do_reduce(tail, fun.(head, acc), fun)
+  end
+end
+
+defimpl Collectable, for: Bag do
+  def into(%Bag{} = bag) do
+    collector = fn
+      acc, {:cont, element} -> Bag.put(acc, element)
+      acc, :done -> acc
+      _acc, :halt -> :ok
+    end
+
+    {bag, collector}
+  end
+end
+
+# Demonstrate Enumerable and Collectable protocols
+IO.puts("=== Enumerable & Collectable Demo ===")
+
+# Build a bag by putting elements
+bag = Bag.new() |> Bag.put(:a) |> Bag.put(:a) |> Bag.put(:b) |> Bag.put(:c)
+
+# Test Enumerable
+assert Enum.count(bag) == 4
+assert Enum.member?(bag, :a)
+assert Enum.member?(bag, :d) == false
+
+IO.puts("Enumerable.count: #{Enum.count(bag)}")
+
+# Test Enum.to_list
+list = Enum.to_list(bag) |> Enum.sort()
+assert list == [:a, :a, :b, :c]
+IO.puts("Enum.to_list: #{inspect(list)}")
+
+# Test Enum.map
+mapped = bag |> Enum.map(&to_string/1) |> Enum.sort()
+IO.puts("Enum.map over bag: #{inspect(mapped)}")
+
+# Test Enum.take (tests :halt)
+taken = Enum.take(bag, 2)
+assert length(taken) == 2
+IO.puts("Enum.take(bag, 2): took #{length(taken)} elements")
+
+# Test Collectable via Enum.into
+new_bag = Enum.into([:x, :y, :y, :z], Bag.new())
+assert Enum.count(new_bag) == 4
+assert Enum.member?(new_bag, :y)
+IO.puts("Enum.into created bag: counts = #{Enum.count(new_bag)}")
+
+# Test for...into syntax
+for_bag = for i <- 1..3, into: Bag.new(), do: rem(i, 2)
+IO.puts("for...into created bag: #{Enum.count(for_bag)} elements")
+
+# Test accumulation
+start = Bag.new() |> Bag.put(:a)
+accumulated = Enum.into([:a, :b], start)
+assert Enum.count(accumulated) == 3
+assert Enum.member?(accumulated, :a)
+assert Enum.member?(accumulated, :b)
+
+IO.puts("Enum.into on non-empty bag accumulated correctly")
+IO.puts("All Enumerable & Collectable assertions passed!")
+```
+
+
 ## Resources
 
 - [`Enumerable` — Elixir stdlib](https://hexdocs.pm/elixir/Enumerable.html)

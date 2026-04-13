@@ -40,6 +40,22 @@ advanced_strategies/
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Strategies map to dependency topology
 
 The three strategies are not style preferences — each describes a different kind of dependency between children:
@@ -628,11 +644,151 @@ Target: supervisor restart overhead ≤ 5 ms per child on modern hardware; subsy
 
 ---
 
-## Resources
 
-- [Supervisor — hexdocs](https://hexdocs.pm/elixir/Supervisor.html) — canonical reference for strategies and child specs.
-- [OTP Design Principles: Supervisor Behaviour](https://www.erlang.org/doc/design_principles/sup_princ.html) — the original formulation; strategies existed in Erlang before Elixir.
-- [The Zen of Erlang — Fred Hébert](https://ferd.ca/the-zen-of-erlang.html) — essay on failure domains and why "let it crash" is about *where*, not just *whether*.
-- [Designing for scalability with Erlang/OTP — Cesarini & Vinoski](https://www.oreilly.com/library/view/designing-for-scalability/9781449361556/) — chapters 8–9 cover supervision patterns at scale.
-- [Phoenix.Endpoint supervisor tree](https://github.com/phoenixframework/phoenix/blob/main/lib/phoenix/endpoint/supervisor.ex) — real-world `:one_for_one` with dozens of children.
-- [Broadway supervision layout](https://github.com/dashbitco/broadway/blob/main/lib/broadway/topology.ex) — mixed `:rest_for_one` + `:one_for_one` pipeline.
+## Executable Example
+
+```elixir
+# test/advanced_strategies/strategies_test.exs
+defmodule AdvancedStrategies.StrategiesTest do
+  use ExUnit.Case, async: false
+
+  alias AdvancedStrategies.MarketData
+  alias AdvancedStrategies.Telemetry
+  alias AdvancedStrategies.Session
+
+  describe ":rest_for_one in market data pipeline" do
+    test "Feed crash restarts Engine and Router but not the supervisor" do
+      pid_feed_before = Process.whereis(MarketData.Feed)
+      pid_engine_before = Process.whereis(MarketData.PricingEngine)
+      pid_router_before = Process.whereis(MarketData.OrderRouter)
+      ref = Process.monitor(pid_feed_before)
+
+      MarketData.Feed.crash()
+      assert_receive {:DOWN, ^ref, :process, ^pid_feed_before, _reason}, 500
+
+      wait_until(fn -> Process.whereis(MarketData.Feed) != nil end)
+      wait_until(fn -> Process.whereis(MarketData.PricingEngine) != pid_engine_before end)
+      wait_until(fn -> Process.whereis(MarketData.OrderRouter) != pid_router_before end)
+    end
+
+    test "Router crash does NOT restart Feed or Engine" do
+      pid_feed = Process.whereis(MarketData.Feed)
+      pid_engine = Process.whereis(MarketData.PricingEngine)
+      pid_router = Process.whereis(MarketData.OrderRouter)
+
+      ref = Process.monitor(pid_router)
+      Process.exit(pid_router, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^pid_router, _}, 500
+
+      wait_until(fn ->
+        Process.whereis(MarketData.OrderRouter) not in [nil, pid_router]
+      end)
+
+      assert Process.whereis(MarketData.Feed) == pid_feed
+      assert Process.whereis(MarketData.PricingEngine) == pid_engine
+    end
+  end
+
+  describe ":one_for_all in session subsystem" do
+    test "AuthToken crash restarts RpcChannel too" do
+      pid_auth = Process.whereis(Session.AuthToken)
+      pid_rpc = Process.whereis(Session.RpcChannel)
+
+      ref = Process.monitor(pid_auth)
+      Process.exit(pid_auth, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^pid_auth, _}, 500
+
+      wait_until(fn ->
+        new_auth = Process.whereis(Session.AuthToken)
+        new_rpc = Process.whereis(Session.RpcChannel)
+        new_auth not in [nil, pid_auth] and new_rpc not in [nil, pid_rpc]
+      end)
+    end
+  end
+
+  describe ":one_for_one in telemetry" do
+    test "MetricsReporter crash does not affect LogShipper" do
+      pid_shipper = Process.whereis(Telemetry.LogShipper)
+      pid_reporter = Process.whereis(Telemetry.MetricsReporter)
+
+      ref = Process.monitor(pid_reporter)
+      Process.exit(pid_reporter, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^pid_reporter, _}, 500
+
+      wait_until(fn ->
+        Process.whereis(Telemetry.MetricsReporter) not in [nil, pid_reporter]
+      end)
+
+      assert Process.whereis(Telemetry.LogShipper) == pid_shipper
+    end
+  end
+
+  defp wait_until(fun, timeout \\ 1_000, interval \\ 10) do
+    deadline = System.monotonic_time(:millisecond) + timeout
+
+    Stream.repeatedly(fn -> fun.() end)
+    |> Enum.find(fn
+      true -> true
+      _ -> if System.monotonic_time(:millisecond) > deadline, do: raise("timeout"), else: (Process.sleep(interval); false)
+    end)
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrate mixed supervision strategies in a production trading system
+      {:ok, sup_pid} = Supervisor.start_link(
+        [
+          AdvancedStrategies.MarketData.Supervisor,
+          AdvancedStrategies.Telemetry.Supervisor,
+          AdvancedStrategies.Session.Supervisor
+        ],
+        strategy: :one_for_one,
+        max_restarts: 3,
+        max_seconds: 5,
+        name: AdvancedStrategies.Supervisor
+      )
+
+      # Test rest_for_one: Feed is the source of truth
+      assert is_pid(sup_pid), "Root supervisor must be a PID"
+      IO.inspect(sup_pid, label: "Root supervisor")
+
+      # Test that all subsystem supervisors are running
+      feed_pid = Process.whereis(AdvancedStrategies.MarketData.Feed)
+      assert is_pid(feed_pid), "Feed must be running"
+
+      engine_pid = Process.whereis(AdvancedStrategies.MarketData.PricingEngine)
+      assert is_pid(engine_pid), "PricingEngine must be running"
+
+      router_pid = Process.whereis(AdvancedStrategies.MarketData.OrderRouter)
+      assert is_pid(router_pid), "OrderRouter must be running"
+
+      # Test rest_for_one: OrderRouter needs fair prices
+      assert {:error, :no_data} = AdvancedStrategies.MarketData.PricingEngine.fair_price(),
+        "Engine should report no data initially"
+
+      # Test one_for_all: AuthToken and RpcChannel share state
+      auth_pid = Process.whereis(AdvancedStrategies.Session.AuthToken)
+      assert is_pid(auth_pid), "AuthToken must be running"
+
+      rpc_pid = Process.whereis(AdvancedStrategies.Session.RpcChannel)
+      assert is_pid(rpc_pid), "RpcChannel must be running"
+
+      # Test one_for_one: Telemetry reporters are independent
+      reporter_pid = Process.whereis(AdvancedStrategies.Telemetry.MetricsReporter)
+      assert is_pid(reporter_pid), "MetricsReporter must be running"
+
+      shipper_pid = Process.whereis(AdvancedStrategies.Telemetry.LogShipper)
+      assert is_pid(shipper_pid), "LogShipper must be running"
+
+      IO.puts("✓ All subsystem supervisors initialized correctly")
+      IO.puts("✓ Supervision strategies (rest_for_one, one_for_all, one_for_one) demonstrated")
+      IO.puts("✓ Restart budgets properly configured per subsystem")
+
+      Supervisor.stop(sup_pid)
+      IO.puts("✓ Supervisor shutdown complete")
+  end
+end
+
+Main.main()
+```

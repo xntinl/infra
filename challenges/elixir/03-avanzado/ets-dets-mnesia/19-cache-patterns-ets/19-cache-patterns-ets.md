@@ -47,6 +47,22 @@ Cachex is the right answer in production. For an exercise whose goal is to under
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Read-through — lazy population
 
 ```
@@ -654,11 +670,416 @@ Target: read-through hit under 2 us; miss path dominated by loader; TTL sweep bo
 
 ---
 
-## Resources
+## Executable Example
 
-- [`:ets` reference](https://www.erlang.org/doc/man/ets.html)
-- [Cachex — production cache library](https://github.com/whitfin/cachex) — see its implementation of fallback (read-through) and transactions
-- [Nebulex — multi-backend cache](https://github.com/cabol/nebulex) — supports all three patterns
-- [Martin Kleppmann — "Designing Data-Intensive Applications"](https://dataintensive.net/) — chapter on caching strategies
-- [AWS — Caching best practices](https://aws.amazon.com/caching/best-practices/)
-- [Discord engineering — "Scaling Elixir f#cking fast"](https://discord.com/blog/how-discord-scaled-elixir-to-5-000-000-concurrent-users)
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+
+defmodule EtsCachePatterns.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :ets_cache_patterns, version: "0.1.0", elixir: "~> 1.16",
+     deps: []]
+  end
+
+  def application do
+    [extra_applications: [:logger], mod: {EtsCachePatterns.Application, []}]
+  end
+end
+
+defmodule EtsCachePatterns.Application do
+  @moduledoc false
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    children = [
+      EtsCachePatterns.Source,
+      EtsCachePatterns.ReadThrough,
+      EtsCachePatterns.WriteThrough,
+      EtsCachePatterns.WriteBehind
+    ]
+
+    Supervisor.start_link(children, strategy: :one_for_one, name: EtsCachePatterns.Supervisor)
+  end
+end
+
+defmodule EtsCachePatterns.Source do
+  end
+  @moduledoc "Stub source-of-truth. Each op sleeps to simulate DB latency."
+  use GenServer
+
+  @latency_ms 2
+
+  def start_link(_), do: GenServer.start_link(__MODULE__, %{}, name: __MODULE__)
+
+  def get(key), do: GenServer.call(__MODULE__, {:get, key})
+  def put(key, value), do: GenServer.call(__MODULE__, {:put, key, value})
+  def fail(flag), do: GenServer.call(__MODULE__, {:fail, flag})
+  def reset, do: GenServer.call(__MODULE__, :reset)
+
+  @impl true
+  def init(_), do: {:ok, %{store: %{}, fail?: false}}
+
+  @impl true
+  def handle_call({:get, _k}, _from, %{fail?: true} = s), do: {:reply, {:error, :source_down}, s}
+
+  def handle_call({:get, k}, _from, %{store: store} = s) do
+    Process.sleep(@latency_ms)
+    {:reply, Map.fetch(store, k), s}
+  end
+
+  def handle_call({:put, _k, _v}, _from, %{fail?: true} = s),
+    do: {:reply, {:error, :source_down}, s}
+
+  def handle_call({:put, k, v}, _from, %{store: store} = s) do
+    Process.sleep(@latency_ms)
+    {:reply, :ok, %{s | store: Map.put(store, k, v)}}
+  end
+
+  def handle_call({:fail, flag}, _from, s), do: {:reply, :ok, %{s | fail?: flag}}
+  def handle_call(:reset, _from, _s), do: {:reply, :ok, %{store: %{}, fail?: false}}
+end
+
+defmodule EtsCachePatterns.CacheStrategy do
+  @moduledoc "Common contract for all three cache patterns."
+
+  @callback get(key :: term()) :: {:ok, term()} | :error | {:error, term()}
+  @callback put(key :: term(), value :: term()) :: :ok | {:error, term()}
+end
+
+defmodule EtsCachePatterns.ReadThrough do
+  end
+  @moduledoc """
+  Read-through cache. On miss we call the source and fill the cache.
+
+  Includes single-flight coalescing: concurrent misses for the same key share
+  one source call. The first caller stores `{key, {:pending, [waiters]}}` in a
+  parallel :flight table; others attach to that list and wait on a message.
+  """
+  use GenServer
+  @behaviour EtsCachePatterns.CacheStrategy
+
+  alias EtsCachePatterns.Source
+
+  @cache :rt_cache
+  @flight :rt_flight
+
+  def start_link(_), do: GenServer.start_link(__MODULE__, nil, name: __MODULE__)
+
+  @impl EtsCachePatterns.CacheStrategy
+  def get(key) do
+    case :ets.lookup(@cache, key) do
+      [{^key, v}] -> {:ok, v}
+      [] -> single_flight_fetch(key)
+    end
+  end
+
+  @impl EtsCachePatterns.CacheStrategy
+  def put(_key, _value), do: {:error, :read_only_strategy}
+
+  @impl true
+  def init(_) do
+    :ets.new(@cache, [:named_table, :public, :set, read_concurrency: true])
+    :ets.new(@flight, [:named_table, :public, :set])
+    {:ok, %{}}
+  end
+
+  defp single_flight_fetch(key) do
+    case :ets.insert_new(@flight, {key, self()}) do
+      true ->
+        result = fetch_and_fill(key)
+        notify_waiters(key, result)
+        result
+
+      false ->
+        wait_for_result(key)
+    end
+  end
+
+  defp fetch_and_fill(key) do
+    case Source.get(key) do
+      {:ok, value} ->
+        :ets.insert(@cache, {key, value})
+        {:ok, value}
+
+      :error ->
+        :error
+
+      {:error, _} = err ->
+        err
+    end
+  end
+
+  defp notify_waiters(key, result) do
+    # Register waiters under a second ets key during wait; publish to all.
+    waiters =
+      case :ets.lookup(@flight, {key, :waiters}) do
+        [{_, list}] -> list
+        [] -> []
+      end
+
+    Enum.each(waiters, fn pid -> send(pid, {:rt_result, key, result}) end)
+    :ets.delete(@flight, {key, :waiters})
+    :ets.delete(@flight, key)
+  end
+
+  defp wait_for_result(key) do
+    :ets.update_counter(@flight, {key, :waiters}, {2, 0}, {{key, :waiters}, []})
+    # Append self to waiters list — done via a small update trick below.
+    existing =
+      case :ets.lookup(@flight, {key, :waiters}) do
+        [{_, list}] -> list
+        [] -> []
+      end
+
+    :ets.insert(@flight, {{key, :waiters}, [self() | existing]})
+
+    receive do
+      {:rt_result, ^key, result} -> result
+    after
+      5_000 -> {:error, :timeout}
+    end
+  end
+end
+
+defmodule EtsCachePatterns.WriteThrough do
+  @moduledoc """
+  Write-through cache. Writes hit source first, then cache. Reads are
+  cache-first with lazy fill on miss (same as read-through).
+  """
+  use GenServer
+  @behaviour EtsCachePatterns.CacheStrategy
+
+  alias EtsCachePatterns.Source
+
+  @cache :wt_cache
+
+  def start_link(_), do: GenServer.start_link(__MODULE__, nil, name: __MODULE__)
+
+  @impl EtsCachePatterns.CacheStrategy
+  def get(key) do
+    case :ets.lookup(@cache, key) do
+      [{^key, v}] ->
+        {:ok, v}
+
+      [] ->
+        case Source.get(key) do
+          {:ok, v} ->
+            :ets.insert(@cache, {key, v})
+            {:ok, v}
+
+          other ->
+            other
+        end
+    end
+  end
+
+  @impl EtsCachePatterns.CacheStrategy
+  def put(key, value) do
+    case Source.put(key, value) do
+      :ok ->
+        :ets.insert(@cache, {key, value})
+        :ok
+
+      err ->
+        err
+    end
+  end
+
+  @impl true
+  def init(_) do
+    :ets.new(@cache, [:named_table, :public, :set, read_concurrency: true])
+    {:ok, %{}}
+  end
+end
+
+defmodule EtsCachePatterns.WriteBehind do
+  @moduledoc """
+  Write-behind cache. Writes land only in the cache and in an ETS-backed
+  write buffer. A periodic flusher drains the buffer in batches to the source.
+
+  The buffer is `:duplicate_bag` so multiple writes for the same key are
+  preserved in arrival order — the flusher keeps only the most recent.
+  """
+  use GenServer
+  @behaviour EtsCachePatterns.CacheStrategy
+
+  alias EtsCachePatterns.Source
+
+  @cache :wb_cache
+  @buffer :wb_buffer
+  @flush_interval_ms 50
+  @batch_size 100
+
+  def start_link(_), do: GenServer.start_link(__MODULE__, nil, name: __MODULE__)
+
+  @impl EtsCachePatterns.CacheStrategy
+  def get(key) do
+    case :ets.lookup(@cache, key) do
+      [{^key, v}] -> {:ok, v}
+      [] ->
+        case Source.get(key) do
+          {:ok, v} -> :ets.insert(@cache, {key, v}); {:ok, v}
+          other -> other
+        end
+    end
+  end
+
+  @impl EtsCachePatterns.CacheStrategy
+  def put(key, value) do
+    ts = :erlang.monotonic_time()
+    :ets.insert(@cache, {key, value})
+    :ets.insert(@buffer, {key, value, ts})
+    :ok
+  end
+
+  @doc "Forces an immediate flush; returns the number of records written to source."
+  def flush_now, do: GenServer.call(__MODULE__, :flush, 30_000)
+
+  @impl true
+  def init(_) do
+    :ets.new(@cache, [:named_table, :public, :set, read_concurrency: true])
+    :ets.new(@buffer, [:named_table, :public, :duplicate_bag, write_concurrency: true])
+    schedule_flush()
+    {:ok, %{inflight: 0}}
+  end
+
+  @impl true
+  def handle_info(:flush, state) do
+    count = do_flush()
+    schedule_flush()
+    {:noreply, %{state | inflight: count}}
+  end
+
+  @impl true
+  def handle_call(:flush, _from, state), do: {:reply, do_flush(), state}
+
+  defp do_flush do
+    rows = :ets.tab2list(@buffer) |> Enum.take(@batch_size)
+
+    latest =
+      rows
+      |> Enum.group_by(fn {k, _v, _ts} -> k end)
+      |> Enum.map(fn {k, list} ->
+        {k, _v, _ts} = Enum.max_by(list, fn {_, _, ts} -> ts end)
+        {k, Enum.max_by(list, fn {_, _, ts} -> ts end) |> elem(1)}
+      end)
+
+    Enum.each(latest, fn {k, v} ->
+      case Source.put(k, v) do
+        :ok -> delete_buffer_for(k)
+        {:error, _} -> :ok  # leave in buffer for next cycle
+      end
+    end)
+
+    length(latest)
+  end
+
+  defp delete_buffer_for(key) do
+    for {k, v, ts} <- :ets.lookup(@buffer, key) do
+      :ets.delete_object(@buffer, {k, v, ts})
+    end
+  end
+
+  defp schedule_flush, do: Process.send_after(self(), :flush, @flush_interval_ms)
+end
+
+defmodule EtsCachePatterns.PatternsTest do
+  use ExUnit.Case, async: false
+
+  alias EtsCachePatterns.{Source, ReadThrough, WriteThrough, WriteBehind}
+
+  setup do
+    Source.reset()
+    :ets.delete_all_objects(:rt_cache)
+    :ets.delete_all_objects(:rt_flight)
+    :ets.delete_all_objects(:wt_cache)
+    :ets.delete_all_objects(:wb_cache)
+    :ets.delete_all_objects(:wb_buffer)
+    :ok
+  end
+
+  describe "read-through" do
+    test "first read hits source, second read hits cache" do
+      :ok = Source.put(:k1, "v1")
+
+      assert {:ok, "v1"} = ReadThrough.get(:k1)
+      # After fill, a hot read should be instant — no way to measure directly,
+      # but :ets.lookup should have the key.
+      assert [{:k1, "v1"}] = :ets.lookup(:rt_cache, :k1)
+    end
+
+    test "100 concurrent misses coalesce into far fewer source calls" do
+      :ok = Source.put(:hot, "x")
+      :ets.delete_all_objects(:rt_cache)
+
+      tasks = for _ <- 1..100, do: Task.async(fn -> ReadThrough.get(:hot) end)
+      results = Task.await_many(tasks, 5_000)
+
+      assert Enum.all?(results, &match?({:ok, "x"}, &1))
+    end
+  end
+
+  describe "write-through" do
+    test "put persists to source and cache" do
+      assert :ok = WriteThrough.put(:wt, "hello")
+      assert {:ok, "hello"} = WriteThrough.get(:wt)
+      # Source also has it
+      assert {:ok, "hello"} = Source.get(:wt)
+    end
+
+    test "source failure propagates and cache is NOT updated" do
+      Source.fail(true)
+      assert {:error, :source_down} = WriteThrough.put(:fail_key, "never")
+      assert [] = :ets.lookup(:wt_cache, :fail_key)
+    end
+  end
+
+  describe "write-behind" do
+    test "put is fast and eventually flushes to source" do
+      assert :ok = WriteBehind.put(:wb, "lazy")
+      # Source does NOT have it yet
+      assert :error = Source.get(:wb)
+
+      # After a manual flush, the source catches up
+      _ = WriteBehind.flush_now()
+      assert {:ok, "lazy"} = Source.get(:wb)
+    end
+
+    test "buffered writes survive transient source failure" do
+      Source.fail(true)
+      WriteBehind.put(:retry, 1)
+      _ = WriteBehind.flush_now()
+      assert :error = Source.get(:retry)
+
+      Source.fail(false)
+      _ = WriteBehind.flush_now()
+      assert {:ok, 1} = Source.get(:retry)
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrating 19-cache-patterns-ets
+      :ok
+  end
+end
+
+Main.main()
+end
+end
+end
+end
+end
+end
+end
+end
+end
+```

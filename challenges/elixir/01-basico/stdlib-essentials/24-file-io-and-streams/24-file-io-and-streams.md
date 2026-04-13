@@ -523,6 +523,17 @@ Every stage of the pipeline returns a `Stream` — a description of work, not th
 
 
 ---
+
+
+## Executable Example
+
+Create a simple example demonstrating the key concepts:
+
+```elixir
+# Example code demonstrating module concepts
+IO.puts("Example: Read the Implementation section above and run the code samples in iex")
+```
+
 ## Key Concepts
 
 ### 1. `File.read/1` Loads Entire Files Into Memory

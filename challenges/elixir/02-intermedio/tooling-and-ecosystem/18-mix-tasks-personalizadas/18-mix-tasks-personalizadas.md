@@ -436,6 +436,81 @@ which you own — don't ship `mix build` in a published Hex package).
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule Mix.Tasks.MyMixTask.Greet do
+    @moduledoc """
+    Greets the given name(s).
+
+        $ mix my_mix_task.greet Alice
+        Hello, Alice!
+
+        $ mix my_mix_task.greet Alice Bob --shout
+        HELLO, ALICE!
+        HELLO, BOB!
+
+        $ mix my_mix_task.greet Alice --times 3
+        Hello, Alice!
+        Hello, Alice!
+        Hello, Alice!
+
+    ## Options
+
+      * `--shout` / `-s` — uppercase the greeting.
+      * `--times N` / `-t N` — repeat the greeting N times (default 1).
+    """
+    @shortdoc "Greets the given name(s)"
+
+    use Mix.Task
+
+    @switches [shout: :boolean, times: :integer]
+    @aliases [s: :shout, t: :times]
+
+    @impl Mix.Task
+    def run(args) do
+      {opts, names} = OptionParser.parse!(args, strict: @switches, aliases: @aliases)
+
+      if names == [] do
+        # Fail loudly — Mix tasks should not silently succeed on missing input.
+        Mix.raise("mix my_mix_task.greet expects at least one NAME. See `mix help my_mix_task.greet`.")
+      end
+
+      shout? = Keyword.get(opts, :shout, false)
+      times = Keyword.get(opts, :times, 1)
+
+      if times < 1, do: Mix.raise("--times must be >= 1, got: #{times}")
+
+      for name <- names, _ <- 1..times do
+        Mix.shell().info(MyMixTask.greeting(name, shout: shout?))
+      end
+
+      :ok
+    end
+  end
+
+  def main do
+    IO.puts("=== CustomTask Demo ===
+  ")
+  
+    # Demo: Custom Mix tasks
+  IO.puts("1. Create Mix.Task in lib/mix/tasks/")
+  IO.puts("2. Run with: mix custom_task")
+  IO.puts("3. Access CLI args and Mix config")
+
+  IO.puts("
+  ✓ Custom Mix tasks demo completed!")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Mix.Task` — Elixir docs](https://hexdocs.pm/mix/Mix.Task.html)

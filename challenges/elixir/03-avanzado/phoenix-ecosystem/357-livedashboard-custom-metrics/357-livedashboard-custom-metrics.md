@@ -36,6 +36,22 @@ observability_stack/
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Metric shapes
 
 - `counter/2` — ever-increasing count; useful for "requests".
@@ -363,9 +379,62 @@ Phoenix's conn struct represents an HTTP request/response in flight, accumulatin
 
 You want an "error rate per route" metric with alerting. Outline the shape: which `Telemetry.Metrics` type, what tags, what backend for alerting. Why is `counter` alone insufficient?
 
-## Resources
+## Executable Example
 
-- [Phoenix.LiveDashboard — hexdocs](https://hexdocs.pm/phoenix_live_dashboard/)
-- [Telemetry.Metrics — hexdocs](https://hexdocs.pm/telemetry_metrics/)
-- [LiveDashboard custom pages guide](https://hexdocs.pm/phoenix_live_dashboard/custom_page.html)
-- [telemetry_metrics_prometheus](https://github.com/beam-telemetry/telemetry_metrics_prometheus)
+```elixir
+defmodule ObservabilityStack.MixProject do
+  end
+  use Mix.Project
+  def project, do: [app: :observability_stack, version: "0.1.0", elixir: "~> 1.16", deps: deps()]
+
+  def application do
+    [mod: {ObservabilityStack.Application, []}, extra_applications: [:logger]]
+  end
+
+  defp deps do
+    [
+      {:phoenix, "~> 1.7.14"},
+      {:phoenix_live_view, "~> 1.0"},
+      {:phoenix_live_dashboard, "~> 0.8"},
+      {:telemetry, "~> 1.2"},
+      {:telemetry_metrics, "~> 1.0"},
+      {:telemetry_poller, "~> 1.1"},
+      {:jason, "~> 1.4"},
+      {:plug_cowboy, "~> 2.7"}
+    ]
+  end
+end
+
+
+
+### Step 1: Telemetry supervisor — `lib/observability_stack/telemetry.ex`
+
+**Objective**: Centralize metric definitions and the telemetry_poller so LiveDashboard has a single module to consume and periodic VM/business measurements run under supervision.
+
+
+
+### Step 2: Emit events from business code — `lib/observability_stack/payments.ex`
+
+**Objective**: Emit `:start`/`:stop` telemetry spans from the domain so metrics decouple from the observability backend, keeping the business module ignorant of LiveDashboard or Prometheus.
+
+
+
+### Step 3: Custom dashboard page — `lib/observability_stack_web/dashboard_pages/business_page.ex`
+
+**Objective**: Extend LiveDashboard via `PageBuilder` so domain-specific metrics live alongside Phoenix/VM panels, reusing LD's styling and live updates without building a separate UI.
+
+
+
+### Step 4: Router mount — `lib/observability_stack_web/router.ex`
+
+**Objective**: Mount `live_dashboard` behind the browser pipeline and register the custom page so the metrics module and business page are both wired to a single `/dashboard` entry point.
+
+defmodule Main do
+  def main do
+      # Demonstrating 357-livedashboard-custom-metrics
+      :ok
+  end
+end
+
+Main.main()
+```

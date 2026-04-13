@@ -323,6 +323,103 @@ not for dependencies that should be configured by their host.
 
 - Listá 3 valores que DEBEN estar en `runtime.exs` y 3 que DEBEN estar en `config.exs`. Justificá cada uno.
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule RuntimeConfigDemo.Application do
+    @moduledoc false
+    use Application
+    require Logger
+
+    # `compile_env/2` is evaluated at COMPILE TIME and embedded here.
+    # Even if runtime.exs later rewrites :mode, THIS value is frozen.
+    @compiled_mode Application.compile_env(:runtime_config_demo, :mode)
+
+    @impl true
+    def start(_type, _args) do
+      # `get_env/2` is evaluated at CALL TIME — sees whatever runtime.exs set.
+      runtime_mode = Application.get_env(:runtime_config_demo, :mode)
+      endpoint = Application.get_env(:runtime_config_demo, :endpoint)
+
+      Logger.info("compile_env :mode = #{inspect(@compiled_mode)}")
+      Logger.info("get_env     :mode = #{inspect(runtime_mode)}")
+      Logger.info("get_env :endpoint = #{inspect(endpoint)}")
+
+      Supervisor.start_link([], strategy: :one_for_one, name: RuntimeConfigDemo.Supervisor)
+    end
+  end
+
+  defmodule RuntimeConfigDemo.Application do
+    @moduledoc false
+    use Application
+    require Logger
+
+    # `compile_env/2` is evaluated at COMPILE TIME and embedded here.
+    # Even if runtime.exs later rewrites :mode, THIS value is frozen.
+    @compiled_mode Application.compile_env(:runtime_config_demo, :mode)
+
+    @impl true
+    def start(_type, _args) do
+      # `get_env/2` is evaluated at CALL TIME — sees whatever runtime.exs set.
+      runtime_mode = Application.get_env(:runtime_config_demo, :mode)
+      endpoint = Application.get_env(:runtime_config_demo, :endpoint)
+
+      Logger.info("compile_env :mode = #{inspect(@compiled_mode)}")
+      Logger.info("get_env     :mode = #{inspect(runtime_mode)}")
+      Logger.info("get_env :endpoint = #{inspect(endpoint)}")
+
+      Supervisor.start_link([], strategy: :one_for_one, name: RuntimeConfigDemo.Supervisor)
+    end
+  end
+
+  defmodule RuntimeConfigDemo do
+    @moduledoc """
+    Public surface for inspecting the three values side by side.
+    """
+
+    @compiled_mode Application.compile_env(:runtime_config_demo, :mode)
+
+    @spec compiled_mode() :: atom()
+    def compiled_mode, do: @compiled_mode
+
+    @spec runtime_mode() :: atom()
+    def runtime_mode, do: Application.get_env(:runtime_config_demo, :mode)
+
+    @spec endpoint() :: String.t()
+    def endpoint, do: Application.fetch_env!(:runtime_config_demo, :endpoint)
+  end
+
+  def main do
+    # Demo: compile-time vs runtime configuration
+    {:ok, _apps} = Application.ensure_all_started(:runtime_config_demo)
+  
+    # compile_env es fijo en tiempo de compilación
+    compiled = RuntimeConfigDemo.compiled_mode()
+    assert compiled == :compile_time_default, "compile_env debe ser congelado"
+  
+    # get_env ve los cambios en runtime.exs
+    runtime = RuntimeConfigDemo.runtime_mode()
+    assert runtime == :runtime_override, "get_env debe ver runtime.exs"
+  
+    # endpoint tiene un default
+    endpoint = RuntimeConfigDemo.endpoint()
+    assert endpoint == "http://localhost:4000", "endpoint debe tener default"
+  
+    IO.puts("RuntimeConfigDemo: demostración de configuración exitosa")
+    IO.puts("  compile_mode: #{inspect(compiled)} (congelado)")
+    IO.puts("  runtime_mode: #{inspect(runtime)} (dinámico)")
+    IO.puts("  endpoint: #{endpoint}")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Config` — Elixir stdlib](https://hexdocs.pm/elixir/Config.html)

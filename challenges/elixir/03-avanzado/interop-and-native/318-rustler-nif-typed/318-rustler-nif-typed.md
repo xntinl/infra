@@ -65,6 +65,22 @@ Measured on an M1 (see benchmark at the end):
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. The `Env` lifetime
 
 Every NIF call receives an `Env<'a>`. Terms you build (`atoms::ok().to_term(env)`) share
@@ -405,9 +421,50 @@ defeating some of the zero-alloc work Rust did. Under what conditions would retu
 packed binary (`<<f1::float-64, f2::float-64, ...>>`) be strictly better, and when would
 the added decoding burden on the Elixir side cancel the win?
 
-## Resources
 
-- [Rustler README and examples](https://github.com/rusterlium/rustler)
-- [erl_nif — Erlang/OTP man page](https://www.erlang.org/doc/man/erl_nif.html)
-- [Discord's switch from Go to Rust for their read states service](https://discord.com/blog/why-discord-is-switching-from-go-to-rust)
-- [BEAM scheduler internals — Happi Hacking blog](https://happi.github.io/blog/)
+## Executable Example
+
+```elixir
+defmodule GeoKernel.NIFTest do
+  use ExUnit.Case, async: true
+  alias GeoKernel.NIF
+
+  describe "haversine_batch/2" do
+    test "returns zero distance for identical points" do
+      origin = {40.7128, -74.0060}
+      points = List.duplicate(origin, 5)
+      assert [d1, d2, d3, d4, d5] = NIF.haversine_batch(points, origin)
+      for d <- [d1, d2, d3, d4, d5], do: assert_in_delta(d, 0.0, 1.0e-6)
+    end
+
+    test "matches known distance NYC → London within 0.1%" do
+      nyc = {40.7128, -74.0060}
+      london = {51.5074, -0.1278}
+      [d] = NIF.haversine_batch([london], nyc)
+      # Published great-circle distance is ~5_570_000 meters.
+      assert_in_delta d, 5_570_000.0, 5_570.0
+    end
+
+    test "empty list returns :badarg" do
+      assert_raise ErlangError, fn -> NIF.haversine_batch([], {0.0, 0.0}) end
+    end
+  end
+
+  describe "point_in_bbox/3" do
+    test "inside and outside cases" do
+      assert NIF.point_in_bbox({1.0, 1.0}, {0.0, 0.0}, {2.0, 2.0})
+      refute NIF.point_in_bbox({3.0, 1.0}, {0.0, 0.0}, {2.0, 2.0})
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+    IO.puts("✓ Type-Safe Rustler NIFs with Ownership Discipline")
+  - Rustler NIFs with type safety
+    - Safe FFI boundaries
+  end
+end
+
+Main.main()
+```

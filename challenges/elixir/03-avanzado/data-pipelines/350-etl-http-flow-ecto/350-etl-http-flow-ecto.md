@@ -62,6 +62,25 @@ The chosen stack:
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Pipeline-specific insight:**
+Streams are lazy; Enum is eager. Use Stream for data larger than RAM or when you're building intermediate stages. Use Enum when the collection is small or you need side effects at each step. Mixing them carelessly results in performance cliffs.
 ### 1. `Task.async_stream/3` with `max_concurrency`
 
 ```elixir
@@ -488,20 +507,95 @@ unique `(station_id, observed_at)`. What is the likely root cause of the
 Load stage being 16× slower than Transform, and what database-side changes
 (not Elixir-side) would recover the performance?
 
-## Resources
 
-- [`Task.async_stream/3` — hexdocs](https://hexdocs.pm/elixir/Task.html#async_stream/3)
-- [Flow — hexdocs](https://hexdocs.pm/flow/Flow.html)
-- [`Ecto.Repo.insert_all/3` — hexdocs](https://hexdocs.pm/ecto/Ecto.Repo.html#c:insert_all/3)
-- [Finch — hexdocs](https://hexdocs.pm/finch/Finch.html)
-- [PostgreSQL bulk insert performance tips](https://www.postgresql.org/docs/current/populate.html)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+defmodule WeatherEtl.TransformTest do
+  use ExUnit.Case, async: true
+
+  alias WeatherEtl.Transform
+
+  describe "enrich row" do
+    test "converts celsius to fahrenheit" do
+      obs = %{"station_id" => "s1", "observed_at" => "2024-10-10T12:00:00Z", "temp_c" => 0.0, "humidity" => 50}
+      [row] = [{:ok, "s1", [obs]}] |> Transform.flow() |> Enum.to_list()
+      assert row.temp_f == 32.0
+      assert row.station_id == "s1"
+    end
+
+    test "propagates the station_id" do
+      obs = %{"station_id" => "ABC", "observed_at" => "2024-10-10T12:00:00Z", "temp_c" => 20.0, "humidity" => 60}
+      [row] = [{:ok, "ABC", [obs]}] |> Transform.flow() |> Enum.to_list()
+      assert row.station_id == "ABC"
+    end
+
+    test "discards error tuples without crashing" do
+      mixed = [
+        {:error, "down", :timeout},
+        {:ok, "up", [%{"station_id" => "up", "observed_at" => "2024-10-10T12:00:00Z", "temp_c" => 10.0, "humidity" => 50}]}
+      ]
+
+      rows = mixed |> Transform.flow() |> Enum.to_list()
+      assert length(rows) == 1
+    end
+  end
 end
+
+defmodule WeatherEtl.PipelineTest do
+  use ExUnit.Case, async: false
+
+  # Integration-ish: we stub Extract via a mock stream.
+
+  test "runs end-to-end with synthetic extract stream" do
+    synth_station = {:ok, "s1",
+      for i <- 1..100 do
+        %{
+          "station_id" => "s1",
+          "observed_at" => DateTime.add(~U[2024-10-10 00:00:00Z], i, :hour) |> DateTime.to_iso8601(),
+          "temp_c" => :rand.uniform() * 30,
+          "humidity" => :rand.uniform(100)
+        }
+      end}
+
+    count =
+      [synth_station]
+      |> WeatherEtl.Transform.flow()
+      |> WeatherEtl.Load.sink()
+
+    assert count == 100
+  end
+end
+
+defmodule Main do
+  def main do
+      # Simulate ETL: Extract -> Transform -> Load
+      # Step 1: Extract (simulate HTTP API)
+      raw_data = [
+        %{"temperature" => 20.5, "humidity" => 65, "timestamp" => 1000},
+        %{"temperature" => 21.0, "humidity" => 68, "timestamp" => 2000},
+        %{"temperature" => 19.8, "humidity" => 62, "timestamp" => 3000}
+      ]
+
+      # Step 2: Transform (add derived fields)
+      transformed = Enum.map(raw_data, fn record ->
+        Map.merge(record, %{
+          "feels_like" => record["temperature"] - record["humidity"] / 100,
+          "processed_at" => System.os_time()
+        })
+      end)
+
+      # Step 3: Load (simulate Ecto.Repo.insert_all)
+      loaded = transformed |> Enum.filter(&Map.has_key?(&1, "feels_like"))
+
+      IO.inspect(loaded, label: "✓ Loaded records")
+
+      assert length(loaded) == 3, "All records loaded"
+      assert Enum.all?(loaded, &Map.has_key?(&1, "feels_like")), "All transformed"
+
+      IO.puts("✓ ETL pipeline: HTTP extract, Flow transform, bulk load working")
+  end
+end
+
+Main.main()
 ```

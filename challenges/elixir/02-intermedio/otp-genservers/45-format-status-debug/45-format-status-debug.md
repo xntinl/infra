@@ -328,6 +328,108 @@ noise for no gain. Add it where there is something to protect.
 
 - ¿Qué campos redactás en producción y cuáles dejás para dev? Definí una política de redacción testeable.
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule FormatStatusGs do
+    @moduledoc """
+    An API-client-style GenServer holding a secret bearer token. Demonstrates
+    `format_status/2` redacting the token for `:sys.get_status/1` and crash
+    reports without altering the real in-memory state used by callbacks.
+    """
+
+    use GenServer
+
+    defmodule State do
+      @moduledoc false
+      @enforce_keys [:endpoint, :token]
+      defstruct [:endpoint, :token, last_call_at: nil, call_count: 0]
+
+      @type t :: %__MODULE__{
+              endpoint: String.t(),
+              token: String.t(),
+              last_call_at: integer() | nil,
+              call_count: non_neg_integer()
+            }
+    end
+
+    # ── Public API ──────────────────────────────────────────────────────────
+
+    @spec start_link(keyword()) :: GenServer.on_start()
+    def start_link(opts) do
+      {endpoint, opts} = Keyword.pop!(opts, :endpoint)
+      {token, opts} = Keyword.pop!(opts, :token)
+      GenServer.start_link(__MODULE__, {endpoint, token}, opts)
+    end
+
+    @doc "Simulated API call — bumps the counter, records the time."
+    @spec call(GenServer.server()) :: :ok
+    def call(server), do: GenServer.call(server, :do_call)
+
+    # ── Callbacks ───────────────────────────────────────────────────────────
+
+    @impl true
+    def init({endpoint, token}) do
+      {:ok, %State{endpoint: endpoint, token: token}}
+    end
+
+    @impl true
+    def handle_call(:do_call, _from, %State{call_count: n} = state) do
+      new_state = %{state | call_count: n + 1, last_call_at: System.monotonic_time()}
+      {:reply, :ok, new_state}
+    end
+
+    @doc """
+    Redacts the `token` field. Called by OTP debug tooling: `:sys.get_status/1`,
+    crash reports, and `GenServer.stop/3` logs. Real state in memory is unchanged.
+
+    Uses the 1-arity OTP 25+ map shape. Falls back to the legacy 2-arity
+    callback below for older OTP.
+    """
+    @impl true
+    def format_status(%{state: %State{} = state} = status) do
+      %{status | state: redact(state)}
+    end
+
+    def format_status(status), do: status
+
+    # Legacy 2-arity callback for OTP < 25. Harmless to keep on newer OTP.
+    def format_status(_reason, [_pdict, %State{} = state]) do
+      [{:data, [{"State", redact(state)}]}]
+    end
+
+    def format_status(_reason, [_pdict, state]), do: [{:data, [{"State", state}]}]
+
+    # ── Helpers ─────────────────────────────────────────────────────────────
+
+    defp redact(%State{} = s), do: %{s | token: "[REDACTED]"}
+  end
+
+  def main do
+    {:ok, pid} = FormatStatusGs.start_link(endpoint: "https://api.example.com", token: "secret-token-123")
+  
+    :ok = FormatStatusGs.call(pid)
+    :ok = FormatStatusGs.call(pid)
+  
+    status = :sys.get_status(pid)
+    status_str = inspect(status)
+  
+    if String.contains?(status_str, "[REDACTED]") do
+      IO.puts("Token correctly redacted in status")
+    end
+  
+    IO.puts("✓ FormatStatusGs works correctly")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`GenServer.format_status/1` — Elixir stdlib (OTP 25+)](https://hexdocs.pm/elixir/GenServer.html#c:format_status/1)

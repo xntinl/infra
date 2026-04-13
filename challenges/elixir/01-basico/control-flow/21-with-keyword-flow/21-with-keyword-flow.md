@@ -613,6 +613,73 @@ If two steps in your `with` can both return `{:error, :not_found}` but for diffe
 
 Your teammate adds an `else` clause that rescues unexpected errors and logs them. Is that the right place for cross-cutting logging, or does it belong in a middleware layer? Argue both sides.
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule CheckoutFlow.Checkout do
+  @moduledoc """
+  Orchestrates the checkout pipeline using `with`.
+
+  The pipeline is the value proposition of this module: every step is named,
+  each failure has a typed reason, and the success path reads top to bottom
+  without nesting.
+  """
+
+  alias CheckoutFlow.{Cart, Coupon, Shipping}
+
+  @type request :: %{
+          cart: Cart.cart(),
+          stock: Cart.stock(),
+          coupon: Coupon.coupon() | nil,
+          address: Shipping.address(),
+          today: Date.t()
+        }
+
+  @type order :: %{
+          subtotal_cents: integer(),
+          discounted_cents: integer(),
+          shipping_cents: integer(),
+          total_cents: integer()
+        }
+
+  @type error_reason ::
+          :empty_cart
+          | {:out_of_stock, String.t()}
+          | :coupon_expired
+          | :invalid_discount
+          | :unsupported_country
+
+  @spec process(request()) :: {:ok, order()} | {:error, error_reason()}
+  def process(%{
+        cart: cart,
+        stock: stock,
+        coupon: coupon,
+        address: address,
+        today: today
+      }) do
+    with {:ok, validated_cart} <- Cart.validate(cart, stock),
+         subtotal = Cart.subtotal(validated_cart),
+         {:ok, discounted} <- Coupon.apply(subtotal, coupon, today),
+         total_items = count_items(validated_cart),
+         {:ok, shipping} <- Shipping.calculate(address, total_items) do
+      {:ok,
+       %{
+         subtotal_cents: subtotal,
+         discounted_cents: discounted,
+         shipping_cents: shipping,
+         total_cents: discounted + shipping
+       }}
+    end
+  end
+
+  defp count_items(%{items: items}) do
+    Enum.reduce(items, 0, fn %{quantity: q}, acc -> acc + q end)
+  end
+end
+```
+
 ## Resources
 
 - [`with` expression — Elixir docs](https://hexdocs.pm/elixir/Kernel.SpecialForms.html#with/1)

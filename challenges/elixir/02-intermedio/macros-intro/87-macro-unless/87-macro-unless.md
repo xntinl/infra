@@ -322,6 +322,91 @@ purely so you understand what's happening when you read Elixir source.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule MyUnless do
+    @moduledoc """
+    A from-scratch implementation of `Kernel.unless/2`, intended as a
+    teaching exercise. Do not use in production — `Kernel.unless` already
+    exists, is faster at compile time, and is recognized by every tool.
+    """
+
+    @doc """
+    Executes `do_block` when `condition` is falsy; otherwise executes
+    `else_block` (or returns `nil` if none was given).
+
+    Expands to `if/2` under the hood, which means no runtime overhead
+    versus the built-in.
+    """
+    defmacro my_unless(condition, do: do_block, else: else_block) do
+      quote do
+        if unquote(condition) do
+          unquote(else_block)
+        else
+          unquote(do_block)
+        end
+      end
+    end
+
+    defmacro my_unless(condition, do: do_block) do
+      quote do
+        if unquote(condition) do
+          nil
+        else
+          unquote(do_block)
+        end
+      end
+    end
+  end
+
+  def main do
+    require MyUnless
+  
+    # Test 1: my_unless with false condition, do-only
+    result1 = MyUnless.my_unless(false, do: :executed)
+    IO.puts("Test 1 (false, do-only): #{inspect(result1)}")
+    assert result1 == :executed
+  
+    # Test 2: my_unless with true condition, do-only
+    result2 = MyUnless.my_unless(true, do: :not_executed)
+    IO.puts("Test 2 (true, do-only): #{inspect(result2)}")
+    assert result2 == nil
+  
+    # Test 3: my_unless with false condition, do/else
+    result3 = MyUnless.my_unless(false, do: :primary, else: :fallback)
+    IO.puts("Test 3 (false, do/else): #{inspect(result3)}")
+    assert result3 == :primary
+  
+    # Test 4: my_unless with true condition, do/else
+    result4 = MyUnless.my_unless(true, do: :primary, else: :fallback)
+    IO.puts("Test 4 (true, do/else): #{inspect(result4)}")
+    assert result4 == :fallback
+  
+    # Test 5: Demonstrate lazy evaluation
+    {:ok, agent} = Agent.start_link(fn -> 0 end)
+    MyUnless.my_unless(true, do: Agent.update(agent, &(&1 + 1)))
+    count1 = Agent.get(agent, & &1)
+    IO.puts("Test 5a (lazy, condition true): side effect not executed, count=#{count1}")
+    assert count1 == 0
+  
+    MyUnless.my_unless(false, do: Agent.update(agent, &(&1 + 1)))
+    count2 = Agent.get(agent, & &1)
+    IO.puts("Test 5b (lazy, condition false): side effect executed, count=#{count2}")
+    assert count2 == 1
+  
+    IO.puts("\n✓ All MyUnless tests passed!")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Kernel.unless/2` source](https://github.com/elixir-lang/elixir/blob/main/lib/elixir/lib/kernel.ex) — search for `defmacro unless`

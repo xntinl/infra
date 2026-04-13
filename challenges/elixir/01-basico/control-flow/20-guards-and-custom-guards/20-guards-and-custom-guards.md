@@ -519,6 +519,101 @@ A new business rule says users on a trial plan can only access features if `tria
 
 What happens at the BEAM level if a guard raises (e.g., `hd/1` on an empty list)? Why is that the correct design decision?
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule AuthPolicy.Engine do
+  @moduledoc """
+  Policy engine that decides whether a subject may perform an action on a resource.
+
+  The decision is a function of four inputs:
+    - role: :admin | :editor | :viewer | :guest
+    - action: :read | :write | :delete | :publish
+    - resource: a map with :owner_id and :status
+    - context: a map with :user_id, :day_of_week, :hour
+
+  Every branch of the decision tree is a separate function clause guarded by
+  `defguard` predicates. This gives exhaustive compile-time coverage: if you
+  add a new role and forget to handle it, the compiler does not warn (Elixir
+  does not prove exhaustiveness for arbitrary atoms) — but the final catch-all
+  clause ensures a safe default of `{:deny, :no_matching_rule}`.
+  """
+
+  import AuthPolicy.Guards
+
+  @type role :: :admin | :editor | :viewer | :guest
+  @type action :: :read | :write | :delete | :publish
+  @type resource :: %{owner_id: integer(), status: :draft | :published}
+  @type context :: %{user_id: integer(), day_of_week: 1..7, hour: 0..23}
+  @type decision :: {:allow, atom()} | {:deny, atom()}
+
+  @doc """
+  Entry point. Validates shape with guards, then delegates to rule clauses.
+  """
+  @spec authorize(role(), action(), resource(), context()) :: decision()
+  def authorize(role, action, resource, context)
+      when is_role(role) and is_action(action) and is_map(resource) and is_map(context) do
+    decide(role, action, resource, context)
+  end
+
+  def authorize(_role, _action, _resource, _context) do
+    # Invalid input shape — fail closed. Never guess what the caller meant.
+    {:deny, :invalid_input}
+  end
+
+  # Rule 1: admins bypass every other check.
+  # Using `is_admin/1` makes the intent obvious at the clause level.
+  defp decide(role, _action, _resource, _context) when is_admin(role) do
+    {:allow, :admin_override}
+  end
+
+  # Rule 2: viewers can read anything, regardless of ownership or time.
+  defp decide(:viewer, :read, _resource, _context) do
+    {:allow, :viewer_read}
+  end
+
+  # Rule 3: editors can read anything at any time.
+  defp decide(:editor, :read, _resource, _context) do
+    {:allow, :editor_read}
+  end
+
+  # Rule 4: editors can write their own drafts during working hours.
+  # Three conditions composed with `and` — all must hold.
+  defp decide(:editor, :write, %{owner_id: owner_id, status: :draft}, %{
+         user_id: user_id,
+         day_of_week: dow,
+         hour: hour
+       })
+       when owner_id == user_id and is_working_hours(dow, hour) do
+    {:allow, :editor_write_own_draft}
+  end
+
+  # Rule 5: editors cannot write to published resources — even their own.
+  # A separate clause makes the denial reason explicit in the return value.
+  defp decide(:editor, :write, %{status: :published}, _context) do
+    {:deny, :cannot_edit_published}
+  end
+
+  # Rule 6: editors writing outside working hours.
+  defp decide(:editor, :write, %{status: :draft}, %{day_of_week: dow, hour: hour})
+       when not is_working_hours(dow, hour) do
+    {:deny, :outside_working_hours}
+  end
+
+  # Rule 7: guests get nothing except anonymous read of published content.
+  defp decide(:guest, :read, %{status: :published}, _context) do
+    {:allow, :guest_read_public}
+  end
+
+  # Final catch-all. Fail closed.
+  defp decide(_role, _action, _resource, _context) do
+    {:deny, :no_matching_rule}
+  end
+end
+```
+
 ## Resources
 
 - [Kernel guards — HexDocs](https://hexdocs.pm/elixir/Kernel.html#guards)

@@ -48,6 +48,22 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. The BEAM memory map
 
 `:erlang.memory/0` returns eight buckets. You need to know what they mean:
@@ -599,22 +615,80 @@ seconds.
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
 
-- [`:recon` docs](https://ferd.github.io/recon/) — Fred Hébert
-- [Erlang in Anger — chapter 7 Memory](https://www.erlang-in-anger.com/) — free PDF
-- [`:recon_alloc`](https://ferd.github.io/recon/recon_alloc.html) — allocator API reference
-- [Erlang memory layout — ERTS User's Guide](https://www.erlang.org/doc/apps/erts/alloc.html)
-- ["The Hitchhiker's Tour of the BEAM"](https://www.youtube.com/watch?v=_Pwlvy3zz9M) — Robert Virding
-- [Dashbit blog — debugging memory](https://dashbit.co/blog) — look for posts by José Valim on profiling
-- [LiveDashboard Memory page source](https://github.com/phoenixframework/phoenix_live_dashboard/blob/main/lib/phoenix/live_dashboard/pages/home_page.ex)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+defmodule MemoryProfiling.NodeReport do
+  @moduledoc """
+  High-level node memory breakdown. Renders `:erlang.memory/0` plus
+  allocator totals in bytes and percentages.
+  """
+
+  @type breakdown :: %{
+          total_bytes: non_neg_integer(),
+          allocated_bytes: non_neg_integer(),
+          rss_overhead_pct: float(),
+          buckets: %{atom() => {non_neg_integer(), float()}}
+        }
+
+  @spec build() :: breakdown()
+  def build do
+    mem = :erlang.memory()
+    total = Keyword.fetch!(mem, :total)
+    allocated = :recon_alloc.memory(:allocated)
+    used = :recon_alloc.memory(:used)
+
+    buckets =
+      mem
+      |> Keyword.delete(:total)
+      |> Map.new(fn {k, v} -> {k, {v, pct(v, total)}} end)
+
+    %{
+      total_bytes: total,
+      allocated_bytes: allocated,
+      rss_overhead_pct: pct(allocated - used, allocated),
+      buckets: buckets
+    }
+  end
+
+  @spec format(breakdown()) :: String.t()
+  def format(%{buckets: buckets, total_bytes: total, allocated_bytes: alloc, rss_overhead_pct: overhead}) do
+    lines =
+      buckets
+      |> Enum.sort_by(fn {_k, {v, _}} -> -v end)
+      |> Enum.map(fn {k, {v, pct}} -> "  #{pad(k, 10)}  #{human(v)}  #{Float.round(pct, 1)}%" end)
+
+    IO.iodata_to_binary([
+      "Total:      #{human(total)}\n",
+      "Allocated:  #{human(alloc)}  (overhead: #{Float.round(overhead, 1)}%)\n",
+      "\n",
+      Enum.intersperse(lines, "\n")
+    ])
+  end
+
+  defp pct(_, 0), do: 0.0
+  defp pct(num, denom), do: num / denom * 100.0
+
+  defp pad(a, n), do: a |> Atom.to_string() |> String.pad_trailing(n)
+
+  defp human(n) when n >= 1_073_741_824, do: "#{Float.round(n / 1_073_741_824, 2)} GiB"
+  defp human(n) when n >= 1_048_576, do: "#{Float.round(n / 1_048_576, 2)} MiB"
+  defp human(n) when n >= 1_024, do: "#{Float.round(n / 1_024, 2)} KiB"
+  defp human(n), do: "#{n} B"
 end
+
+defmodule Main do
+  def main do
+      IO.puts("Benchmarking initialized")
+      {elapsed_us, result} = :timer.tc(fn ->
+        Enum.reduce(1..1000, 0, &+/2)
+      end)
+      if is_number(elapsed_us) do
+        IO.puts("✓ Benchmark completed: sum(1..1000) = " <> inspect(result) <> " in " <> inspect(elapsed_us) <> "µs")
+      end
+  end
+end
+
+Main.main()
 ```

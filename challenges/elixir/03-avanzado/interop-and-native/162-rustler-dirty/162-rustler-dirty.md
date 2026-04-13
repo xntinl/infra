@@ -36,6 +36,22 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Scheduler types
 
 ```
@@ -364,12 +380,37 @@ Benchee.run(%{
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
+## Executable Example
 
-- https://www.erlang.org/doc/man/erlang.html#system_info-1 — `:dirty_cpu_schedulers`, `:dirty_io_schedulers`
-- https://docs.rs/rustler/latest/rustler/attr.nif.html — `schedule` attribute
-- https://blog.erlang.org/Scheduler-Locks/ — Erlang/OTP team on scheduler internals
-- https://www.erlang.org/doc/apps/erts/erl_nif.html#dirty_nifs — official NIF docs on dirty scheduling
-- https://github.com/riverrun/argon2_elixir — production NIF using DirtyCpu
-- https://ferd.ca/beam-schedulers.html — Fred Hébert on scheduler behavior
-- https://www.erlang.org/doc/man/msacc.html — microstate accounting for dirty scheduler queue time
+```elixir
+### Step 2: `native/rustler_dirty_nif/src/lib.rs`
+
+**Objective**: Route CPU-bound hashing and blocking IO to separate dirty schedulers so main scheduler stays responsive.
+
+
+
+### Step 3: `lib/rustler_dirty/native.ex`
+
+**Objective**: Provide typed stubs so Dialyzer validates dirty-scheduled calls before dylib load succeeds.
+
+
+
+### Step 4: `mix.exs`
+
+**Objective**: Declare release-mode Rustler build so argon2 compiles with optimizations, avoiding debug-mode throughput penalties.
+
+
+
+### Step 5: `test/rustler_dirty_test.exs`
+
+**Objective**: Assert heartbeat responsiveness during heavy CPU NIFs and verify dirty-scheduled hash correctness under concurrent load.
+
+defmodule Main do
+  def main do
+      # Demonstrating 162-rustler-dirty
+      :ok
+  end
+end
+
+Main.main()
+```

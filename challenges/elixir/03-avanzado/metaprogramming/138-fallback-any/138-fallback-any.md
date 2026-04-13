@@ -40,6 +40,25 @@ Requiring `defimpl` for every type means every new struct in every consumer is a
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Metaprogramming-specific insight:**
+Code generation is powerful and dangerous. Every macro you write is a place where intent is hidden. Use macros sparingly, only when they eliminate genuine boilerplate. If your macro is more than 10 lines, you probably need a function or data structure instead. Future maintainers will thank you.
 ### 1. What `@fallback_to_any true` compiles to
 
 When a protocol has `@fallback_to_any true` and a `defimpl ... for: Any`,
@@ -389,11 +408,100 @@ Target: fallback path within 10 ns of direct impl; no measurable overhead after 
 
 ---
 
-## Resources
 
-- [`Protocol` — hexdocs.pm](https://hexdocs.pm/elixir/Protocol.html)
-- [Elixir source: Protocol.consolidate](https://github.com/elixir-lang/elixir/blob/main/lib/elixir/lib/protocol.ex)
-- [Jason.Encoder fallback discussion](https://github.com/michalmuskala/jason#readme)
-- [Inspect protocol — Any fallback in core](https://github.com/elixir-lang/elixir/blob/main/lib/elixir/lib/inspect.ex)
-- [Erlang: `term_to_binary/1`](https://www.erlang.org/doc/man/erlang.html#term_to_binary-1)
-- [Fred Hébert — "Erlang types vs protocols"](https://ferd.ca/)
+## Executable Example
+
+```elixir
+defmodule FallbackAnyTest do
+  use ExUnit.Case, async: true
+
+  alias FallbackAny.{WithFallback, WithoutFallback}
+
+  describe "WithFallback (has Any)" do
+    test "encodes known types via their specific impl" do
+      assert is_binary(WithFallback.encode(42))
+      assert WithFallback.encode("abc") == "abc"
+      assert WithFallback.encode(:ok) == "ok"
+    end
+
+    test "encodes unknown struct via Any impl" do
+      defmodule Weird, do: defstruct(x: 1)
+      bin = WithFallback.encode(%Weird{})
+      assert is_binary(bin)
+      assert :erlang.binary_to_term(bin) == %Weird{x: 1}
+    end
+
+    test "impl_for returns Any for unknown" do
+      defmodule Weird2, do: defstruct(a: 1)
+      assert WithFallback.impl_for(%Weird2{}) == FallbackAny.WithFallback.Any
+    end
+  end
+
+  describe "WithoutFallback (no Any)" do
+    test "encodes known types" do
+      assert is_binary(WithoutFallback.encode(42))
+    end
+
+    test "raises Protocol.UndefinedError on unknown struct" do
+      defmodule Weird3, do: defstruct(y: 1)
+
+      assert_raise Protocol.UndefinedError, fn ->
+        WithoutFallback.encode(%Weird3{})
+      end
+    end
+
+    test "impl_for returns nil for unknown" do
+      defmodule Weird4, do: defstruct(z: 1)
+      assert WithoutFallback.impl_for(%Weird4{}) == nil
+    end
+  end
+
+  describe "consolidation" do
+    test "both protocols are consolidated in test env" do
+      assert WithFallback.__protocol__(:consolidated?)
+      assert WithoutFallback.__protocol__(:consolidated?)
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrate @fallback_to_any performance implications
+      defprotocol WithFallback do
+        @fallback_to_any true
+        def process(data)
+      end
+
+      defimpl WithFallback, for: String do
+        def process(s), do: {:string, s}
+      end
+
+      # Fallback implementation for any type
+      defimpl WithFallback, for: Any do
+        def process(data), do: {:any, data}
+      end
+
+      # Benchmark dispatch
+      t0 = System.monotonic_time(:microsecond)
+      result1 = WithFallback.process("hello")
+      t1 = System.monotonic_time(:microsecond)
+
+      result2 = WithFallback.process(42)
+      t2 = System.monotonic_time(:microsecond)
+
+      string_time = t1 - t0
+      any_time = t2 - t1
+
+      IO.puts("✓ String dispatch: #{string_time} µs → #{inspect(result1)}")
+      IO.puts("✓ Any dispatch: #{any_time} µs → #{inspect(result2)}")
+      IO.puts("✓ Cost ratio: #{Float.round(any_time / max(string_time, 1), 2)}")
+
+      assert match?({:string, _}, result1), "String impl works"
+      assert match?({:any, _}, result2), "Any fallback works"
+
+      IO.puts("✓ @fallback_to_any: performance comparison working")
+  end
+end
+
+Main.main()
+```

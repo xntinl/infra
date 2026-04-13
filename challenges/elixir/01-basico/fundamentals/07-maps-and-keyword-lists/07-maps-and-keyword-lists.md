@@ -432,6 +432,133 @@ mix test --trace
 
 The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
 
+---
+
+## Executable Example
+
+Create a file `lib/app_config.ex` with the `AppConfig` module above, then test it in `iex`:
+
+```elixir
+defmodule AppConfig do
+  @defaults %{
+    server: %{
+      host: "localhost",
+      port: 4000,
+      pool_size: 10
+    },
+    database: %{
+      host: "localhost",
+      port: 5432,
+      name: "app_dev",
+      pool_size: 10,
+      ssl: false
+    },
+    logging: %{
+      level: :info,
+      format: "json"
+    }
+  }
+
+  def defaults, do: @defaults
+
+  def build(opts \\ []) do
+    file_config = Keyword.get(opts, :file_config, %{})
+    env_config = Keyword.get(opts, :env_config, %{})
+    validate? = Keyword.get(opts, :validate, true)
+
+    config =
+      @defaults
+      |> deep_merge(file_config)
+      |> deep_merge(env_config)
+
+    if validate? do
+      case validate(config) do
+        :ok -> {:ok, config}
+        {:error, errors} -> {:error, errors}
+      end
+    else
+      {:ok, config}
+    end
+  end
+
+  def deep_merge(left, right) when is_map(left) and is_map(right) do
+    Map.merge(left, right, fn _key, left_val, right_val ->
+      if is_map(left_val) and is_map(right_val) do
+        deep_merge(left_val, right_val)
+      else
+        right_val
+      end
+    end)
+  end
+
+  def get_in_config(config, keys) when is_map(config) and is_list(keys) do
+    case get_in(config, keys) do
+      nil -> :error
+      value -> {:ok, value}
+    end
+  end
+
+  def validate(config) do
+    errors =
+      []
+      |> validate_port(config, [:server, :port])
+      |> validate_port(config, [:database, :port])
+      |> validate_non_empty_string(config, [:server, :host])
+      |> validate_non_empty_string(config, [:database, :host])
+      |> validate_non_empty_string(config, [:database, :name])
+      |> validate_positive_integer(config, [:server, :pool_size])
+      |> validate_positive_integer(config, [:database, :pool_size])
+      |> validate_log_level(config)
+
+    case errors do
+      [] -> :ok
+      errs -> {:error, Enum.reverse(errs)}
+    end
+  end
+
+  defp validate_port(errors, config, path) do
+    case get_in(config, path) do
+      port when is_integer(port) and port > 0 and port <= 65535 -> errors
+      _ -> ["Port at #{inspect(path)} must be 1..65535" | errors]
+    end
+  end
+
+  defp validate_non_empty_string(errors, config, path) do
+    case get_in(config, path) do
+      str when is_binary(str) and byte_size(str) > 0 -> errors
+      _ -> ["String at #{inspect(path)} must be non-empty" | errors]
+    end
+  end
+
+  defp validate_positive_integer(errors, config, path) do
+    case get_in(config, path) do
+      n when is_integer(n) and n > 0 -> errors
+      _ -> ["Integer at #{inspect(path)} must be > 0" | errors]
+    end
+  end
+
+  defp validate_log_level(errors, config) do
+    case get_in(config, [:logging, :level]) do
+      level when level in [:debug, :info, :warning, :error] -> errors
+      _ -> ["Log level must be one of :debug, :info, :warning, :error" | errors]
+    end
+  end
+end
+
+# Test it:
+{:ok, config} = AppConfig.build(file_config: %{server: %{port: 8080}})
+IO.inspect(config.server.port)  # 8080 - overridden by file_config
+IO.inspect(config.server.host)  # "localhost" - kept from defaults
+IO.inspect(config.database.name)  # "app_dev" - from defaults
+
+{:ok, _} = AppConfig.build()  # Valid config with all defaults
+IO.puts("Valid config built successfully")
+
+{:error, errors} = AppConfig.build(file_config: %{server: %{port: 99999}})
+IO.inspect(errors)  # Port validation fails
+```
+
+---
 
 ## Key Concepts
 

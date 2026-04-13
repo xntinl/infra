@@ -396,6 +396,119 @@ ordering guarantees against a subsequent read from the same caller.
 
 - Tu GenServer recibe 10k casts/seg y procesa 8k/seg. Describí exactamente cómo y cuándo muere el nodo, y qué cambios harías para que falle ruidosamente antes.
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule CallVsCastDemo do
+    @moduledoc """
+    Micro-benchmark comparing `call` and `cast` throughput for the same
+    logical operation. See module docs of `SyncServer` and `AsyncServer`.
+    """
+
+    alias CallVsCastDemo.{SyncServer, AsyncServer}
+
+    @type result :: %{
+            flavor: :call | :cast,
+            operations: pos_integer(),
+            total_us: non_neg_integer(),
+            per_op_us: float(),
+            final_value: integer()
+          }
+
+    @doc """
+    Runs `n` add-1 operations against both servers and returns a list of
+    results. For the async run, the elapsed time INCLUDES the drain `call`,
+    which is the only honest way to measure effective throughput.
+    """
+    @spec bench(pos_integer()) :: [result()]
+    def bench(n \\ 100_000) do
+      [bench_sync(n), bench_async(n)]
+    end
+
+    defp bench_sync(n) do
+      {:ok, pid} = SyncServer.start_link()
+
+      {elapsed, _} =
+        :timer.tc(fn ->
+          Enum.each(1..n, fn _ -> SyncServer.add(pid, 1) end)
+        end)
+
+      value = SyncServer.value(pid)
+      GenServer.stop(pid)
+
+      %{
+        flavor: :call,
+        operations: n,
+        total_us: elapsed,
+        per_op_us: elapsed / n,
+        final_value: value
+      }
+    end
+
+    defp bench_async(n) do
+      {:ok, pid} = AsyncServer.start_link()
+
+      {elapsed, value} =
+        :timer.tc(fn ->
+          Enum.each(1..n, fn _ -> AsyncServer.add(pid, 1) end)
+          # Drain: the call flushes every prior cast because the mailbox is FIFO.
+          AsyncServer.value(pid)
+        end)
+
+      GenServer.stop(pid)
+
+      %{
+        flavor: :cast,
+        operations: n,
+        total_us: elapsed,
+        per_op_us: elapsed / n,
+        final_value: value
+      }
+    end
+  end
+
+  defmodule SyncServer do
+    use GenServer
+    def start_link(), do: GenServer.start_link(__MODULE__, 0)
+    def add(pid, n), do: GenServer.call(pid, {:add, n})
+    def value(pid), do: GenServer.call(pid, :value)
+    def init(state), do: {:ok, state}
+    def handle_call({:add, n}, _from, state), do: {:reply, state + n, state + n}
+    def handle_call(:value, _from, state), do: {:reply, state, state}
+  end
+
+  defmodule AsyncServer do
+    use GenServer
+    def start_link(), do: GenServer.start_link(__MODULE__, 0)
+    def add(pid, n), do: GenServer.cast(pid, {:add, n})
+    def value(pid), do: GenServer.call(pid, :value)
+    def init(state), do: {:ok, state}
+    def handle_cast({:add, n}, state), do: {:noreply, state + n}
+    def handle_call(:value, _from, state), do: {:reply, state, state}
+  end
+
+  def main do
+    {:ok, sync_pid} = SyncServer.start_link()
+    v1 = SyncServer.add(sync_pid, 10)
+    IO.puts("SyncServer add result: #{v1}")
+  
+    {:ok, async_pid} = AsyncServer.start_link()
+    :ok = AsyncServer.add(async_pid, 10)
+    v2 = AsyncServer.value(async_pid)
+    IO.puts("AsyncServer final value: #{v2}")
+  
+    IO.puts("✓ CallVsCastDemo works correctly")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`GenServer.call/3` and `GenServer.cast/2`](https://hexdocs.pm/elixir/GenServer.html#call/3)

@@ -36,6 +36,25 @@ Elixir AST is lists of three-element tuples. Reading them by eye past three leve
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Metaprogramming-specific insight:**
+Code generation is powerful and dangerous. Every macro you write is a place where intent is hidden. Use macros sparingly, only when they eliminate genuine boilerplate. If your macro is more than 10 lines, you probably need a function or data structure instead. Future maintainers will thank you.
 ### 1. `Macro.expand_once/2` vs `Macro.expand/2`
 
 - `expand_once/2`: expands the outermost macro one step; returns the result
@@ -355,11 +374,121 @@ activity.
 
 ---
 
-## Resources
 
-- [`Macro` — hexdocs.pm](https://hexdocs.pm/elixir/Macro.html) — `expand_once`, `expand`, `to_string`
-- [`Macro.Env` docs](https://hexdocs.pm/elixir/Macro.Env.html)
-- [Kernel.dbg/1 source](https://github.com/elixir-lang/elixir/blob/main/lib/elixir/lib/kernel.ex) — search for `defmacro dbg`
-- [`Code.env_for_eval/1`](https://hexdocs.pm/elixir/Code.html#env_for_eval/1)
-- [*Metaprogramming Elixir* — debugging chapter](https://pragprog.com/titles/cmelixir/metaprogramming-elixir/)
-- [Dashbit blog on macro internals](https://dashbit.co/blog)
+## Executable Example
+
+```elixir
+defmodule MacroExpandDebug.Inspector do
+  @moduledoc """
+  Tools for inspecting macro expansion step by step.
+
+  Usage:
+
+      iex> env = __ENV__
+      iex> ast = quote do: unless(true, do: :ok)
+      iex> MacroExpandDebug.Inspector.trace_expansion(ast, env)
+  """
+
+  @type step :: %{ast: Macro.t(), source: String.t(), step_number: non_neg_integer()}
+
+  @spec expand_step(Macro.t(), Macro.Env.t()) :: {Macro.t(), boolean()}
+  def expand_step(ast, env) do
+    expanded = Macro.expand_once(ast, env)
+    {expanded, expanded != ast}
+  end
+
+  @spec trace_expansion(Macro.t(), Macro.Env.t(), pos_integer()) :: [step()]
+  def trace_expansion(ast, env, max_steps \\ 10) do
+    trace_loop(ast, env, max_steps, 0, [])
+  end
+
+  defp trace_loop(ast, env, max, step, acc) when step >= max do
+    Enum.reverse([to_step(ast, step) | acc])
+  end
+
+  defp trace_loop(ast, env, max, step, acc) do
+    entry = to_step(ast, step)
+    {expanded, changed?} = expand_step(ast, env)
+
+    if changed? do
+      trace_loop(expanded, env, max, step + 1, [entry | acc])
+    else
+      Enum.reverse([entry | acc])
+    end
+  end
+
+  defp to_step(ast, step) do
+    %{ast: ast, source: safe_to_string(ast), step_number: step}
+  end
+
+  @spec inspect_ast(Macro.t()) :: :ok
+  def inspect_ast(ast) do
+    IO.puts("== AST ==")
+    IO.inspect(ast, structs: false, limit: :infinity)
+    IO.puts("\n== SOURCE ==")
+    IO.puts(safe_to_string(ast))
+    :ok
+  end
+
+  @spec print_trace([step()]) :: :ok
+  def print_trace(steps) do
+    Enum.each(steps, fn %{step_number: n, source: src} ->
+      IO.puts("--- step #{n} ---")
+      IO.puts(src)
+    end)
+
+    :ok
+  end
+
+  defp safe_to_string(ast) do
+    try do
+      Macro.to_string(ast)
+    rescue
+      _ -> inspect(ast)
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrate macro debugging with expand and to_string
+      defmodule DebugHelper do
+        defmacro debug_expand(expr) do
+          # Capture the quoted expression
+          quote bind_quoted: [expr: expr] do
+            # Expand once
+            expanded_once = Macro.expand_once(expr, __ENV__)
+
+            # Convert to string
+            source = Macro.to_string(expanded_once)
+
+            # Return expanded form
+            IO.puts("✓ Original: #{inspect(expr)}")
+            IO.puts("✓ Expanded: #{source}")
+
+            expanded_once
+          end
+        end
+      end
+
+      require DebugHelper
+
+      # Test with a simple macro
+      defmacro_simple = quote do: 1 + 2
+
+      # Expand it (simulating the debugging process)
+      result = Macro.expand_once(defmacro_simple, __ENV__)
+      source_str = Macro.to_string(result)
+
+      IO.puts("✓ Macro debug info:")
+      IO.puts("  AST: #{inspect(result)}")
+      IO.puts("  Source: #{source_str}")
+
+      assert source_str |> String.contains?(["1", "2"]), "Source contains operands"
+
+      IO.puts("✓ Macro debugging: expand and to_string working")
+  end
+end
+
+Main.main()
+```

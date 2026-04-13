@@ -345,6 +345,75 @@ correctly, but a naive implementation that assumes "shutdown ⇒
 
 - Diseñá la política de resultados parciales: ¿qué hacés con las tasks que no respondieron dentro del deadline?
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule YieldManyDemo do
+    @moduledoc """
+    Best-effort deadline-oriented collection of a batch of tasks.
+
+    `poll/3` runs `fun` over each input concurrently, waits up to
+    `deadline_ms`, and returns a normalized outcome list. Tasks still
+    running at the deadline are shut down so they can't leak work past
+    the reply.
+    """
+
+    @type input :: term()
+    @type outcome :: {:ok, term()} | {:exit, term()} | :timeout
+
+    @doc """
+    Runs `fun.(input)` in parallel for each `input`, returns outcomes in
+    input order. Every task is guaranteed terminated by the time this
+    function returns.
+
+    Options:
+      * `:shutdown` — how to terminate still-running tasks at the
+        deadline. One of `:brutal_kill` (default) or a non-negative
+        integer grace period in milliseconds.
+    """
+    @spec poll([input()], (input() -> term()), pos_integer(), keyword()) :: [outcome()]
+    def poll(inputs, fun, deadline_ms, opts \\ [])
+        when is_list(inputs) and is_function(fun, 1) and is_integer(deadline_ms) do
+      shutdown_mode = Keyword.get(opts, :shutdown, :brutal_kill)
+
+      tasks = Enum.map(inputs, fn i -> Task.async(fn -> fun.(i) end) end)
+
+      tasks
+      |> Task.yield_many(deadline_ms)
+      |> Enum.map(fn {task, result} -> normalize(task, result, shutdown_mode) end)
+    end
+
+    # Either the task is already done (result is {:ok, _} / {:exit, _}), or
+    # it's still running (result is nil) and we need to shut it down.
+    defp normalize(_task, {:ok, value}, _mode), do: {:ok, value}
+    defp normalize(_task, {:exit, reason}, _mode), do: {:exit, reason}
+
+    defp normalize(task, nil, mode) do
+      case Task.shutdown(task, mode) do
+        {:ok, value} -> {:ok, value}
+        {:exit, reason} -> {:exit, reason}
+        nil -> :timeout
+      end
+    end
+  end
+
+  def main do
+    inputs = [1, 2, 3]
+    work = fn x -> x * 2 end
+    results = YieldManyDemo.poll(inputs, work, 1000)
+    IO.puts("Polled results: #{inspect(results)}")
+    IO.puts("✓ YieldManyDemo works correctly")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Task.yield_many/2`](https://hexdocs.pm/elixir/Task.html#yield_many/2)

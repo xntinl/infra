@@ -851,19 +851,137 @@ Target: operation should complete in the low-microsecond range on modern hardwar
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
 
-- [`:queue` module -- Erlang/OTP](https://www.erlang.org/doc/man/queue.html) -- functional FIFO queue
-- [`:gb_sets` module -- Erlang/OTP](https://www.erlang.org/doc/man/gb_sets.html) -- balanced BST used as priority queue
-- [Introduction to Algorithms -- CLRS](https://mitpress.mit.edu/9780262046305/introduction-to-algorithms/) -- BFS, DFS, Dijkstra (chapters 22-24)
-- [libgraph](https://github.com/bitwalker/libgraph) -- production-grade graph library for Elixir
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+defmodule ApiGateway.Graph.CycleDetector do
+  alias ApiGateway.Graph
+
+  @doc """
+  Detects cycles in a directed graph using 3-color DFS.
+
+  Colors:
+    :white -- not yet visited
+    :gray  -- currently in the DFS stack (ancestor)
+    :black -- fully processed
+
+  A back edge (gray -> gray) indicates a cycle.
+  """
+  @spec has_cycle?(Graph.t()) :: boolean()
+  def has_cycle?(graph) do
+    nodes = Graph.nodes(graph)
+    colors = Map.new(nodes, fn n -> {n, :white} end)
+    Enum.reduce_while(nodes, colors, fn node, colors ->
+      if colors[node] == :white do
+        case dfs(graph, node, colors) do
+          {:cycle, _}    -> {:halt, true}
+          {:ok, colors}  -> {:cont, colors}
+        end
+      else
+        {:cont, colors}
+      end
+    end)
+    |> case do
+      true -> true
+      _colors -> false
+    end
+  end
+
+  @doc """
+  Finds one cycle path in the graph. Returns a list of nodes forming the cycle,
+  or an empty list if no cycle exists.
+  """
+  @spec find_cycle(Graph.t()) :: [Graph.node_id()]
+  def find_cycle(graph) do
+    nodes = Graph.nodes(graph)
+    colors = Map.new(nodes, fn n -> {n, :white} end)
+
+    Enum.reduce_while(nodes, {colors, []}, fn node, {colors, _path} ->
+      if colors[node] == :white do
+        case dfs_with_path(graph, node, colors, []) do
+          {:cycle, _colors, cycle_path} -> {:halt, {colors, cycle_path}}
+          {:ok, colors}                 -> {:cont, {colors, []}}
+        end
+      else
+        {:cont, {colors, []}}
+      end
+    end)
+    |> elem(1)
+  end
+
+  defp dfs(graph, node, colors) do
+    colors = Map.put(colors, node, :gray)
+
+    neighbors = Graph.neighbors(graph, node)
+    neighbor_ids = Enum.map(neighbors, fn
+      {n, _w} -> n
+      n -> n
+    end)
+
+    result = Enum.reduce_while(neighbor_ids, {:ok, colors}, fn neighbor, {:ok, c} ->
+      case c[neighbor] do
+        :gray  -> {:halt, {:cycle, c}}
+        :white ->
+          case dfs(graph, neighbor, c) do
+            {:cycle, _} = cycle -> {:halt, cycle}
+            {:ok, c}            -> {:cont, {:ok, c}}
+          end
+        :black -> {:cont, {:ok, c}}
+        nil    -> {:cont, {:ok, c}}
+      end
+    end)
+
+    case result do
+      {:cycle, c}  -> {:cycle, c}
+      {:ok, c}     -> {:ok, Map.put(c, node, :black)}
+    end
+  end
+
+  defp dfs_with_path(graph, node, colors, path) do
+    colors = Map.put(colors, node, :gray)
+    path = path ++ [node]
+
+    neighbors = Graph.neighbors(graph, node)
+    neighbor_ids = Enum.map(neighbors, fn
+      {n, _w} -> n
+      n -> n
+    end)
+
+    result = Enum.reduce_while(neighbor_ids, {:ok, colors}, fn neighbor, {:ok, c} ->
+      case c[neighbor] do
+        :gray ->
+          cycle_start_idx = Enum.find_index(path, &(&1 == neighbor))
+          cycle_path = Enum.slice(path, cycle_start_idx..-1//1) ++ [neighbor]
+          {:halt, {:cycle, c, cycle_path}}
+        :white ->
+          case dfs_with_path(graph, neighbor, c, path) do
+            {:cycle, _, _} = cycle -> {:halt, cycle}
+            {:ok, c}               -> {:cont, {:ok, c}}
+          end
+        :black -> {:cont, {:ok, c}}
+        nil    -> {:cont, {:ok, c}}
+      end
+    end)
+
+    case result do
+      {:cycle, c, cycle_path} -> {:cycle, c, cycle_path}
+      {:ok, c}                -> {:ok, Map.put(c, node, :black)}
+    end
+  end
 end
+
+defmodule Main do
+  def main do
+      IO.puts("Benchmarking initialized")
+      {elapsed_us, result} = :timer.tc(fn ->
+        Enum.reduce(1..1000, 0, &+/2)
+      end)
+      if is_number(elapsed_us) do
+        IO.puts("✓ Benchmark completed: sum(1..1000) = " <> inspect(result) <> " in " <> inspect(elapsed_us) <> "µs")
+      end
+  end
+end
+
+Main.main()
 ```

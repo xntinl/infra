@@ -346,6 +346,81 @@ a list is a code smell unless you're also filtering or combining.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule EventAggregator do
+  @moduledoc """
+  Aggregations over event streams using Enum.reduce/reduce_while.
+  """
+
+  @doc """
+  Counts events grouped by their `:type` field.
+
+  Returns a map `%{type => count}`. Single pass, O(n) time, O(k) memory
+  where k = number of distinct types (typically small).
+  """
+  @spec count_by_type([map()]) :: %{atom() => non_neg_integer()}
+  def count_by_type(events) do
+    # Map accumulator: Map.update/4 is O(log n) but n = number of types (small).
+    # We avoid the double traversal of group_by + map_values.
+    Enum.reduce(events, %{}, fn %{type: type}, acc ->
+      Map.update(acc, type, 1, &(&1 + 1))
+    end)
+  end
+
+  @doc """
+  Revenue statistics for `:purchase` events.
+
+  Returns `%{count: n, sum: s, avg: a}`. If there are no purchases, `avg` is `0.0`
+  to avoid a division-by-zero crash on empty datasets — fail fast, but don't crash
+  on a legitimately empty input.
+  """
+  @spec revenue_stats([map()]) :: %{count: non_neg_integer(), sum: float(), avg: float()}
+  def revenue_stats(events) do
+    # Tuple accumulator {count, sum} — cheaper than a map when keys are fixed.
+    {count, sum} =
+      Enum.reduce(events, {0, 0.0}, fn
+        %{type: :purchase, amount: amount}, {c, s} -> {c + 1, s + amount}
+        _other, acc -> acc
+      end)
+
+    avg = if count == 0, do: 0.0, else: sum / count
+    %{count: count, sum: sum, avg: avg}
+  end
+
+  @doc """
+  Walks the stream and returns the first `n` distinct user_ids, stopping as soon as
+  `n` are found. Uses `reduce_while` to avoid scanning the rest of the input.
+
+  Returns a list in the order users were first seen.
+  """
+  @spec first_unique_users(Enumerable.t(), pos_integer()) :: [integer()]
+  def first_unique_users(events, n) when n > 0 do
+    # Accumulator: {MapSet for O(1) membership test, list in reverse for O(1) prepend}.
+    # We reverse once at the end — the classic "build reversed, flip once" pattern.
+    {_seen, acc} =
+      Enum.reduce_while(events, {MapSet.new(), []}, fn %{user_id: uid}, {seen, acc} ->
+        cond do
+          MapSet.member?(seen, uid) ->
+            {:cont, {seen, acc}}
+
+          MapSet.size(seen) + 1 == n ->
+            # Found the nth unique user — halt immediately.
+            {:halt, {seen, [uid | acc]}}
+
+          true ->
+            {:cont, {MapSet.put(seen, uid), [uid | acc]}}
+        end
+      end)
+
+    Enum.reverse(acc)
+  end
+end
+```
+
 ## Resources
 
 - [`Enum.reduce/3` docs](https://hexdocs.pm/elixir/Enum.html#reduce/3)

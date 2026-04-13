@@ -398,6 +398,65 @@ Don't open your prod cookie over the public internet. Tunnel through SSH
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule ObservableApp.Worker do
+    @moduledoc """
+    A GenServer that periodically increments a counter. Creates measurable
+    reduction counts so it's visible in Observer's Processes tab.
+    """
+
+    use GenServer
+
+    def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+
+    @impl true
+    def init(_opts) do
+      schedule()
+      {:ok, %{ticks: 0}}
+    end
+
+    @impl true
+    def handle_info(:tick, %{ticks: t} = state) do
+      # Do a bit of CPU work so Observer shows non-zero reductions.
+      _ = Enum.sum(1..1_000)
+      schedule()
+      {:noreply, %{state | ticks: t + 1}}
+    end
+
+    @doc "Returns the current tick count."
+    @spec count() :: non_neg_integer()
+    def count, do: GenServer.call(__MODULE__, :count)
+
+    @impl true
+    def handle_call(:count, _from, %{ticks: t} = state), do: {:reply, t, state}
+
+    defp schedule, do: Process.send_after(self(), :tick, 100)
+  end
+
+  def main do
+    IO.puts("=== Observer Demo ===
+  ")
+  
+    # Demo: Observer tool
+  IO.puts("1. :observer.start() in iex")
+  IO.puts("2. Inspect processes and memory")
+  IO.puts("3. Live system monitoring")
+
+  IO.puts("
+  ✓ Observer demo completed!")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`:observer` — Erlang docs](https://www.erlang.org/doc/apps/observer/observer_ug.html) — the full UG

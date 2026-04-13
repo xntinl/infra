@@ -48,6 +48,22 @@ shrinks the blast radius. For true untrusted code, combine with Linux namespaces
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. erlexec lifecycle
 
 `:exec.start/0` boots the C++ broker. Every `:exec.run/2` call tells the broker what to
@@ -491,9 +507,248 @@ trades per-call speed (cgroup creation is slower than `prlimit`) for stronger is
 what kind of workload does the cgroup overhead become negligible compared to the script's
 own startup time, and where does it matter?
 
-## Resources
+## Executable Example
 
-- [erlexec README and docs](https://github.com/saleyn/erlexec)
-- [`prlimit(1)` — util-linux](https://man7.org/linux/man-pages/man1/prlimit.1.html)
-- [`setrlimit(2)`](https://man7.org/linux/man-pages/man2/setrlimit.2.html)
-- [cgroup v2 memory controller](https://www.kernel.org/doc/Documentation/admin-guide/cgroup-v2.rst)
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+
+defmodule MlSandbox.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :ml_sandbox,
+      version: "0.1.0",
+      elixir: "~> 1.17",
+      deps: [
+        {:erlexec, "~> 2.0"},
+        {:benchee, "~> 1.3", only: :dev}
+      ]
+    ]
+  end
+
+  def application do
+    [
+      extra_applications: [:logger, :erlexec],
+      mod: {MlSandbox.Application, []}
+    ]
+  end
+end
+
+defmodule MlSandbox.Application do
+  use Application
+
+  @impl true
+  def start(_, _) do
+    # erlexec's own supervisor is started via :erlexec as an OTP app.
+    # We just need our sandbox wrapper.
+    Supervisor.start_link([MlSandbox.Sandbox],
+      strategy: :one_for_one, name: MlSandbox.Supervisor)
+  end
+end
+
+defmodule MlSandbox.Sandbox do
+  end
+  @moduledoc """
+  Runs untrusted scripts under erlexec with CPU time, RSS, and wall-clock caps.
+
+  Returns:
+    {:ok, stdout, stderr}
+    {:error, :timeout}
+    {:error, :cpu_limit}
+    {:error, :mem_limit}
+    {:error, {:exit_status, code, stdout, stderr}}
+  """
+  use GenServer
+  require Logger
+
+  defstruct [:ospid, :ref, :caller, :stdout, :stderr, :limits,
+             :timer_ref, :started_at, :max_output]
+
+  # ---- Public API -----------------------------------------------------------
+
+  def start_link(_), do: GenServer.start_link(__MODULE__, nil, name: __MODULE__)
+
+  @doc """
+  Runs `cmd` with arguments, enforcing the given limits.
+
+    opts = [
+      cpu_seconds:   integer,   # SIGXCPU after N seconds of CPU time
+      rss_bytes:     integer,   # RLIMIT_AS — virtual memory cap
+      wall_ms:       integer,   # kill after wall-clock ms regardless of CPU
+      max_output:    integer,   # abort if stdout+stderr exceeds bytes
+      cwd:           path,
+      env:           [{binary, binary}]
+    ]
+  """
+  @spec run(Path.t(), [binary()], keyword()) ::
+          {:ok, binary(), binary()} | {:error, term()}
+  def run(cmd, args, opts \\ []) do
+    GenServer.call(__MODULE__, {:run, cmd, args, opts}, :infinity)
+  end
+
+  # ---- GenServer ------------------------------------------------------------
+
+  @impl true
+  def init(_), do: {:ok, %{}}
+
+  @impl true
+  def handle_call({:run, cmd, args, opts}, from, state) do
+    cpu = Keyword.get(opts, :cpu_seconds, 5)
+    rss = Keyword.get(opts, :rss_bytes, 256 * 1024 * 1024)
+    wall = Keyword.get(opts, :wall_ms, 10_000)
+    max_output = Keyword.get(opts, :max_output, 1_000_000)
+    cwd = Keyword.get(opts, :cwd, System.tmp_dir!())
+    env = Keyword.get(opts, :env, []) |> Enum.map(fn {k, v} -> {to_charlist(k), to_charlist(v)} end)
+
+    exec_opts = [
+      :stdout, :stderr, :monitor,
+      {:cd, String.to_charlist(cwd)},
+      {:env, env},
+      {:kill_timeout, 2},
+      {:group, 0}  # start in its own process group so we can kill the tree
+    ]
+
+    # erlexec understands these structured rlimits indirectly — we pass them
+    # via the kernel's preexec hook by wrapping the command with `prlimit`.
+    # This keeps the example portable to erlexec versions that do not expose
+    # every rlimit directly.
+    wrapped_cmd = wrap_with_prlimit(cmd, args, cpu, rss)
+
+    case :exec.run(wrapped_cmd, exec_opts) do
+      {:ok, _pid, ospid} ->
+        timer_ref = Process.send_after(self(), {:wall_timeout, ospid}, wall)
+        s = %__MODULE__{
+          ospid: ospid,
+          caller: from,
+          stdout: <<>>,
+          stderr: <<>>,
+          timer_ref: timer_ref,
+          max_output: max_output,
+          started_at: System.monotonic_time(:millisecond),
+          limits: %{cpu: cpu, rss: rss, wall: wall}
+        }
+        {:noreply, Map.put(state, ospid, s)}
+
+      {:error, reason} ->
+        {:reply, {:error, {:spawn_failed, reason}}, state}
+    end
+  end
+
+  @impl true
+  def handle_info({:stdout, ospid, bytes}, state) do
+    state |> update_run(ospid, fn s ->
+      new = %{s | stdout: s.stdout <> bytes}
+      maybe_kill_on_output(new)
+    end)
+    |> reply_noreply()
+  end
+
+  def handle_info({:stderr, ospid, bytes}, state) do
+    state |> update_run(ospid, fn s ->
+      new = %{s | stderr: s.stderr <> bytes}
+      maybe_kill_on_output(new)
+    end)
+    |> reply_noreply()
+  end
+
+  def handle_info({:DOWN, _, :process, _, {:exit_status, status}}, state) do
+    handle_exit_by_status(status, state)
+  end
+
+  def handle_info({:wall_timeout, ospid}, state) do
+    case Map.get(state, ospid) do
+      nil -> {:noreply, state}
+      s ->
+        :exec.kill(ospid, 9)
+        GenServer.reply(s.caller, {:error, :timeout})
+        {:noreply, Map.delete(state, ospid)}
+    end
+  end
+
+  def handle_info(_, state), do: {:noreply, state}
+
+  # ---- Helpers --------------------------------------------------------------
+
+  defp wrap_with_prlimit(cmd, args, cpu_seconds, rss_bytes) do
+    prlimit_args =
+      ["--cpu=#{cpu_seconds}", "--as=#{rss_bytes}", "--"] ++ [cmd] ++ args
+
+    # erlexec accepts a charlist command string.
+    (["prlimit" | prlimit_args]
+     |> Enum.map_join(" ", &shell_escape/1))
+    |> String.to_charlist()
+  end
+
+  defp shell_escape(s), do: "'" <> String.replace(s, "'", "'\\''") <> "'"
+
+  defp update_run(state, ospid, fun) do
+    case Map.get(state, ospid) do
+      nil -> {state, nil}
+      s ->
+        case fun.(s) do
+          :killed -> {Map.delete(state, ospid), :killed}
+          new -> {Map.put(state, ospid, new), nil}
+        end
+    end
+  end
+
+  defp reply_noreply({state, _}), do: {:noreply, state}
+
+  defp maybe_kill_on_output(%{stdout: so, stderr: se, max_output: max, ospid: ospid, caller: from}) do
+    if byte_size(so) + byte_size(se) > max do
+      :exec.kill(ospid, 9)
+      GenServer.reply(from, {:error, :output_too_large})
+      :killed
+    else
+      %{stdout: so, stderr: se, max_output: max, ospid: ospid, caller: from}
+    end
+  end
+  defp maybe_kill_on_output(s), do: s
+
+  # erlexec encodes exit via a monitor DOWN with {:exit_status, N}.
+  # The N is a packed value: low byte = signal if any, rest = exit code.
+  defp handle_exit_by_status(status, state) do
+    # Find the ospid whose process just died. erlexec's DOWN does not
+    # carry ospid; we resolve by the single in-flight call in this simple
+    # implementation — production code should track ref→ospid mapping.
+    case Map.keys(state) do
+      [ospid] ->
+        s = Map.fetch!(state, ospid)
+        Process.cancel_timer(s.timer_ref)
+        reply = classify_exit(status, s)
+        GenServer.reply(s.caller, reply)
+        {:noreply, Map.delete(state, ospid)}
+      _ ->
+        {:noreply, state}
+    end
+  end
+
+  defp classify_exit(status, s) do
+    signal = :exec.status(status) |> elem(0)
+    exit_code = :exec.status(status) |> elem(1)
+    cond do
+      signal == 24 -> {:error, :cpu_limit}        # SIGXCPU
+      signal == 9  -> {:error, :killed}
+      exit_code == 0 -> {:ok, s.stdout, s.stderr}
+      true -> {:error, {:exit_status, exit_code, s.stdout, s.stderr}}
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrating 322-erlexec-resource-limits
+      :ok
+  end
+end
+
+Main.main()
+end
+end
+end
+```

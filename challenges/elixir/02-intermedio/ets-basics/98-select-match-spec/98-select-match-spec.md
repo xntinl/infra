@@ -417,6 +417,125 @@ at that point, `lookup/2` is usually clearer.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule SelectMsDemo do
+    @moduledoc """
+    A small "people" table storing `{id, name, age}` and three query flavors
+    that all compute the same thing:
+
+      1. `adults_handwritten/1` — the match spec written by hand.
+      2. `adults_fun2ms/1` — generated via `:ets.fun2ms/1` (literal fun only).
+      3. `adults_ex2ms/1` — generated via the `Ex2ms.fun` macro at compile time.
+
+    Run them all and confirm identical results — the point of the exercise is
+    that (3) is the ergonomic choice in Elixir and is strictly equivalent.
+    """
+
+    require Ex2ms
+
+    @type row :: {integer(), String.t(), non_neg_integer()}
+
+    @doc "Creates and seeds a `:set` table with five people."
+    @spec seed() :: :ets.tid()
+    def seed do
+      t = :ets.new(:people, [:set, :public])
+
+      :ets.insert(t, [
+        {1, "Alice", 30},
+        {2, "Bob", 17},
+        {3, "Carol", 42},
+        {4, "Dan", 12},
+        {5, "Eve", 25}
+      ])
+
+      t
+    end
+
+    @doc """
+    Returns `{id, name}` for each person with `age >= 18`, using a match spec
+    built by hand. Demonstrates what `fun2ms` is generating under the hood.
+    """
+    @spec adults_handwritten(:ets.tid()) :: [{integer(), String.t()}]
+    def adults_handwritten(t) do
+      match_spec = [
+        {
+          {:"$1", :"$2", :"$3"},          # id=$1, name=$2, age=$3
+          [{:>=, :"$3", 18}],             # guard: $3 >= 18
+          [{{:"$1", :"$2"}}]              # body: return {id, name}
+        }
+      ]
+
+      :ets.select(t, match_spec)
+    end
+
+    @doc """
+    Same query, but the spec is generated at compile time by `Ex2ms.fun`.
+    The macro inspects the AST of the fun, validates it, and emits the same
+    match spec structure as `adults_handwritten/1`.
+    """
+    @spec adults_ex2ms(:ets.tid()) :: [{integer(), String.t()}]
+    def adults_ex2ms(t) do
+      ms =
+        Ex2ms.fun do
+          {id, name, age} when age >= 18 -> {id, name}
+        end
+
+      :ets.select(t, ms)
+    end
+
+    @doc """
+    A more interesting query: adults whose name starts with "A" or "C",
+    returning the full row. Shows a compound guard in both flavors.
+    """
+    @spec acs_adults(:ets.tid()) :: [row()]
+    def acs_adults(t) do
+      ms =
+        Ex2ms.fun do
+          {id, name, age} = row
+          when age >= 18 and
+                 (:binary.part(name, 0, 1) == "A" or :binary.part(name, 0, 1) == "C") ->
+            row
+        end
+
+      :ets.select(t, ms)
+    end
+  end
+
+  def main do
+    # Demo: consultas con match specs
+    t = SelectMsDemo.seed()
+  
+    # Buscar adultos (edad >= 18) con match spec manual
+    handwritten_result = SelectMsDemo.adults_handwritten(t)
+    assert Enum.sort(handwritten_result) == [{1, "Alice"}, {3, "Carol"}, {5, "Eve"}]
+  
+    # Buscar adultos con Ex2ms
+    ex2ms_result = SelectMsDemo.adults_ex2ms(t)
+    assert Enum.sort(ex2ms_result) == [{1, "Alice"}, {3, "Carol"}, {5, "Eve"}]
+  
+    # Buscar adultos cuyo nombre empieza con A o C
+    acs_result = SelectMsDemo.acs_adults(t)
+    assert Enum.sort(acs_result) == [{1, "Alice", 30}, {3, "Carol", 42}]
+  
+    :ets.delete(t)
+  
+    IO.puts("SelectMsDemo: demostración de match specs exitosa")
+    IO.puts("  handwritten: #{inspect(Enum.sort(handwritten_result))}")
+    IO.puts("  ex2ms: #{inspect(Enum.sort(ex2ms_result))}")
+    IO.puts("  A/C adults: #{inspect(Enum.sort(acs_result))}")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`:ets.select/2`](https://www.erlang.org/doc/man/ets.html#select-2), [`select/3`](https://www.erlang.org/doc/man/ets.html#select-3), [`fun2ms/1`](https://www.erlang.org/doc/man/ets.html#fun2ms-1)

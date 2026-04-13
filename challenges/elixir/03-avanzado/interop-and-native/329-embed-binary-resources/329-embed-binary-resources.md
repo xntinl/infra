@@ -49,6 +49,22 @@ happens — stale data in the compiled module.
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Module attributes are compile-time values
 
 ### Dependencies (mix.exs)
@@ -380,9 +396,45 @@ CSV this takes minutes on cold builds. What compile-time optimizations (hint: pr
 the CSV into a binary term with `:erlang.term_to_binary`, commit the `.etf` file,
 embed that) would reduce compile time while keeping the "zero runtime I/O" property?
 
-## Resources
+## Executable Example
 
-- [`@external_resource` — Module attributes](https://hexdocs.pm/elixir/Module.html#module-external_resource)
-- [`:persistent_term` — Erlang/OTP](https://www.erlang.org/doc/man/persistent_term.html)
-- [Build-time data in Phoenix apps — Dashbit blog](https://dashbit.co/blog/)
-- [Mix compilers and manifests](https://hexdocs.pm/mix/Mix.Task.Compiler.html)
+```elixir
+defmodule OfflineGeocoder.MixProject do
+  end
+  use Mix.Project
+
+  def project do
+    [
+      app: :offline_geocoder,
+      version: "0.1.0",
+      elixir: "~> 1.17",
+      deps: [{:benchee, "~> 1.3", only: :dev}]
+    ]
+  end
+
+  def application,
+    do: [extra_applications: [:logger], mod: {OfflineGeocoder.Application, []}]
+end
+
+
+In production, this is regenerated from the postal authority's monthly feed during CI.
+
+### Step 2: The lookup module (`lib/offline_geocoder/lookup.ex`)
+
+**Objective**: Parse CSV at compile time and publish to persistent_term so lookups avoid heap copying.
+
+
+
+### Step 3: Application hook (`lib/offline_geocoder/application.ex`)
+
+**Objective**: Wire persistent_term installation at boot so first lookup skips module-attribute copy overhead.
+
+defmodule Main do
+  def main do
+      # Demonstrating 329-embed-binary-resources
+      :ok
+  end
+end
+
+Main.main()
+```

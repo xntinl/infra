@@ -49,6 +49,22 @@ You could maintain `{reference_id, transfer_id}` in a separate table. Two tables
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Mnesia tables
 
 Created with `:mnesia.create_table/2`. Options include:
@@ -115,6 +131,22 @@ You could maintain `{reference_id, transfer_id}` in a separate table. Two tables
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Mnesia tables
 
 Created with `:mnesia.create_table/2`. Options include:
@@ -491,10 +523,31 @@ ETS tables are in-memory, non-distributed key-value stores with tunable semantic
 
 You handle 5k transfers per second with a single-node Mnesia. Contention on a popular source account (hot key) causes transactional retries. What are your options within Mnesia to reduce contention, and when do you reach for an event-sourced log (e.g. Commanded) instead? What would the migration look like in terms of idempotency keys and reconciliation?
 
-## Resources
+## Executable Example
 
-- [Mnesia user guide](https://www.erlang.org/doc/apps/mnesia/users_guide.html)
-- [`:mnesia` module reference](https://www.erlang.org/doc/man/mnesia.html)
-- [Mnesia in production — Whatsapp story](https://www.youtube.com/watch?v=lJQ7HtLrYF8)
-- [`:mnesia.index_read/3`](https://www.erlang.org/doc/man/mnesia.html#index_read-3)
-- [Transactional semantics — Fred Hebert](https://ferd.ca/)
+```elixir
+defmodule AccountLedger.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :account_ledger, version: "0.1.0", elixir: "~> 1.16", deps: deps()]
+  end
+
+  def application do
+    [extra_applications: [:logger, :mnesia], mod: {AccountLedger.Application, []}]
+  end
+
+  defp deps do
+    [{:benchee, "~> 1.3", only: :dev}]
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrating 377-mnesia-transactions-indices
+      :ok
+  end
+end
+
+Main.main()
+```

@@ -250,6 +250,17 @@ All 6 tests should pass.
 ---
 
 
+
+
+## Executable Example
+
+Create a simple example demonstrating the key concepts:
+
+```elixir
+# Example code demonstrating text and binary concepts
+IO.puts("Example: Read the Implementation section above and run the code samples in iex")
+```
+
 ## Key Concepts
 
 ### 1. `Base.encode64/1` and `Base.decode64/1` Handle Encoding

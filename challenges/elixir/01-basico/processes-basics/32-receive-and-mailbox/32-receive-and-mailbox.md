@@ -445,7 +445,59 @@ mix format
 
 ---
 
+## Executable Example
 
+Create `lib/req_resp.ex` and test in `iex`:
+
+```elixir
+defmodule ReqResp.EchoServer do
+  def start do
+    spawn(fn -> loop() end)
+  end
+
+  defp loop do
+    receive do
+      {:call, value, caller_pid, ref} ->
+        send(caller_pid, {:reply, ref, value})
+        loop()
+      :stop ->
+        :ok
+    after
+      10_000 ->
+        IO.puts("Echo server timeout, stopping")
+        :ok
+    end
+  end
+end
+
+defmodule ReqResp.Client do
+  def call(server_pid, value, timeout) do
+    ref = make_ref()
+    send(server_pid, {:call, value, self(), ref})
+    receive do
+      {:reply, ^ref, result} -> {:ok, result}
+    after
+      timeout -> {:error, :timeout}
+    end
+  end
+end
+
+# Test it
+pid = ReqResp.EchoServer.start()
+
+{:ok, result} = ReqResp.Client.call(pid, 42, 1000)
+IO.inspect(result)  # 42
+
+{:ok, result2} = ReqResp.Client.call(pid, "hello", 1000)
+IO.inspect(result2)  # "hello"
+
+# Test timeout
+{:error, :timeout} = ReqResp.Client.call(spawn(fn -> :ok end), 99, 100)
+IO.puts("Timeout correctly detected")
+
+# Clean up
+send(pid, :stop)
+```
 
 ---
 ## Key Concepts

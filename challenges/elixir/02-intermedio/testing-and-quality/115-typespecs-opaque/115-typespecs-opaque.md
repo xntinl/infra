@@ -325,6 +325,68 @@ caller.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule UserId do
+    @moduledoc """
+    An opaque user identifier. Callers MUST use `new/1` to construct and
+    `to_string/1` to render. The underlying representation is private and
+    may change without notice.
+    """
+
+    # Internally a struct. Externally, callers see only `UserId.t()`.
+    defstruct [:value, :tenant]
+
+    @opaque t :: %__MODULE__{value: String.t(), tenant: atom()}
+
+    @doc "Builds a UserId. Raises on empty input."
+    @spec new(String.t(), atom()) :: t()
+    def new(value, tenant \\ :default)
+        when is_binary(value) and value != "" and is_atom(tenant) do
+      %__MODULE__{value: value, tenant: tenant}
+    end
+
+    @doc "Renders a UserId to its canonical string form."
+    @spec to_string(t()) :: String.t()
+    def to_string(%__MODULE__{value: v, tenant: :default}), do: v
+    def to_string(%__MODULE__{value: v, tenant: t}), do: "#{t}:#{v}"
+
+    @doc "Opaque equality — safe, doesn't expose structure."
+    @spec equal?(t(), t()) :: boolean()
+    def equal?(%__MODULE__{} = a, %__MODULE__{} = b), do: a == b
+
+    @doc "Returns the tenant. The only approved way to read it."
+    @spec tenant(t()) :: atom()
+    def tenant(%__MODULE__{tenant: t}), do: t
+  end
+
+  def main do
+    IO.puts("=== User Demo ===
+  ")
+  
+    # Demo: Create and inspect a user
+  user = User.new("alice", "alice@example.com", 30)
+  IO.puts("1. User created: name='#{User.name(user)}', email='#{User.email(user)}', age=#{User.age(user)}")
+  assert User.is_adult(user)
+
+  user_child = User.new("bob", "bob@example.com", 10)
+  IO.puts("2. User child: name='#{User.name(user_child)}', age=#{User.age(user_child)}")
+  assert not User.is_adult(user_child)
+
+  IO.puts("
+  ✓ Typespecs demo completed!")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [Typespecs — `@opaque`](https://hexdocs.pm/elixir/typespecs.html#user-defined-types)

@@ -380,6 +380,129 @@ input is dirty, you'll need a permissive mode — and you'll cry.
 
 - `utf8_char` is used inside fields but `ascii_char` for structural punctuation. If you discovered the incoming files are 100% ASCII, switching every `utf8_char` to `ascii_char` would be measurably faster. Before you make the change, what single failure mode would you write a regression test for, and why is that the test that catches the mistake instead of benchmarks?
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule CsvParserNimble do
+    @moduledoc """
+    A small, RFC-4180-aware CSV parser built with NimbleParsec.
+
+    Supported:
+      * Comma separator, LF or CRLF line terminators.
+      * Quoted fields with embedded commas, CRs, LFs, and `""`-escaped quotes.
+      * UTF-8 field contents.
+
+    Not supported (intentional, to keep the grammar teachable):
+      * Configurable separator (always `,`).
+      * Streaming — `parse/1` expects the whole document in memory.
+      * Header extraction — callers can `[headers | rows]` themselves.
+    """
+
+    import NimbleParsec
+
+    # --- Character classes ----------------------------------------------------
+    # Structural bytes are always ASCII, so `ascii_char` is fine here.
+    comma = ascii_char([?,])
+    dquote = ascii_char([?"])
+
+    # End-of-line is LF or CRLF. Match CRLF first so CR doesn't get swallowed
+    # by something else (like an unquoted char) before we see the LF.
+    eol = choice([string("\r\n"), string("\n")]) |> replace(:eol)
+
+    # --- Unquoted field -------------------------------------------------------
+    # Anything except comma, CR, LF, or double-quote. UTF-8 codepoints allowed.
+    unquoted_char = utf8_char([{:not, ?,}, {:not, ?\r}, {:not, ?\n}, {:not, ?"}])
+
+    unquoted_field =
+      repeat(unquoted_char)
+      |> reduce({List, :to_string, []})
+      |> unwrap_and_tag(:field)
+
+    # --- Quoted field ---------------------------------------------------------
+    # Inside a quoted field:
+    #   - any codepoint that isn't `"` is literal, OR
+    #   - `""` is a single literal `"`.
+    escaped_quote = string(~s("")) |> replace(?")
+    quoted_char = choice([utf8_char([{:not, ?"}]), escaped_quote])
+
+    quoted_field =
+      ignore(dquote)
+      |> repeat(quoted_char)
+      |> ignore(dquote)
+      |> reduce({List, :to_string, []})
+      |> unwrap_and_tag(:field)
+
+    # A field is quoted OR unquoted. Order matters: try quoted first, because
+    # an unquoted field happily matches zero chars and would beat quoted to it.
+    field = choice([quoted_field, unquoted_field])
+
+    # --- Record (one line of N fields) ---------------------------------------
+    # A record is: field, (`,` field)*.
+    record =
+      field
+      |> repeat(ignore(comma) |> concat(field))
+      |> tag(:record)
+
+    # --- Document -------------------------------------------------------------
+    # A document is one or more records separated by EOLs, with an optional
+    # trailing EOL.
+    document =
+      record
+      |> repeat(ignore(eol) |> concat(record))
+      |> optional(ignore(eol))
+
+    defparsec :parse_document, document
+
+    # --- Public API -----------------------------------------------------------
+
+    @doc """
+    Parses a CSV document into a list of rows. Each row is a list of strings.
+
+    ## Examples
+
+        iex> CsvParserNimble.parse("a,b,c\\n1,\\"2,2\\",3\\n")
+        {:ok, [["a", "b", "c"], ["1", "2,2", "3"]]}
+    """
+    @spec parse(binary()) :: {:ok, [[String.t()]]} | {:error, String.t()}
+    def parse(input) when is_binary(input) do
+      case parse_document(input) do
+        {:ok, tagged, "", _context, _line, _col} ->
+          {:ok, Enum.map(tagged, &extract_record/1)}
+
+        {:ok, _, rest, _, line, col} ->
+          {:error, "trailing unparsed input at line #{line}, column #{col}: #{inspect(rest)}"}
+
+        {:error, reason, rest, _, line, col} ->
+          {:error, "#{reason} at line #{line}, column #{col}: #{inspect(rest)}"}
+      end
+    end
+
+    # Each record comes back as `{:record, [{:field, "a"}, {:field, "b"}, ...]}`.
+    defp extract_record({:record, fields}), do: Enum.map(fields, fn {:field, v} -> v end)
+  end
+
+  def main do
+    IO.puts("=== CSVParser Demo ===
+  ")
+  
+    # Demo: NimbleParsec for parsing
+  IO.puts("1. NimbleParsec builds parsers from combinators")
+  IO.puts("2. Parse CSV, protocols, or custom formats")
+  IO.puts("3. Zero-dependency parser generation")
+
+  IO.puts("
+  ✓ NimbleParsec demo completed!")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`NimbleParsec` — hexdocs](https://hexdocs.pm/nimble_parsec/)

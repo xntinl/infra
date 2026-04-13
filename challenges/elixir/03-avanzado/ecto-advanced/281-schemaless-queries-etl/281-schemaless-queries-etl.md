@@ -29,6 +29,25 @@ data_pipeline/
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Ecto-specific insight:**
+Ecto separates the query layer (building queries) from the execution layer (sending them). This separation allows for debugging, composability, and testing without a database. Never load all rows first and filter in-memory — write the filter into the query itself, or you've just built an N+1 problem.
 ### 1. Table as string, columns as atoms
 
 ```elixir
@@ -470,19 +489,168 @@ sequence?
 
 ---
 
-## Resources
-
-- [Ecto — schemaless queries](https://hexdocs.pm/ecto/schemaless-queries.html)
-- [`Repo.stream/2`](https://hexdocs.pm/ecto/Ecto.Repo.html#c:stream/2)
-- [Postgres — DECLARE CURSOR](https://www.postgresql.org/docs/current/sql-declare.html)
-- [Dashbit — "Streaming with Ecto"](https://dashbit.co/blog)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
 defp deps do
   [
-    # Add dependencies here
+    {:ecto_sql, "~> 3.12"},
+    {:postgrex, "~> 0.19"},
+    {:benchee, "~> 1.3", only: :dev}
   ]
 end
+
+
+# priv/repo/migrations/20260101000000_create_legacy_and_new.exs
+defmodule DataPipeline.Repo.Migrations.CreateLegacyAndNew do
+  use Ecto.Migration
+
+  def change do
+    create table(:orders_v1) do
+      add :customer_name, :string
+      add :total_cents, :integer
+      add :created_at, :utc_datetime
+      add :legacy_status, :string
+    end
+
+    create table(:orders_v2) do
+      add :customer_key, :string
+      add :total_cents, :integer
+      add :placed_at, :utc_datetime
+      add :status, :string
+      add :imported_from, :integer
+      timestamps()
+    end
+
+    create unique_index(:orders_v2, [:imported_from])
+    create index(:orders_v1, [:created_at])
+  end
+end
+
+
+# lib/data_pipeline/etl.ex
+defmodule DataPipeline.Etl do
+  @moduledoc """
+  Schemaless ETL: streams rows from orders_v1, transforms, and inserts into orders_v2.
+  """
+  import Ecto.Query
+
+  alias DataPipeline.Repo
+
+  @chunk_size 500
+  @cursor_chunk 1_000
+
+  @doc """
+  Streams all legacy orders through a transformation and inserts them into orders_v2.
+
+  Idempotent: skips rows already imported via a UNIQUE constraint on imported_from.
+  """
+  @spec migrate_orders() :: {:ok, non_neg_integer()} | {:error, term()}
+  def migrate_orders do
+    Repo.transaction(fn ->
+      legacy_stream()
+      |> Stream.chunk_every(@chunk_size)
+      |> Stream.map(&transform_batch/1)
+      |> Stream.map(&insert_batch/1)
+      |> Enum.sum()
+    end, timeout: :infinity)
+  end
+
+  @doc """
+  Source query — schemaless select from orders_v1 with explicit types.
+  """
+  def legacy_stream do
+    query =
+      from o in "orders_v1",
+        select: %{
+          id: type(o.id, :integer),
+          customer_name: o.customer_name,
+          total_cents: type(o.total_cents, :integer),
+          created_at: type(o.created_at, :utc_datetime),
+          legacy_status: o.legacy_status
+        },
+        order_by: [asc: o.id]
+
+    Repo.stream(query, max_rows: @cursor_chunk)
+  end
+
+  @doc """
+  Transform a batch. Pure function — no DB access.
+  """
+  def transform_batch(rows) do
+    now = DateTime.utc_now() |> DateTime.truncate(:second)
+
+    Enum.map(rows, fn row ->
+      %{
+        customer_key: customer_key(row.customer_name),
+        total_cents: row.total_cents,
+        placed_at: row.created_at,
+        status: map_status(row.legacy_status),
+        imported_from: row.id,
+        inserted_at: now,
+        updated_at: now
+      }
+    end)
+  end
+
+  defp customer_key(nil), do: "unknown"
+
+  defp customer_key(name) do
+    name
+    |> String.downcase()
+    |> String.replace(~r/[^a-z0-9]/, "")
+    |> String.slice(0, 40)
+  end
+
+  defp map_status("OPEN"), do: "pending"
+  defp map_status("DONE"), do: "completed"
+  defp map_status("CANCELED"), do: "cancelled"
+  defp map_status(_), do: "unknown"
+
+  defp insert_batch(rows) do
+    {n, _} =
+      Repo.insert_all(
+        "orders_v2",
+        rows,
+        on_conflict: :nothing,
+        conflict_target: :imported_from
+      )
+
+    n
+  end
+
+  # --------------------------------------------------------------------------
+  # Verification helpers — run after migration
+  # --------------------------------------------------------------------------
+
+  @doc "Counts rows in both tables and returns the delta."
+  def row_count_delta do
+    [%{n: v1}] = Repo.all(from o in "orders_v1", select: %{n: count(o.id)})
+    [%{n: v2}] = Repo.all(from o in "orders_v2", select: %{n: count(o.id)})
+    {v1, v2, v1 - v2}
+  end
+
+  @doc "Returns legacy IDs that failed to import (diff by set)."
+  def missing_ids(limit \ 100) do
+    query =
+      from o in "orders_v1",
+        left_join: n in "orders_v2", on: n.imported_from == o.id,
+        where: is_nil(n.imported_from),
+        select: o.id,
+        limit: ^limit
+
+    Repo.all(query)
+  end
+end
+end
+end
+end
+
+defmodule Main do
+  def main do
+      :ok
+  end
+end
+
+Main.main()
 ```

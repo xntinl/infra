@@ -283,9 +283,84 @@ mix docs  # if ex_doc is configured — @moduledoc renders the module page
 
 The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
 
+---
 
+## Executable Example
+
+Create a file `lib/api_client.ex` with the module above, then test in `iex`:
+
+```elixir
+defmodule APIClient do
+  @version "1.0.0"
+  @base_url "https://api.example.com"
+  @timeout_ms 5000
+  @valid_endpoints ~w[users products orders]a
+  @rate_limit_per_minute 100
+
+  @moduledoc """
+  HTTP API client v#{@version} for example.com
+  """
+
+  def version, do: @version
+  def base_url, do: @base_url
+  def timeout, do: @timeout_ms
+
+  def valid_endpoints, do: @valid_endpoints
+
+  def rate_limit_per_minute, do: @rate_limit_per_minute
+
+  def get(endpoint) when endpoint in @valid_endpoints do
+    {:ok, "#{@base_url}/#{endpoint}"}
+  end
+
+  def get(endpoint) do
+    {:error, "Invalid endpoint: #{endpoint}. Must be one of #{inspect(@valid_endpoints)}"}
+  end
+
+  def build_url(endpoint, query_params) when endpoint in @valid_endpoints do
+    base = "#{@base_url}/#{endpoint}"
+    case query_params do
+      [] -> {:ok, base}
+      params -> {:ok, base <> "?" <> URI.encode_query(params)}
+    end
+  end
+
+  def build_url(endpoint, _params) do
+    {:error, "Invalid endpoint: #{endpoint}"}
+  end
+
+  def request_timeout, do: @timeout_ms
+
+  def rate_limit_check(count) do
+    if count > @rate_limit_per_minute do
+      {:error, "Rate limit exceeded: #{@rate_limit_per_minute} requests/minute"}
+    else
+      :ok
+    end
+  end
+end
+
+# Test it
+IO.puts("APIClient v#{APIClient.version()}")
+IO.puts("Base URL: #{APIClient.base_url()}")
+IO.puts("Timeout: #{APIClient.timeout()}ms")
+
+{:ok, url} = APIClient.get(:users)
+IO.inspect(url)  # "https://api.example.com/users"
+
+{:error, msg} = APIClient.get(:invalid)
+IO.puts(msg)  # Invalid endpoint error
+
+{:ok, url} = APIClient.build_url(:products, [page: 1, limit: 50])
+IO.inspect(url)  # Full URL with query params
+
+:ok = APIClient.rate_limit_check(50)
+{:error, msg} = APIClient.rate_limit_check(150)
+IO.puts(msg)  # Rate limit exceeded
+```
 
 ---
+
 ## Key Concepts
 
 ### 1. Module Attributes Are Compile-Time Constants

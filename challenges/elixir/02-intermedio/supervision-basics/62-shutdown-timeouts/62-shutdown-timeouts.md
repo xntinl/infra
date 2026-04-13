@@ -313,6 +313,54 @@ wait that long. Only tune when you can measure the actual drain time.
 
 - Tu proceso escribe a S3 en `terminate/2`. ¿Qué `shutdown` ponés y por qué? ¿Cambia si es `:brutal_kill` por default upstream?
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule ShutdownTimeoutsDemo.SlowWorker do
+    @moduledoc """
+    A GenServer with a configurable-duration terminate/2. Used to explore
+    what happens when termination takes longer than :shutdown allows.
+    """
+
+    use GenServer
+
+    @spec start_link(keyword()) :: GenServer.on_start()
+    def start_link(opts) do
+      name = Keyword.fetch!(opts, :name)
+      terminate_ms = Keyword.get(opts, :terminate_ms, 0)
+      notify_to = Keyword.get(opts, :notify_to)
+      GenServer.start_link(__MODULE__, {terminate_ms, notify_to}, name: name)
+    end
+
+    @impl true
+    def init({terminate_ms, notify_to}) do
+      # Trap exits so terminate/2 runs on shutdown EXIT signals.
+      Process.flag(:trap_exit, true)
+      {:ok, %{terminate_ms: terminate_ms, notify_to: notify_to}}
+    end
+
+    @impl true
+    def terminate(reason, %{terminate_ms: ms, notify_to: notify}) do
+      # Simulate flushing a buffer / closing a connection.
+      if ms > 0, do: Process.sleep(ms)
+      if notify, do: send(notify, {:terminated, self(), reason})
+      :ok
+    end
+  end
+
+  def main do
+    IO.puts("ShutdownTimeoutsDemo OK")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Supervisor` — child specifications](https://hexdocs.pm/elixir/Supervisor.html#module-child-specification)

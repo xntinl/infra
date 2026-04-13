@@ -41,6 +41,25 @@ Hand implementations become N copies of the same `defimpl`. `@derive` calls a si
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Metaprogramming-specific insight:**
+Code generation is powerful and dangerous. Every macro you write is a place where intent is hidden. Use macros sparingly, only when they eliminate genuine boilerplate. If your macro is more than 10 lines, you probably need a function or data structure instead. Future maintainers will thank you.
 ### 1. How `@derive` works
 
 `@derive X` — before `defstruct` — records the instruction. When `defstruct`
@@ -369,11 +388,104 @@ dispatch.
 
 ---
 
-## Resources
 
-- [`Protocol` — hexdocs.pm](https://hexdocs.pm/elixir/Protocol.html) — `__deriving__` explanation
-- [Jason.Encoder derive source](https://github.com/michalmuskala/jason/blob/master/lib/encoder.ex)
-- [Inspect.Any + defprotocol](https://github.com/elixir-lang/elixir/blob/main/lib/elixir/lib/inspect.ex)
-- [*Elixir in Action* — Saša Jurić](https://www.manning.com/books/elixir-in-action-third-edition) — protocols chapter
-- [Dashbit blog on protocols](https://dashbit.co/blog)
-- [Ecto @derive usage](https://hexdocs.pm/ecto/Ecto.Schema.html#module-the-ecto-changeset-derive)
+## Executable Example
+
+```elixir
+defmodule ProtocolDeriveTest do
+  use ExUnit.Case, async: true
+
+  alias ProtocolDerive.AuditEncoder
+  alias ProtocolDerive.Schemas.{Customer, Order, Payment}
+
+  describe "Inspect derive" do
+    test "Customer hides :ssn" do
+      assert inspect(%Customer{id: 1, name: "A", email: "a@b", ssn: "123"}) =~ "#Customer<"
+      refute inspect(%Customer{id: 1, ssn: "secret"}) =~ "secret"
+    end
+  end
+
+  describe "AuditEncoder — explicit fields" do
+    test "Customer: only name/email/id" do
+      c = %Customer{id: 1, name: "A", email: "a@b.c", ssn: "123"}
+      audit = AuditEncoder.to_audit(c)
+      assert audit.type == Customer
+      assert audit.id == 1
+      assert Map.keys(audit.fields) |> Enum.sort() == [:email, :id, :name]
+      refute Map.has_key?(audit.fields, :ssn)
+    end
+  end
+
+  describe "AuditEncoder — all fields (no only/except)" do
+    test "Order includes every non-struct field" do
+      o = %Order{id: 9, customer_id: 1, total: 100, status: :paid, internal_notes: "ok"}
+      audit = AuditEncoder.to_audit(o)
+      assert audit.type == Order
+      assert audit.id == 9
+      assert audit.fields == %{
+               id: 9,
+               customer_id: 1,
+               total: 100,
+               status: :paid,
+               internal_notes: "ok"
+             }
+    end
+  end
+
+  describe "AuditEncoder — except + PII masking" do
+    test "Payment masks :credit_card automatically, excludes :internal_notes" do
+      p = %Payment{id: 7, order_id: 9, amount: 100, credit_card: "4242", internal_notes: "x"}
+      audit = AuditEncoder.to_audit(p)
+      assert audit.fields.credit_card == "[MASKED]"
+      refute Map.has_key?(audit.fields, :internal_notes)
+    end
+  end
+
+  describe "Any fallback" do
+    test "non-derived value gets :anonymous type" do
+      assert %{type: :anonymous, id: nil} = AuditEncoder.to_audit(42)
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrate @derive for automatic protocol implementations
+      defmodule User do
+        @derive [Inspect]
+        defstruct name: "", age: 0
+      end
+
+      # Create instance
+      user = %User{name: "Alice", age: 30}
+
+      # Derived Inspect protocol
+      inspected = inspect(user)
+
+      IO.puts("✓ Derived Inspect:")
+      IO.puts("  #{inspected}")
+
+      # Create a custom protocol with @derive support
+      defprotocol Serializable do
+        def to_json(data)
+      end
+
+      # Implement for User
+      defimpl Serializable, for: User do
+        def to_json(user) do
+          Jason.encode!(%{"name" => user.name, "age" => user.age})
+        end
+      end
+
+      json = Serializable.to_json(user)
+      IO.puts("✓ Custom protocol: #{json}")
+
+      assert String.contains?(inspected, "Alice"), "Inspect works"
+      assert String.contains?(json, "Alice"), "Serializable works"
+
+      IO.puts("✓ Protocol @derive: automatic implementation working")
+  end
+end
+
+Main.main()
+```

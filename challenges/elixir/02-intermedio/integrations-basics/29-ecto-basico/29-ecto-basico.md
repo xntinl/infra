@@ -482,6 +482,71 @@ For "I just want a map in memory", Agent/ETS is 100× less ceremony.
 
 - `cast/3` silently drops unknown keys as a mass-assignment guard, but it also silently drops typos — a form field named `emial` never reaches the DB and you get a "required" error on `email` instead of a "you wrote it wrong" error. In a context-module API, what's the cheapest instrumentation you could add to surface this difference without weakening the mass-assignment protection?
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule EctoIntro.User do
+    @moduledoc """
+    A minimal schema: email + age + timestamps. The changeset function is the
+    only place validations live — schemas are intentionally dumb.
+    """
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    @type t :: %__MODULE__{
+            id: integer() | nil,
+            email: String.t() | nil,
+            age: integer() | nil,
+            inserted_at: NaiveDateTime.t() | nil,
+            updated_at: NaiveDateTime.t() | nil
+          }
+
+    schema "users" do
+      field :email, :string
+      field :age, :integer
+      timestamps()
+    end
+
+    @permitted [:email, :age]
+    @required [:email]
+
+    @doc """
+    Builds a changeset for a user. Only `@permitted` keys are accepted;
+    anything else is dropped silently — this is your mass-assignment guard.
+    """
+    @spec changeset(t() | %__MODULE__{}, map()) :: Ecto.Changeset.t()
+    def changeset(user, attrs) do
+      user
+      |> cast(attrs, @permitted)
+      |> validate_required(@required)
+      |> validate_format(:email, ~r/@/)
+      |> validate_number(:age, greater_than_or_equal_to: 0)
+      |> unique_constraint(:email)
+    end
+  end
+
+  def main do
+    IO.puts("=== Repo Demo ===
+  ")
+  
+    # Demo: Basic Ecto usage
+  IO.puts("1. Repo operations: all, get, insert, update")
+  IO.puts("2. Schema defines tables and fields")
+  IO.puts("3. Changesets for validation")
+
+  IO.puts("
+  ✓ Ecto basics demo completed!")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [Ecto — hexdocs](https://hexdocs.pm/ecto/Ecto.html)

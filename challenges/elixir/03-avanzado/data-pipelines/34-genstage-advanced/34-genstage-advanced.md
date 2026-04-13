@@ -58,6 +58,25 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Pipeline-specific insight:**
+Streams are lazy; Enum is eager. Use Stream for data larger than RAM or when you're building intermediate stages. Use Enum when the collection is small or you need side effects at each step. Mixing them carelessly results in performance cliffs.
 ### 1. The three built-in dispatchers
 
 GenStage ships with three dispatchers that decide how a producer's events are
@@ -489,21 +508,117 @@ the parquet writer's rate (~2k events/sec).
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
 
-- [GenStage — HexDocs](https://hexdocs.pm/gen_stage/GenStage.html)
-- [GenStage announcement — José Valim](https://elixir-lang.org/blog/2016/07/14/announcing-genstage/)
-- [Flow and GenStage in production — Dashbit](https://dashbit.co/blog/flow-and-genstage-in-production)
-- [Designing Elixir Systems with OTP — Bruce Tate & James Gray](https://pragprog.com/titles/jgotp/designing-elixir-systems-with-otp/)
-- [Broadway producer source](https://github.com/dashbitco/broadway/blob/main/lib/broadway/producer.ex)
-- [GenStage buffer implementation](https://github.com/elixir-lang/gen_stage/blob/main/lib/gen_stage.ex)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+defmodule GenstageAdvanced.Aggregator do
+  @moduledoc "CPU-bound consumer. Simulates ~1ms of work per event."
+  use GenStage
+
+  def start_link(opts), do: GenStage.start_link(__MODULE__, opts, name: __MODULE__)
+
+  @impl true
+  def init(opts) do
+    sub = Keyword.fetch!(opts, :subscribe_to)
+    {:consumer, %{count: 0}, subscribe_to: sub}
+  end
+
+  @impl true
+  def handle_events(events, _from, state) do
+    Enum.each(events, fn _ -> :timer.sleep(1) end)
+    {:noreply, [], %{state | count: state.count + length(events)}}
+  end
 end
+
+defmodule GenstageAdvanced.ParquetWriter do
+  @moduledoc """
+  IO-bound consumer that only flushes when it has collected >= 500 events
+  or 500ms have elapsed since the last flush.
+  """
+  use GenStage
+
+  def start_link(opts), do: GenStage.start_link(__MODULE__, opts, name: __MODULE__)
+
+  @impl true
+  def init(opts) do
+    sub = Keyword.fetch!(opts, :subscribe_to)
+    Process.send_after(self(), :flush_tick, 500)
+    {:consumer, %{buf: [], flushed: 0}, subscribe_to: sub}
+  end
+
+  @impl true
+  def handle_events(events, _from, state) do
+    buf = events ++ state.buf
+
+    if length(buf) >= 500 do
+      {:noreply, [], %{state | buf: [], flushed: state.flushed + length(buf)}}
+    else
+      {:noreply, [], %{state | buf: buf}}
+    end
+  end
+
+  @impl true
+  def handle_info(:flush_tick, state) do
+    Process.send_after(self(), :flush_tick, 500)
+    {:noreply, [], %{state | buf: [], flushed: state.flushed + length(state.buf)}}
+  end
+end
+
+defmodule GenstageAdvanced.Sampler do
+  @moduledoc "Forwards ~1% of events to a subscriber pid."
+  use GenStage
+
+  def start_link(opts), do: GenStage.start_link(__MODULE__, opts, name: __MODULE__)
+
+  @impl true
+  def init(opts) do
+    sub = Keyword.fetch!(opts, :subscribe_to)
+    target = Keyword.fetch!(opts, :target)
+    {:consumer, %{target: target}, subscribe_to: sub}
+  end
+
+  @impl true
+  def handle_events(events, _from, state) do
+    Enum.each(events, fn e ->
+      if :rand.uniform(100) == 1, do: send(state.target, {:sample, e})
+    end)
+
+    {:noreply, [], state}
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrate GenStage with manual subscription and buffer management
+      {:ok, _sup} = Supervisor.start_link([], strategy: :one_for_one)
+      {:ok, p} = GenStage.start_link(GenstageAdvanced.IngestProducer, 
+        [buffer_size: 5, buffer_keep: :first], [])
+      {:ok, c} = GenStage.start_link(GenstageAdvanced.ManualConsumer, 
+        [subscribe_to: [{p, max_demand: 10}]], [])
+
+      Process.sleep(20)
+
+      # Push 3 events
+      for i <- 1..3 do
+        GenStage.cast(p, {:push, %{id: i, payload: "event_#{i}", ts: System.os_time()}})
+      end
+
+      Process.sleep(50)
+
+      # Pull from consumer
+      :ok = GenstageAdvanced.ManualConsumer.pull(c, 5)
+      Process.sleep(50)
+
+      seen = :sys.get_state(c).seen
+      IO.inspect(seen, label: "✓ Events received by consumer")
+
+      assert length(seen) == 3, "Expected 3 events"
+      assert Enum.map(seen, & &1.id) == [1, 2, 3], "Events in order"
+
+      IO.puts("✓ GenStage advanced: producer, consumer, manual subscription working")
+  end
+end
+
+Main.main()
 ```

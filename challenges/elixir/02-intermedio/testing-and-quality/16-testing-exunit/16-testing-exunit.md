@@ -279,6 +279,58 @@ Test behavior, not plumbing.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule Calculator do
+    @moduledoc """
+    A tiny pure module used to exercise ExUnit primitives.
+    """
+
+    @spec add(number(), number()) :: number()
+    def add(a, b), do: a + b
+
+    @spec sub(number(), number()) :: number()
+    def sub(a, b), do: a - b
+
+    @spec mul(number(), number()) :: number()
+    def mul(a, b), do: a * b
+
+    @doc "Integer division. Raises `ArithmeticError` if the divisor is zero."
+    @spec div(integer(), integer()) :: integer()
+    def div(_a, 0), do: raise(ArithmeticError, message: "division by zero")
+    def div(a, b) when is_integer(a) and is_integer(b), do: Kernel.div(a, b)
+
+    @doc "Safe division that returns a result tuple instead of raising."
+    @spec safe_div(integer(), integer()) :: {:ok, integer()} | {:error, :division_by_zero}
+    def safe_div(_a, 0), do: {:error, :division_by_zero}
+    def safe_div(a, b), do: {:ok, Kernel.div(a, b)}
+  end
+
+  def main do
+    IO.puts("=== StringMath Demo ===
+  ")
+  
+    # Demo: ExUnit assertions
+  IO.puts("1. StringMath.to_number('42'): #{StringMath.to_number('42')}")
+  assert StringMath.to_number("42") == 42
+
+  IO.puts("2. StringMath.to_number('hello'): #{inspect(StringMath.to_number('hello'))}")
+  assert StringMath.to_number("hello") == :error
+
+  IO.puts("
+  ✓ ExUnit demo completed!")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`ExUnit` — HexDocs](https://hexdocs.pm/ex_unit/ExUnit.html)

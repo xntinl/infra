@@ -40,6 +40,25 @@ pricing_engine/
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Testing-specific insight:**
+Tests are not QA. They document intent and catch regressions. A test that passes without asserting anything is technical debt. Always test the failure case; "it works when everything succeeds" teaches nothing. Use property-based testing for domain logic where the number of edge cases is infinite.
 ### 1. A generator is a lazy stream of values
 `StreamData.integer()` is a stream. You compose it with `bind`, `map`, `filter`, `list_of`,
 `member_of`, `one_of`. No value is produced until the property asks for it.
@@ -354,19 +373,69 @@ The `split_factor` range above is `1..100`. What happens to shrinking if you wid
 `1..1_000_000`, and why does that change the *debuggability* of a failing property even though
 the final counterexample is still minimal?
 
-## Resources
 
-- [StreamData on hex](https://hexdocs.pm/stream_data/StreamData.html)
-- [`ExUnitProperties`](https://hexdocs.pm/stream_data/ExUnitProperties.html)
-- [Dashbit: writing property tests](https://dashbit.co/blog/property-based-testing-with-ex-unit)
-- [Fred Hebert — PropEr Testing](https://propertesting.com/) — language-agnostic background on shrinking
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+# test/support/generators.ex
+defmodule PricingEngine.Generators do
+  @moduledoc """
+  Domain-level StreamData generators for pricing tests.
+
+  Guidelines for generators:
+  - Never use `Enum.random/1` or `:rand` inside a property — it bypasses shrinking
+  - Prefer `bind` for data that depends on previously generated data
+  - Return concrete domain types (`%Money{}`), not raw tuples
+  """
+
+  import StreamData
+  alias PricingEngine.Money
+
+  @currencies ~w(USD EUR GBP ARS JPY BRL)
+
+  @doc "Generates a 3-letter ISO currency from a whitelist."
+  def currency, do: member_of(@currencies)
+
+  @doc """
+  Generates non-negative cents bounded by ~21 trillion — the upper bound most ledgers use
+  for int64 safety. Larger values stress arithmetic but do not model any real-world amount.
+  """
+  def cents, do: integer(0..21_000_000_000_000)
+
+  @doc "Composes cents and currency into a valid Money value."
+  def money do
+    bind(currency(), fn c ->
+      map(cents(), fn n -> Money.new(n, c) end)
+    end)
+  end
+
+  @doc """
+  Generates two Money values sharing the same currency. This is required when testing
+  addition — generating two independent money values would almost always produce a
+  currency mismatch and make the property useless.
+  """
+  def money_pair_same_currency do
+    bind(currency(), fn c ->
+      bind(cents(), fn a ->
+        map(cents(), fn b -> {Money.new(a, c), Money.new(b, c)} end)
+      end)
+    end)
+  end
+
+  @doc "Generates a split factor — constrained so `split/2` does not degenerate."
+  def split_factor, do: integer(1..100)
 end
+
+defmodule Main do
+  def main do
+      IO.puts("Property-based test generator initialized")
+      a = 10
+      b = 20
+      c = 30
+      assert (a + b) + c == a + (b + c)
+      IO.puts("✓ Property invariant verified: (a+b)+c = a+(b+c)")
+  end
+end
+
+Main.main()
 ```

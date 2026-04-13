@@ -317,6 +317,95 @@ and don't agonize over specing every private one.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule Pricing do
+    @moduledoc """
+    Minimal pricing helpers for orders with line items. All public functions
+    carry `@spec`s so Dialyzer can verify the module end-to-end.
+    """
+
+    # Public types — callers may pattern-match or construct these.
+    @type currency :: String.t()
+    @type money :: %{amount: integer(), currency: currency()}
+    @type line_item :: %{sku: String.t(), unit_price: money(), quantity: pos_integer()}
+    @type discount :: {:percent, 0..100} | {:flat, money()}
+    @type pricing_error :: :currency_mismatch | :empty_cart
+
+    # Private type — only used by helpers inside this module.
+    @typep subtotal_acc :: %{currency: currency() | nil, amount: integer()}
+
+    @doc "Builds a money struct. Amount is in minor units (cents)."
+    @spec money(integer(), currency()) :: money()
+    def money(amount, currency) when is_integer(amount) and is_binary(currency) do
+      %{amount: amount, currency: currency}
+    end
+
+    @doc """
+    Computes the subtotal of a cart. Returns `{:error, :empty_cart}` if empty,
+    `{:error, :currency_mismatch}` if line items mix currencies.
+    """
+    @spec subtotal([line_item()]) :: {:ok, money()} | {:error, pricing_error()}
+    def subtotal([]), do: {:error, :empty_cart}
+
+    def subtotal(items) when is_list(items) do
+      Enum.reduce_while(items, %{currency: nil, amount: 0}, &accumulate/2)
+      |> finalize_subtotal()
+    end
+
+    @spec accumulate(line_item(), subtotal_acc()) ::
+            {:cont, subtotal_acc()} | {:halt, {:error, :currency_mismatch}}
+    defp accumulate(%{unit_price: %{currency: c, amount: a}, quantity: q}, %{currency: nil} = acc) do
+      {:cont, %{currency: c, amount: acc.amount + a * q}}
+    end
+
+    defp accumulate(%{unit_price: %{currency: c, amount: a}, quantity: q}, %{currency: c} = acc) do
+      {:cont, %{acc | amount: acc.amount + a * q}}
+    end
+
+    defp accumulate(_item, _acc), do: {:halt, {:error, :currency_mismatch}}
+
+    @spec finalize_subtotal(subtotal_acc() | {:error, :currency_mismatch}) ::
+            {:ok, money()} | {:error, pricing_error()}
+    defp finalize_subtotal({:error, _} = err), do: err
+    defp finalize_subtotal(%{currency: c, amount: a}), do: {:ok, money(a, c)}
+
+    @doc "Applies a discount to a `money()` total. Never goes below zero."
+    @spec apply_discount(money(), discount()) :: money()
+    def apply_discount(%{amount: a, currency: c}, {:percent, p}) when p in 0..100 do
+      money(max(a - div(a * p, 100), 0), c)
+    end
+
+    def apply_discount(%{amount: a, currency: c}, {:flat, %{amount: d, currency: c}}) do
+      money(max(a - d, 0), c)
+    end
+  end
+
+  def main do
+    IO.puts("=== MathLib Demo ===
+  ")
+  
+    # Demo: Use type-specced functions
+  IO.puts("1. MathLib.factorial(5): #{MathLib.factorial(5)}")
+  assert MathLib.factorial(5) == 120
+
+  IO.puts("2. MathLib.fibonacci(6): #{MathLib.fibonacci(6)}")
+  assert MathLib.fibonacci(6) == 8
+
+  IO.puts("
+  ✓ Typespecs demo completed!")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [Typespecs — Elixir reference](https://hexdocs.pm/elixir/typespecs.html)

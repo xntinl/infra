@@ -382,6 +382,121 @@ is arbitrary and ad-hoc.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule OrderedSetRange do
+    @moduledoc """
+    An event store keyed by integer timestamp. Uses `:ordered_set` so that
+    `range/3` can use a match spec with `:ets.select/2` and touch only the
+    events inside the requested window.
+
+    Events are stored as `{timestamp, payload}`. Timestamps must be unique
+    (it's a set by timestamp); if you need multiple events at the same
+    timestamp, key by `{timestamp, counter}` instead.
+    """
+
+    @type event :: {integer(), term()}
+
+    @doc "Creates a new ordered-set event table."
+    @spec new() :: :ets.tid()
+    def new do
+      :ets.new(:events, [:ordered_set, :public])
+    end
+
+    @doc "Stores an event. Overwrites any existing event at the same timestamp."
+    @spec put(:ets.tid(), integer(), term()) :: true
+    def put(table, ts, payload), do: :ets.insert(table, {ts, payload})
+
+    @doc """
+    Returns all events with `from <= timestamp <= to`, in ascending timestamp order.
+
+    This uses a hand-written match spec. On an `:ordered_set` the engine walks
+    only the relevant slice of the tree — O(log N + K) where K is the number of
+    matches — not O(N).
+    """
+    @spec range(:ets.tid(), integer(), integer()) :: [event()]
+    def range(table, from, to) do
+      match_spec = [
+        {
+          # Match head: every tuple in the table shaped `{ts, payload}`.
+          # :"$1" captures the timestamp, :"$2" captures the payload.
+          {:"$1", :"$2"},
+          # Guards: the range condition. Erlang-style prefix notation.
+          [{:>=, :"$1", from}, {:"=<", :"$1", to}],
+          # Body: what to return — the original tuple. Double-braces = tuple literal.
+          [{{:"$1", :"$2"}}]
+        }
+      ]
+
+      :ets.select(table, match_spec)
+    end
+
+    @doc """
+    Returns events in `[from, to]` whose payload is a map containing `:level`
+    equal to `level`. Demonstrates a range PLUS a value-shape filter in the
+    same match spec.
+
+    For anything more complex than this, reach for `:ets.fun2ms/1`
+    — hand-writing deep match specs is a debugging nightmare.
+    """
+    @spec range_with_level(:ets.tid(), integer(), integer(), atom()) :: [event()]
+    def range_with_level(table, from, to, level) do
+      # Here the match head pins the payload to a map shape with a :level key.
+      # Match specs cannot destructure arbitrary maps richly, so we keep this
+      # example intentionally simple — the value filter is done in the guard.
+      match_spec = [
+        {
+          {:"$1", :"$2"},
+          [
+            {:>=, :"$1", from},
+            {:"=<", :"$1", to},
+            # `map_get/2` is allowed in match spec guards since OTP 22.
+            {:==, {:map_get, :level, :"$2"}, level}
+          ],
+          [{{:"$1", :"$2"}}]
+        }
+      ]
+
+      :ets.select(table, match_spec)
+    end
+  end
+
+  def main do
+    # Demo: range queries en :ordered_set
+    t = OrderedSetRange.new()
+  
+    # Insertar eventos con timestamps
+    for {ts, msg} <- [{10, :a}, {20, :b}, {30, :c}, {40, :d}, {50, :e}] do
+      OrderedSetRange.put(t, ts, msg)
+    end
+  
+    # Consultas de rango
+    range_20_40 = OrderedSetRange.range(t, 20, 40)
+    assert range_20_40 == [{20, :b}, {30, :c}, {40, :d}], "rango debe incluir límites"
+  
+    range_10_30 = OrderedSetRange.range(t, 10, 30)
+    assert range_10_30 == [{10, :a}, {20, :b}, {30, :c}], "rango debe estar en orden"
+  
+    range_outside = OrderedSetRange.range(t, 60, 70)
+    assert range_outside == [], "rango fuera de datos debe estar vacío"
+  
+    :ets.delete(t)
+  
+    IO.puts("OrderedSetRange: demostración de consultas de rango exitosa")
+    IO.puts("  rango [20, 40]: #{inspect(range_20_40)}")
+    IO.puts("  rango [10, 30]: #{inspect(range_10_30)}")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [Erlang match spec — official reference](https://www.erlang.org/doc/apps/erts/match_spec.html)

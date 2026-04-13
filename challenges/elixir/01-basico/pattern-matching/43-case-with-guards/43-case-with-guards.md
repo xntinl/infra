@@ -325,7 +325,65 @@ mix test
 
 The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
 
+---
 
+## Executable Example
+
+Create `lib/rbac.ex` and test in `iex`:
+
+```elixir
+defmodule RBAC do
+  def evaluate(role, action, status) do
+    case {role, action, status} do
+      {:admin, _action, _status} -> {:allow, :admin_all_access}
+      
+      {:viewer, :read, :published} -> {:allow, :viewer_published_read}
+      {:viewer, :read, :draft} -> {:deny, :draft_not_readable}
+      {:viewer, :write, _status} -> {:deny, :viewer_cannot_write}
+      
+      {:editor, :read, _status} -> {:allow, :editor_read_all}
+      {:editor, :write, _status} -> {:allow, :editor_write_all}
+      
+      {:guest, _action, _status} -> {:deny, :guest_no_access}
+      
+      _ -> {:deny, :no_matching_rule}
+    end
+  end
+
+  def evaluate_many(role, requests, status) when is_list(requests) do
+    Enum.map(requests, fn {action, _resource} ->
+      evaluate(role, action, status)
+    end)
+  end
+
+  def check_payment(payment) do
+    case payment do
+      %{amount: a, status: :pending} when a > 0 -> {:process, a}
+      %{amount: a, status: :pending} when a <= 0 -> {:reject, "negative"}
+      %{status: :completed} -> {:skip, "already_done"}
+      _ -> {:error, :invalid}
+    end
+  end
+end
+
+# Test it
+IO.inspect(RBAC.evaluate(:admin, :write, :draft))  # {:allow, :admin_all_access}
+IO.inspect(RBAC.evaluate(:viewer, :read, :published))  # {:allow, :viewer_published_read}
+IO.inspect(RBAC.evaluate(:viewer, :read, :draft))  # {:deny, :draft_not_readable}
+IO.inspect(RBAC.evaluate(:guest, :read, :published))  # {:deny, :guest_no_access}
+
+# Test evaluate_many
+requests = [{:read, :post}, {:write, :post}]
+results = RBAC.evaluate_many(:viewer, requests, :published)
+IO.inspect(length(results))  # 2
+
+# Test check_payment
+{:process, amt} = RBAC.check_payment(%{amount: 100, status: :pending})
+IO.inspect(amt)  # 100
+
+{:reject, reason} = RBAC.check_payment(%{amount: -50, status: :pending})
+IO.inspect(reason)  # "negative"
+```
 
 ---
 ## Key Concepts

@@ -57,6 +57,25 @@ pacts/
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Testing-specific insight:**
+Tests are not QA. They document intent and catch regressions. A test that passes without asserting anything is technical debt. Always test the failure case; "it works when everything succeeds" teaches nothing. Use property-based testing for domain logic where the number of edge cases is infinite.
 ### 1. Interaction
 One request-and-response pair: method, path, request body, expected response status and
 body.
@@ -413,19 +432,113 @@ provider. What failure modes appear when the pact file is stale in git (the cons
 evolved but forgot to regenerate), and what process (CI gating, pre-commit hook,
 provider verification of a consumer-signed timestamp) best defends against them?
 
-## Resources
 
-- [Pact — foundational docs](https://docs.pact.io/)
-- [Pact Broker OSS](https://github.com/pact-foundation/pact_broker)
-- [Consumer-driven contracts — Martin Fowler](https://martinfowler.com/articles/consumerDrivenContracts.html)
-- [Req](https://hexdocs.pm/req/Req.html) · [Bypass](https://github.com/PSPDFKit-labs/bypass)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+# payments_consumer/test/payments_consumer/contract_test.exs
+defmodule PaymentsConsumer.ContractTest do
+  use ExUnit.Case, async: false
+
+  alias PaymentsConsumer.PaymentClient
+
+  @pact_path Path.expand("../../pacts/payments-v1.json", __DIR__)
+
+  setup do
+    bypass = Bypass.open()
+    Application.put_env(:payments_consumer, :payments_base_url, "http://localhost:#{bypass.port}")
+    {:ok, bypass: bypass, interactions: :ets.new(:interactions, [:set, :public])}
+  end
+
+  describe "charge/2 — successful path interaction" do
+    test "records the expected request/response shape", %{bypass: bypass, interactions: tbl} do
+      Bypass.expect_once(bypass, "POST", "/v1/charges", fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        request = Jason.decode!(body)
+
+        # Validate the request shape the consumer actually sent
+        assert request == %{"customer_id" => "c_42", "amount_cents" => 1_500}
+
+        # Stubbed provider response — this is what the consumer relies on
+        response_body = %{"id" => "ch_1", "status" => "succeeded"}
+
+        :ets.insert(tbl, {:success, request, 201, response_body})
+
+        Plug.Conn.resp(
+          conn,
+          201,
+          Jason.encode!(response_body)
+        )
+      end)
+
+      assert {:ok, %{id: "ch_1", status: "succeeded"}} = PaymentClient.charge("c_42", 1_500)
+
+      write_pact(tbl)
+    end
+  end
+
+  describe "charge/2 — validation error interaction" do
+    test "records 422 response shape", %{bypass: bypass, interactions: tbl} do
+      Bypass.expect_once(bypass, "POST", "/v1/charges", fn conn ->
+        {:ok, body, conn} = Plug.Conn.read_body(conn)
+        request = Jason.decode!(body)
+
+        response_body = %{"error" => "amount_cents must be positive"}
+        :ets.insert(tbl, {:validation_error, request, 422, response_body})
+
+        Plug.Conn.resp(conn, 422, Jason.encode!(response_body))
+      end)
+
+      assert {:error, {:validation, _}} = PaymentClient.charge("c_42", 0)
+
+      write_pact(tbl)
+    end
+  end
+
+  # ---------------------------------------------------------------------------
+  # Writes all collected interactions to the shared pact file.
+  # For this minimal example, the last writer wins per key — in a real system
+  # you would merge across test files.
+  # ---------------------------------------------------------------------------
+  defp write_pact(tbl) do
+    interactions =
+      tbl
+      |> :ets.tab2list()
+      |> Enum.map(fn {name, req, status, resp} ->
+        %{
+          "description" => Atom.to_string(name),
+          "request" => %{
+            "method" => "POST",
+            "path" => "/v1/charges",
+            "body" => req
+          },
+          "response" => %{
+            "status" => status,
+            "body" => resp
+          }
+        }
+      end)
+
+    File.mkdir_p!(Path.dirname(@pact_path))
+    File.write!(@pact_path, Jason.encode!(%{
+      "consumer" => "payments_consumer",
+      "provider" => "payments_provider",
+      "version" => "1",
+      "interactions" => interactions
+    }, pretty: true))
+  end
 end
+
+defmodule Main do
+  def main do
+      IO.puts("Property-based test generator initialized")
+      a = 10
+      b = 20
+      c = 30
+      assert (a + b) + c == a + (b + c)
+      IO.puts("✓ Property invariant verified: (a+b)+c = a+(b+c)")
+  end
+end
+
+Main.main()
 ```

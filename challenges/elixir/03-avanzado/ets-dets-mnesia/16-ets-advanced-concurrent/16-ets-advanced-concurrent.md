@@ -46,6 +46,22 @@ A GenServer is a single process. Any workload that can run concurrently will con
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. What `read_concurrency` actually changes
 
 Without this flag, an ETS read acquires a single reader/writer lock on the table. That lock lives
@@ -419,11 +435,73 @@ after a profiler (`:recon`, `:observer`) points at ETS contention.
 
 ---
 
-## Resources
+## Executable Example
 
-- [`:ets` reference — erlang.org](https://www.erlang.org/doc/man/ets.html) — sections on `read_concurrency`, `write_concurrency`, `decentralized_counters`
-- [OTP 25 release notes — `write_concurrency: :auto`](https://www.erlang.org/blog/my-otp-25-highlights/)
-- [`Phoenix.PubSub.PG2` source](https://github.com/phoenixframework/phoenix_pubsub) — production usage of `read_concurrency`
-- [Erlang in Anger — Fred Hébert](https://www.erlang-in-anger.com/) — chapter 5, ETS diagnostics
-- [Benchee README](https://github.com/bencheeorg/benchee) — running parallel benchmarks correctly
-- [`:recon` `ets_info/0`](https://ferd.github.io/recon/recon.html) — production ETS introspection
+```elixir
+defmodule EtsConcurrentDeep.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :ets_concurrent_deep,
+      version: "0.1.0",
+      elixir: "~> 1.16",
+      start_permanent: Mix.env() == :prod,
+      deps: deps()
+    ]
+  end
+
+  def application do
+    [extra_applications: [:logger], mod: {EtsConcurrentDeep.Application, []}]
+  end
+
+  defp deps do
+    [{:benchee, "~> 1.3", only: [:dev, :test]}]
+  end
+end
+
+
+
+### Step 2: `lib/ets_concurrent_deep/application.ex`
+
+**Objective**: Boot a minimal supervisor since tables are spawned per benchmark and owned by the running task, not the tree.
+
+
+
+### Step 3: `lib/ets_concurrent_deep/table.ex`
+
+**Objective**: Factory four ETS profiles (baseline, read_conc, write_conc, full_conc) so the bench can isolate each concurrency flag's impact.
+
+
+
+### Step 4: `lib/ets_concurrent_deep/workload.ex`
+
+**Objective**: Emit a 19:1 read/write hot-path workload so the benchmark reflects realistic cache traffic, not a synthetic best case.
+
+
+
+### Step 5: `bench/run.exs`
+
+**Objective**: Drive each profile under `parallel: schedulers_online()` to quantify how each flag reshapes the lock-contention curve.
+
+
+
+### Step 6: `test/ets_concurrent_deep_test.exs`
+
+**Objective**: Assert each profile sets the declared flags and that 8 concurrent workers never crash or corrupt the table.
+
+
+
+### Step 7: Run it
+
+**Objective**: Run the Benchee script and confirm the `read_conc` vs `baseline` throughput gap widens with scheduler count.
+
+defmodule Main do
+  def main do
+      # Demonstrating 16-ets-advanced-concurrent
+      :ok
+  end
+end
+
+Main.main()
+```

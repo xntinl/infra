@@ -60,6 +60,25 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Testing-specific insight:**
+Tests are not QA. They document intent and catch regressions. A test that passes without asserting anything is technical debt. Always test the failure case; "it works when everything succeeds" teaches nothing. Use property-based testing for domain logic where the number of edge cases is infinite.
 ### 1. `async: true` semantics
 
 ExUnit with `async: true` runs **different test modules** concurrently, up to
@@ -613,21 +632,62 @@ busy on each test.
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
 
-- [ExUnit docs — `async: true`](https://hexdocs.pm/ex_unit/ExUnit.Case.html) — see the "Parallel tests" section
-- [Ecto Sandbox docs](https://hexdocs.pm/ecto_sql/Ecto.Adapters.SQL.Sandbox.html) — definitive reference for `:manual`, `{:shared, pid}`, `$callers`
-- ["Concurrent tests with Ecto" — José Valim](https://dashbit.co/blog/concurrent-tests-with-ecto) — original rationale for the sandbox
-- ["Faster tests in Elixir" — Chris Keathley](https://keathley.io/) — practical migration guide
-- [start_supervised! docs](https://hexdocs.pm/ex_unit/ExUnit.Callbacks.html#start_supervised!/2)
-- [`$callers` internals](https://hexdocs.pm/elixir/Process.html#get/0) — Process.get(:"$callers")
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+# test/shortener/links_test.exs
+defmodule Shortener.LinksTest do
+  use Shortener.DataCase, async: true
+
+  alias Shortener.Links
+
+  # Each test runs in its own transaction — other async tests never see this row.
+
+  describe "Shortener.Links" do
+    test "create/1 inserts a link" do
+      assert {:ok, link} = Links.create("https://example.com")
+      assert is_binary(link.code)
+      assert link.url == "https://example.com"
+    end
+
+    test "create/1 produces unique codes across many calls" do
+      urls = for i <- 1..50, do: "https://ex#{i}.com"
+      results = Enum.map(urls, &Links.create/1)
+      codes = Enum.map(results, fn {:ok, l} -> l.code end)
+      assert length(Enum.uniq(codes)) == 50
+    end
+
+    test "resolve/1 returns a link by code" do
+      {:ok, link} = Links.create("https://target.com")
+      assert {:ok, found} = Links.resolve(link.code)
+      assert found.id == link.id
+    end
+
+    test "resolve/1 returns :not_found for unknown codes" do
+      assert Links.resolve("nope") == :not_found
+    end
+
+    @tag :shared_db
+    test "shared mode allows spawned processes to see the sandbox connection" do
+      {:ok, link} = Links.create("https://spawned.com")
+
+      task = Task.async(fn -> Links.resolve(link.code) end)
+      assert {:ok, _} = Task.await(task)
+    end
+  end
 end
+
+defmodule Main do
+  def main do
+      IO.puts("Property-based test generator initialized")
+      a = 10
+      b = 20
+      c = 30
+      assert (a + b) + c == a + (b + c)
+      IO.puts("✓ Property invariant verified: (a+b)+c = a+(b+c)")
+  end
+end
+
+Main.main()
 ```

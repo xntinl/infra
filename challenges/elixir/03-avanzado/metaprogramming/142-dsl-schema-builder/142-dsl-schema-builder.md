@@ -61,6 +61,25 @@ Runtime validation needs a schema description in data form and branches at every
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Metaprogramming-specific insight:**
+Code generation is powerful and dangerous. Every macro you write is a place where intent is hidden. Use macros sparingly, only when they eliminate genuine boilerplate. If your macro is more than 10 lines, you probably need a function or data structure instead. Future maintainers will thank you.
 ### 1. `defstruct` generated from accumulated fields
 
 Every `field :x, :type, default: val` appends `{:x, :type, opts}` to a module
@@ -479,11 +498,142 @@ Expect ~4–8 µs per cast — dominated by map operations.
 
 ---
 
-## Resources
 
-- [Ecto.Schema source](https://github.com/elixir-ecto/ecto/blob/master/lib/ecto/schema.ex) — canonical
-- [Ecto.Changeset source](https://github.com/elixir-ecto/ecto/blob/master/lib/ecto/changeset.ex) — cast/4
-- [*Metaprogramming Elixir*, ch. 7](https://pragprog.com/titles/cmelixir/metaprogramming-elixir/) — DSL study
-- [Ash.Resource — DSL architecture](https://github.com/ash-project/ash)
-- [`Module.register_attribute/3`](https://hexdocs.pm/elixir/Module.html#register_attribute/3)
-- [Dashbit blog — on DSL design](https://dashbit.co/blog)
+## Executable Example
+
+```elixir
+defmodule SchemaDSL do
+  @moduledoc """
+  Ecto-style compile-time schema DSL.
+
+  Usage:
+
+      defmodule User do
+        use SchemaDSL
+
+        schema "users" do
+          field :name, :string, required: true
+          field :age, :integer, default: 0
+        end
+      end
+  """
+
+  alias SchemaDSL.Types
+
+  defmacro __using__(_) do
+    quote do
+      import SchemaDSL, only: [schema: 2]
+      Module.register_attribute(__MODULE__, :schema_fields, accumulate: true)
+    end
+  end
+
+  defmacro schema(source, do: block) do
+    quote do
+      @schema_source unquote(source)
+      import SchemaDSL, only: [field: 2, field: 3]
+      unquote(block)
+      @before_compile SchemaDSL
+    end
+  end
+
+  defmacro field(name, type, opts \\ []) do
+    quote bind_quoted: [name: name, type: type, opts: opts] do
+      unless SchemaDSL.Types.supported?(type) do
+        raise CompileError,
+          description: "unsupported type #{inspect(type)} for field #{inspect(name)}"
+      end
+
+      @schema_fields {name, type, opts}
+    end
+  end
+
+  defmacro __before_compile__(env) do
+    fields = env.module |> Module.get_attribute(:schema_fields) |> Enum.reverse()
+    source = Module.get_attribute(env.module, :schema_source)
+
+    struct_defaults =
+      for {name, _type, opts} <- fields do
+        {name, Keyword.get(opts, :default)}
+      end
+
+    field_names = Enum.map(fields, &elem(&1, 0))
+
+    quote do
+      defstruct unquote(Macro.escape(struct_defaults))
+
+      @spec __schema__(:source) :: String.t()
+      @spec __schema__(:fields) :: [atom()]
+      @spec __schema__(:specs) :: [{atom(), atom(), keyword()}]
+      def __schema__(:source), do: unquote(source)
+      def __schema__(:fields), do: unquote(field_names)
+      def __schema__(:specs), do: unquote(Macro.escape(fields))
+
+      @spec cast(map()) :: {:ok, struct()} | {:error, keyword()}
+      def cast(params) when is_map(params) do
+        SchemaDSL.Casting.cast(unquote(Macro.escape(fields)), __MODULE__, params)
+      end
+
+      @spec dump(struct()) :: map()
+      def dump(%__MODULE__{} = struct) do
+        Map.take(struct, unquote(field_names))
+      end
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+      # Simulate Ecto-style schema DSL
+      defmodule Schema do
+        defmacro schema(name, do: block) do
+          quote do
+            @schema_name unquote(name)
+            @fields []
+
+            # Execute block to collect fields
+            unquote(block)
+
+            # Generate struct
+            @enforce_keys Enum.map(@fields, &elem(&1, 0))
+            defstruct @fields
+
+            # Helper to list fields
+            def __schema__(:fields), do: @fields
+            def __schema__(:name), do: @schema_name
+          end
+        end
+
+        defmacro field(name, type) do
+          quote do
+            @fields @fields ++ [{unquote(name), nil}]
+          end
+        end
+      end
+
+      # Define schema using DSL
+      defmodule User do
+        require Schema
+
+        Schema.schema "users" do
+          Schema.field :name, :string
+          Schema.field :email, :string
+          Schema.field :age, :integer
+        end
+      end
+
+      # Test
+      fields = User.__schema__(:fields)
+      schema_name = User.__schema__(:name)
+
+      IO.puts("✓ Schema: #{schema_name}")
+      IO.inspect(fields, label: "✓ Fields")
+
+      assert length(fields) == 3, "All fields defined"
+      assert schema_name == "users", "Schema name set"
+
+      IO.puts("✓ Schema DSL: Ecto-style builder working")
+  end
+end
+
+Main.main()
+```

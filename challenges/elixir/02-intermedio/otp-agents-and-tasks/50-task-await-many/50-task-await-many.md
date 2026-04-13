@@ -334,6 +334,84 @@ collect them.
 
 - Con 1k tasks y timeout 5s, ¿qué pasa si 990 terminan en 1s y 10 cuelgan? Describí el comportamiento exacto y el impacto.
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule TaskAwaitMany do
+    @moduledoc """
+    Three task-collection strategies with identical signatures, so the
+    semantic differences are easy to compare in tests.
+
+    `inputs` is a list of elements. For each element, `fun.(element)` is
+    run in its own task. The collector's job is to return — or refuse to
+    return — the list of results by the deadline.
+    """
+
+    @type input :: term()
+    @type result :: term()
+
+    @doc """
+    Per-task timeout: each `Task.await` call has its own budget.
+    """
+    @spec per_task_await([input()], (input() -> result()), pos_integer()) :: [result()]
+    def per_task_await(inputs, fun, timeout_ms) do
+      inputs
+      |> Enum.map(&Task.async(fn -> fun.(&1) end))
+      |> Enum.map(&Task.await(&1, timeout_ms))
+    end
+
+    @doc """
+    Batch timeout, all-or-nothing. Exits if any single task misses the
+    deadline. Remaining tasks are shut down automatically.
+    """
+    @spec await_many_batch([input()], (input() -> result()), pos_integer()) :: [result()]
+    def await_many_batch(inputs, fun, timeout_ms) do
+      inputs
+      |> Enum.map(&Task.async(fn -> fun.(&1) end))
+      |> Task.await_many(timeout_ms)
+    end
+
+    @doc """
+    Batch timeout, partial results. Returns a list of `{:ok, value}` /
+    `{:exit, reason}` / `:timeout` tuples in input order. Any task still
+    running at the deadline is killed (`Task.shutdown(t, :brutal_kill)`).
+    """
+    @spec yield_many_partial([input()], (input() -> result()), pos_integer()) ::
+            [{:ok, result()} | {:exit, term()} | :timeout]
+    def yield_many_partial(inputs, fun, timeout_ms) do
+      tasks = Enum.map(inputs, &Task.async(fn -> fun.(&1) end))
+
+      tasks
+      |> Task.yield_many(timeout_ms)
+      |> Enum.map(fn {task, outcome} ->
+        case outcome do
+          {:ok, value} -> {:ok, value}
+          {:exit, reason} -> {:exit, reason}
+          nil ->
+            # Still running — kill it so it doesn't leak.
+            _ = Task.shutdown(task, :brutal_kill)
+            :timeout
+        end
+      end)
+    end
+  end
+
+  def main do
+    work = fn x -> x * 2 end
+    results = TaskAwaitMany.per_task_await([1, 2, 3], work, 1000)
+    IO.puts("Results: #{inspect(results)}")
+    IO.puts("✓ TaskAwaitMany works correctly")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Task.await/2`](https://hexdocs.pm/elixir/Task.html#await/2)

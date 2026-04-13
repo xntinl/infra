@@ -349,7 +349,72 @@ mix test test/task_queue/pattern_matching_test.exs --trace
 
 The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
 
+---
 
+## Executable Example
+
+Create the module file and test in `iex`:
+
+```elixir
+defmodule JobRouter do
+  def route(%{type: :webhook, payload: %{"url" => url, "method" => _}}) when is_binary(url) and byte_size(url) > 0 do
+    :webhook_handler
+  end
+
+  def route(%{type: :cron, payload: %{"schedule" => schedule}}) when is_binary(schedule) do
+    :cron_handler
+  end
+
+  def route(%{type: :pipeline, payload: %{"steps" => steps}}) when is_list(steps) and length(steps) > 0 do
+    :pipeline_handler
+  end
+
+  def route(_), do: :unknown_handler
+
+  def validate(job = %{type: type, payload: payload, retry_count: count}) do
+    cond do
+      not (type in [:webhook, :cron, :pipeline]) -> {:error, :invalid_type}
+      payload == nil -> {:error, :nil_payload}
+      not is_integer(count) or count < 0 -> {:error, :invalid_retry}
+      true -> {:ok, job}
+    end
+  end
+end
+
+defmodule PayloadDecoder do
+  def decode(%{"url" => url, "method" => method} = raw) when is_binary(url) and is_binary(method) do
+    {:ok, %{type: :webhook, url: url, method: method}}
+  end
+
+  def decode(%{"schedule" => schedule} = raw) when is_binary(schedule) do
+    {:ok, %{type: :cron, schedule: schedule, timezone: "UTC"}}
+  end
+
+  def decode(%{"steps" => []}) do
+    {:error, {:steps, :empty}}
+  end
+
+  def decode(%{"steps" => steps}) when is_list(steps) do
+    {:ok, %{type: :pipeline, steps: steps}}
+  end
+
+  def decode(%{"url" => _}), do: {:error, {:method, :missing}}
+  def decode(_), do: {:error, :unknown_type}
+end
+
+# Test it:
+webhook_job = %{type: :webhook, payload: %{"url" => "https://api.example.com", "method" => "POST"}, retry_count: 0}
+IO.inspect(JobRouter.route(webhook_job))  # :webhook_handler
+{:ok, job} = JobRouter.validate(webhook_job)
+IO.puts("Webhook job validated")
+
+raw_webhook = %{"url" => "https://example.com", "method" => "GET"}
+{:ok, decoded} = PayloadDecoder.decode(raw_webhook)
+IO.inspect(decoded)  # %{type: :webhook, url: "https://example.com", method: "GET"}
+
+{:error, {:steps, :empty}} = PayloadDecoder.decode(%{"steps" => []})
+IO.puts("Empty steps correctly rejected")
+```
 
 ---
 ## Key Concepts

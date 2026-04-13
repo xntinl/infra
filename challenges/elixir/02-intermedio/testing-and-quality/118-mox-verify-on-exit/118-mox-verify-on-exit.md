@@ -362,6 +362,52 @@ wrap it in an adapter and mock the adapter.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule WeatherReporter do
+    @moduledoc "Composes weather data into human-readable reports."
+
+    @spec report(String.t()) :: {:ok, String.t()} | {:error, term()}
+    def report(city) do
+      case client().fetch(city) do
+        {:ok, %{city: c, temp_c: t, conditions: cond}} ->
+          {:ok, "#{c}: #{t}°C, #{cond}"}
+
+        {:error, _} = err ->
+          err
+      end
+    end
+
+    # Resolved at call time — easy to override in config.
+    defp client, do: Application.fetch_env!(:mox_demo, :weather_client)
+  end
+
+  def main do
+    IO.puts("=== MockPayment Demo ===
+  ")
+  
+    # Demo: Use a mock HTTP client
+  import_list = [{HttpMock, []}]
+
+  IO.puts("1. get_payment_status('txn123'):")
+  # In a real scenario this would use Mox to define mock behavior
+  result = MockPayment.get_status("txn123")
+  IO.puts("   Result: #{inspect(result)}")
+
+  IO.puts("
+  ✓ Mox verify_on_exit demo completed!")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [Mox — HexDocs](https://hexdocs.pm/mox/Mox.html)

@@ -30,6 +30,22 @@ partition_sup_demo/
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. What `PartitionSupervisor` is (and is not)
 
 It is a `Supervisor` that starts **N copies** of the same child spec, each identified by an integer partition `0..N-1`. That is all. It does NOT do:
@@ -425,11 +441,118 @@ Target: partition mailbox ≤ 20 under peak load; p99 call latency < 5 ms; via-r
 
 ---
 
-## Resources
 
-- [`PartitionSupervisor` — hexdocs](https://hexdocs.pm/elixir/PartitionSupervisor.html) — official API.
-- [Elixir v1.14 CHANGELOG — PartitionSupervisor](https://github.com/elixir-lang/elixir/blob/main/CHANGELOG.md#v1140) — the introduction rationale by José Valim.
-- [`:erlang.phash2/2` internals](https://www.erlang.org/doc/man/erlang.html#phash2-2) — hash function, distribution characteristics.
-- [Dashbit blog — Elixir 1.14 highlights](https://dashbit.co/blog/welcome-to-elixir-1-14) — design motivations from the team that shipped it.
-- [Oban's peer/queue sharding](https://github.com/sorentwo/oban/tree/main/lib/oban/peers) — real-world example of sharded supervision in a library.
-- [Phoenix PubSub sharded registry](https://github.com/phoenixframework/phoenix_pubsub) — another production-grade sharded pattern.
+## Executable Example
+
+```elixir
+# lib/partition_sup_demo/usage_counter.ex
+defmodule PartitionSupDemo.UsageCounter do
+  @moduledoc """
+  A partitioned per-tenant counter. Each partition owns ~1/N of the tenant
+  keyspace.
+  """
+  use GenServer
+
+  @type tenant_id :: String.t()
+
+  @spec incr(tenant_id(), pos_integer()) :: pos_integer()
+  def incr(tenant_id, by \\ 1) do
+    GenServer.call(partition(tenant_id), {:incr, tenant_id, by})
+  end
+
+  @spec get(tenant_id()) :: non_neg_integer()
+  def get(tenant_id) do
+    GenServer.call(partition(tenant_id), {:get, tenant_id})
+  end
+
+  @doc "Sum across all partitions. O(N_partitions)."
+  @spec total() :: non_neg_integer()
+  def total do
+    PartitionSupDemo.UsageCounter.Partitions
+    |> PartitionSupervisor.which_children()
+    |> Enum.map(fn {_id, pid, _type, _modules} -> GenServer.call(pid, :dump_total) end)
+    |> Enum.sum()
+  end
+
+  defp partition(key) do
+    {:via, PartitionSupervisor, {PartitionSupDemo.UsageCounter.Partitions, key}}
+  end
+
+  def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
+
+  @impl true
+  def init(_opts), do: {:ok, %{counts: %{}}}
+
+  @impl true
+  def handle_call({:incr, tenant_id, by}, _from, %{counts: counts} = state) do
+    new = Map.update(counts, tenant_id, by, &(&1 + by))
+    {:reply, Map.fetch!(new, tenant_id), %{state | counts: new}}
+  end
+
+  def handle_call({:get, tenant_id}, _from, state) do
+    {:reply, Map.get(state.counts, tenant_id, 0), state}
+  end
+
+  def handle_call(:dump_total, _from, state) do
+    {:reply, state.counts |> Map.values() |> Enum.sum(), state}
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrate PartitionSupervisor scaling GenServer contention
+
+      # Start PartitionSupervisor with N partitions equal to schedulers
+      {:ok, sup_pid} = PartitionSupervisor.start_link(
+        child_spec: PartitionSupDemo.UsageCounter.child_spec([]),
+        name: PartitionSupDemo.UsageCounter.Partitions,
+        partitions: System.schedulers_online()
+      )
+
+      assert is_pid(sup_pid), "PartitionSupervisor must start"
+      IO.inspect(System.schedulers_online(), label: "Schedulers (partitions)")
+
+      # Test monotonic per-tenant increments across partitions
+      incr_result_1 = PartitionSupDemo.UsageCounter.incr("tenant_1", 10)
+      assert incr_result_1 == 10, "First incr should return 10"
+
+      incr_result_2 = PartitionSupDemo.UsageCounter.incr("tenant_1", 5)
+      assert incr_result_2 == 15, "Second incr should return 15"
+
+      # Different tenants should not affect each other
+      incr_result_3 = PartitionSupDemo.UsageCounter.incr("tenant_2", 7)
+      assert incr_result_3 == 7, "Different tenant should start at 0"
+
+      # Get per-tenant counters
+      count_1 = PartitionSupDemo.UsageCounter.get("tenant_1")
+      count_2 = PartitionSupDemo.UsageCounter.get("tenant_2")
+
+      assert count_1 == 15, "Tenant 1 counter should be 15"
+      assert count_2 == 7, "Tenant 2 counter should be 7"
+
+      IO.inspect(count_1, label: "Tenant 1 counter")
+      IO.inspect(count_2, label: "Tenant 2 counter")
+
+      # Aggregate across all partitions
+      total = PartitionSupDemo.UsageCounter.total()
+      assert total == 22, "Total should be 15 + 7"
+      IO.inspect(total, label: "Total across all partitions")
+
+      # Verify partition distribution via phash2
+      partitions_count = System.schedulers_online()
+      partition_idx = :erlang.phash2("tenant_1", partitions_count)
+      assert partition_idx >= 0 and partition_idx < partitions_count, "Partition index should be valid"
+      IO.inspect(partition_idx, label: "Tenant 1 partition index")
+
+      IO.puts("✓ PartitionSupervisor initialized with #{partitions_count} partitions")
+      IO.puts("✓ Per-tenant monotonic increments verified")
+      IO.puts("✓ Cross-partition aggregation working")
+      IO.puts("✓ Load distribution via phash2 demonstrated")
+
+      PartitionSupervisor.stop(sup_pid)
+      IO.puts("✓ PartitionSupervisor shutdown complete")
+  end
+end
+
+Main.main()
+```

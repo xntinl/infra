@@ -540,6 +540,102 @@ consume atom table entries too.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule OrderFsm.State do
+  @valid_states [:pending, :confirmed, :shipped, :delivered, :cancelled]
+  @transitions %{
+    pending: [:confirmed, :cancelled],
+    confirmed: [:shipped],
+    shipped: [:delivered],
+    delivered: [],
+    cancelled: []
+  }
+
+  def valid_states, do: @valid_states
+  def allowed_transitions(state) when state in @valid_states, do: Map.fetch!(@transitions, state)
+  def valid_transition?(from, to) when from in @valid_states and to in @valid_states, do: to in Map.fetch!(@transitions, from)
+  def valid_transition?(_, _), do: false
+  def parse(state_str) do
+    try do
+      state = String.to_existing_atom(state_str)
+      if state in @valid_states, do: {:ok, state}, else: {:error, :unknown_state}
+    rescue
+      _  -> {:error, :unknown_state}
+    end
+  end
+  def terminal?(:delivered), do: true
+  def terminal?(:cancelled), do: true
+  def terminal?(_), do: false
+end
+
+defmodule OrderFsm.Order do
+  defstruct [:id, :items, :state, :history]
+  def new(id, items), do: %__MODULE__{id: id, items: items, state: :pending, history: []}
+  def transition(%{state: current} = order, target) do
+    if OrderFsm.State.valid_transition?(current, target) do
+      updated = order |> Map.put(:state, target) |> Map.update!(:history, &[{current, target, DateTime.utc_now()} | &1])
+      {:ok, updated}
+    else
+      {:error, :invalid_transition}
+    end
+  end
+  def transition_chain(order, states) do
+    Enum.reduce_while(states, {:ok, order}, fn target, {:ok, current} ->
+      case transition(current, target) do
+        {:ok, updated} -> {:cont, {:ok, updated}}
+        {:error, reason} -> {:halt, {:error, reason, current}}
+      end
+    end)
+  end
+  def history(%{history: history}), do: Enum.reverse(history)
+end
+
+def main do
+  IO.puts("=== OrderFsm Test ===\n")
+
+  # Test 1: Create order
+  IO.puts("Test 1: create order")
+  order = OrderFsm.Order.new("ORD-001", ["Widget"])
+  IO.puts("  State: #{order.state}")
+  assert order.state == :pending
+
+  # Test 2: Valid transition
+  IO.puts("\nTest 2: valid transition")
+  {:ok, confirmed} = OrderFsm.Order.transition(order, :confirmed)
+  IO.puts("  New state: #{confirmed.state}")
+  assert confirmed.state == :confirmed
+
+  # Test 3: Invalid transition
+  IO.puts("\nTest 3: invalid transition")
+  {:error, :invalid_transition} = OrderFsm.Order.transition(order, :delivered)
+  IO.puts("  Correctly rejected")
+
+  # Test 4: Transition chain
+  IO.puts("\nTest 4: transition chain")
+  {:ok, delivered} = OrderFsm.Order.transition_chain(order, [:confirmed, :shipped, :delivered])
+  IO.puts("  Final state: #{delivered.state}")
+  assert delivered.state == :delivered
+
+  # Test 5: Terminal state check
+  IO.puts("\nTest 5: terminal state")
+  is_terminal = OrderFsm.State.terminal?(delivered.state)
+  IO.puts("  Is delivered terminal: #{is_terminal}")
+  assert is_terminal == true
+
+  IO.puts("\n=== All tests passed! ===")
+end
+
+defp assert(condition) do
+  unless condition, do: raise "Assertion failed!"
+end
+
+main()
+```
+
 ## Reflection
 
 If your e-commerce platform had 50 different order states (B2B with custom workflows per customer), would you still use atoms, or model states as a struct field with a string? Why?

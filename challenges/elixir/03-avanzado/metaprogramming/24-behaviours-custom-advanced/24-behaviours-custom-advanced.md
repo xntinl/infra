@@ -47,6 +47,25 @@ Duck typing works until someone forgets a callback and the error appears in prod
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Metaprogramming-specific insight:**
+Code generation is powerful and dangerous. Every macro you write is a place where intent is hidden. Use macros sparingly, only when they eliminate genuine boilerplate. If your macro is more than 10 lines, you probably need a function or data structure instead. Future maintainers will thank you.
 ### 1. `@callback` vs `@optional_callbacks`
 
 ### Dependencies (mix.exs)
@@ -467,12 +486,115 @@ is mostly `function_exported?` lookup, cached in the VM after first call).
 
 ---
 
-## Resources
 
-- [`Module` — hexdocs.pm](https://hexdocs.pm/elixir/Module.html) — `@callback`, `@optional_callbacks`
-- [`Behaviour` discussion in Elixir docs](https://hexdocs.pm/elixir/typespecs.html#behaviours)
-- [Plug behaviour source](https://github.com/elixir-plug/plug/blob/main/lib/plug.ex) — canonical
-- [Phoenix.Channel behaviour](https://github.com/phoenixframework/phoenix/blob/main/lib/phoenix/channel.ex) — real optional callbacks
-- [Code.ensure_loaded — Elixir docs](https://hexdocs.pm/elixir/Code.html#ensure_loaded/1)
-- [José Valim on behaviours](https://dashbit.co/blog) — Dashbit
-- [Erlang docs — behaviours](https://www.erlang.org/doc/design_principles/des_princ.html#behaviours)
+## Executable Example
+
+```elixir
+defmodule BehavioursAdvanced.NotifierTest do
+  use ExUnit.Case, async: true
+
+  alias BehavioursAdvanced.Plugins.{Slack, SMS, Partial}
+  alias BehavioursAdvanced.Registry
+
+  @user %{id: "u-1"}
+
+  describe "dispatch/3 — required callback" do
+    test "calls send_notification on every plugin" do
+      result = Registry.dispatch([Slack, SMS, Partial], @user, "hello")
+      assert result[Slack] == :ok
+      assert result[SMS] == :ok
+      assert result[Partial] == :ok
+    end
+
+    test "SMS rejects messages over 160 bytes" do
+      long = String.duplicate("a", 200)
+      result = Registry.dispatch([SMS], @user, long)
+      assert result[SMS] == {:error, :too_long}
+    end
+  end
+
+  describe "healthchecks/1 — optional callback" do
+    test "Slack and SMS return :ok or an error" do
+      result = Registry.healthchecks([Slack, SMS])
+      assert result[Slack] in [:ok]
+      assert result[SMS] in [:ok, {:error, :carrier_down}]
+    end
+
+    test "Partial plugin returns :not_implemented" do
+      result = Registry.healthchecks([Partial])
+      assert result[Partial] == :not_implemented
+    end
+  end
+
+  describe "previews/2 — optional callback" do
+    test "Slack formats a preview" do
+      result = Registry.previews([Slack], "hi there")
+      assert result[Slack] =~ "[slack]"
+    end
+
+    test "SMS and Partial return :not_implemented" do
+      result = Registry.previews([SMS, Partial], "hi")
+      assert result[SMS] == :not_implemented
+      assert result[Partial] == :not_implemented
+    end
+  end
+
+  describe "version enforcement" do
+    test "plugin below minimum version fails to compile" do
+      code = """
+      defmodule TooOld do
+        use BehavioursAdvanced.Notifier
+        @impl true
+        def send_notification(_, _), do: :ok
+        @impl true
+        def version, do: "0.9.0"
+      end
+      """
+
+      assert_raise CompileError, ~r/minimum required is 1.0.0/, fn ->
+        Code.compile_string(code)
+      end
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrate behaviour with optional callbacks and runtime checks
+      defmodule PluginBehaviour do
+        @callback required_callback(term()) :: term()
+        @callback optional_callback(term()) :: term() | :not_implemented
+
+        @doc false
+        def spec(callback) do
+          "Plugin callback spec for #{inspect(callback)}"
+        end
+      end
+
+      defmodule MyPlugin do
+        @behaviour PluginBehaviour
+
+        def required_callback(data) do
+          {:processed, data}
+        end
+
+        # optional_callback not implemented, falls back to default
+      end
+
+      # Runtime check
+      result = MyPlugin.required_callback("test")
+
+      IO.inspect(result, label: "✓ Behaviour callback result")
+
+      # Check if optional callback exists
+      optional_impl = function_exported?(MyPlugin, :optional_callback, 1)
+      IO.puts("✓ Optional callback implemented: #{optional_impl}")
+
+      assert match?({:processed, "test"}, result), "Required callback works"
+
+      IO.puts("✓ Advanced behaviours: optional callbacks and runtime checks working")
+  end
+end
+
+Main.main()
+```

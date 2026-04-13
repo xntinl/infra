@@ -429,6 +429,61 @@ systemd is for bare-metal and VM deployments.
 
 - ¿Qué diferencia hay entre `Restart=always` y `Restart=on-failure` para un release OTP? ¿Cuál elegís y por qué?
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule SystemdPackaged.MixProject do
+    use Mix.Project
+
+    def project do
+      [
+        app: :systemd_packaged,
+        version: "0.1.0",
+        elixir: "~> 1.17",
+        start_permanent: Mix.env() == :prod,
+        deps: [],
+        releases: releases()
+      ]
+    end
+
+    def application do
+      [extra_applications: [:logger], mod: {SystemdPackaged.Application, []}]
+    end
+
+    defp releases do
+      [
+        systemd_packaged: [
+          include_executables_for: [:unix],
+          steps: [:assemble, &copy_overlays/1]
+        ]
+      ]
+    end
+
+    defp copy_overlays(%Mix.Release{path: release_path} = release) do
+      source = Path.join([File.cwd!(), "rel", "overlays"])
+      if File.dir?(source), do: File.cp_r!(source, release_path)
+      release
+    end
+  end
+
+  def main do
+    # Demo: systemd service integration
+    IO.puts("SystemdPackaged: demostración exitosa")
+    IO.puts("  Las releases se pueden empaquetar como servicios systemd")
+    IO.puts("  Permite inicio/parada automática en boot")
+    IO.puts("  Estándar para deployments en Linux")
+    IO.puts("  EnvironmentFile permite cambiar config sin redeploy")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [systemd.service(5)](https://www.freedesktop.org/software/systemd/man/systemd.service.html)

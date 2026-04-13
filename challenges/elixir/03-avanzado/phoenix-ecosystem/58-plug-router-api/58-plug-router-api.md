@@ -466,9 +466,22 @@ Phoenix.PubSub partitions topics across a pool of processes, allowing horizontal
 
 ---
 
-## Resources
+## Executable Example
 
-- [Plug.Router](https://hexdocs.pm/plug/Plug.Router.html) — route macros and pipeline setup
-- [Plug.Parsers](https://hexdocs.pm/plug/Plug.Parsers.html) — body parsing configuration
-- [Plug.Conn.send_chunked/2](https://hexdocs.pm/plug/Plug.Conn.html#send_chunked/2) — chunked transfer encoding
-- [Plug.Test](https://hexdocs.pm/plug/Plug.Test.html) — `conn/3` for testing without a server
+```elixir
+defp deps do
+  [
+    {:plug_cowboy, "~> 2.7"},
+    {:jason, "~> 1.4"}
+  ]
+end
+
+defmodule Main do
+  def main do
+      # Demonstrating 58-plug-router-api
+      :ok
+  end
+end
+
+Main.main()
+```

@@ -48,6 +48,22 @@ A socket is a connection; a channel is a topic. They are different units of auth
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Connect vs join: two gates, not one
 
 ```
@@ -705,11 +721,85 @@ Target: join overhead under 1 ms including token verification; message overhead 
 
 ---
 
-## Resources
 
-- [`Phoenix.Socket` docs](https://hexdocs.pm/phoenix/Phoenix.Socket.html)
-- [`Phoenix.Token` docs](https://hexdocs.pm/phoenix/Phoenix.Token.html) — read the `max_age` semantics carefully
-- [`Phoenix.ChannelTest` docs](https://hexdocs.pm/phoenix/Phoenix.ChannelTest.html) — `connect/3`, `subscribe_and_join/3`, `push/3`, `assert_reply`
-- [Phoenix security guide — Channels section](https://hexdocs.pm/phoenix/channels.html#authentication)
-- [Chris McCord — Real-time Phoenix (Pragmatic Bookshelf)](https://pragprog.com/titles/sbsockets/real-time-phoenix/) — Chapter 5 covers authn/z end to end
-- [OWASP WebSocket Security cheatsheet](https://cheatsheetseries.owasp.org/cheatsheets/HTML5_Security_Cheat_Sheet.html#websockets)
+## Executable Example
+
+```elixir
+# test/channels_auth/channels/document_channel_test.exs
+defmodule ChannelsAuth.Channels.DocumentChannelTest do
+  use ExUnit.Case, async: true
+  import Phoenix.ChannelTest
+
+  @endpoint ChannelsAuth.Endpoint
+
+  alias ChannelsAuth.{Token, UserSocket}
+
+  defp connect_as(role, workspace \\ "acme") do
+    token =
+      Token.sign(@endpoint, %{user_id: "u_1", workspace_id: workspace, role: role})
+
+    {:ok, socket} = connect(UserSocket, %{"token" => token})
+    socket
+  end
+
+  describe "join/3" do
+    test "viewer can join a document in their workspace" do
+      socket = connect_as(:viewer)
+
+      assert {:ok, _reply, _socket} =
+               subscribe_and_join(socket, "document:acme:42", %{})
+    end
+
+    test "rejects joining a document in another workspace" do
+      socket = connect_as(:editor, "acme")
+
+      assert {:error, %{reason: "workspace_mismatch"}} =
+               subscribe_and_join(socket, "document:globex:42", %{})
+    end
+  end
+
+  describe "edit" do
+    test "editor can edit" do
+      socket = connect_as(:editor)
+      {:ok, _, socket} = subscribe_and_join(socket, "document:acme:1", %{})
+
+      ref = push(socket, "edit", %{"op" => "insert", "at" => 5, "text" => "foo"})
+      assert_reply ref, :ok
+    end
+
+    test "viewer cannot edit" do
+      socket = connect_as(:viewer)
+      {:ok, _, socket} = subscribe_and_join(socket, "document:acme:1", %{})
+
+      ref = push(socket, "edit", %{"op" => "insert", "at" => 5, "text" => "foo"})
+      assert_reply ref, :error, %{reason: "role_insufficient"}
+    end
+  end
+
+  describe "delete" do
+    test "only owner can delete" do
+      socket = connect_as(:editor)
+      {:ok, _, socket} = subscribe_and_join(socket, "document:acme:1", %{})
+
+      ref = push(socket, "delete", %{})
+      assert_reply ref, :error, %{reason: "role_insufficient"}
+
+      owner = connect_as(:owner)
+      {:ok, _, owner_socket} = subscribe_and_join(owner, "document:acme:1", %{})
+
+      ref2 = push(owner_socket, "delete", %{})
+      assert_reply ref2, :ok
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+    IO.puts("✓ Channel Authentication with Signed Tokens and `socket_info`")
+  - Phoenix Channel authentication
+    - Join predicates and access control
+  end
+end
+
+Main.main()
+```

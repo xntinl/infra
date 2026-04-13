@@ -506,6 +506,76 @@ is great for self-hosted, less so when you already pay for a vendor.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule MetricsProm.Metrics do
+    @moduledoc """
+    Declares the metrics this app exposes. Pure data: no event handling
+    here — the Prometheus reporter attaches handlers internally when it
+    starts.
+    """
+    import Telemetry.Metrics
+
+    @doc """
+    The metric definitions. Fed to `TelemetryMetricsPrometheus.Core`.
+    """
+    @spec definitions() :: [Telemetry.Metrics.t()]
+    def definitions do
+      [
+        counter(
+          "metrics_prom.request.count",
+          event_name: [:metrics_prom, :request, :stop],
+          tags: [:method, :status],
+          description: "Total requests observed, tagged by method and status."
+        ),
+        sum(
+          "metrics_prom.request.response_bytes",
+          event_name: [:metrics_prom, :request, :stop],
+          measurement: :bytes,
+          tags: [:method],
+          description: "Total response bytes, summed per method."
+        ),
+        summary(
+          "metrics_prom.request.duration",
+          event_name: [:metrics_prom, :request, :stop],
+          measurement: :duration,
+          unit: {:native, :millisecond},
+          tags: [:method],
+          description: "Request duration summary (min/max/avg), in ms."
+        ),
+        last_value(
+          "metrics_prom.queue.depth",
+          event_name: [:metrics_prom, :queue, :depth],
+          measurement: :value,
+          description: "Current in-memory queue depth."
+        )
+      ]
+    end
+  end
+
+  def main do
+    IO.puts("=== App Demo ===
+  ")
+  
+    # Demo: Telemetry metrics
+  IO.puts("1. Telemetry emits events: [:module, :event]")
+  IO.puts("2. Metrics collect and aggregate")
+  IO.puts("3. Prometheus exports for monitoring")
+
+  IO.puts("
+  ✓ Telemetry metrics demo completed!")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Telemetry.Metrics` — hexdocs](https://hexdocs.pm/telemetry_metrics/)

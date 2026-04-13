@@ -368,6 +368,105 @@ loop of `delete/2` — and atomic from the table's point of view.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule MatchObjectDemo do
+    @moduledoc """
+    A small "users" table storing `{user_id, name, role}` tuples, queried with
+    `:ets.match/2` and `:ets.match_object/2` to illustrate pattern-based queries.
+
+    All the query functions accept pre-built patterns so tests can see how the
+    pattern shape maps to results.
+    """
+
+    @type user :: {integer(), String.t(), atom()}
+
+    @doc "Creates the users table and seeds it with fixtures."
+    @spec seed() :: :ets.tid()
+    def seed do
+      t = :ets.new(:users, [:set, :public])
+
+      :ets.insert(t, [
+        {1, "Alice", :admin},
+        {2, "Bob", :user},
+        {3, "Carol", :admin},
+        {4, "Dan", :user},
+        {5, "Eve", :guest}
+      ])
+
+      t
+    end
+
+    @doc """
+    Returns only the requested bindings, using `:ets.match/2`.
+
+    Example: `names_by_role(t, :admin)` uses the pattern `{:_, :"$1", :admin}`
+    and returns `[["Alice"], ["Carol"]]` — a list-of-lists, one binding per
+    `$N` position in the pattern (just `$1` = name here).
+    """
+    @spec names_by_role(:ets.tid(), atom()) :: [[String.t()]]
+    def names_by_role(t, role) do
+      # Pattern: id is wildcarded (we don't want it), name is captured as $1,
+      # role must literally equal the given atom.
+      :ets.match(t, {:_, :"$1", role})
+    end
+
+    @doc """
+    Returns full tuples for users with the given role, via `:ets.match_object/2`.
+
+    The pattern is exactly the same shape, but we get the whole record back
+    instead of just bound positions.
+    """
+    @spec users_by_role(:ets.tid(), atom()) :: [user()]
+    def users_by_role(t, role) do
+      :ets.match_object(t, {:_, :_, role})
+    end
+
+    @doc """
+    Returns `{id, name}` pairs for admins, via `match/2` with two bindings.
+    Demonstrates multi-binding extraction without the cost of copying the role.
+    """
+    @spec admin_id_and_name(:ets.tid()) :: [[term()]]
+    def admin_id_and_name(t) do
+      # $1 = id, $2 = name, role = literal :admin.
+      :ets.match(t, {:"$1", :"$2", :admin})
+    end
+  end
+
+  def main do
+    # Demo: consultas por patrón en ETS
+    t = MatchObjectDemo.seed()
+  
+    # Buscar nombres de administradores
+    admin_names = MatchObjectDemo.names_by_role(t, :admin)
+    assert Enum.sort(admin_names) == [["Alice"], ["Carol"]], "debe retornar nombres de admins"
+  
+    # Buscar usuarios completos por rol
+    user_roles = MatchObjectDemo.users_by_role(t, :user)
+    assert Enum.sort(user_roles) == [{2, "Bob", :user}, {4, "Dan", :user}], "debe retornar tuplas completas"
+  
+    # Extraer id y nombre de admins
+    admin_pairs = MatchObjectDemo.admin_id_and_name(t)
+    assert Enum.sort(admin_pairs) == [[1, "Alice"], [3, "Carol"]], "debe retornar pares id,nombre"
+  
+    :ets.delete(t)
+  
+    IO.puts("MatchObjectDemo: demostración de consultas por patrón exitosa")
+    IO.puts("  admin_names: #{inspect(Enum.sort(admin_names))}")
+    IO.puts("  user_roles: #{inspect(Enum.sort(user_roles))}")
+    IO.puts("  admin_pairs: #{inspect(Enum.sort(admin_pairs))}")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`:ets.match/2`](https://www.erlang.org/doc/man/ets.html#match-2)

@@ -384,6 +384,154 @@ module call is clearer.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Storage do
+  @moduledoc """
+  Storage behaviour. Defines the contract that any storage adapter must implement.
+  """
+
+  @type key :: any()
+  @type value :: any()
+
+  @callback get(key) :: {:ok, value} | :error
+  @callback put(key, value) :: :ok
+  @callback delete(key) :: :ok
+  @callback clear() :: :ok
+
+  @spec fetch(atom(), key, value) :: value
+  def fetch(impl, key, default) do
+    case impl.get(key) do
+      {:ok, value} -> value
+      :error -> default
+    end
+  end
+end
+
+defmodule Storage.InMemory do
+  @moduledoc """
+  In-memory `Storage` implementation using the process dictionary.
+  """
+
+  @behaviour Storage
+
+  @impl true
+  def get(key) do
+    case Process.get(key) do
+      nil -> :error
+      value -> {:ok, value}
+    end
+  end
+
+  @impl true
+  def put(key, value) do
+    Process.put(key, value)
+    :ok
+  end
+
+  @impl true
+  def delete(key) do
+    Process.delete(key)
+    :ok
+  end
+
+  @impl true
+  def clear do
+    Process.get_keys([])
+    |> Enum.each(&Process.delete/1)
+    :ok
+  end
+end
+
+defmodule Storage.EtsStore do
+  @moduledoc """
+  ETS-backed `Storage` implementation. The table is created lazily on first
+  use and shared across processes (`:public` + `:named_table`).
+  """
+
+  @behaviour Storage
+
+  @table :storage_ets_store
+
+  @impl true
+  def get(key) do
+    ensure_table()
+
+    case :ets.lookup(@table, key) do
+      [{^key, value}] -> {:ok, value}
+      [] -> :error
+    end
+  end
+
+  @impl true
+  def put(key, value) do
+    ensure_table()
+    :ets.insert(@table, {key, value})
+    :ok
+  end
+
+  @impl true
+  def delete(key) do
+    ensure_table()
+    :ets.delete(@table, key)
+    :ok
+  end
+
+  @impl true
+  def clear do
+    ensure_table()
+    :ets.delete_all_objects(@table)
+    :ok
+  end
+
+  # ETS tables are owned by the process that creates them. For a standalone
+  # demo we create with :public so any process can read/write.
+  defp ensure_table do
+    case :ets.whereis(@table) do
+      :undefined -> :ets.new(@table, [:named_table, :public, :set])
+      _tid -> @table
+    end
+  end
+end
+
+# Demonstrate behaviour contracts
+IO.puts("=== Storage Behaviour Demo ===")
+
+# Test InMemory implementation
+Storage.InMemory.clear()
+Storage.InMemory.put(:user_1, "Alice")
+Storage.InMemory.put(:user_2, "Bob")
+assert Storage.InMemory.get(:user_1) == {:ok, "Alice"}
+assert Storage.InMemory.get(:user_2) == {:ok, "Bob"}
+assert Storage.InMemory.get(:missing) == :error
+
+IO.puts("InMemory adapter: put and get work correctly")
+
+# Test EtsStore implementation
+Storage.EtsStore.clear()
+Storage.EtsStore.put(:id_1, 100)
+Storage.EtsStore.put(:id_2, 200)
+assert Storage.EtsStore.get(:id_1) == {:ok, 100}
+assert Storage.EtsStore.get(:id_2) == {:ok, 200}
+assert Storage.EtsStore.get(:missing) == :error
+
+IO.puts("EtsStore adapter: put and get work correctly")
+
+# Test the adapter-agnostic function
+value = Storage.fetch(Storage.InMemory, :user_1, "default")
+assert value == "Alice"
+
+value = Storage.fetch(Storage.InMemory, :no_key, "default")
+assert value == "default"
+
+IO.puts("Storage.fetch works with adapters")
+IO.puts("All behaviour assertions passed!")
+```
+
+
 ## Resources
 
 - [Typespecs and behaviours — Elixir guide](https://hexdocs.pm/elixir/typespecs.html)

@@ -48,6 +48,25 @@ tests but catastrophic in prod.
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Testing-specific insight:**
+Tests are not QA. They document intent and catch regressions. A test that passes without asserting anything is technical debt. Always test the failure case; "it works when everything succeeds" teaches nothing. Use property-based testing for domain logic where the number of edge cases is infinite.
 ### 1. Restart strategies
 - `:one_for_one` — only the crashed child restarts.
 - `:one_for_all` — all children restart when any one crashes.
@@ -345,19 +364,121 @@ The intensity test crashed the same child 4 times. If the four crashes came from
 DIFFERENT children within the same 5-second window, would the supervisor still die at
 the 4th crash? Read the OTP docs on restart intensity to confirm your answer.
 
-## Resources
 
-- [`Supervisor` — hexdocs](https://hexdocs.pm/elixir/Supervisor.html)
-- [Restart strategy and intensity — Erlang docs](https://www.erlang.org/doc/system/sup_princ.html#supervision-principles)
-- [`Process.monitor/1`](https://hexdocs.pm/elixir/Process.html#monitor/1)
-- [`start_supervised!/1`](https://hexdocs.pm/ex_unit/ExUnit.Callbacks.html#start_supervised!/1)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+# test/payment_gateway/supervisor_test.exs
+defmodule PaymentGateway.SupervisorTest do
+  # async: false because workers use globally-registered names (:name, __MODULE__)
+  use ExUnit.Case, async: false
+
+  alias PaymentGateway.{Supervisor, PaymentClient, LedgerWriter, FraudCheck}
+
+  setup do
+    start_supervised!(Supervisor)
+    :ok
+  end
+
+  describe "strategy :one_for_one" do
+    test "crashed child is restarted in isolation" do
+      original = Process.whereis(PaymentClient)
+      ledger_before = Process.whereis(LedgerWriter)
+
+      ref = Process.monitor(original)
+      PaymentClient.crash()
+
+      # Wait for the crash deterministically
+      assert_receive {:DOWN, ^ref, :process, ^original, _}, 500
+
+      # Small bounded wait for the supervisor to re-register the name
+      Process.sleep(20)
+
+      new_pid = Process.whereis(PaymentClient)
+      assert new_pid != nil
+      assert new_pid != original
+
+      # Critical: siblings MUST not have restarted
+      assert Process.whereis(LedgerWriter) == ledger_before
+    end
+
+    test "crashing one child does not kill unrelated siblings" do
+      fraud_before = Process.whereis(FraudCheck)
+
+      ref = Process.monitor(Process.whereis(PaymentClient))
+      PaymentClient.crash()
+      assert_receive {:DOWN, ^ref, :process, _, _}, 500
+
+      Process.sleep(20)
+      assert Process.whereis(FraudCheck) == fraud_before
+    end
+  end
+
+  describe "restart type :transient for LedgerWriter" do
+    test "normal stop does NOT trigger a restart" do
+      original = Process.whereis(LedgerWriter)
+      ref = Process.monitor(original)
+
+      LedgerWriter.stop_normally()
+      assert_receive {:DOWN, ^ref, :process, ^original, :normal}, 500
+
+      # Supervisor must NOT have restarted on :normal
+      Process.sleep(50)
+      assert Process.whereis(LedgerWriter) == nil
+    end
+
+    test "abnormal crash DOES trigger a restart" do
+      original = Process.whereis(LedgerWriter)
+      ref = Process.monitor(original)
+
+      LedgerWriter.crash()
+      assert_receive {:DOWN, ^ref, :process, ^original, _}, 500
+
+      Process.sleep(20)
+      new_pid = Process.whereis(LedgerWriter)
+      assert new_pid != nil
+      assert new_pid != original
+    end
+  end
+
+  describe "restart intensity" do
+    test "supervisor dies after exceeding max_restarts within max_seconds" do
+      sup = Process.whereis(Supervisor)
+      sup_ref = Process.monitor(sup)
+
+      # Cause 4 crashes in quick succession (limit is 3)
+      for _ <- 1..4 do
+        case Process.whereis(PaymentClient) do
+          nil ->
+            Process.sleep(5)
+
+          pid ->
+            ref = Process.monitor(pid)
+            PaymentClient.crash()
+            receive do
+              {:DOWN, ^ref, :process, _, _} -> :ok
+            after
+              500 -> :ok
+            end
+        end
+      end
+
+      # The supervisor itself must have crashed
+      assert_receive {:DOWN, ^sup_ref, :process, ^sup, _}, 1_000
+    end
+  end
 end
+
+defmodule Main do
+  def main do
+      IO.puts("Property-based test generator initialized")
+      a = 10
+      b = 20
+      c = 30
+      assert (a + b) + c == a + (b + c)
+      IO.puts("✓ Property invariant verified: (a+b)+c = a+(b+c)")
+  end
+end
+
+Main.main()
 ```

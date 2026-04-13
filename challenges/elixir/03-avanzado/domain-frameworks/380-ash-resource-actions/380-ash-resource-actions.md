@@ -50,6 +50,22 @@ Ash 3.x renamed `Api` to `Domain`. The domain groups resources that belong toget
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Resource
 A module `use Ash.Resource` with four DSL blocks: `attributes`, `relationships`, `actions`, `calculations`. Everything that is state or behaviour of the entity lives there.
 
@@ -463,19 +479,91 @@ If your domain has three CRUD resources and no plans to grow, the ceremony outwe
 
 The `:pay` action guards `status == :pending` via a validation. Under high concurrency two callers could pass the validation and both try to mark the invoice paid. Should the guarantee live in Elixir (Ash validation), in SQL (a `CHECK` constraint plus unique partial index on `paid_at`), or both? Consider failure modes: what do you tell the second caller, and what does the audit log show?
 
-## Resources
 
-- [Ash Framework docs](https://hexdocs.pm/ash/)
-- [Ash 3 upgrade guide](https://hexdocs.pm/ash/upgrading-to-3-0.html)
-- [ash_postgres](https://hexdocs.pm/ash_postgres/)
-- [Dashbit: Idioms vs frameworks (José Valim)](https://dashbit.co/blog/)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+defmodule BillingCore.Billing.InvoiceTest do
+  use ExUnit.Case, async: false
+
+  alias BillingCore.Billing
+
+  setup do
+    Ecto.Adapters.SQL.Sandbox.checkout(BillingCore.Repo)
+    :ok
+  end
+
+  describe "create/1" do
+    test "creates an invoice with valid attributes" do
+      assert {:ok, invoice} =
+               Billing.create_invoice(%{
+                 customer_id: Ecto.UUID.generate(),
+                 amount_cents: 1_000,
+                 currency: "USD"
+               })
+
+      assert invoice.status == :pending
+      assert invoice.amount_cents == 1_000
+    end
+
+    test "rejects non-positive amount" do
+      assert {:error, %Ash.Error.Invalid{}} =
+               Billing.create_invoice(%{
+                 customer_id: Ecto.UUID.generate(),
+                 amount_cents: 0,
+                 currency: "USD"
+               })
+    end
+  end
+
+  describe "pay/1" do
+    test "transitions from pending to paid and sets paid_at" do
+      {:ok, invoice} = create_pending()
+
+      assert {:ok, paid} = Billing.pay_invoice(invoice.id)
+      assert paid.status == :paid
+      assert not is_nil(paid.paid_at)
+    end
+
+    test "rejects paying an already paid invoice" do
+      {:ok, invoice} = create_pending()
+      {:ok, _paid} = Billing.pay_invoice(invoice.id)
+
+      assert {:error, %Ash.Error.Invalid{}} = Billing.pay_invoice(invoice.id)
+    end
+  end
+
+  describe "void/1" do
+    test "voids a pending invoice" do
+      {:ok, invoice} = create_pending()
+      assert {:ok, voided} = Billing.void_invoice(invoice.id)
+      assert voided.status == :void
+      assert not is_nil(voided.voided_at)
+    end
+
+    test "rejects voiding a paid invoice" do
+      {:ok, invoice} = create_pending()
+      {:ok, _paid} = Billing.pay_invoice(invoice.id)
+      assert {:error, %Ash.Error.Invalid{}} = Billing.void_invoice(invoice.id)
+    end
+  end
+
+  defp create_pending do
+    Billing.create_invoice(%{
+      customer_id: Ecto.UUID.generate(),
+      amount_cents: 2_500,
+      currency: "USD"
+    })
+  end
 end
+
+defmodule Main do
+  def main do
+    IO.puts("✓ Ash Framework — Resource and Basic Actions")
+  - Ash Framework resources and actions
+    - Domain-driven data modeling
+  end
+end
+
+Main.main()
 ```

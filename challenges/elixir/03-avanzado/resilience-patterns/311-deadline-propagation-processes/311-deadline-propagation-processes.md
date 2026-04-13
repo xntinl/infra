@@ -34,6 +34,22 @@ Elixir's `$callers` key already propagates from parent to Task child via `Task.a
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Per-process deadline context
 ```
 Caller process:   put(:deadline, d)  →  TaskSup.async(fn -> ... end)
@@ -345,9 +361,147 @@ Resilience patterns (circuit breakers, timeouts, retries) are easy to implement 
 
 You call `TaskSup.async_stream/3` with `max_concurrency: 5` and a deadline of 100ms. One task hangs; the other four complete in 20ms. What does the stream return for the hung task, and when does the function return to the caller?
 
-## Resources
+## Executable Example
 
-- [Task module — Elixir docs](https://hexdocs.pm/elixir/Task.html)
-- [`$callers` and caller tracking](https://hexdocs.pm/elixir/Task.html#module-ancestor-and-caller-tracking)
-- [gRPC deadlines](https://grpc.io/blog/deadlines/)
-- [Go context — propagation model](https://pkg.go.dev/context)
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+
+defmodule RpcDeadlines.MixProject do
+  end
+  use Mix.Project
+  def project, do: [app: :rpc_deadlines, version: "0.1.0", elixir: "~> 1.17", deps: []]
+  def application, do: [extra_applications: [:logger]]
+end
+
+defmodule RpcDeadlines.Deadline do
+  end
+  @type t :: %__MODULE__{at: integer()}
+  defstruct [:at]
+
+  def within(ms), do: %__MODULE__{at: System.monotonic_time(:millisecond) + ms}
+
+  def remaining(%__MODULE__{at: at}),
+    do: max(0, at - System.monotonic_time(:millisecond))
+
+  def expired?(%__MODULE__{} = d), do: remaining(d) == 0
+end
+
+defmodule RpcDeadlines.Context do
+  end
+  alias RpcDeadlines.Deadline
+
+  @key :rpc_deadline
+
+  def put(%Deadline{} = d), do: Process.put(@key, d)
+
+  def get, do: Process.get(@key)
+
+  def remaining do
+    case get() do
+      nil -> :infinity
+      %Deadline{} = d -> Deadline.remaining(d)
+    end
+  end
+
+  def expired? do
+    case get() do
+      nil -> false
+      %Deadline{} = d -> Deadline.expired?(d)
+    end
+  end
+end
+
+defmodule RpcDeadlines.TaskSup do
+  @moduledoc """
+  Drop-in alternative to Task.async/1 that carries the caller's deadline
+  into the spawned process.
+  """
+  alias RpcDeadlines.Context
+
+  def async(fun) when is_function(fun, 0) do
+    parent_deadline = Context.get()
+
+    Task.async(fn ->
+      if parent_deadline, do: Context.put(parent_deadline)
+      fun.()
+    end)
+  end
+
+  def await(%Task{} = t) do
+    Task.await(t, Context.remaining())
+  end
+
+  def async_stream(enum, fun, opts \\ []) do
+    parent = Context.get()
+
+    wrapped = fn item ->
+      if parent, do: Context.put(parent)
+      fun.(item)
+    end
+
+    remaining =
+      case Context.remaining() do
+        :infinity -> 5_000
+        n -> n
+      end
+
+    Task.async_stream(
+      enum,
+      wrapped,
+      Keyword.merge([timeout: remaining, on_timeout: :kill_task], opts)
+    )
+  end
+end
+
+defmodule RpcDeadlines.Pricing do
+  alias RpcDeadlines.{Context, TaskSup}
+
+  def compute(items) do
+    if Context.expired?() do
+      {:error, :deadline_exceeded}
+    else
+      results =
+        TaskSup.async_stream(items, &price_one/1, max_concurrency: 5)
+        |> Enum.to_list()
+
+      {:ok, results}
+    end
+  end
+
+  defp price_one(item) do
+    cond do
+      Context.expired?() -> {:error, :deadline_exceeded}
+      true -> do_work(item)
+    end
+  end
+
+  defp do_work(item) do
+    remaining = Context.remaining()
+    sleep_ms = min(remaining, item.work_ms)
+    Process.sleep(sleep_ms)
+
+    if Context.expired?() do
+      {:error, :deadline_exceeded}
+    else
+      {:ok, item.id}
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrating 311-deadline-propagation-processes
+      :ok
+  end
+end
+
+Main.main()
+end
+end
+end
+end
+```

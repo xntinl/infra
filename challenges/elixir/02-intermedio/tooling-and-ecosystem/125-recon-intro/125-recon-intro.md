@@ -424,6 +424,73 @@ analyzer in Erlang docs or `crashdump_viewer`).
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule ReconIntro.BloatedWorker do
+    @moduledoc """
+    Deliberately misbehaves so we can spot it with `:recon`:
+
+      * grows its state every tick (heap bloat),
+      * never drains its mailbox if external senders pile up.
+
+    Use `stuff/0` from IEx to push it harder.
+    """
+
+    use GenServer
+
+    def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+
+    @doc "Simulates external pressure — sends many messages that we never read."
+    @spec stuff(pos_integer()) :: :ok
+    def stuff(n \\ 10_000) do
+      for _ <- 1..n, do: send(__MODULE__, {:noise, :crypto.strong_rand_bytes(1_024)})
+      :ok
+    end
+
+    @impl true
+    def init(_opts) do
+      # A big initial blob so the process is visibly fat from the start.
+      schedule()
+      {:ok, %{blobs: [], ticks: 0}}
+    end
+
+    @impl true
+    def handle_info(:tick, %{blobs: blobs, ticks: t} = state) do
+      # Append 256KB of junk each tick → heap grows without bound.
+      new_blob = :crypto.strong_rand_bytes(256 * 1_024)
+      schedule()
+      {:noreply, %{state | blobs: [new_blob | blobs], ticks: t + 1}}
+    end
+
+    # Deliberately DO NOT match {:noise, _} so those messages accumulate in the
+    # mailbox — simulating a slow consumer being overwhelmed.
+
+    defp schedule, do: Process.send_after(self(), :tick, 500)
+  end
+
+  def main do
+    IO.puts("=== Recon Demo ===
+  ")
+  
+    # Demo: Recon tracing
+  IO.puts("1. recon_trace for lightweight tracing")
+  IO.puts("2. recon.info - system info")
+  IO.puts("3. Alternative to :dbg")
+
+  IO.puts("
+  ✓ Recon demo completed!")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`:recon` — main docs](https://hexdocs.pm/recon/) and the [Recon User's Guide](https://ferd.github.io/recon/)

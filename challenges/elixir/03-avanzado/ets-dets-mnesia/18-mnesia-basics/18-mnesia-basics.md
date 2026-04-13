@@ -43,6 +43,22 @@ Anything that needs multi-key atomicity or multi-node replication needs a transa
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Schema, tables, storage types
 
 Mnesia stores its schema in a file under `-mnesia dir`. Before you can create tables, you must
@@ -536,11 +552,253 @@ Target: transactional write 50-200 us; read within a transaction 20-50 us; dirty
 
 ---
 
-## Resources
+## Executable Example
 
-- [`:mnesia` user's guide](https://www.erlang.org/doc/apps/mnesia/users_guide.html)
-- [`:mnesia` reference](https://www.erlang.org/doc/man/mnesia.html)
-- [`Record` — Elixir stdlib](https://hexdocs.pm/elixir/Record.html) — how to use Erlang records idiomatically
-- [Mnesia in 3 examples — Saša Jurić](https://www.theerlangelist.com/article/mnesia_1)
-- [Elixir School — Mnesia](https://elixirschool.com/en/lessons/storage/mnesia)
-- [Ulf Wiger — "How we do Mnesia at Klarna"](https://www.youtube.com/watch?v=HQnfDpTGSJg)
+```elixir
+defmodule MnesiaIntro.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :mnesia_intro,
+      version: "0.1.0",
+      elixir: "~> 1.16",
+      start_permanent: Mix.env() == :prod,
+      deps: []
+    ]
+
+  def application do
+    [
+      extra_applications: [:logger, :mnesia],
+      mod: {MnesiaIntro.Application, []}
+    ]
+
+
+defmodule MnesiaIntro.Schema do
+  @moduledoc """
+  Creates the Mnesia schema and tables on this node if they do not exist.
+
+  Call `ensure!/0` at application startup. It's idempotent: running it twice
+  is harmless.
+  """
+  require Record
+  require Logger
+
+  Record.defrecord(:order, [:id, :side, :symbol, :qty, :price, :account_id, :status])
+  Record.defrecord(:execution, [:id, :order_id, :qty, :price, :ts])
+  Record.defrecord(:account, [:id, :balance, :updated_at])
+
+  @spec ensure!() :: :ok
+  def ensure! do
+    :stopped = :mnesia.stop()
+    create_schema()
+    :ok = :mnesia.start()
+    ensure_table(:order, [:id, :side, :symbol, :qty, :price, :account_id, :status], [:symbol])
+    ensure_table(:execution, [:id, :order_id, :qty, :price, :ts], [:order_id])
+    ensure_table(:account, [:id, :balance, :updated_at], [])
+    :ok = :mnesia.wait_for_tables([:order, :execution, :account], 5_000)
+    :ok
+
+  defp create_schema do
+    case :mnesia.create_schema([node()]) do
+      :ok -> :ok
+      {:error, {_node, {:already_exists, _}}} -> :ok
+      {:error, reason} -> raise "mnesia schema creation failed: #{inspect(reason)}"
+
+  defp ensure_table(name, attrs, index_attrs) do
+    opts = [
+      attributes: attrs,
+      disc_copies: [node()],
+      index: index_attrs,
+      type: :set
+    ]
+
+    case :mnesia.create_table(name, opts) do
+      {:atomic, :ok} -> :ok
+      {:aborted, {:already_exists, ^name}} -> :ok
+      {:aborted, reason} -> raise "create_table #{name} failed: #{inspect(reason)}"
+    end
+  end
+end
+
+
+defmodule MnesiaIntro.Application do
+  @moduledoc false
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    MnesiaIntro.Schema.ensure!()
+    Supervisor.start_link([], strategy: :one_for_one, name: MnesiaIntro.Supervisor)
+  end
+end
+
+
+defmodule MnesiaIntro.OrderBook do
+  @moduledoc """
+  Order book operations wrapped in Mnesia transactions.
+
+  Side conventions: :buy or :sell. qty and price are positive integers
+  (cents and shares — no floats, ever, in financial code).
+  """
+  require MnesiaIntro.Schema
+  import MnesiaIntro.Schema, only: [order: 1, order: 2, execution: 1]
+
+  @type side :: :buy | :sell
+  @type order_id :: pos_integer()
+
+  @spec place(map()) :: {:ok, order_id()} | {:error, term()}
+  def place(%{side: side, symbol: sym, qty: qty, price: price, account_id: acct})
+      when side in [:buy, :sell] and qty > 0 and price > 0 do
+    id = :erlang.unique_integer([:positive, :monotonic])
+
+    txn = fn ->
+      ensure_account!(acct)
+
+      row =
+        order(id: id, side: side, symbol: sym, qty: qty, price: price,
+              account_id: acct, status: :open)
+
+      :ok = :mnesia.write(row)
+      id
+    end
+
+    case :mnesia.transaction(txn) do
+      {:atomic, id} -> {:ok, id}
+      {:aborted, reason} -> {:error, reason}
+    end
+  end
+
+  @spec cancel(order_id()) :: :ok | {:error, term()}
+  def cancel(id) do
+    txn = fn ->
+      case :mnesia.read({:order, id}) do
+        [] -> :mnesia.abort(:not_found)
+        [row] ->
+          :mnesia.write(order(row, status: :cancelled))
+      end
+    end
+
+    case :mnesia.transaction(txn) do
+      {:atomic, :ok} -> :ok
+      {:aborted, reason} -> {:error, reason}
+    end
+  end
+
+  @doc """
+  Dirty read of a single order — used for hot-path lookups where eventual
+  consistency is acceptable.
+  """
+  @spec get(order_id()) :: {:ok, tuple()} | :error
+  def get(id) do
+    case :mnesia.dirty_read({:order, id}) do
+      [row] -> {:ok, row}
+      [] -> :error
+    end
+  end
+
+  @doc """
+  Returns all open buy orders for `symbol`, ordered descending by price.
+  Uses an index read (declared on :symbol) for efficient filtering.
+  """
+  @spec match_bids_for(String.t()) :: [tuple()]
+  def match_bids_for(symbol) do
+    txn = fn -> :mnesia.index_read(:order, symbol, :symbol) end
+
+    case :mnesia.transaction(txn) do
+      {:atomic, rows} ->
+        rows
+        |> Enum.filter(&match?(order(side: :buy, status: :open), &1))
+        |> Enum.sort_by(&order(&1, :price), :desc)
+
+      {:aborted, _} ->
+        []
+    end
+  end
+
+  @spec record_execution(order_id(), pos_integer(), pos_integer()) :: :ok | {:error, term()}
+  def record_execution(order_id, qty, price) do
+    txn = fn ->
+      case :mnesia.read({:order, order_id}) do
+        [] ->
+          :mnesia.abort(:order_not_found)
+
+        [row] ->
+          remaining = order(row, :qty) - qty
+
+          if remaining < 0 do
+            :mnesia.abort(:overfill)
+          else
+            exec =
+              execution(id: :erlang.unique_integer([:positive, :monotonic]),
+                        order_id: order_id, qty: qty, price: price,
+                        ts: System.system_time(:millisecond))
+
+            :mnesia.write(exec)
+
+            new_status = if remaining == 0, do: :filled, else: :open
+            :mnesia.write(order(row, qty: remaining, status: new_status))
+            :ok
+          end
+      end
+    end
+
+    case :mnesia.transaction(txn) do
+      {:atomic, :ok} -> :ok
+      {:aborted, reason} -> {:error, reason}
+    end
+  end
+
+  defp ensure_account!(id) do
+    case :mnesia.read({:account, id}) do
+      [] ->
+        :mnesia.write({:account, id, 0, System.system_time(:millisecond)})
+
+      [_] ->
+        :ok
+    end
+  end
+end
+
+
+defmodule MnesiaIntro.OrderBookTest do
+  use ExUnit.Case, async: false
+
+  alias MnesiaIntro.OrderBook
+
+    test "creates the account row on first use" do
+      {:ok, _} = OrderBook.place(%{side: :sell, symbol: "MSFT", qty: 5, price: 40_100, account_id: 42})
+      assert [_row] = :mnesia.dirty_read({:account, 42})
+    end
+  end
+
+    test "returns :not_found when the id does not exist" do
+      assert {:error, :not_found} = OrderBook.cancel(99_999_999)
+    end
+  end
+
+    test "aborts on overfill and leaves no execution row" do
+      {:ok, id} = OrderBook.place(%{side: :sell, symbol: "GOOG", qty: 2, price: 150_000, account_id: 7})
+      assert {:error, :overfill} = OrderBook.record_execution(id, 10, 150_000)
+
+      assert :mnesia.dirty_read({:execution, id}) == []
+      {:ok, row} = OrderBook.get(id)
+      assert elem(row, 4) == 2  # untouched
+    end
+  end
+  end
+end
+
+
+
+First run creates `Mnesia.nonode@nohost/` directory under the project root. Delete it to start
+fresh. In production set the directory explicitly:
+
+defmodule Main do
+  def main do
+      :ok
+  end
+end
+
+Main.main()
+```

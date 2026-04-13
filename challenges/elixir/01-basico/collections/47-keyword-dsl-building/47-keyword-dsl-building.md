@@ -351,6 +351,72 @@ your code for "not respecting the option". Always validate opts in a public DSL.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule MiniQuery do
+  @moduledoc """
+  A tiny in-memory query DSL built on keyword-list options.
+  """
+
+  @valid_opts [:select, :where, :order_by, :limit]
+
+  @doc """
+  Runs a query over a list of maps.
+
+  ## Options
+
+    * `:select`   — list of atom keys to keep (defaults to all keys).
+    * `:where`    — keyword list of equality filters, all AND-ed together.
+    * `:order_by` — atom key to sort ascending by. No sort if omitted.
+    * `:limit`    — positive integer, max rows to return. No cap if omitted.
+
+  Raises `ArgumentError` if an unknown option is given — fail fast on typos.
+  """
+  @spec run([map()], keyword()) :: [map()]
+  def run(rows, opts \\ []) when is_list(rows) do
+    # Validate first: any unknown key raises immediately.
+    # Keyword.validate!/2 also documents the allowed set in one place.
+    opts = Keyword.validate!(opts, Enum.map(@valid_opts, &{&1, nil}))
+
+    rows
+    |> apply_where(opts[:where])
+    |> apply_order(opts[:order_by])
+    |> apply_limit(opts[:limit])
+    |> apply_select(opts[:select])
+  end
+
+  # ---- internal stages --------------------------------------------------------
+  # Each stage is a no-op when its opt is nil — this keeps `run/2` a clean pipe
+  # and avoids nested `case` ladders.
+
+  defp apply_where(rows, nil), do: rows
+
+  defp apply_where(rows, filters) when is_list(filters) do
+    # All filters must match (AND). Enum.all?/2 short-circuits on first mismatch.
+    Enum.filter(rows, fn row ->
+      Enum.all?(filters, fn {k, v} -> Map.get(row, k) == v end)
+    end)
+  end
+
+  defp apply_order(rows, nil), do: rows
+  defp apply_order(rows, key) when is_atom(key), do: Enum.sort_by(rows, &Map.get(&1, key))
+
+  defp apply_limit(rows, nil), do: rows
+  defp apply_limit(rows, n) when is_integer(n) and n >= 0, do: Enum.take(rows, n)
+
+  defp apply_select(rows, nil), do: rows
+
+  defp apply_select(rows, keys) when is_list(keys) do
+    # Map.take/2 silently drops missing keys — that matches SQL-like semantics
+    # where selecting a non-existent column is an error caller's responsibility.
+    Enum.map(rows, &Map.take(&1, keys))
+  end
+end
+```
+
 ## Resources
 
 - [`Keyword` module docs](https://hexdocs.pm/elixir/Keyword.html)

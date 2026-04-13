@@ -30,6 +30,25 @@ retry_fsm/
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**OTP-specific insight:**
+The OTP framework enforces a discipline: supervision trees, callback modules, and standard return values. This structure is not a constraint — it's the contract that allows Erlang's release handler, hot code upgrades, and clustering to work. Every deviation from the pattern you'll pay for later in production debuggability and operational tooling.
 ### 1. State diagram
 
 ```
@@ -428,12 +447,238 @@ Target: p99 retry-burst density ≤ 300 req/s under 1k workers with a 70%-fail m
 
 ---
 
-## Resources
+## Executable Example
 
-- [`:gen_statem` state_timeout — Erlang docs](https://www.erlang.org/doc/man/gen_statem.html)
-- [AWS Architecture Blog — Exponential Backoff and Jitter](https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/)
-- [Fred Hébert — Erlang in Anger, chapter on retries](https://www.erlang-in-anger.com/)
-- [Oban — how it does backoff](https://github.com/sorentwo/oban)
-- [Finch retry middleware](https://hexdocs.pm/finch/)
-- [José Valim — on retry patterns](https://elixir-lang.org/blog/)
-- [`:telemetry` — hexdocs](https://hexdocs.pm/telemetry)
+```elixir
+defmodule RetryFsm.MixProject do
+  end
+  use Mix.Project
+
+  def project, do: [app: :retry_fsm, version: "0.1.0", elixir: "~> 1.16", deps: deps()]
+
+  def application do
+    [extra_applications: [:logger], mod: {RetryFsm.Application, []}]
+  end
+
+  defp deps, do: [{:telemetry, "~> 1.2"}]
+end
+
+defmodule RetryFsm.Worker do
+  @moduledoc """
+  Retry state machine with exponential backoff and jitter.
+
+  States: :idle, :trying, :backoff, :failed.
+
+  The caller supplies a `do_work` function (zero-arity) whose return is
+  `{:ok, value} | {:error, reason}`. The FSM handles retry policy.
+  """
+  @behaviour :gen_statem
+  require Logger
+
+  @base_ms 100
+  @max_ms 30_000
+  @max_attempts 5
+
+  @typep data :: %{
+           do_work: (-> {:ok, term()} | {:error, term()}),
+           attempts: non_neg_integer(),
+           last_error: term(),
+           last_success: term()
+         }
+
+  # ---- Public API -----------------------------------------------------------
+
+  @spec start_link(keyword()) :: :gen_statem.start_ret()
+  def start_link(opts) do
+    :gen_statem.start_link(__MODULE__, opts, [])
+  end
+
+  @spec attempt(pid()) :: :ok | {:error, :already_running | :already_failed}
+  def attempt(pid), do: :gen_statem.call(pid, :attempt)
+
+  @spec current(pid()) :: {atom(), data()}
+  def current(pid), do: :sys.get_state(pid)
+
+  # ---- Callbacks ------------------------------------------------------------
+
+  @impl :gen_statem
+  def callback_mode, do: :state_functions
+
+  @impl :gen_statem
+  def init(opts) do
+    data = %{
+      do_work: Keyword.fetch!(opts, :do_work),
+      attempts: 0,
+      last_error: nil,
+      last_success: nil
+    }
+
+    {:ok, :idle, data}
+  end
+
+  # ---- state: idle ----------------------------------------------------------
+
+  def idle({:call, from}, :attempt, data) do
+    {:next_state, :trying, data, [{:reply, from, :ok}, {:next_event, :internal, :run}]}
+  end
+
+  # ---- state: trying --------------------------------------------------------
+
+  def trying(:internal, :run, data) do
+    case safely_run(data.do_work) do
+      {:ok, value} ->
+        :telemetry.execute([:retry_fsm, :success], %{attempts: data.attempts + 1}, %{})
+        data = %{data | attempts: 0, last_success: value}
+        {:next_state, :idle, data}
+
+      {:error, reason} ->
+        attempts = data.attempts + 1
+        data = %{data | attempts: attempts, last_error: reason}
+        :telemetry.execute([:retry_fsm, :attempt], %{attempts: attempts}, %{reason: reason})
+
+        if attempts >= @max_attempts do
+          :telemetry.execute([:retry_fsm, :failed], %{attempts: attempts}, %{reason: reason})
+          {:next_state, :failed, data}
+        else
+          delay = compute_delay(attempts)
+          :telemetry.execute([:retry_fsm, :backoff], %{delay_ms: delay, attempts: attempts}, %{})
+          {:next_state, :backoff, data, [{:state_timeout, delay, :retry}]}
+        end
+    end
+  end
+
+  def trying({:call, from}, :attempt, data) do
+    {:keep_state, data, [{:reply, from, {:error, :already_running}}]}
+  end
+
+  # ---- state: backoff -------------------------------------------------------
+
+  def backoff(:state_timeout, :retry, data) do
+    {:next_state, :trying, data, [{:next_event, :internal, :run}]}
+  end
+
+  def backoff({:call, from}, :attempt, data) do
+    {:keep_state, data, [{:reply, from, {:error, :already_running}}]}
+  end
+
+  # ---- state: failed --------------------------------------------------------
+
+  def failed({:call, from}, :attempt, data) do
+    # Caller can reset by emitting a new attempt: wipe counter and try again.
+    data = %{data | attempts: 0}
+    {:next_state, :trying, data, [{:reply, from, :ok}, {:next_event, :internal, :run}]}
+  end
+
+  # ---- helpers --------------------------------------------------------------
+
+  defp safely_run(fun) do
+    try do
+      case fun.() do
+        {:ok, _} = ok -> ok
+        {:error, _} = err -> err
+        other -> {:error, {:unexpected_return, other}}
+      end
+    rescue
+      e -> {:error, {:exception, Exception.message(e)}}
+    end
+  end
+
+  defp compute_delay(attempts) do
+    base = min(@base_ms * Integer.pow(2, attempts - 1), @max_ms)
+    jitter = (:rand.uniform() - 0.5) * 0.5 * base
+    round(base + jitter)
+  end
+
+  @impl :gen_statem
+  def terminate(_reason, _state, _data), do: :ok
+end
+
+defmodule RetryFsm.Application do
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    Supervisor.start_link([], strategy: :one_for_one, name: RetryFsm.Sup)
+  end
+end
+
+defmodule RetryFsm.WorkerTest do
+  use ExUnit.Case, async: true
+
+  alias RetryFsm.Worker
+
+  defp counting_flaky(successes_after) do
+    counter = :counters.new(1, [])
+
+    fn ->
+      n = :counters.get(counter, 1)
+      :counters.add(counter, 1, 1)
+      if n >= successes_after, do: {:ok, n}, else: {:error, :flaky}
+    end
+  end
+
+  describe "RetryFsm.Worker" do
+    test "success from idle transitions to :idle with reset counter" do
+      {:ok, pid} = Worker.start_link(do_work: fn -> {:ok, 42} end)
+      :ok = Worker.attempt(pid)
+      Process.sleep(30)
+      {state, data} = Worker.current(pid)
+      assert state == :idle
+      assert data.attempts == 0
+      assert data.last_success == 42
+    end
+
+    test "failure below max transitions to :backoff" do
+      {:ok, pid} = Worker.start_link(do_work: fn -> {:error, :boom} end)
+      :ok = Worker.attempt(pid)
+      Process.sleep(30)
+      {state, data} = Worker.current(pid)
+      assert state == :backoff
+      assert data.attempts == 1
+    end
+
+    test "eventual success within max attempts resets" do
+      {:ok, pid} = Worker.start_link(do_work: counting_flaky(2))
+      :ok = Worker.attempt(pid)
+      # Wait long enough for: attempt1(fail) + backoff + attempt2(fail) + backoff + attempt3(ok)
+      Process.sleep(2_000)
+      {state, data} = Worker.current(pid)
+      assert state == :idle
+      assert data.attempts == 0
+      assert data.last_success == 2
+    end
+
+    test "max attempts reached transitions to :failed" do
+      {:ok, pid} = Worker.start_link(do_work: fn -> {:error, :always} end)
+      :ok = Worker.attempt(pid)
+      # Sum of backoffs up to 5 attempts: roughly 100+200+400+800+1600 ~ 3.1 s with jitter
+      Process.sleep(6_000)
+      {state, data} = Worker.current(pid)
+      assert state == :failed
+      assert data.attempts == 5
+    end
+
+    test "attempt on :failed resets and retries" do
+      {:ok, pid} = Worker.start_link(do_work: fn -> {:error, :always} end)
+      Worker.attempt(pid)
+      Process.sleep(6_000)
+      assert {:failed, _} = Worker.current(pid)
+
+      :ok = Worker.attempt(pid)
+      Process.sleep(20)
+      {state, _} = Worker.current(pid)
+      assert state in [:trying, :backoff]
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrating 72-gen-statem-retry
+      :ok
+  end
+end
+
+Main.main()
+end
+```

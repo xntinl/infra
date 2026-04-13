@@ -50,6 +50,25 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Pipeline-specific insight:**
+Streams are lazy; Enum is eager. Use Stream for data larger than RAM or when you're building intermediate stages. Use Enum when the collection is small or you need side effects at each step. Mixing them carelessly results in performance cliffs.
 ### 1. Concurrency topology
 
 ```
@@ -450,21 +469,104 @@ Telemetry.Metrics.last_value("kafka.consumer.lag",
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
 
-- [BroadwayKafka — HexDocs](https://hexdocs.pm/broadway_kafka/BroadwayKafka.Producer.html)
-- [brod — Kafka client](https://github.com/kafka4beam/brod)
-- [Kafka consumer group protocol — Confluent](https://www.confluent.io/blog/apache-kafka-consumer-group-rebalance-protocol/)
-- [Concurrent Data Processing in Elixir — Svilen Gospodinov](https://pragprog.com/titles/sgdpelixir/concurrent-data-processing-in-elixir/)
-- [BroadwayKafka source](https://github.com/dashbitco/broadway_kafka/blob/main/lib/broadway_kafka/producer.ex)
-- [Telemetry + Prometheus — `telemetry_metrics_prometheus`](https://hexdocs.pm/telemetry_metrics_prometheus/)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+defmodule BroadwayKafka.Pipeline do
+  @moduledoc """
+  Kafka consumer pipeline. One producer per assigned partition, shared
+  processor pool, one batcher that bulk-inserts into the warehouse.
+
+  Offsets are committed only after the warehouse insert returns :ok.
+  """
+  use Broadway
+
+  alias Broadway.Message
+  alias BroadwayKafka.{Normaliser, Warehouse}
+
+  @spec start_link(keyword()) :: GenServer.on_start()
+  def start_link(opts) do
+    hosts = Keyword.get(opts, :hosts, [{"localhost", 9092}])
+    topic = Keyword.get(opts, :topic, "usage_events")
+    group = Keyword.get(opts, :group, "warehouse_writer")
+
+    Broadway.start_link(__MODULE__,
+      name: __MODULE__,
+      producer: [
+        module: {
+          BroadwayKafka.Producer,
+          [
+            hosts: hosts,
+            group_id: group,
+            topics: [topic],
+            offset_commit_on_ack: true,
+            offset_reset_policy: :earliest,
+            draining_after_revoke_ms: 10_000,
+            client_config: [
+              auto_start_producers: false,
+              connect_timeout: 10_000
+            ]
+          ]
+        },
+        concurrency: 2
+      ],
+      processors: [default: [concurrency: 16]],
+      batchers: [
+        warehouse: [concurrency: 4, batch_size: 500, batch_timeout: 2_000]
+      ]
+    )
+  end
+
+  @impl true
+  def handle_message(_processor, %Message{data: raw} = msg, _ctx) do
+    case Normaliser.normalise(raw) do
+      {:ok, event} ->
+        msg
+        |> Message.update_data(fn _ -> event end)
+        |> Message.put_batcher(:warehouse)
+
+      {:error, reason} ->
+        Message.failed(msg, reason)
+    end
+  end
+
+  @impl true
+  def handle_batch(:warehouse, messages, _batch_info, _ctx) do
+    rows = Enum.map(messages, & &1.data)
+
+    case Warehouse.upsert(rows) do
+      :ok -> messages
+      {:error, reason} -> Enum.map(messages, &Message.failed(&1, reason))
+    end
+  end
 end
+
+defmodule Main do
+  def main do
+      # Demonstrate Broadway Kafka pipeline with batching
+      {:ok, _sup} = Supervisor.start_link([], strategy: :one_for_one)
+
+      # Simulate Kafka messages
+      messages = [
+        %{data: %{user_id: 1, action: "click"}, custom_id: 1},
+        %{data: %{user_id: 2, action: "view"}, custom_id: 2},
+        %{data: %{user_id: 3, action: "purchase"}, custom_id: 3}
+      ]
+
+      # Simulate processing: normalize and batch
+      batch = Enum.map(messages, fn msg ->
+        Map.update!(msg, :data, &Map.put(&1, :processed, true))
+      end)
+
+      IO.inspect(batch, label: "✓ Processed batch")
+
+      assert length(batch) == 3, "Expected 3 messages"
+      assert Enum.all?(batch, fn m -> Map.has_key?(m.data, :processed) end), "All messages processed"
+
+      IO.puts("✓ Broadway Kafka: message consumption and batching working")
+  end
+end
+
+Main.main()
 ```

@@ -331,6 +331,52 @@ with a bounded pool.
 
 - ¿Cuándo es aceptable perder una tarea silenciosamente? Dá un ejemplo real donde fire-and-forget es la respuesta correcta.
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule FireForgetSup.Application do
+    @moduledoc false
+    use Application
+
+    @impl true
+    def start(_type, _args) do
+      children = [
+        # Task.Supervisor owns every background task spawned via
+        # `FireForgetSup.Audit.enqueue/1`.
+        {Task.Supervisor, name: FireForgetSup.AuditTasks}
+      ]
+
+      Supervisor.start_link(children,
+        strategy: :one_for_one,
+        name: FireForgetSup.Supervisor
+      )
+    end
+  end
+
+  defmodule FireForgetSup.Application do
+    use Application
+    def start(_type, _args) do
+      children = [{Task.Supervisor, name: FireForgetSup.AuditTasks}]
+      Supervisor.start_link(children, strategy: :one_for_one, name: FireForgetSup.Supervisor)
+    end
+  end
+
+  def main do
+    {:ok, _} = FireForgetSup.Application.start(:normal, [])
+    Task.Supervisor.start_child(FireForgetSup.AuditTasks, fn -> IO.puts("Task running") end)
+    Process.sleep(100)
+    IO.puts("✓ FireForgetSup works correctly")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Task.Supervisor` — Elixir stdlib](https://hexdocs.pm/elixir/Task.Supervisor.html)

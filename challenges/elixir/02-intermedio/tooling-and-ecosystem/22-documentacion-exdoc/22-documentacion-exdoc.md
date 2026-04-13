@@ -482,6 +482,80 @@ For those, describe the behavior in prose and test it in the test file.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule DocsDemo.MathUtils do
+    @moduledoc """
+    Numeric helpers.
+
+    Use with `DocsDemo.StringUtils` for the full "hello world" experience.
+    """
+
+    @typedoc "A non-negative integer used as a count or size."
+    @type non_neg :: non_neg_integer()
+
+    @doc section: :math
+    @doc """
+    Returns the square of a number.
+
+    ## Examples
+
+        iex> DocsDemo.MathUtils.square(3)
+        9
+
+        iex> DocsDemo.MathUtils.square(-4)
+        16
+    """
+    @spec square(number()) :: number()
+    def square(n) when is_number(n), do: n * n
+
+    @doc section: :math
+    @doc """
+    Clamps `n` to the range `[min, max]`.
+
+    Raises `ArgumentError` if `min > max`.
+
+    ## Examples
+
+        iex> DocsDemo.MathUtils.clamp(5, 0, 10)
+        5
+
+        iex> DocsDemo.MathUtils.clamp(-1, 0, 10)
+        0
+
+        iex> DocsDemo.MathUtils.clamp(99, 0, 10)
+        10
+    """
+    @spec clamp(number(), number(), number()) :: number()
+    def clamp(_n, min, max) when min > max, do: raise(ArgumentError, "min > max")
+    def clamp(n, min, _max) when n < min, do: min
+    def clamp(n, _min, max) when n > max, do: max
+    def clamp(n, _min, _max), do: n
+  end
+
+  def main do
+    IO.puts("=== Docs Demo ===
+  ")
+  
+    # Demo: ExDoc documentation
+  IO.puts("1. mix docs - generate HTML docs")
+  IO.puts("2. @doc and @moduledoc strings")
+  IO.puts("3. Code examples in docs")
+
+  IO.puts("
+  ✓ ExDoc demo completed!")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [ExDoc](https://hexdocs.pm/ex_doc/) — main docs, configuration options

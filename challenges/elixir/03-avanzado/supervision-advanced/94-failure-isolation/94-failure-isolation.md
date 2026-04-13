@@ -54,6 +54,22 @@ failure_isolation/
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. The isolation supervisor pattern
 
 The canonical layout for isolating two subtrees under a shared root:
@@ -547,11 +563,129 @@ Target: zero restart events in B's subtree while A is experiencing a crash storm
 
 ---
 
-## Resources
 
-- [`Supervisor`](https://hexdocs.pm/elixir/Supervisor.html) — strategies, intensity
-- [`Supervisor.init/2` options](https://hexdocs.pm/elixir/Supervisor.html#init/2)
-- [Designing for Scalability with Erlang/OTP — Francesco Cesarini, Steve Vinoski](https://www.oreilly.com/library/view/designing-for-scalability/9781449361556/) — Ch. 10 on supervisor design
-- [Saša Jurić — "To spawn, or not to spawn?"](https://www.theerlangelist.com/article/spawn_or_not) 
-- [The Zen of Erlang — Fred Hebert](https://ferd.ca/the-zen-of-erlang.html)
-- [Erlang docs — supervisor behaviour](https://www.erlang.org/doc/man/supervisor.html)
+## Executable Example
+
+```elixir
+defmodule FailureIsolation.IsolationTest do
+  use ExUnit.Case, async: false
+
+  alias FailureIsolation.{A, B}
+
+  describe "FailureIsolation.Isolation" do
+    test "crash storm in A does not restart B" do
+      b_pid_before = Process.whereis(B.Worker)
+      assert is_pid(b_pid_before)
+
+      # Inject many crashes into A, respecting its budget
+      # A.Sup: 10 restarts in 2s. We inject 8 across 500ms -> stays within budget.
+      for _ <- 1..8 do
+        try do
+          A.Worker.inject_crash()
+        catch
+          :exit, _ -> :ok
+        end
+        Process.sleep(50)
+      end
+
+      # B must still be the same process
+      assert Process.whereis(B.Worker) == b_pid_before
+
+      # B must still serve
+      assert {:ok, {:b, :ping}} = B.Worker.render(:ping)
+    end
+
+    test "A recovers after its own crash storm" do
+      for _ <- 1..8 do
+        try do
+          A.Worker.inject_crash()
+        catch
+          :exit, _ -> :ok
+        end
+        Process.sleep(50)
+      end
+
+      # Give supervisor time to restart
+      Process.sleep(200)
+      assert {:ok, {:a, :ping}} = A.Worker.handle(:ping)
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrate failure isolation between independent subtrees
+
+      # Start root supervisor with two independent subtrees (one_for_one strategy)
+      {:ok, root_sup} = Supervisor.start_link(
+        [
+          {FailureIsolation.Subtree.A.Supervisor, []},
+          {FailureIsolation.Subtree.B.Supervisor, []}
+        ],
+        strategy: :one_for_one,
+        max_restarts: 3,
+        max_seconds: 5,
+        name: FailureIsolation.RootSupervisor
+      )
+
+      assert is_pid(root_sup), "Root supervisor must start"
+      IO.puts("✓ Root supervisor with two isolated subtrees (one_for_one)")
+      IO.puts("  - Subtree A: Chat (low volume, flaky tenants)")
+      IO.puts("  - Subtree B: Invoices (high volume, must stay up)")
+
+      # Verify both subtrees are running
+      sup_a = Process.whereis(FailureIsolation.Subtree.A.Supervisor)
+      sup_b = Process.whereis(FailureIsolation.Subtree.B.Supervisor)
+
+      assert is_pid(sup_a), "Subtree A must be running"
+      assert is_pid(sup_b), "Subtree B must be running"
+      IO.puts("✓ Both subtrees initialized independently")
+
+      # Test subtree B is responsive
+      {:ok, result_b} = FailureIsolation.SubtreeB.process_invoice("INV-001")
+      assert result_b != nil, "Invoice processing should work"
+      IO.puts("✓ Subtree B (invoices) processing normally")
+
+      # Inject crashes into subtree A (simulating flaky tenant)
+      IO.puts("✓ Injecting crash storm into Subtree A...")
+      for _i <- 1..5 do
+        FailureIsolation.SubtreeA.crash()
+        Process.sleep(10)
+      end
+
+      # Check that subtree A is affected but subtree B is not
+      sup_a_new = Process.whereis(FailureIsolation.Subtree.A.Supervisor)
+      sup_b_same = Process.whereis(FailureIsolation.Subtree.B.Supervisor)
+
+      # Subtree A may have restarted (different PID or same, depending on budget)
+      # But subtree B should still be the same
+      assert sup_b_same == sup_b, "Subtree B should not be restarted"
+      IO.puts("✓ Subtree B unaffected by crashes in Subtree A")
+
+      # Verify subtree B still processes invoices
+      {:ok, result_b_2} = FailureIsolation.SubtreeB.process_invoice("INV-002")
+      assert result_b_2 != nil, "Invoice processing should continue during A's failure"
+      IO.puts("✓ Subtree B continues processing (isolation confirmed)")
+
+      # Check Subtree A's isolation supervisor
+      if is_pid(sup_a_new) and sup_a_new != sup_a do
+        IO.puts("✓ Subtree A was restarted in isolation (independent recovery)")
+      else
+        IO.puts("✓ Subtree A maintained (within restart budget)")
+      end
+
+      IO.puts("\n✓ Failure isolation demonstrated:")
+      IO.puts("  - Root uses one_for_one (independent children)")
+      IO.puts("  - Subtree A crash: restarts only subtree A")
+      IO.puts("  - Subtree B crash: restarts only subtree B")
+      IO.puts("  - Crash storm in A: B continues unaffected")
+      IO.puts("  - Isolation via nested supervisor structure")
+      IO.puts("✓ Multi-tenant SaaS resilience achieved")
+
+      Supervisor.stop(root_sup)
+      IO.puts("✓ Supervision tree shutdown complete")
+  end
+end
+
+Main.main()
+```

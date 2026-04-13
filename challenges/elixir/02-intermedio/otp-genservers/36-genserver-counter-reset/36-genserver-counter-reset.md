@@ -323,6 +323,98 @@ a GenServer when you need logic, not just a number.
 
 - Si necesitaras exponer `reset` a usuarios no admins, ¿seguiría siendo `cast`? ¿Qué cambiás y por qué?
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule CounterResetGs do
+    @moduledoc """
+    A GenServer counter that deliberately mixes `call` and `cast` to teach the
+    trade-off:
+
+      * `increment/1`, `decrement/1`, `get/1` use `call` — the caller wants the
+        updated value and benefits from back-pressure.
+      * `reset/1` uses `cast` — fire-and-forget admin operation.
+    """
+
+    use GenServer
+
+    @type name :: GenServer.server()
+
+    # ── Public API ──────────────────────────────────────────────────────────
+
+    @doc "Starts the counter. `initial` defaults to 0."
+    @spec start_link(keyword()) :: GenServer.on_start()
+    def start_link(opts \\ []) do
+      {initial, opts} = Keyword.pop(opts, :initial, 0)
+      GenServer.start_link(__MODULE__, initial, opts)
+    end
+
+    @doc "Returns the current value. Synchronous — caller waits for reply."
+    @spec get(name()) :: integer()
+    def get(server), do: GenServer.call(server, :get)
+
+    @doc "Increments by `n` (default 1) and returns the new value."
+    @spec increment(name(), integer()) :: integer()
+    def increment(server, n \\ 1), do: GenServer.call(server, {:increment, n})
+
+    @doc "Decrements by `n` (default 1) and returns the new value."
+    @spec decrement(name(), integer()) :: integer()
+    def decrement(server, n \\ 1), do: GenServer.call(server, {:decrement, n})
+
+    @doc """
+    Resets the counter to 0. Asynchronous — fire and forget.
+    Returns `:ok` immediately, not the new value (which is 0 by definition).
+    """
+    @spec reset(name()) :: :ok
+    def reset(server), do: GenServer.cast(server, :reset)
+
+    # ── Callbacks ───────────────────────────────────────────────────────────
+
+    @impl true
+    def init(initial) when is_integer(initial), do: {:ok, initial}
+
+    @impl true
+    def handle_call(:get, _from, value), do: {:reply, value, value}
+
+    def handle_call({:increment, n}, _from, value) do
+      new_value = value + n
+      {:reply, new_value, new_value}
+    end
+
+    def handle_call({:decrement, n}, _from, value) do
+      new_value = value - n
+      {:reply, new_value, new_value}
+    end
+
+    @impl true
+    def handle_cast(:reset, _value), do: {:noreply, 0}
+  end
+
+  def main do
+    {:ok, pid} = CounterResetGs.start_link(initial: 10)
+  
+    v1 = CounterResetGs.get(pid)
+    IO.puts("Initial value: #{v1}")
+  
+    v2 = CounterResetGs.increment(pid, 5)
+    IO.puts("After increment(5): #{v2}")
+  
+    :ok = CounterResetGs.reset(pid)
+    v3 = CounterResetGs.get(pid)
+    IO.puts("After reset: #{v3}")
+  
+    IO.puts("✓ CounterResetGs works correctly")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`GenServer` — Elixir stdlib](https://hexdocs.pm/elixir/GenServer.html)

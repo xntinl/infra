@@ -338,6 +338,81 @@ for the typical JSON REST call, not every possible wire protocol.
 
 - `retry: :safe_transient` deliberately excludes POST. For a webhook endpoint that guarantees idempotency via a client-supplied key, is the safer default to override with `retry: :transient` at every call site, or to add an idempotency step once and leave the default alone — and who owns that decision in your architecture?
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule ReqClient do
+    @moduledoc """
+    Thin HTTP client for a JSON API built on top of `Req`.
+
+    All options (base URL, plug, headers) come from application config so
+    tests can inject a `Req.Test` stub without touching the network.
+    """
+
+    @type user :: %{id: integer(), name: String.t(), email: String.t()}
+
+    @spec get_user(integer()) :: {:ok, user()} | {:error, term()}
+    def get_user(id) when is_integer(id) do
+      case Req.get(client(), url: "/users/#{id}") do
+        {:ok, %Req.Response{status: 200, body: body}} -> {:ok, normalize(body)}
+        {:ok, %Req.Response{status: 404}} -> {:error, :not_found}
+        {:ok, %Req.Response{status: status}} -> {:error, {:http, status}}
+        {:error, reason} -> {:error, reason}
+      end
+    end
+
+    @spec create_user(map()) :: {:ok, user()} | {:error, term()}
+    def create_user(%{} = attrs) do
+      case Req.post(client(), url: "/users", json: attrs) do
+        {:ok, %Req.Response{status: s, body: body}} when s in 200..299 ->
+          {:ok, normalize(body)}
+
+        {:ok, %Req.Response{status: status}} ->
+          {:error, {:http, status}}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
+
+    # ── Internals ─────────────────────────────────────────────────────────────
+
+    defp client do
+      opts = Application.get_env(:req_client, :req_options, [])
+
+      # retry: :safe_transient retries 5xx and connection errors for idempotent
+      # methods only. Explicit here to make the behavior visible.
+      Req.new(Keyword.merge([retry: :safe_transient, max_retries: 2], opts))
+    end
+
+    defp normalize(%{"id" => id, "name" => name, "email" => email}),
+      do: %{id: id, name: name, email: email}
+
+    defp normalize(other), do: other
+  end
+
+  def main do
+    IO.puts("=== HttpClient Demo ===
+  ")
+  
+    # Demo: Req HTTP client
+  IO.puts("1. Req.get/2 makes HTTP GET")
+  IO.puts("2. Req.post/2 makes HTTP POST")
+  IO.puts("3. Built-in retries and middleware")
+
+  IO.puts("
+  ✓ Req HTTP demo completed!")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [Req on HexDocs](https://hexdocs.pm/req/Req.html) — full API

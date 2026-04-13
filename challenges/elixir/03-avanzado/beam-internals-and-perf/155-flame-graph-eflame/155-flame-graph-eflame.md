@@ -57,6 +57,22 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Sampling vs instrumentation
 
 Two schools of profiling:
@@ -482,21 +498,66 @@ writing them.
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
 
-- [Brendan Gregg — Flame Graphs](https://www.brendangregg.com/flamegraphs.html) — the foundational concept
-- [`eflame` on GitHub (Vagabond mirror)](https://github.com/Vagabond/eflame) — the library used here
-- [`FlameGraph` toolkit](https://github.com/brendangregg/FlameGraph) — `stack_to_flame.pl` and friends
-- [Ferd's profiling guide](https://ferd.ca/) — multi-part series on Erlang profiling
-- [`:fprof` reference](https://www.erlang.org/doc/man/fprof.html) — alternative exact profiler
-- [José Valim — benchmarking Elixir code](https://elixir-lang.org/blog/) — complementary with Benchee
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+defmodule EflameDemo.Profiler do
+  @moduledoc """
+  Wrap `:eflame.apply/4` with a file-output convention.
+
+  Produces `priv/stacks/<name>.bare` which you then fold and render.
+  """
+
+  @spec profile(atom(), (-> any()), keyword()) :: {:ok, Path.t()}
+  def profile(name, fun, opts \\ []) when is_atom(name) and is_function(fun, 0) do
+    mode = Keyword.get(opts, :mode, :normal_with_children)
+    out_dir = Path.join(:code.priv_dir(:eflame_demo), "stacks")
+    File.mkdir_p!(out_dir)
+    out_path = Path.join(out_dir, "#{name}.bare")
+
+    _result = :eflame.apply(mode, to_charlist(out_path), fun, [])
+    fold(out_path)
+  end
+
+  @doc """
+  Sleep-aware variant. Off-CPU time appears as `SLEEP` frames in the graph.
+  """
+  @spec profile_with_sleep(atom(), (-> any())) :: {:ok, Path.t()}
+  def profile_with_sleep(name, fun) when is_atom(name) and is_function(fun, 0) do
+    out_dir = Path.join(:code.priv_dir(:eflame_demo), "stacks")
+    File.mkdir_p!(out_dir)
+    out_path = Path.join(out_dir, "#{name}.sleep.bare")
+
+    _result = :eflame.apply(:normal_with_children, to_charlist(out_path), fun, [])
+    fold(out_path)
+  end
+
+  defp fold(bare_path) do
+    folded =
+      bare_path
+      |> File.stream!()
+      |> Stream.map(&String.trim/1)
+      |> Enum.frequencies()
+      |> Enum.map(fn {stack, n} -> "#{stack} #{n}\n" end)
+
+    folded_path = String.replace_suffix(bare_path, ".bare", ".folded")
+    File.write!(folded_path, folded)
+    {:ok, folded_path}
+  end
 end
+
+defmodule Main do
+  def main do
+      IO.puts("Benchmarking initialized")
+      {elapsed_us, result} = :timer.tc(fn ->
+        Enum.reduce(1..1000, 0, &+/2)
+      end)
+      if is_number(elapsed_us) do
+        IO.puts("✓ Benchmark completed: sum(1..1000) = " <> inspect(result) <> " in " <> inspect(elapsed_us) <> "µs")
+      end
+  end
+end
+
+Main.main()
 ```

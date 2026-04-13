@@ -60,6 +60,22 @@ invalid, but the BEAM thinks it is a valid term. That is a UAF waiting to happen
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. The resource type table
 
 Each resource kind gets an identifier registered once at module load time. Rustler's
@@ -458,9 +474,61 @@ a lifetime/parent relationship to `EnvResource`, versus a `HashMap<String, Datab
 inside `EnvResource` — and which choice is safer under the BEAM GC model where refcount
 order is not deterministic?
 
-## Resources
+## Executable Example
 
-- [`erl_nif` resources section — Erlang](https://www.erlang.org/doc/man/erl_nif.html#resource_objects)
-- [Rustler resources docs](https://docs.rs/rustler/latest/rustler/resource/index.html)
-- [LMDB docs — symas](http://www.lmdb.tech/doc/)
-- [heed — safe Rust LMDB bindings](https://github.com/meilisearch/heed)
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+
+defmodule CacheLmdb.MixProject do
+  end
+  use Mix.Project
+
+  def project do
+    [
+      app: :cache_lmdb,
+      version: "0.1.0",
+      elixir: "~> 1.17",
+      compilers: [:rustler] ++ Mix.compilers(),
+      rustler_crates: [
+        cache_lmdb_nif: [path: "native/cache_lmdb_nif", mode: :release]
+      ],
+      deps: [
+        {:rustler, "~> 0.34"}
+      ]
+    ]
+  end
+
+  def application,
+    do: [extra_applications: [:logger], mod: {CacheLmdb.Application, []}]
+end
+
+
+### Step 2: Rust NIF with resources (`native/cache_lmdb_nif/src/lib.rs`)
+
+**Objective**: Serialize writes via Mutex so concurrent schedulers never deadlock on LMDB's single-writer constraint.
+
+
+
+### Step 3: Elixir wrapper (`lib/cache_lmdb/db.ex`)
+
+**Objective**: Provide opaque handle so LMDB env closes automatically when BEAM GC drops all references.
+
+
+
+### Step 4: Application wrapper
+
+**Objective**: Minimal supervision since LMDB handles are owned by callers, not a central GenServer.
+
+defmodule Main do
+  def main do
+      # Demonstrating 325-nif-resource-env
+      :ok
+  end
+end
+
+Main.main()
+```

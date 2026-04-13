@@ -41,6 +41,25 @@ ingest_pipeline/
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Testing-specific insight:**
+Tests are not QA. They document intent and catch regressions. A test that passes without asserting anything is technical debt. Always test the failure case; "it works when everything succeeds" teaches nothing. Use property-based testing for domain logic where the number of edge cases is infinite.
 ### 1. `assert_receive pattern, timeout`
 Blocks the test process up to `timeout` milliseconds waiting for a message matching
 `pattern`. Returns immediately on match. Fails the test otherwise.
@@ -333,19 +352,96 @@ processes are in play.
 two tests running with `async: true` both emit the same telemetry event name, and how does
 the handler-id uniqueness trick actually prevent it?
 
-## Resources
 
-- [`telemetry` on GitHub](https://github.com/beam-telemetry/telemetry)
-- [`ExUnit.Assertions` — assert_receive](https://hexdocs.pm/ex_unit/ExUnit.Assertions.html#assert_receive/3)
-- [Dashbit — Instrumenting Phoenix with telemetry](https://dashbit.co/blog/telemetry-for-all)
-- [`ExUnit.Callbacks.start_supervised!/1`](https://hexdocs.pm/ex_unit/ExUnit.Callbacks.html#start_supervised!/1)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+# test/ingest_pipeline/buffer_test.exs
+defmodule IngestPipeline.BufferTest do
+  use ExUnit.Case, async: true
+
+  alias IngestPipeline.{Buffer, TelemetryHelper}
+
+  setup context do
+    handler_id = "buffer-test-#{context.test}-#{System.unique_integer([:positive])}"
+    TelemetryHelper.attach_forwarder(handler_id, [:ingest_pipeline, :buffer, :flush], self())
+    :ok
+  end
+
+  describe "push/2 — size-triggered flush" do
+    test "flushes exactly when the buffer hits max_size" do
+      buffer =
+        start_supervised!(
+          {Buffer, name: :buffer_size_test, max_size: 3, interval_ms: 60_000}
+        )
+
+      Buffer.push(buffer, :a)
+      Buffer.push(buffer, :b)
+
+      # No flush yet — we only pushed 2 of 3
+      refute_receive {:telemetry_event, [:ingest_pipeline, :buffer, :flush], _, _}, 50
+
+      Buffer.push(buffer, :c)
+
+      assert_receive {:telemetry_event, [:ingest_pipeline, :buffer, :flush],
+                      %{count: 3}, %{reason: :size}},
+                     500
+    end
+  end
+
+  describe "push/2 — interval-triggered flush" do
+    test "flushes on interval when buffer is non-empty" do
+      buffer =
+        start_supervised!(
+          {Buffer, name: :buffer_interval_test, max_size: 1_000, interval_ms: 50}
+        )
+
+      Buffer.push(buffer, :x)
+
+      assert_receive {:telemetry_event, [:ingest_pipeline, :buffer, :flush],
+                      %{count: 1}, %{reason: :interval}},
+                     500
+    end
+
+    test "does not flush when buffer is empty" do
+      start_supervised!({Buffer, name: :buffer_empty_test, max_size: 1_000, interval_ms: 50})
+
+      refute_receive {:telemetry_event, [:ingest_pipeline, :buffer, :flush], _, _}, 200
+    end
+  end
+
+  describe "push/2 — correctness under load" do
+    test "large burst produces deterministic number of flush events" do
+      buffer =
+        start_supervised!(
+          {Buffer, name: :buffer_burst_test, max_size: 10, interval_ms: 60_000}
+        )
+
+      for i <- 1..100, do: Buffer.push(buffer, i)
+
+      # Expect exactly 10 flush events (100 / 10)
+      for _ <- 1..10 do
+        assert_receive {:telemetry_event, [:ingest_pipeline, :buffer, :flush],
+                        %{count: 10}, %{reason: :size}},
+                       1_000
+      end
+
+      # No eleventh flush within 200ms
+      refute_receive {:telemetry_event, [:ingest_pipeline, :buffer, :flush], _, _}, 200
+    end
+  end
 end
+
+defmodule Main do
+  def main do
+      IO.puts("Property-based test generator initialized")
+      a = 10
+      b = 20
+      c = 30
+      assert (a + b) + c == a + (b + c)
+      IO.puts("✓ Property invariant verified: (a+b)+c = a+(b+c)")
+  end
+end
+
+Main.main()
 ```

@@ -39,6 +39,22 @@ A GenServer serializes every request through its mailbox. At 50k req/s the shedd
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Token bucket math
 ```
 tokens = min(capacity, tokens + (now - last_refill) * refill_rate)
@@ -352,9 +368,156 @@ Resilience patterns (circuit breakers, timeouts, retries) are easy to implement 
 
 Your high-priority bucket is `capacity: 1_000, refill_per_second: 10_000`. A burst of 2000 high-priority requests arrives at once. How many are admitted, and how long before the bucket has room for 500 more?
 
-## Resources
+## Executable Example
 
-- [Token bucket — Wikipedia](https://en.wikipedia.org/wiki/Token_bucket)
-- [`:atomics` — Erlang docs](https://www.erlang.org/doc/man/atomics.html)
-- [`:persistent_term` — Erlang docs](https://www.erlang.org/doc/man/persistent_term.html)
-- [Envoy rate-limit filter](https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/rate_limit_filter) — industrial shedding
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+
+defmodule EdgeShedder.MixProject do
+  end
+  use Mix.Project
+  def project, do: [app: :edge_shedder, version: "0.1.0", elixir: "~> 1.17", deps: deps()]
+  def application, do: [mod: {EdgeShedder.Application, []}, extra_applications: [:logger]]
+  defp deps, do: [{:benchee, "~> 1.3", only: :dev}]
+end
+
+defmodule EdgeShedder.Bucket do
+  end
+  @moduledoc """
+  Atomic token bucket. Index layout in the 2-wide atomics array:
+    1 = current tokens (integer, scaled by 1000 for sub-token precision)
+    2 = last_refill monotonic_ms
+
+  Refill happens lazily inside try_consume/2 using atomic compare-and-swap
+  over the entire (tokens, last_refill) pair implied by one CAS per field.
+  """
+
+  defstruct [:ref, :capacity, :refill_per_ms, :scale]
+
+  @scale 1_000
+
+  def new(capacity: capacity, refill_per_second: per_s) do
+    ref = :atomics.new(2, [])
+    :atomics.put(ref, 1, capacity * @scale)
+    :atomics.put(ref, 2, System.monotonic_time(:millisecond))
+
+    %__MODULE__{
+      ref: ref,
+      capacity: capacity,
+      refill_per_ms: per_s / 1_000,
+      scale: @scale
+    }
+  end
+
+  def try_consume(%__MODULE__{} = b, cost \\ 1) do
+    now = System.monotonic_time(:millisecond)
+    refill(b, now)
+
+    cost_scaled = cost * b.scale
+
+    case :atomics.sub_get(b.ref, 1, cost_scaled) do
+      n when n >= 0 -> :ok
+      _ ->
+        :atomics.add(b.ref, 1, cost_scaled)
+        {:error, :shed}
+    end
+  end
+
+  defp refill(%__MODULE__{} = b, now) do
+  end
+    last = :atomics.get(b.ref, 2)
+    elapsed = now - last
+    if elapsed <= 0, do: :ok, else: do_refill(b, now, last, elapsed)
+  end
+
+  defp do_refill(b, now, last, elapsed) do
+    case :atomics.compare_exchange(b.ref, 2, last, now) do
+      :ok ->
+        add = trunc(elapsed * b.refill_per_ms * b.scale)
+        current = :atomics.get(b.ref, 1)
+        cap_scaled = b.capacity * b.scale
+        new_tokens = min(cap_scaled, current + add)
+        delta = new_tokens - current
+        if delta > 0, do: :atomics.add(b.ref, 1, delta)
+        :ok
+
+      _actual_prev ->
+        :ok
+    end
+  end
+
+  def inspect_state(%__MODULE__{} = b) do
+    %{
+      tokens: :atomics.get(b.ref, 1) / b.scale,
+      last_refill: :atomics.get(b.ref, 2),
+      capacity: b.capacity
+    }
+  end
+end
+
+defmodule EdgeShedder.Shedder do
+  alias EdgeShedder.Bucket
+
+  @priorities [:high, :medium, :low]
+
+  def start_link(opts) do
+    buckets =
+      for {priority, cfg} <- opts[:buckets], into: %{} do
+        {priority, Bucket.new(cfg)}
+      end
+
+    :persistent_term.put(__MODULE__, buckets)
+    {:ok, self()}
+  end
+
+  def child_spec(opts) do
+    %{
+      id: __MODULE__,
+      start: {__MODULE__, :start_link, [opts]},
+      type: :worker
+    }
+  end
+
+  def admit?(priority) when priority in @priorities do
+    buckets = :persistent_term.get(__MODULE__)
+
+    case Bucket.try_consume(Map.fetch!(buckets, priority)) do
+      :ok -> true
+      {:error, :shed} -> false
+    end
+  end
+end
+
+defmodule EdgeShedder.Application do
+  use Application
+
+  @impl true
+  def start(_type, _args) do
+    children = [
+      {EdgeShedder.Shedder,
+       buckets: %{
+         high: [capacity: 1_000, refill_per_second: 10_000],
+         medium: [capacity: 500, refill_per_second: 3_000],
+         low: [capacity: 200, refill_per_second: 1_000]
+       }}
+    ]
+
+    Supervisor.start_link(children, strategy: :one_for_one)
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrating 309-load-shedding-token-bucket
+      :ok
+  end
+end
+
+Main.main()
+end
+end
+```

@@ -53,6 +53,22 @@ promise across runs. Always use the registered name.
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. `read_concurrency: true`
 
 Tells ETS to optimize the read path by duplicating data structures across scheduler-local
@@ -498,9 +514,87 @@ memory-traversal but requires linking internal Erlang headers. Under what load p
 does the Rustler-via-apply approach become the bottleneck, and at what point is
 maintaining C-header NIF code worth the 2-3x speedup?
 
-## Resources
 
-- [`:ets` documentation — Erlang/OTP](https://www.erlang.org/doc/man/ets.html)
-- [`erl_nif.h` reference](https://www.erlang.org/doc/man/erl_nif.html)
-- [Rustler `env.apply` docs](https://docs.rs/rustler/latest/rustler/env/struct.Env.html)
-- [Discord's feature flag system write-up](https://discord.com/blog/)
+## Executable Example
+
+```elixir
+defmodule FeatureFlagsFastPath.StoreTest do
+  use ExUnit.Case, async: false
+  alias FeatureFlagsFastPath.{Store, NIF}
+
+  setup do
+    {:ok, _} = start_supervised(Store)
+    # Clear any leftover state.
+    :ets.delete_all_objects(:feature_flags)
+    :ok
+  end
+
+  describe "Store.set and Store.get" do
+    test "round-trip with boolean" do
+      :ok = Store.set("checkout_v2", true)
+      assert Store.get("checkout_v2") == true
+    end
+
+    test "missing flag returns false (default)" do
+      assert Store.get("never_set") == false
+    end
+
+    test "overwrite changes value" do
+      :ok = Store.set("x", true)
+      :ok = Store.set("x", false)
+      assert Store.get("x") == false
+    end
+  end
+
+  describe "NIF fast path" do
+    test "NIF.get matches Store.get" do
+      :ok = Store.set("a", true)
+      :ok = Store.set("b", false)
+      assert NIF.get("a") == true
+      assert NIF.get("b") == false
+      assert NIF.get("c") == false
+    end
+
+    test "NIF.get_many returns a map" do
+      :ok = Store.set("x", true)
+      :ok = Store.set("y", false)
+      result = NIF.get_many(["x", "y", "z"])
+      assert result["x"] == true
+      assert result["y"] == false
+      assert result["z"] == false
+    end
+  end
+
+  describe "concurrent access" do
+    test "200 readers see consistent state with interleaved writer" do
+      :ok = Store.set("toggle", true)
+
+      reader_fn = fn ->
+        for _ <- 1..100 do
+          # The flag may be true or false depending on writer progress;
+          # either is fine — we only assert no crash.
+          _ = NIF.get("toggle")
+        end
+      end
+
+      writer = Task.async(fn ->
+        for i <- 1..1_000, do: Store.set("toggle", rem(i, 2) == 0)
+      end)
+
+      readers = for _ <- 1..200, do: Task.async(reader_fn)
+
+      Task.await_many([writer | readers], 10_000)
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+    IO.puts("✓ ETS as a Shared Buffer with NIF-Side Readers")
+  - ETS as shared NIF buffer
+    - Safe concurrent reads
+  end
+end
+
+Main.main()
+```

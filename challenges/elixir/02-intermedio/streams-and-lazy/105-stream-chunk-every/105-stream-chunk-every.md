@@ -303,6 +303,76 @@ smaller representation before windowing.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule ChunkBatch do
+    @moduledoc """
+    Three stream utilities built on `Stream.chunk_every/4`: fixed-size
+    batching with optional forced flush, sliding windows, and n-gram
+    generation.
+    """
+
+    @doc """
+    Batches `stream` into lists of at most `size`. By default the trailing
+    partial batch is kept; pass `:discard` to drop it.
+
+    Useful for bulk operations where each batch is sent independently
+    (DB inserts, HTTP POSTs, log lines).
+    """
+    @spec batches(Enumerable.t(), pos_integer(), :keep | :discard) :: Enumerable.t()
+    def batches(stream, size, tail \\ :keep)
+        when is_integer(size) and size > 0 and tail in [:keep, :discard] do
+      leftover = if tail == :discard, do: :discard, else: []
+      Stream.chunk_every(stream, size, size, leftover)
+    end
+
+    @doc """
+    Emits a moving window of size `size` advancing `1` element at a time.
+    The tail partial windows are discarded so every emitted window is
+    exactly `size` long — which is what downstream averages/variances
+    assume.
+    """
+    @spec sliding(Enumerable.t(), pos_integer()) :: Enumerable.t()
+    def sliding(stream, size) when is_integer(size) and size > 0 do
+      Stream.chunk_every(stream, size, 1, :discard)
+    end
+
+    @doc """
+    Produces consecutive n-grams from a stream of tokens. Identical to
+    `sliding/2` but renamed for intent — "sliding window of strings" is
+    exactly what "n-grams" means in NLP.
+    """
+    @spec ngrams(Enumerable.t(), pos_integer()) :: Enumerable.t()
+    def ngrams(stream, n) when is_integer(n) and n > 0 do
+      sliding(stream, n)
+    end
+
+    @doc """
+    Classic use-case: compute a moving average over a numeric stream.
+    Demonstrates composing `sliding/2` with a simple `Stream.map/2`.
+    """
+    @spec moving_average(Enumerable.t(), pos_integer()) :: Enumerable.t()
+    def moving_average(stream, window) when is_integer(window) and window > 0 do
+      stream
+      |> sliding(window)
+      |> Stream.map(fn chunk -> Enum.sum(chunk) / window end)
+    end
+  end
+
+  def main do
+    IO.puts("ChunkBatch OK")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`Stream.chunk_every/4` — hexdocs](https://hexdocs.pm/elixir/Stream.html#chunk_every/4)

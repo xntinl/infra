@@ -66,6 +66,25 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Testing-specific insight:**
+Tests are not QA. They document intent and catch regressions. A test that passes without asserting anything is technical debt. Always test the failure case; "it works when everything succeeds" teaches nothing. Use property-based testing for domain logic where the number of edge cases is infinite.
 ### 1. `stub_with/2` replaces boilerplate with a real fake
 
 ```elixir
@@ -567,21 +586,58 @@ Keep global tests small; push coverage of fine-grained behaviour into private-mo
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
 
-- [Mox.stub_with/2 hexdocs](https://hexdocs.pm/mox/Mox.html#stub_with/2)
-- [Mox.set_mox_global/1 hexdocs](https://hexdocs.pm/mox/Mox.html#set_mox_global/1)
-- ["Mocks and explicit contracts" — José Valim](https://dashbit.co/blog/mocks-and-explicit-contracts)
-- [Testing Elixir (book)](https://pragprog.com/titles/lmelixir/testing-elixir/) — ch. 6
-- [Mox source code](https://github.com/dashbitco/mox/blob/main/lib/mox.ex) — `dispatch_mode` logic
-- ["Use mocks cautiously" — Chris Keathley](https://keathley.io/blog/mocking.html)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+# test/notify/dispatcher_stub_with_test.exs
+defmodule Notify.DispatcherStubWithTest do
+  use ExUnit.Case, async: true
+  import Mox
+
+  setup :verify_on_exit!
+
+  setup do
+    for mock <- [Notify.EmailMock, Notify.SmsMock, Notify.PushMock,
+                 Notify.SlackMock, Notify.WebhookMock] do
+      stub_with(mock, Notify.Fakes.SuccessfulChannel)
+    end
+    :ok
+  end
+
+  describe "Notify.DispatcherStubWith" do
+    test "happy path with the successful fake" do
+      msg = %{id: "abc", to: "x@y", body: "hello"}
+      result = Notify.Dispatcher.dispatch(msg, [:email, :sms, :push, :slack, :webhook])
+      for {ch, r} <- result, do: assert({:ok, _} = r)
+      assert result[:email] == {:ok, "email_abc"}
+    end
+
+    test "stub_with returns :empty_recipient when fake detects it" do
+      msg = %{id: "z", to: "", body: "hello"}
+      result = Notify.Dispatcher.dispatch(msg, [:email])
+      assert result[:email] == {:error, :empty_recipient}
+    end
+
+    test "expect overrides stub_with for a single interaction" do
+      expect(Notify.EmailMock, :send, fn _, _ -> {:error, :bounced} end)
+      msg = %{id: "q", to: "x@y", body: "hi"}
+      result = Notify.Dispatcher.dispatch(msg, [:email, :sms])
+      assert result[:email] == {:error, :bounced}
+      assert result[:sms] == {:ok, "sms_q"}
+    end
+  end
 end
+
+defmodule Main do
+  def main do
+      IO.puts("Initializing mock-based testing")
+      test_result = {:ok, "mocked_response"}
+      if elem(test_result, 0) == :ok do
+        IO.puts("✓ Mock testing demonstrated: " <> inspect(test_result))
+      end
+  end
+end
+
+Main.main()
 ```

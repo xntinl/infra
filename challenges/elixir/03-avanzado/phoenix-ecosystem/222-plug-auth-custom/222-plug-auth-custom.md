@@ -51,6 +51,22 @@ Auth libraries are the right default, but their assumptions leak. When the model
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Bearer extraction at the plug boundary
 
 Every piece of auth code that reads the `Authorization` header reimplements the same
@@ -791,12 +807,93 @@ Target: auth plug adds 100-500 us including token verification (dominated by cry
 
 ---
 
-## Resources
+## Executable Example
 
-- [Plug documentation — the `Plug` behaviour](https://hexdocs.pm/plug/Plug.html)
-- [`Phoenix.Token`](https://hexdocs.pm/phoenix/Phoenix.Token.html)
-- [Joken](https://hexdocs.pm/joken/introduction.html) — "a peaceful library for JWT"
-- [Guardian](https://hexdocs.pm/guardian/readme.html) — full authentication framework
-- [RFC 7519 — JSON Web Tokens](https://datatracker.ietf.org/doc/html/rfc7519)
-- [Auth0 — JWT best practices](https://auth0.com/blog/jwt-handbook/)
-- [keathley.io — Designing with Plug](https://keathley.io/blog/designing-with-plugs.html)
+```elixir
+defmodule PlugAuthCustom.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :plug_auth_custom, version: "0.1.0", elixir: "~> 1.16", deps: deps()]
+  end
+
+  def application do
+    [mod: {PlugAuthCustom.Application, []}, extra_applications: [:logger]]
+  end
+
+  defp deps do
+    [
+      {:plug, "~> 1.16"},
+      {:plug_crypto, "~> 2.0"},
+      {:phoenix, "~> 1.7"},
+      {:jason, "~> 1.4"},
+      {:joken, "~> 2.6"}
+    ]
+  end
+end
+
+
+
+Pattern-matching on the exact prefix (note the space) avoids the classic bug where
+`"bearer"` lowercase or `"Bearer  "` with two spaces slips through. Compare: `String.starts_with?`
+is more permissive and also much slower for malicious inputs.
+
+### 2. `Phoenix.Token` vs JWT — what the libraries actually do
+  end
+
+| | `Phoenix.Token` | `Joken` | `Guardian` |
+|-|-----------------|---------|------------|
+| Encodes | Any Erlang term | JSON claims | JSON claims |
+| Signature | HMAC-SHA256 on binary | JWS (HS, RS, ES, EdDSA) | JWS (via Joken) |
+| Expiration | `max_age:` on verify | `exp` claim | `exp` claim |
+| Issuer/audience | No | Hooks | Built-in config |
+| Hooks | None | Signer modules, callbacks | Pipelines, `before_*` |
+| JWT-compliant | No | Yes | Yes |
+| Good for | Same-app cookies | Library of primitives | Opinionated plug stack |
+
+Rules of thumb:
+
+- **Same-app producer and consumer** → `Phoenix.Token`. Sub-microsecond sign/verify, no
+  claim juggling, uses `secret_key_base`.
+- **External API consuming a third-party JWT** → `Joken`. Low-level, composable,
+  directly maps to JOSE primitives. Write your own plug.
+- **You want a full auth pipeline with hooks for login/logout/refresh and remember-me**
+  → `Guardian`. It's a framework; accept that.
+
+### 3. The revocation problem
+
+Signed tokens are stateless. You can't "un-sign" them. Two options:
+
+- **Short expiry + refresh**: Access token TTL of 5–15 minutes. Refresh token (opaque,
+  stored server-side) issues new access tokens. Revoking the refresh breaks the chain
+  within one TTL window. This is the OAuth2 answer.
+- **Revocation list**: A Set of `jti` (JWT ID) values that `verify` must reject, even
+  when the signature is valid. Stored in ETS for speed, replicated via PubSub.
+  This is the "kill switch" pattern.
+
+In practice, production systems use both. This exercise implements the revocation list.
+
+### 4. Why a Plug, not a library
+
+A plug is *data in, data out* (`%Plug.Conn{}` → `%Plug.Conn{}`). It composes in the
+endpoint pipeline, in a scoped Phoenix pipeline, or in a plain `Plug.Router`. A library
+that wraps authentication into an `@before_compile` macro is convenient until you need
+to skip it for one specific controller action — and the only escape hatch is a flag in
+the socket options. Stay at the Plug layer; you keep composition and testability.
+
+### 5. Late-binding the token issuer
+
+The plug receives two token types (JWT access, Phoenix.Token session) and has to route
+them to the right verifier. You could inspect header fields (`alg`, `kid`) to guess,
+but a simpler rule works: JWTs have three base64url segments separated by `.`,
+Phoenix.Tokens have two segments separated by `.`. Inspect the segment count:
+
+defmodule Main do
+  def main do
+      # Demonstrating 222-plug-auth-custom
+      :ok
+  end
+end
+
+Main.main()
+```

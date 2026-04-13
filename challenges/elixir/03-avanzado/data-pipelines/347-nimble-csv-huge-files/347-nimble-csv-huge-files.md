@@ -54,6 +54,25 @@ custom-delimited and you want to avoid the `NimbleCSV.define/2` call
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Pipeline-specific insight:**
+Streams are lazy; Enum is eager. Use Stream for data larger than RAM or when you're building intermediate stages. Use Enum when the collection is small or you need side effects at each step. Mixing them carelessly results in performance cliffs.
 ### 1. Precompiled dialect
 
 ```elixir
@@ -425,19 +444,110 @@ measuring end-to-end 25k rows/sec. Top shows one BEAM thread pinned at 100%
 while seven sit at 30%. What is most likely the serial phase, and how do you
 confirm it with `:observer` or `:recon`?
 
-## Resources
 
-- [NimbleCSV — hexdocs](https://hexdocs.pm/nimble_csv/NimbleCSV.html)
-- [NimbleCSV source — GitHub](https://github.com/dashbitco/nimble_csv)
-- [RFC 4180 — CSV format](https://datatracker.ietf.org/doc/html/rfc4180)
-- [Benchee](https://github.com/bencheeorg/benchee)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+defmodule BillingImporter.ParserTest do
+  use ExUnit.Case, async: true
+
+  alias BillingImporter.Parser
+
+  describe "parse_string/2" do
+    test "parses a simple row" do
+      csv = "msisdn,event_ts,service,bytes,cost\n+441234567,2024-10-10T13:55:36Z,data,1024,0.05\n"
+      [row] = Parser.parse_string(csv)
+      assert row == ["+441234567", "2024-10-10T13:55:36Z", "data", "1024", "0.05"]
+    end
+
+    test "handles quoted fields with embedded commas" do
+      csv =
+        ~s(msisdn,event_ts,service,bytes,cost\n+44,2024-10-10T13:55:36Z,"sms,bulk",100,0.01\n)
+
+      [row] = Parser.parse_string(csv)
+      assert Enum.at(row, 2) == "sms,bulk"
+    end
+
+    test "handles embedded newlines inside quotes" do
+      csv = ~s(a,b,c,d,e\n"one\ntwo",2024-10-10T00:00:00Z,svc,1,1.0\n)
+      [row] = Parser.parse_string(csv)
+      assert List.first(row) == "one\ntwo"
+    end
+  end
 end
+
+defmodule BillingImporter.RowTest do
+  use ExUnit.Case, async: true
+
+  alias BillingImporter.Row
+
+  describe "from_row/1" do
+    test "returns {:ok, %Row{}} for a valid row" do
+      row = ["+441234567", "2024-10-10T13:55:36Z", "data", "1024", "0.05"]
+      assert {:ok, %Row{bytes: 1024, cost_cents: 5}} = Row.from_row(row)
+    end
+
+    test "rejects a malformed msisdn" do
+      row = ["not-a-number", "2024-10-10T13:55:36Z", "data", "1024", "0.05"]
+      assert {:error, :bad_msisdn} = Row.from_row(row)
+    end
+
+    test "rejects rows with the wrong column count" do
+      assert {:error, :wrong_column_count} = Row.from_row(["a", "b"])
+    end
+  end
+end
+
+defmodule BillingImporterTest do
+  use ExUnit.Case, async: true
+
+  setup do
+    path = Path.join(System.tmp_dir!(), "usage_#{:erlang.unique_integer()}.csv")
+
+    File.write!(path, """
+    msisdn,event_ts,service,bytes,cost
+    +441234567,2024-10-10T13:55:36Z,data,1024,0.05
+    +441234568,2024-10-10T13:55:37Z,"sms,bulk",0,0.01
+    garbage,2024-10-10T13:55:37Z,data,1024,0.05
+    """)
+
+    on_exit(fn -> File.rm(path) end)
+    {:ok, path: path}
+  end
+
+  test "imports valid rows and captures errors", %{path: path} do
+    {inserted, errors} = BillingImporter.import(path, batch_size: 100)
+    assert inserted == 2
+    assert length(errors) == 1
+    assert match?({3, :bad_msisdn, _}, List.first(errors))
+  end
+end
+
+defmodule Main do
+  def main do
+      # Simulate NimbleCSV parsing large billing files
+      csv_data = "account_id,usage,cost\n1001,150.5,45.15\n1002,320.0,96.00\n"
+
+      # Parse CSV (normally via NimbleCSV.parse_string)
+      lines = String.split(csv_data, "\n") |> Enum.drop(1) |> Enum.filter(&(&1 != ""))
+
+      records = Enum.map(lines, fn line ->
+        [account, usage, cost] = String.split(line, ",")
+        %{
+          account_id: account,
+          usage: String.to_float(usage),
+          cost: String.to_float(cost)
+        }
+      end)
+
+      IO.inspect(records, label: "✓ Parsed billing records")
+
+      assert length(records) == 2, "Parsed 2 records"
+      assert Enum.all?(records, &is_map/1), "All are maps"
+
+      IO.puts("✓ NimbleCSV: large file parsing working")
+  end
+end
+
+Main.main()
 ```

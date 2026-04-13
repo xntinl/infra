@@ -311,6 +311,71 @@ Your team adds a rule: classify `429 Too Many Requests` as `:retry_later` only i
 
 How would you unit-test each classification branch without building an HTTP response? What does that imply about input types?
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule HttpStatusClassifier.Classifier do
+  @moduledoc """
+  Classifies HTTP-shaped results into actionable categories.
+
+  Input shapes:
+    {:ok, status}                         — response received
+    {:error, {:http, status}}             — response received, non-2xx (e.g. 4xx/5xx)
+    {:error, {:network, reason}}          — transport failure (timeout, closed)
+    anything else                         — :unknown
+  """
+
+  @type http_result ::
+          {:ok, non_neg_integer()}
+          | {:error, {:http, non_neg_integer()}}
+          | {:error, {:network, atom()}}
+
+  @type category ::
+          :success
+          | :redirect
+          | :client_error
+          | :server_error
+          | :network_timeout
+          | :network_closed
+          | :unknown
+
+  @spec classify(http_result() | term()) :: category()
+  def classify(result) do
+    case result do
+      # 2xx — success. Guard narrows the range inside the tuple.
+      {:ok, status} when status in 200..299 ->
+        :success
+
+      # 3xx — redirect (still an :ok tuple because the transport succeeded).
+      {:ok, status} when status in 300..399 ->
+        :redirect
+
+      # 4xx — client error. Note the nested pattern: {:error, {:http, status}}.
+      {:error, {:http, status}} when status in 400..499 ->
+        :client_error
+
+      # 5xx — server error. Same nested shape, different range.
+      {:error, {:http, status}} when status in 500..599 ->
+        :server_error
+
+      # Network-level failures — reason is an atom, not a number.
+      # Two clauses because different reasons warrant different retry strategies.
+      {:error, {:network, :timeout}} ->
+        :network_timeout
+
+      {:error, {:network, :closed}} ->
+        :network_closed
+
+      # Catch-all — never silently drop malformed input in production.
+      _ ->
+        :unknown
+    end
+  end
+end
+```
+
 ## Resources
 
 - [Elixir — Case, cond, and if](https://hexdocs.pm/elixir/case-cond-and-if.html)

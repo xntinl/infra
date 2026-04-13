@@ -641,18 +641,78 @@ Target: operation should complete in the low-microsecond range on modern hardwar
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
 
-- [Mix Release docs](https://hexdocs.pm/mix/Mix.Tasks.Release.html) -- comprehensive release configuration
-- [Kubernetes probes](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/) -- liveness vs readiness
-- [hexpm/elixir Docker images](https://hub.docker.com/r/hexpm/elixir) -- official multi-arch images
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+defmodule GatewayApiWeb.Plugs.HealthCheck do
+  @moduledoc """
+  Health check plug registered BEFORE the Phoenix router.
+
+  /health/live  -- liveness: always 200 if the BEAM is running
+  /health/ready -- readiness: 200 only when DB and dependencies are healthy,
+                  503 when draining (SIGTERM received)
+  """
+  @behaviour Plug
+  import Plug.Conn
+
+  def init(opts), do: opts
+
+  def call(%Plug.Conn{request_path: "/health/live"} = conn, _) do
+    conn
+    |> put_resp_content_type("application/json")
+    |> send_resp(200, Jason.encode!(%{status: "ok", node: node()}))
+    |> halt()
+  end
+
+  def call(%Plug.Conn{request_path: "/health/ready"} = conn, _) do
+    draining = :persistent_term.get(:app_draining, false)
+
+    if draining do
+      conn
+      |> put_resp_content_type("application/json")
+      |> send_resp(503, Jason.encode!(%{status: "draining"}))
+      |> halt()
+    else
+      case check_database() do
+        :ok ->
+          conn
+          |> put_resp_content_type("application/json")
+          |> send_resp(200, Jason.encode!(%{status: "ok", checks: %{database: "ok"}}))
+          |> halt()
+
+        {:error, reason} ->
+          conn
+          |> put_resp_content_type("application/json")
+          |> send_resp(503, Jason.encode!(%{status: "unhealthy", checks: %{database: inspect(reason)}}))
+          |> halt()
+      end
+    end
+  end
+
+  def call(conn, _), do: conn
+
+  defp check_database do
+    case Ecto.Adapters.SQL.query(GatewayCore.Repo, "SELECT 1", []) do
+      {:ok, _} -> :ok
+      {:error, reason} -> {:error, reason}
+    end
+  rescue
+    error -> {:error, error}
+  end
 end
+
+defmodule Main do
+  def main do
+      IO.puts("Benchmarking initialized")
+      {elapsed_us, result} = :timer.tc(fn ->
+        Enum.reduce(1..1000, 0, &+/2)
+      end)
+      if is_number(elapsed_us) do
+        IO.puts("✓ Benchmark completed: sum(1..1000) = " <> inspect(result) <> " in " <> inspect(elapsed_us) <> "µs")
+      end
+  end
+end
+
+Main.main()
 ```

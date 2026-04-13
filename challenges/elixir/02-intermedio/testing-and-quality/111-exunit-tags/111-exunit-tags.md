@@ -297,6 +297,75 @@ concerns (speed, externality), not organization.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule FeatureFlags do
+    @moduledoc """
+    A deterministic feature-flag checker used to demonstrate tagged tests.
+    """
+
+    @flags %{
+      "new_checkout" => true,
+      "dark_mode" => true,
+      "legacy_api" => false
+    }
+
+    @spec enabled?(String.t()) :: boolean()
+    def enabled?(flag) when is_binary(flag), do: Map.get(@flags, flag, false)
+
+    @spec all() :: %{String.t() => boolean()}
+    def all, do: @flags
+
+    @doc "Simulates a slow external check. Used in `:slow` tests."
+    @spec expensive_check(String.t()) :: boolean()
+    def expensive_check(flag) do
+      Process.sleep(200)
+      enabled?(flag)
+    end
+  end
+
+  def main do
+    IO.puts("=== ExUnit Tags Demo ===\n")
+  
+    # Demo 1: Check enabled flags
+    IO.puts("1. FeatureFlags.enabled?/1:")
+    IO.puts("   enabled?('new_checkout'): #{FeatureFlags.enabled?("new_checkout")}")
+    assert FeatureFlags.enabled?("new_checkout") == true
+    IO.puts("   enabled?('legacy_api'): #{FeatureFlags.enabled?("legacy_api")}")
+    assert FeatureFlags.enabled?("legacy_api") == false
+    IO.puts("   enabled?('unknown'): #{FeatureFlags.enabled?("unknown")}")
+    assert FeatureFlags.enabled?("unknown") == false
+  
+    # Demo 2: Check all flags
+    IO.puts("\n2. FeatureFlags.all/0:")
+    flags = FeatureFlags.all()
+    IO.puts("   All flags: #{inspect(flags)}")
+    assert Map.fetch!(flags, "new_checkout") == true
+    assert Map.fetch!(flags, "dark_mode") == true
+    assert Map.fetch!(flags, "legacy_api") == false
+  
+    # Demo 3: Expensive check (simulates slow test)
+    IO.puts("\n3. FeatureFlags.expensive_check/1 (slow path):")
+    start_time = System.monotonic_time(:millisecond)
+    result = FeatureFlags.expensive_check("dark_mode")
+    end_time = System.monotonic_time(:millisecond)
+    IO.puts("   expensive_check('dark_mode'): #{result}")
+    IO.puts("   Time taken: #{end_time - start_time}ms (includes 200ms sleep)")
+    assert result == true
+  
+    IO.puts("\n✓ All ExUnit tags demos completed!")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`ExUnit.Case` — tags and filtering](https://hexdocs.pm/ex_unit/ExUnit.Case.html#module-tags)

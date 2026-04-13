@@ -328,6 +328,97 @@ where later stages depend on earlier ones, you want `:rest_for_one`. Plain
 
 - Tu supervisor reinicia un child 100 veces en 5s por un bug de config. ¿Qué valores de `max_restarts`/`max_seconds` te hacen fallar rápido sin ser frágil en condiciones normales?
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule BasicSupervisor.Worker do
+  @moduledoc """
+  A trivial GenServer used to demonstrate supervision. Holds a counter and
+  exposes `bump/1`, `value/1`, and `crash/1` so tests can observe the
+  effect of a restart (state is lost — counters go back to zero).
+  """
+
+  use GenServer
+
+  @spec start_link(keyword()) :: GenServer.on_start()
+  def start_link(opts) do
+    name = Keyword.fetch!(opts, :name)
+    GenServer.start_link(__MODULE__, 0, name: name)
+  end
+
+  @spec bump(GenServer.server()) :: :ok
+  def bump(server), do: GenServer.cast(server, :bump)
+
+  @spec value(GenServer.server()) :: non_neg_integer()
+  def value(server), do: GenServer.call(server, :value)
+
+  @spec crash(GenServer.server()) :: :ok
+  def crash(server), do: GenServer.cast(server, :crash)
+
+  @impl true
+  def init(count), do: {:ok, count}
+
+  @impl true
+  def handle_cast(:bump, count), do: {:noreply, count + 1}
+  def handle_cast(:crash, _count), do: raise("boom")
+
+  @impl true
+  def handle_call(:value, _from, count), do: {:reply, count, count}
+end
+
+defmodule BasicSupervisor.Supervisor do
+  @moduledoc """
+  Static supervisor with two named workers. Uses the default `:one_for_one`
+  strategy: only the crashed child is restarted, siblings keep running.
+  """
+
+  use Supervisor
+
+  @spec start_link(keyword()) :: Supervisor.on_start()
+  def start_link(opts \\ []) do
+    Supervisor.start_link(__MODULE__, :ok, opts)
+  end
+
+  @impl true
+  def init(:ok) do
+    children = [
+      # We pass different :id values so the supervisor can tell the two
+      # Worker children apart — without that, both would have id: Worker.
+      Supervisor.child_spec({BasicSupervisor.Worker, [name: :worker_a]}, id: :worker_a),
+      Supervisor.child_spec({BasicSupervisor.Worker, [name: :worker_b]}, id: :worker_b)
+    ]
+
+    # :one_for_one is the default; spelled out for clarity.
+    Supervisor.init(children, strategy: :one_for_one)
+  end
+end
+
+# Demonstrate supervision with real assertions
+IO.puts("=== BasicSupervisor Demo ===")
+{:ok, _sup} = BasicSupervisor.Supervisor.start_link()
+
+# Verify both workers are running
+assert Process.whereis(:worker_a) != nil
+assert Process.whereis(:worker_b) != nil
+
+old_a = Process.whereis(:worker_a)
+old_b = Process.whereis(:worker_b)
+
+# Bump and verify state
+BasicSupervisor.Worker.bump(:worker_a)
+BasicSupervisor.Worker.bump(:worker_a)
+assert BasicSupervisor.Worker.value(:worker_a) == 2
+assert BasicSupervisor.Worker.value(:worker_b) == 0
+
+IO.puts("Supervisor started both workers successfully!")
+IO.puts("Worker A counter: #{BasicSupervisor.Worker.value(:worker_a)}")
+IO.puts("Worker B counter: #{BasicSupervisor.Worker.value(:worker_b)}")
+IO.puts("All supervision assertions passed!")
+```
+
+
 ## Resources
 
 - [`Supervisor` — Elixir stdlib](https://hexdocs.pm/elixir/Supervisor.html)

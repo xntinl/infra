@@ -639,6 +639,268 @@ validate in your constructor before creating.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule UserSchema do
+  @moduledoc """
+  Type-safe user domain model with validated construction.
+
+  Uses @enforce_keys for required fields, a custom new/1 constructor
+  with validation, and an update/2 function that re-validates.
+  This is the pattern used in production Elixir code before you
+  introduce Ecto — and sometimes instead of it.
+  """
+
+  @enforce_keys [:email, :name]
+  defstruct [
+    :email,
+    :name,
+    :phone,
+    age: nil,
+    role: :user,
+    active: true,
+    metadata: %{}
+  ]
+
+  @type t :: %__MODULE__{
+          email: String.t(),
+          name: String.t(),
+          phone: String.t() | nil,
+          age: pos_integer() | nil,
+          role: :user | :admin | :moderator,
+          active: boolean(),
+          metadata: map()
+        }
+
+  @valid_roles [:user, :admin, :moderator]
+
+  @doc """
+  Creates a validated User struct from a keyword list or map.
+
+  Returns {:ok, %UserSchema{}} on success, {:error, errors} on failure.
+  Errors is a map of field => [error_messages].
+
+  ## Examples
+
+      iex> {:ok, user} = UserSchema.new(email: "alice@example.com", name: "Alice")
+      iex> user.role
+      :user
+
+      iex> {:error, errors} = UserSchema.new(email: "", name: "")
+      iex> Map.has_key?(errors, :email)
+      true
+
+      iex> {:error, errors} = UserSchema.new([])
+      iex> Map.has_key?(errors, :email)
+      true
+
+  """
+  @spec new(keyword() | map()) :: {:ok, t()} | {:error, map()}
+  def new(attrs) when is_list(attrs) do
+    attrs |> Map.new() |> new()
+  end
+
+  def new(attrs) when is_map(attrs) do
+    changeset = %{
+      email: attrs[:email] || attrs["email"],
+      name: attrs[:name] || attrs["name"],
+      phone: attrs[:phone] || attrs["phone"],
+      age: attrs[:age] || attrs["age"],
+      role: attrs[:role] || attrs["role"] || :user,
+      active: if(Map.has_key?(attrs, :active), do: attrs[:active], else: true),
+      metadata: attrs[:metadata] || attrs["metadata"] || %{}
+    }
+
+    case validate(changeset) do
+      :ok ->
+        {:ok, struct!(__MODULE__, changeset)}
+
+      {:error, errors} ->
+        {:error, errors}
+    end
+  end
+
+  @doc """
+  Updates an existing user with new attributes and re-validates.
+
+  Only the provided fields are updated; others remain unchanged.
+
+  ## Examples
+
+      iex> {:ok, user} = UserSchema.new(email: "alice@example.com", name: "Alice")
+      iex> {:ok, updated} = UserSchema.update(user, name: "Alice Smith")
+      iex> updated.name
+      "Alice Smith"
+      iex> updated.email
+      "alice@example.com"
+
+      iex> {:ok, user} = UserSchema.new(email: "alice@example.com", name: "Alice")
+      iex> {:error, errors} = UserSchema.update(user, email: "")
+      iex> Map.has_key?(errors, :email)
+      true
+
+  """
+  @spec update(t(), keyword() | map()) :: {:ok, t()} | {:error, map()}
+  def update(%__MODULE__{} = user, attrs) when is_list(attrs) do
+    update(user, Map.new(attrs))
+  end
+
+  def update(%__MODULE__{} = user, attrs) when is_map(attrs) do
+    merged = user |> Map.from_struct() |> Map.merge(attrs)
+
+    case validate(merged) do
+      :ok ->
+        {:ok, struct!(__MODULE__, merged)}
+
+      {:error, errors} ->
+        {:error, errors}
+    end
+  end
+
+  @doc """
+  Returns true if the user has admin privileges.
+
+  Pattern matches on the struct in the function head — only accepts
+  UserSchema structs, not plain maps.
+
+  ## Examples
+
+      iex> {:ok, user} = UserSchema.new(email: "a@b.com", name: "A", role: :admin)
+      iex> UserSchema.admin?(user)
+      true
+
+      iex> {:ok, user} = UserSchema.new(email: "a@b.com", name: "A")
+      iex> UserSchema.admin?(user)
+      false
+
+  """
+  @spec admin?(t()) :: boolean()
+  def admin?(%__MODULE__{role: :admin}), do: true
+  def admin?(%__MODULE__{}), do: false
+
+  @doc """
+  Returns true if the user account is active.
+  """
+  @spec active?(t()) :: boolean()
+  def active?(%__MODULE__{active: true}), do: true
+  def active?(%__MODULE__{}), do: false
+
+  @doc """
+  Deactivates a user account. Returns a new struct (immutable).
+
+  ## Examples
+
+      iex> {:ok, user} = UserSchema.new(email: "a@b.com", name: "A")
+      iex> deactivated = UserSchema.deactivate(user)
+      iex> deactivated.active
+      false
+
+  """
+  @spec deactivate(t()) :: t()
+  def deactivate(%__MODULE__{} = user) do
+    %__MODULE__{user | active: false}
+  end
+
+  @doc """
+  Adds metadata to a user without overwriting existing keys.
+
+  ## Examples
+
+      iex> {:ok, user} = UserSchema.new(email: "a@b.com", name: "A", metadata: %{source: "web"})
+      iex> updated = UserSchema.add_metadata(user, %{campaign: "q1"})
+      iex> updated.metadata
+      %{source: "web", campaign: "q1"}
+
+  """
+  @spec add_metadata(t(), map()) :: t()
+  def add_metadata(%__MODULE__{metadata: existing} = user, new_meta) when is_map(new_meta) do
+    %__MODULE__{user | metadata: Map.merge(existing, new_meta)}
+  end
+
+  # ---------------------------------------------------------------------------
+  # Private — validation
+  # ---------------------------------------------------------------------------
+
+  @spec validate(map()) :: :ok | {:error, map()}
+  defp validate(changeset) do
+    errors =
+      %{}
+      |> validate_required(changeset, :email)
+      |> validate_required(changeset, :name)
+      |> validate_email_format(changeset)
+      |> validate_age(changeset)
+      |> validate_role(changeset)
+      |> validate_name_length(changeset)
+
+    case errors do
+      empty when map_size(empty) == 0 -> :ok
+      errors -> {:error, errors}
+    end
+  end
+
+  @spec validate_required(map(), map(), atom()) :: map()
+  defp validate_required(errors, changeset, field) do
+    value = changeset[field]
+
+    if is_nil(value) or (is_binary(value) and String.trim(value) == "") do
+      add_error(errors, field, "is required")
+    else
+      errors
+    end
+  end
+
+  @spec validate_email_format(map(), map()) :: map()
+  defp validate_email_format(errors, %{email: email}) when is_binary(email) do
+    if String.contains?(email, "@") and String.contains?(email, ".") do
+      errors
+    else
+      add_error(errors, :email, "must be a valid email address")
+    end
+  end
+
+  defp validate_email_format(errors, _changeset), do: errors
+
+  @spec validate_age(map(), map()) :: map()
+  defp validate_age(errors, %{age: nil}), do: errors
+
+  defp validate_age(errors, %{age: age}) when is_integer(age) and age > 0 and age < 150 do
+    errors
+  end
+
+  defp validate_age(errors, %{age: _age}) do
+    add_error(errors, :age, "must be a positive integer less than 150")
+  end
+
+  @spec validate_role(map(), map()) :: map()
+  defp validate_role(errors, %{role: role}) when role in @valid_roles, do: errors
+
+  defp validate_role(errors, %{role: _role}) do
+    add_error(errors, :role, "must be one of: #{inspect(@valid_roles)}")
+  end
+
+  @spec validate_name_length(map(), map()) :: map()
+  defp validate_name_length(errors, %{name: name}) when is_binary(name) do
+    len = String.length(name)
+
+    cond do
+      len < 1 -> add_error(errors, :name, "is too short")
+      len > 100 -> add_error(errors, :name, "is too long (max 100 characters)")
+      true -> errors
+    end
+  end
+
+  defp validate_name_length(errors, _), do: errors
+
+  @spec add_error(map(), atom(), String.t()) :: map()
+  defp add_error(errors, field, message) do
+    Map.update(errors, field, [message], fn existing -> [message | existing] end)
+  end
+end
+```
+
 ## Resources
 
 - [Structs — Elixir Getting Started](https://elixir-lang.org/getting-started/structs.html)

@@ -625,6 +625,231 @@ a meaningful transformation step.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Etl do
+  @moduledoc """
+  Extract-Transform-Load pipeline using the pipe operator.
+
+  Each step in the ETL process is a function that takes data as its
+  first argument and returns transformed data. This makes the entire
+  pipeline expressible as a single pipe chain.
+  """
+
+  @doc """
+  Runs the complete ETL pipeline from raw CSV to structured output.
+
+  ## Examples
+
+      iex> csv = "name,age,email\\nAlice,30,alice@example.com\\nBob,invalid,bob@example.com"
+      iex> {:ok, result} = Etl.run(csv)
+      iex> length(result.valid_records)
+      1
+      iex> hd(result.valid_records)["name"]
+      "alice"
+
+  """
+  @spec run(String.t()) :: {:ok, map()} | {:error, String.t()}
+  def run(csv_text) when is_binary(csv_text) do
+    csv_text
+    |> extract()
+    |> transform()
+    |> load()
+  end
+
+  @doc """
+  Extracts data: parses CSV text into a list of maps.
+
+  The first row is used as headers. Each subsequent row becomes a
+  map with header keys.
+
+  ## Examples
+
+      iex> Etl.extract("name,age\\nAlice,30\\nBob,25")
+      [%{"name" => "Alice", "age" => "30"}, %{"name" => "Bob", "age" => "25"}]
+
+      iex> Etl.extract("")
+      []
+
+  """
+  @spec extract(String.t()) :: [map()]
+  def extract(csv_text) when is_binary(csv_text) do
+    csv_text
+    |> String.trim()
+    |> String.split("\n", trim: true)
+    |> parse_csv()
+  end
+
+  @doc """
+  Transforms data: normalizes values, casts types, and marks validity.
+
+  Each record gets:
+    - String fields trimmed and lowercased
+    - "age" field cast to integer
+    - "email" field validated
+    - A "_valid" boolean field
+
+  ## Examples
+
+      iex> records = [%{"name" => " Alice ", "age" => "30", "email" => "a@b.com"}]
+      iex> [transformed] = Etl.transform(records)
+      iex> transformed["name"]
+      "alice"
+      iex> transformed["age"]
+      30
+
+  """
+  @spec transform([map()]) :: [map()]
+  def transform(records) when is_list(records) do
+    records
+    |> Enum.map(&normalize_strings/1)
+    |> Enum.map(&cast_age/1)
+    |> Enum.map(&validate_email/1)
+    |> Enum.map(&mark_validity/1)
+  end
+
+  @doc """
+  Loads data: separates valid from invalid records and builds output.
+
+  ## Examples
+
+      iex> records = [
+      ...>   %{"name" => "alice", "age" => 30, "email" => "a@b.com", "_valid" => true},
+      ...>   %{"name" => "bob", "age" => nil, "email" => "b@c.com", "_valid" => false}
+      ...> ]
+      iex> {:ok, result} = Etl.load(records)
+      iex> length(result.valid_records)
+      1
+      iex> length(result.invalid_records)
+      1
+
+  """
+  @spec load([map()]) :: {:ok, map()}
+  def load(records) when is_list(records) do
+    {valid, invalid} =
+      records
+      |> Enum.split_with(fn record -> record["_valid"] == true end)
+
+    output = %{
+      valid_records: Enum.map(valid, &strip_internal_fields/1),
+      invalid_records: Enum.map(invalid, &strip_internal_fields/1),
+      stats: %{
+        total: length(records),
+        valid: length(valid),
+        invalid: length(invalid)
+      }
+    }
+
+    {:ok, output}
+  end
+
+  @doc """
+  Converts the output to a JSON string.
+
+  ## Examples
+
+      iex> data = %{valid_records: [%{"name" => "alice"}], invalid_records: [], stats: %{total: 1, valid: 1, invalid: 0}}
+      iex> {:ok, json} = Etl.to_json(data)
+      iex> is_binary(json)
+      true
+
+  """
+  @spec to_json(map()) :: {:ok, String.t()} | {:error, String.t()}
+  def to_json(data) when is_map(data) do
+    case Jason.encode(data, pretty: true) do
+      {:ok, json} -> {:ok, json}
+      {:error, reason} -> {:error, "JSON encoding failed: #{inspect(reason)}"}
+    end
+  end
+
+  # --- Private: CSV parsing ---
+
+  @spec parse_csv([String.t()]) :: [map()]
+  defp parse_csv([]), do: []
+  defp parse_csv([_header_only]), do: []
+
+  defp parse_csv([header_line | data_lines]) do
+    headers =
+      header_line
+      |> String.split(",")
+      |> Enum.map(&String.trim/1)
+
+    data_lines
+    |> Enum.map(fn line ->
+      values =
+        line
+        |> String.split(",")
+        |> Enum.map(&String.trim/1)
+
+      headers
+      |> Enum.zip(values)
+      |> Map.new()
+    end)
+  end
+
+  # --- Private: transformation steps ---
+
+  @spec normalize_strings(map()) :: map()
+  defp normalize_strings(record) do
+    record
+    |> Enum.map(fn
+      {key, value} when is_binary(value) ->
+        {key, value |> String.trim() |> String.downcase()}
+
+      pair ->
+        pair
+    end)
+    |> Map.new()
+  end
+
+  @spec cast_age(map()) :: map()
+  defp cast_age(%{"age" => age_str} = record) when is_binary(age_str) do
+    case Integer.parse(age_str) do
+      {age, ""} when age > 0 and age < 150 -> Map.put(record, "age", age)
+      _ -> Map.put(record, "age", nil)
+    end
+  end
+
+  defp cast_age(record), do: record
+
+  @spec validate_email(map()) :: map()
+  defp validate_email(%{"email" => email} = record) when is_binary(email) do
+    valid =
+      String.contains?(email, "@") and
+        String.contains?(email, ".") and
+        byte_size(email) > 5
+
+    Map.put(record, "_email_valid", valid)
+  end
+
+  defp validate_email(record) do
+    Map.put(record, "_email_valid", false)
+  end
+
+  @spec mark_validity(map()) :: map()
+  defp mark_validity(record) do
+    valid =
+      record["age"] != nil and
+        record["name"] != nil and
+        byte_size(record["name"] || "") > 0 and
+        record["_email_valid"] == true
+
+    record
+    |> Map.put("_valid", valid)
+    |> Map.delete("_email_valid")
+  end
+
+  @spec strip_internal_fields(map()) :: map()
+  defp strip_internal_fields(record) do
+    record
+    |> Map.reject(fn {key, _val} -> String.starts_with?(key, "_") end)
+  end
+end
+```
+
 ## Resources
 
 - [Pipe operator — Elixir Getting Started](https://elixir-lang.org/getting-started/enumerables-and-streams.html#the-pipe-operator)

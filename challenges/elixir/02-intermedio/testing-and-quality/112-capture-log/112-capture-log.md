@@ -306,6 +306,83 @@ for human-readable messages.
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule PaymentGateway do
+    @moduledoc """
+    A stub payment gateway that logs each attempt. Used to demonstrate
+    `ExUnit.CaptureLog`. Deterministic — no randomness.
+    """
+    require Logger
+
+    @type amount :: pos_integer()
+    @type result :: {:ok, String.t()} | {:error, :declined | :invalid_amount}
+
+    @spec charge(String.t(), amount()) :: result()
+    def charge(_user_id, amount) when amount <= 0 do
+      Logger.warning("payment rejected: invalid_amount amount=#{amount}")
+      {:error, :invalid_amount}
+    end
+
+    def charge(user_id, amount) when rem(amount, 13) == 0 do
+      Logger.error("payment declined user_id=#{user_id} amount=#{amount}")
+      {:error, :declined}
+    end
+
+    def charge(user_id, amount) do
+      Logger.info("payment ok user_id=#{user_id} amount=#{amount}")
+      {:ok, "txn_#{user_id}_#{amount}"}
+    end
+  end
+
+  def main do
+    require ExUnit.CaptureLog
+  
+    IO.puts("=== CaptureLog Demo ===\n")
+  
+    # Demo 1: Successful charge (info level)
+    IO.puts("1. charge('user1', 100):")
+    logs = ExUnit.CaptureLog.capture_log(fn ->
+      result = PaymentGateway.charge("user1", 100)
+      IO.puts("   Result: #{inspect(result)}")
+      assert result == {:ok, "txn_user1_100"}
+    end)
+    IO.puts("   Log output:")
+    IO.write(logs |> String.trim())
+  
+    # Demo 2: Declined charge (error level)
+    IO.puts("\n\n2. charge('user2', 13):")
+    logs = ExUnit.CaptureLog.capture_log(fn ->
+      result = PaymentGateway.charge("user2", 13)
+      IO.puts("   Result: #{inspect(result)}")
+      assert result == {:error, :declined}
+    end)
+    IO.puts("   Log output:")
+    IO.write(logs |> String.trim())
+  
+    # Demo 3: Invalid amount (warning level)
+    IO.puts("\n\n3. charge('user3', -5):")
+    logs = ExUnit.CaptureLog.capture_log(fn ->
+      result = PaymentGateway.charge("user3", -5)
+      IO.puts("   Result: #{inspect(result)}")
+      assert result == {:error, :invalid_amount}
+    end)
+    IO.puts("   Log output:")
+    IO.write(logs |> String.trim())
+  
+    IO.puts("\n\n✓ All CaptureLog demos completed!")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`ExUnit.CaptureLog`](https://hexdocs.pm/ex_unit/ExUnit.CaptureLog.html)

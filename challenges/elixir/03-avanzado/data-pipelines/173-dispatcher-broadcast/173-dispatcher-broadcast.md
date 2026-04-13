@@ -48,6 +48,25 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
+
+**Pipeline-specific insight:**
+Streams are lazy; Enum is eager. Use Stream for data larger than RAM or when you're building intermediate stages. Use Enum when the collection is small or you need side effects at each step. Mixing them carelessly results in performance cliffs.
 ### 1. How BroadcastDispatcher computes demand
 
 ```
@@ -376,20 +395,91 @@ rate while the slow consumer dropped.
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
 
-- [GenStage.BroadcastDispatcher — HexDocs](https://hexdocs.pm/gen_stage/GenStage.BroadcastDispatcher.html)
-- [GenStage announcement — José Valim](https://elixir-lang.org/blog/2016/07/14/announcing-genstage/)
-- [Flow and GenStage in production — Dashbit](https://dashbit.co/blog/flow-and-genstage-in-production)
-- [GenStage source — dispatcher_broadcast.ex](https://github.com/elixir-lang/gen_stage/blob/main/lib/gen_stage/broadcast_dispatcher.ex)
-- [Designing Elixir Systems with OTP — ch. Pipelines](https://pragprog.com/titles/jgotp/)
-
-### Dependencies (mix.exs)
+## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # Add dependencies here
-  ]
+defmodule BroadcastDispatcher.RiskEngine do
+  use GenStage
+
+  def start_link(opts), do: GenStage.start_link(__MODULE__, opts, name: __MODULE__)
+
+  @impl true
+  def init(_opts) do
+    {:consumer, %{n: 0},
+     subscribe_to: [{BroadcastDispatcher.TickProducer, max_demand: 500}]}
+  end
+
+  @impl true
+  def handle_events(events, _from, state) do
+    {:noreply, [], %{state | n: state.n + length(events)}}
+  end
 end
+
+defmodule BroadcastDispatcher.WSBroadcaster do
+  use GenStage
+
+  def start_link(opts), do: GenStage.start_link(__MODULE__, opts, name: __MODULE__)
+
+  @impl true
+  def init(_opts) do
+    selector = fn %{price: p} -> p > 0 end
+
+    {:consumer, %{n: 0},
+     subscribe_to: [
+       {BroadcastDispatcher.TickProducer, max_demand: 200, selector: selector}
+     ]}
+  end
+
+  @impl true
+  def handle_events(events, _from, state) do
+    # simulate some work
+    :timer.sleep(div(length(events), 2))
+    {:noreply, [], %{state | n: state.n + length(events)}}
+  end
+end
+
+defmodule BroadcastDispatcher.Auditor do
+  use GenStage
+
+  def start_link(opts), do: GenStage.start_link(__MODULE__, opts, name: __MODULE__)
+
+  @impl true
+  def init(_opts) do
+    {:consumer, %{n: 0},
+     subscribe_to: [{BroadcastDispatcher.TickProducer, max_demand: 1_000}]}
+  end
+
+  @impl true
+  def handle_events(events, _from, state) do
+    {:noreply, [], %{state | n: state.n + length(events)}}
+  end
+end
+
+defmodule Main do
+  def main do
+      # Demonstrate BroadcastDispatcher: all consumers receive all events
+      {:ok, p} = GenStage.start_link(GenstageAdvanced.IngestProducer, 
+        [dispatcher: GenStage.BroadcastDispatcher, buffer_size: 100], [])
+      {:ok, c1} = GenStage.start_link(GenstageAdvanced.Aggregator, 
+        [subscribe_to: [{p, max_demand: 10}]], [])
+      {:ok, c2} = GenStage.start_link(GenstageAdvanced.Aggregator, 
+        [subscribe_to: [{p, max_demand: 10}]], [])
+
+      Process.sleep(20)
+
+      # Push events
+      for i <- 1..5, do: GenStage.cast(p, {:push, %{id: i, payload: "msg", ts: 0}})
+
+      Process.sleep(100)
+
+      count1 = :sys.get_state(c1).count
+      count2 = :sys.get_state(c2).count
+
+      IO.puts("✓ Broadcast dispatcher: consumer1=#{count1}, consumer2=#{count2}")
+      assert count1 > 0 and count2 > 0, "Both consumers received events"
+  end
+end
+
+Main.main()
 ```

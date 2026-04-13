@@ -363,6 +363,67 @@ buffer will save you — you'll just delay the inevitable overflow by
 
 ---
 
+## Executable Example
+
+Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
+
+```elixir
+defmodule Main do
+  defmodule BufferDemand.PushProducer do
+    @moduledoc """
+    A push-style GenStage Producer. External callers send events via
+    `emit/2`; the producer forwards immediately if demand exists, otherwise
+    buffers up to `buffer_size`. Older events are dropped on overflow
+    (`:buffer_keep, :last`) — common for telemetry use cases where newer
+    is more valuable.
+    """
+
+    use GenStage
+
+    @default_buffer_size 100
+
+    def start_link(opts \\ []) do
+      buffer_size = Keyword.get(opts, :buffer_size, @default_buffer_size)
+      buffer_keep = Keyword.get(opts, :buffer_keep, :last)
+      GenStage.start_link(__MODULE__, {buffer_size, buffer_keep}, name: __MODULE__)
+    end
+
+    @spec emit(GenServer.server(), any()) :: :ok
+    def emit(producer \\ __MODULE__, event), do: GenStage.cast(producer, {:emit, event})
+
+    @impl true
+    def init({buffer_size, buffer_keep}) do
+      {:producer, :no_state, buffer_size: buffer_size, buffer_keep: buffer_keep}
+    end
+
+    @impl true
+    def handle_cast({:emit, event}, state) do
+      # Returning [event] gives GenStage the event; it either dispatches it
+      # immediately to satisfy pending demand or buffers it. We never touch
+      # the buffer ourselves.
+      {:noreply, [event], state}
+    end
+
+    @impl true
+    def handle_demand(_demand, state) do
+      # Pull-producer contract requires this callback. In a pure push
+      # producer we have nothing to generate on demand — the buffer handles
+      # it. Return no events; GenStage will record the demand and use it
+      # when the next push arrives.
+      {:noreply, [], state}
+    end
+  end
+
+  def main do
+    IO.puts("BufferDemand OK")
+  end
+
+end
+
+Main.main()
+```
+
+
 ## Resources
 
 - [`GenStage` — hexdocs](https://hexdocs.pm/gen_stage/GenStage.html)

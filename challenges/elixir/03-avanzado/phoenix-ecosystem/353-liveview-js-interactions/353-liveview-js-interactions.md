@@ -33,6 +33,22 @@ Custom `phx-hook` hooks live in a separate JS bundle; they require ESBuild, impo
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Commands are data
 
 `JS.show(to: "#modal")` returns `%Phoenix.LiveView.JS{ops: [["show", %{"to" => "#modal"}]]}`. Piping `JS` commands appends to `:ops`. The struct is rendered into `phx-click`, `phx-keydown`, `phx-window-keyup`, etc.
@@ -321,8 +337,91 @@ Phoenix's conn struct represents an HTTP request/response in flight, accumulatin
 
 You are asked to implement "inline edit" on a table cell: click shows an input, Enter saves, Escape reverts. Sketch (in Elixir) the `JS` command chains for each of those three actions. Which of them need a server round trip and which are purely client?
 
-## Resources
 
-- [Phoenix.LiveView.JS — hexdocs](https://hexdocs.pm/phoenix_live_view/Phoenix.LiveView.JS.html)
-- [`JS.transition` source](https://github.com/phoenixframework/phoenix_live_view/blob/main/lib/phoenix_live_view/js.ex)
-- [LV client runtime reference](https://hexdocs.pm/phoenix_live_view/js-interop.html)
+## Executable Example
+
+```elixir
+defmodule UiKitWeb.GalleryLive do
+  use Phoenix.LiveView
+  alias Phoenix.LiveView.JS
+
+  @impl true
+  def mount(_params, _session, socket) do
+    {:ok, assign(socket, tab: "photos", saved?: false)}
+  end
+
+  @impl true
+  def handle_event("change_tab", %{"tab" => tab}, socket) do
+    {:noreply, assign(socket, tab: tab)}
+  end
+
+  def handle_event("save", %{"name" => name}, socket) do
+    # Simulated persistence. Broadcast could go here in real code.
+    {:noreply, assign(socket, saved?: true, saved_name: name)}
+  end
+
+  @impl true
+  def render(assigns) do
+    ~H"""
+    <div>
+      <button phx-click={show_modal("modal-new")}>New item</button>
+
+      <div id="modal-new" class="modal hidden" phx-click-away={hide_modal("modal-new")}
+           phx-window-keydown={hide_modal("modal-new")} phx-key="escape">
+        <form phx-submit={JS.push("save") |> hide_modal("modal-new")}>
+          <input name="name" phx-mounted={JS.focus()} />
+          <button type="submit">Save</button>
+          <button type="button" phx-click={hide_modal("modal-new")}>Cancel</button>
+        </form>
+      </div>
+
+      <div id="toast" class="toast hidden">Saved!</div>
+
+      <nav>
+        <button :for={t <- ~w(photos videos audio)}
+                phx-click={JS.push("change_tab", value: %{tab: t})}>
+          {String.capitalize(t)}
+        </button>
+      </nav>
+
+      <section id={"panel-" <> @tab}>
+        Current tab: {@tab}
+      </section>
+
+      <div :if={@saved?} id="flash-holder" phx-mounted={show_toast()}>
+        {@saved_name} saved
+      </div>
+    </div>
+    """
+  end
+
+  # --- JS command helpers ---------------------------------------------------
+
+  defp show_modal(id) do
+    JS.remove_class("hidden", to: "#" <> id)
+    |> JS.transition({"ease-out duration-200", "opacity-0", "opacity-100"}, to: "#" <> id)
+    |> JS.focus_first(to: "#" <> id)
+  end
+
+  defp hide_modal(id) do
+    JS.transition({"ease-in duration-150", "opacity-100", "opacity-0"}, to: "#" <> id)
+    |> JS.add_class("hidden", to: "#" <> id, transition: {"ease-in duration-150", "", ""})
+  end
+
+  defp show_toast do
+    JS.remove_class("hidden", to: "#toast")
+    |> JS.transition({"ease-out duration-200", "opacity-0", "opacity-100"}, to: "#toast")
+    |> JS.add_class("hidden", to: "#toast", time: 3_000)
+  end
+end
+
+defmodule Main do
+  def main do
+    IO.puts("✓ LiveView.JS for Client Interactions without Custom JavaScript")
+  - Demonstrating core concepts
+    - Implementation patterns and best practices
+  end
+end
+
+Main.main()
+```

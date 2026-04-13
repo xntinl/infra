@@ -36,6 +36,22 @@ Short-circuits (health check, ACME challenge) also belong at the endpoint: you d
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. Endpoint plug order
 
 `Phoenix.Endpoint` is itself a plug pipeline. The default order (from `mix phx.new`):
@@ -460,9 +476,91 @@ Stream-based pipelines in Elixir achieve backpressure and composability by defer
 
 A new developer wants to add CORS handling. Where in the pipeline does `Corsica` belong relative to `Plug.Parsers` and the router? Justify by describing what happens on a preflight OPTIONS request if the ordering is wrong.
 
-## Resources
 
-- [Plug — hexdocs](https://hexdocs.pm/plug/)
-- [Phoenix.Endpoint — hexdocs](https://hexdocs.pm/phoenix/Phoenix.Endpoint.html)
-- [`Plug.Parsers` :body_reader](https://hexdocs.pm/plug/Plug.Parsers.html)
-- [OWASP Secure Headers project](https://owasp.org/www-project-secure-headers/)
+## Executable Example
+
+```elixir
+defmodule EdgeGatewayWeb.PlugsTest do
+  use ExUnit.Case, async: true
+  use Plug.Test
+
+  alias EdgeGatewayWeb.Plugs.{HealthCheck, RequestId, SecurityHeaders, RawBodyReader}
+
+  describe "HealthCheck" do
+    test "short-circuits /health" do
+      conn = conn(:get, "/health") |> HealthCheck.call("/health")
+      assert conn.halted
+      assert conn.status == 200
+      assert conn.resp_body =~ "\"status\":\"ok\""
+    end
+
+    test "passes through other paths" do
+      conn = conn(:get, "/api/users") |> HealthCheck.call("/health")
+      refute conn.halted
+    end
+  end
+
+  describe "RequestId" do
+    test "preserves upstream id within length bounds" do
+      conn =
+        conn(:get, "/")
+        |> put_req_header("x-request-id", "upstream-abc")
+        |> RequestId.call([])
+
+      assert conn.assigns.request_id == "upstream-abc"
+      assert Plug.Conn.get_resp_header(conn, "x-request-id") == ["upstream-abc"]
+    end
+
+    test "generates one when absent" do
+      conn = conn(:get, "/") |> RequestId.call([])
+      assert byte_size(conn.assigns.request_id) > 0
+    end
+
+    test "discards malicious overlong ids" do
+      giant = String.duplicate("a", 10_000)
+      conn = conn(:get, "/") |> put_req_header("x-request-id", giant) |> RequestId.call([])
+      refute conn.assigns.request_id == giant
+    end
+  end
+
+  describe "SecurityHeaders" do
+    test "headers are added on send" do
+      conn =
+        conn(:get, "/")
+        |> SecurityHeaders.call([])
+        |> Plug.Conn.send_resp(200, "")
+
+      assert ["max-age=" <> _] = Plug.Conn.get_resp_header(conn, "strict-transport-security")
+      assert Plug.Conn.get_resp_header(conn, "x-frame-options") == ["DENY"]
+    end
+  end
+
+  describe "RawBodyReader" do
+    test "caches body on webhook paths" do
+      conn =
+        conn(:post, "/webhooks/stripe", "{\"k\":1}")
+        |> put_req_header("content-type", "application/json")
+
+      {:ok, body, conn} = RawBodyReader.read_body(conn, [])
+      assert body == "{\"k\":1}"
+      assert conn.assigns.raw_body == "{\"k\":1}"
+    end
+
+    test "does not cache on non-webhook paths" do
+      conn = conn(:post, "/api/users", "{}")
+      {:ok, _body, conn} = RawBodyReader.read_body(conn, [])
+      refute Map.has_key?(conn.assigns, :raw_body)
+    end
+  end
+end
+
+defmodule Main do
+  def main do
+    IO.puts("✓ Phoenix Endpoint with a Custom Plug Pipeline")
+  - Demonstrating core concepts
+    - Implementation patterns and best practices
+  end
+end
+
+Main.main()
+```

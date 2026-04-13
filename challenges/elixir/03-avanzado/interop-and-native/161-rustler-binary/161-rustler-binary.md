@@ -36,6 +36,22 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ## Core concepts
 
+
+
+---
+
+**Why this matters:**
+These concepts form the foundation of production Elixir systems. Understanding them deeply allows you to build fault-tolerant, scalable applications that operate correctly under load and failure.
+
+**Real-world use case:**
+This pattern appears in systems like:
+- Phoenix applications handling thousands of concurrent connections
+- Distributed data processing pipelines
+- Financial transaction systems requiring consistency and fault tolerance
+- Microservices communicating over unreliable networks
+
+**Common pitfall:**
+Many developers overlook that Elixir's concurrency model differs fundamentally from threads. Processes are isolated; shared mutable state does not exist. Trying to force shared-memory patterns leads to deadlocks, race conditions, or silently incorrect behavior. Always think in terms of message passing and immutability.
 ### 1. BEAM binary anatomy
 
 ```
@@ -343,11 +359,37 @@ Benchee.run(%{
 - If the expected load grew by 100×, which assumption in this design would break first — the data structure, the process model, or the failure handling? Justify.
 - What would you measure in production to decide whether this implementation is still the right one six months from now?
 
-## Resources
+## Executable Example
 
-- https://docs.rs/rustler/latest/rustler/struct.Binary.html — `Binary` API
-- https://docs.rs/rustler/latest/rustler/struct.OwnedBinary.html — `OwnedBinary`
-- https://www.erlang.org/doc/man/erl_nif.html#enif_inspect_binary — underlying C API
-- https://www.erlang.org/doc/efficiency_guide/binaryhandling.html — BEAM binary internals
-- https://github.com/elixir-nx/explorer — Rustler + big binaries in production
-- https://ferd.ca/erlang-s-big-deletions.html — sub-binary leak war story
+```elixir
+### Step 2: `native/rustler_binary_nif/src/lib.rs`
+
+**Objective**: Zero-copy borrow inputs via Binary<'a> and return OwnedBinary results to move multi-MB payloads without heap copies.
+
+
+
+### Step 3: `lib/rustler_binary/native.ex`
+
+**Objective**: Provide typed stubs with `:nif_not_loaded` so Dialyzer validates zero-copy binary ops even pre-compilation.
+
+
+
+### Step 4: `mix.exs`
+
+**Objective**: Register the `rustler_crates` entry in release mode so `mix compile` triggers `cargo build --release` and caches the artifact under `_build`.
+
+
+
+### Step 5: `test/rustler_binary_test.exs`
+
+**Objective**: Assert round-trip XOR symmetry and empty-mask rejection to catch regressions in lifetime handling and `BadArg` propagation across the FFI boundary.
+
+defmodule Main do
+  def main do
+      # Demonstrating 161-rustler-binary
+      :ok
+  end
+end
+
+Main.main()
+```
