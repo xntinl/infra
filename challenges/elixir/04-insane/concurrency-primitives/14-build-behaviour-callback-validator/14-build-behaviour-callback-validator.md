@@ -389,13 +389,18 @@ The `@after_compile` callback inspects the module's `__info__(:functions)` and c
 
 ```elixir
 def main do
-  IO.puts("======== 14 build behaviour callback validator ========")
-  IO.puts("Demonstrating core functionality")
+  IO.puts("======== 14-build-behaviour-callback-validator ========")
+  IO.puts("Build behaviour callback validator")
   IO.puts("")
+  
+  BehaviourCheck.CallbackLoader.start_link([])
+  IO.puts("BehaviourCheck.CallbackLoader started")
   
   IO.puts("Run: mix test")
 end
 ```
+
+
 
 ## Benchmark
 

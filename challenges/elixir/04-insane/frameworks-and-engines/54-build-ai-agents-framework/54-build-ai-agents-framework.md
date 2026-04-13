@@ -675,13 +675,18 @@ end
 
 ```elixir
 def main do
-  IO.puts("======== 54 build ai agents framework ========")
-  IO.puts("Demonstrating core functionality")
+  IO.puts("======== 54-build-ai-agents-framework ========")
+  IO.puts("Build ai agents framework")
   IO.puts("")
+  
+  AgentFramework.Tool.start_link([])
+  IO.puts("AgentFramework.Tool started")
   
   IO.puts("Run: mix test")
 end
 ```
+
+
 
 ## Benchmark
 

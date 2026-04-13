@@ -777,117 +777,18 @@ defmodule WorkflowEngine.DurabilityTest do
   end
 end
 ```
-
-
 ## Main Entry Point
 
 ```elixir
 def main do
-  IO.puts("======== 47 build workflow engine temporal like ========")
-  IO.puts("Demonstrating core functionality")
+  IO.puts("======== 47-build-workflow-engine-temporal-like ========")
+  IO.puts("Build Workflow Engine Temporal Like")
   IO.puts("")
+  
+  WorkflowEngine.Event.start_link([])
+  IO.puts("WorkflowEngine.Event started")
   
   IO.puts("Run: mix test")
 end
 ```
 
-## Benchmark
-
-```elixir
-# Minimal timing harness — replace with Benchee for production measurement.
-{time_us, _result} = :timer.tc(fn ->
-  # exercise the hot path N times
-  for _ <- 1..10_000, do: :ok
-end)
-
-IO.puts("average: #{time_us / 10_000} µs per op")
-```
-
-## Quick start
-
-To run the workflow engine:
-
-```bash
-# Set up the project
-mix new workflow_engine
-cd workflow_engine
-mkdir -p lib/workflow_engine test bench
-
-# Install dependencies (no external deps — pure Elixir)
-mix deps.get
-
-# Run tests
-mix test
-
-# Observe a workflow's durability across simulated restarts
-iex> WorkflowEngine.History.init()
-iex> {:ok, pid} = WorkflowEngine.Worker.start_link(
-  workflow_id: "test-1",
-  module: MyWorkflow,
-  args: %{amount: 100}
-)
-iex> Process.exit(pid, :kill)
-iex> {:ok, pid2} = WorkflowEngine.Worker.start_link(
-  workflow_id: "test-1",
-  module: MyWorkflow,
-  args: %{amount: 100}
-)
-# Worker reads history, replays deterministically, resumes where it left off
-iex> Process.sleep(500)
-iex> WorkflowEngine.History.read("test-1") |> Enum.map(& &1.type)
-[:workflow_started, :activity_scheduled, :activity_completed, :workflow_completed]
-```
-
-Expected output: Workflow resumes at the exact point it crashed and produces the same result; no activities are re-executed (their results come from history); on process restart, deterministic replay handles all non-determinism.
-
-## Deep Dive: Durable Workflow Orchestration via Event Sourcing and Deterministic Replay
-
-A workflow engine's job is deceptively hard: coordinate multiple external services (payment processors, inventory systems, email), survive crashes and restarts, retry failed steps, and guarantee the workflow completes exactly once even if the orchestrator process dies mid-flow.
-
-**Why not just call the services directly?** Direct calls lose state on crash. If a charge succeeds but inventory fails, you must refund the charge — but if the orchestrator crashes, you lose the fact that the charge succeeded and might double-charge the customer.
-
-**Why event sourcing?** Every side effect (call to a service, timer firing, signal receipt) is recorded as an immutable event. When the process crashes and restarts, it reads the event history, replays the workflow function, and resumes from the last recorded event. The replay is deterministic — it returns the same results as the original run — so decisions made during replay are correct without re-executing activities.
-
-**Why deterministic replay requires banning wall-clock time?** If workflow code calls `DateTime.utc_now()`, replay returns a different time than the original run. The workflow may take a different branch (e.g., if deadline_exceeded?). The solution: workflow code gets time from the `WorkflowStarted` event, guaranteeing the same value on every replay.
-
-**Why durable timers without live processes?** You cannot hold a BEAM process open for 7 days. Instead, `Workflow.sleep(days: 7)` records a `TimerStarted` event with a deadline, releases the process, and a timer service fires a `TimerFired` event when the deadline passes. The workflow resumes on the next heartbeat and continues from the timer-fired event.
-
-**Key invariant**: replay is idempotent. Running a workflow that has already completed (reading all its events and replaying) must not re-execute activities or produce duplicate side effects. Activities are idempotent on the server side (e.g., charge-with-idempotency-key), and the engine does not re-execute activities whose result is already in history.
-
-**Trade-off against Temporal**: Temporal persists to Cassandra and PostgreSQL, handles server-side scalability, and offers a polyglot SDK. This implementation uses ETS and is single-node. For a learning exercise and a system that must be self-contained in the Elixir cluster, that trade-off is acceptable.
-
----
-
-## Trade-off analysis
-
-| Concern | Temporal's approach | This implementation | Trade-off |
-|---|---|---|---|
-| Event storage | PostgreSQL + Cassandra | ETS + DETS | DETS is single-file; sufficient for single-node demo |
-| Worker coordination | Consistent hashing | `:pg` process groups | `:pg` lacks partition tolerance |
-| Deterministic sandbox | SDK wraps stdlib | Process dictionary + Sandbox module | Requires discipline; SDK approach is zero-overhead |
-| Timer granularity | Sub-second, timer cluster | Polling every 1s | Sufficient for business workflows |
-| Activity isolation | Separate worker processes | Task.start per activity | Same BEAM node is not true isolation |
-
-## Common production mistakes
-
-**Calling `DateTime.utc_now()` or `:rand.uniform/1` in workflow code.** During replay, these return different values, causing wrong branches and history corruption. All non-determinism must go through the sandbox.
-
-**Not making activities idempotent.** An activity that fails after producing a side effect (charged card, crashed before returning) will be retried. Use a server-side idempotency key stored in the event payload.
-
-**Holding the workflow GenServer open during a sleep.** The whole point of durable sleep is to release the process. If `Workflow.sleep/1` just calls `Process.sleep/1`, you hold a process for the entire duration.
-
-**Not validating `get_version` ranges on existing workflows.** If an in-flight workflow recorded version 1 and you deploy code expecting min version 2, replay reads version 1 which is now out of range. Raise a `NonDeterministicError`.
-
-**Concurrent replay from two workers.** If both replay and write conflicting events, use optimistic locking on the event sequence number.
-
-## Reflection
-
-A workflow runs for 6 months. During that time you deploy 40 code changes. How do you guarantee deterministic replay when the workflow code itself has changed? Sketch your versioning contract.
-
-## Resources
-
-- Temporal documentation -- https://docs.temporal.io
-- Garcia-Molina & Salem -- "Sagas" (1987) -- ACM SIGMOD
-- Martin Fowler -- "Event Sourcing" -- https://martinfowler.com/eaaDev/EventSourcing.html
-- Erlang DETS documentation -- https://www.erlang.org/doc/man/dets.html
-- Erlang `:pg` documentation -- https://www.erlang.org/doc/man/pg.html

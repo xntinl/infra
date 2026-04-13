@@ -635,127 +635,18 @@ mix test test/apigw/ --trace
 ### Why this works
 
 The design separates concerns along their real axes: what must be correct (the API gateway invariants), what must be fast (the hot path isolated from slow paths), and what must be evolvable (external contracts kept narrow). Each module has one job and fails loudly when given inputs outside its contract, so bugs surface near their source instead of as mysterious downstream symptoms. The tests exercise the invariants directly rather than implementation details, which keeps them useful across refactors.
-
-
 ## Main Entry Point
 
 ```elixir
 def main do
-  IO.puts("======== 34 build api gateway ========")
-  IO.puts("Demonstrating core functionality")
+  IO.puts("======== 34-build-api-gateway ========")
+  IO.puts("Build Api Gateway")
   IO.puts("")
+  
+  Apigw.CircuitBreaker.start_link([])
+  IO.puts("Apigw.CircuitBreaker started")
   
   IO.puts("Run: mix test")
 end
 ```
 
-## Benchmark
-
-```elixir
-# bench/apigw_bench.exs
-{:ok, _cache} = Apigw.Cache.start_link()
-{:ok, pool} = Apigw.Pool.start_link(
-  backends: [
-    %{id: "b1", host: "localhost", port: 8001, healthy: true, draining: false},
-    %{id: "b2", host: "localhost", port: 8002, healthy: true, draining: false}
-  ]
-)
-
-Benchee.run(%{
-  "auth_verify_jwt" => fn ->
-    token = make_test_jwt()
-    Apigw.Auth.JWT.verify(token, "test_secret")
-  end,
-  "cache_hit_etag" => fn ->
-    Apigw.Cache.get("/api/users", %{"if-none-match" => "abc123"})
-  end,
-  "circuit_breaker_check" => fn ->
-    Apigw.CircuitBreaker.check("b1")
-  end,
-  "rate_limiter_consume" => fn ->
-    {:ok, _} = Apigw.RateLimiter.consume("key_1", 1024)
-  end
-}, time: 10, warmup: 3)
-
-defp make_test_jwt do
-  header = Base.url_encode64(~s({"alg":"HS256"}), padding: false)
-  payload = Base.url_encode64(~s({"sub":"user1"}), padding: false)
-  sig = :crypto.mac(:hmac, :sha256, "secret", "#{header}.#{payload}") |> Base.url_encode64(padding: false)
-  "#{header}.#{payload}.#{sig}"
-end
-```
-
-## Quick start
-
-```bash
-# Start the application
-mix deps.get
-mix test
-
-# Or run the benchmark:
-mix run bench/apigw_bench.exs
-```
-
-Target: <500µs gateway overhead per request at p99 excluding upstream latency.
-
-## Key Concepts: Gateway Routing and Rate Limiting Protocols
-
-An API gateway is the composition of independent middleware layers. Each layer can short-circuit the request (auth failure → 401, rate limited → 429, circuit open → 503) without invoking subsequent layers.
-
-**Sliding-window rate limiting**: A naive fixed-window counter allows a burst at boundaries. With limit=100 req/s and a 1-second window, the first 100 requests at 0.999s and the next 100 at 1.001s consume 100 req/sec over a 2ms window. Sliding-window counting avoids this: track a list of request timestamps and drop requests older than the window size when counting. More precise but higher memory cost.
-
-**Lease-based rate limiting**: A single rate limiter process serializes all requests through a call. To scale, distribute the limit: each gateway node acquires a lease of `quota / N` from a central coordinator every few seconds. Within a lease period, the node enforces the limit locally with `:atomics`. Trade-off: short leases mean frequent coordinator hits; long leases mean a crashed node forfeits its tokens.
-
-**Circuit breaker half-open state**: Two-state breakers (open/closed) re-open immediately on timeout, causing thundering herd. The half-open state allows exactly one probe request through. Success closes the breaker for all instances; failure keeps it open. This "single probe" invariant prevents overwhelming a recovering backend.
-
-**Cache validation with ETags**: ETag headers allow resumable downloads and conditional GET. A client sends `If-None-Match: "abc"` and if the ETag matches, the server returns 304 (Not Modified) without the body. This saves bandwidth for large responses. ETags must be opaque to clients — any stable hash of the content is valid.
-
-**Production insight**: Gateways are strict about HTTP compliance. Missing Rate-Limit headers on a 429 leaves clients guessing when to retry. Wrong Cache-Control directives break browser caching. Missing CORS headers block web clients. Test your gateway against real browsers and clients, not just curl.
-
----
-
-## Trade-off analysis
-
-| Concern | Gateway-level (your impl) | Backend-level | External service |
-|---------|--------------------------|---------------|------------------|
-| Auth | centralized, consistent | per-service (risk of gaps) | IdP like Auth0 |
-| Rate limiting | per-key, no backend changes | harder to coordinate | Redis/Envoy |
-| Circuit breaking | protects backend from storms | self-protection only | Hystrix, Resilience4j |
-| Caching | transparent to backend | backend-aware cache | CDN (Cloudflare, etc.) |
-| Tracing | single injection point | manual per service | OpenTelemetry auto-instr |
-| Single point of failure | yes — must be HA | no | usually HA |
-
-Reflection: the gateway is a single point of failure. What changes would you make to run `apigw` in a 3-node cluster with no shared state except ETS? Which components require distributed coordination and which are safe to be node-local?
-
----
-
-## Common production mistakes
-
-**1. Circuit breaker that never transitions to half-open**
-If the `open_duration_ms` timer is reset on every incoming request (even rejected ones), the circuit never gets a chance to probe the backend. The timer must count from `opened_at`, not from the last rejected request.
-
-**2. Rate limit headers missing on denied requests**
-RFC 6585 and industry convention require `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `X-RateLimit-Reset` on ALL responses, not just successful ones. A 429 response without these headers leaves clients guessing when to retry.
-
-**3. JWT algorithm confusion attack**
-A token with `"alg": "none"` bypasses signature verification in naive implementations. Your `verify/2` must reject any algorithm not in an explicit allowlist (`["HS256", "RS256"]`). The `alg` field in the header is attacker-controlled.
-
-**4. Cache key collision between different routes**
-If two routes `/users?sort=name` and `/users?sort=email` map to the same cache key because query params are not normalized, one response pollutes the cache for the other. The cache key must include a canonical representation of the query string (sorted params, lowercase values).
-
-**5. Least-connections count going negative**
-When a backend dies mid-request, the connection count for that backend is never decremented if decrement happens in the response handler. Use `try/after` to guarantee decrement regardless of proxy outcome.
-
----
-
-## Reflection
-
-Your gateway sits between 200 microservices. How do you prevent a single misbehaving upstream from consuming all gateway goroutines/processes, and how does that policy interact with fairness across tenants?
-
-## Resources
-
-- [W3C Trace Context Specification](https://www.w3.org/TR/trace-context/) — the `traceparent` header format your gateway must propagate
-- [Hystrix Design Document](https://github.com/Netflix/Hystrix/wiki/How-it-Works) — Netflix's original circuit breaker design; the half-open state rationale is here
-- [JWT RFC 7519](https://www.rfc-editor.org/rfc/rfc7519) — sections 4 (claims) and 7 (validation) define what your verifier must check
-- [Mint](https://hexdocs.pm/mint/Mint.HTTP.html) — the HTTP client for your reverse proxy; study connection reuse and streaming response handling
-- ["Building Microservices"](https://www.oreilly.com/library/view/building-microservices-2nd/9781492034018/) — Sam Newman, O'Reilly — the API Gateway chapter covers patterns your implementation must handle

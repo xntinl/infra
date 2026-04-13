@@ -633,13 +633,18 @@ Barriers are injected at sources and flow through operators; when an operator se
 
 ```elixir
 def main do
-  IO.puts("======== 22 build stream processor flink like ========")
-  IO.puts("Demonstrating core functionality")
+  IO.puts("======== 22-build-stream-processor-flink-like ========")
+  IO.puts("Build stream processor flink like")
   IO.puts("")
+  
+  Flowex.Job.start_link([])
+  IO.puts("Flowex.Job started")
   
   IO.puts("Run: mix test")
 end
 ```
+
+
 
 ## Benchmark
 

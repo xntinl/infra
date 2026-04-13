@@ -919,13 +919,18 @@ The design separates concerns along their real axes: what must be correct (the t
 
 ```elixir
 def main do
-  IO.puts("======== 31 build test framework ========")
-  IO.puts("Demonstrating core functionality")
+  IO.puts("======== 31-build-test-framework ========")
+  IO.puts("Build test framework")
   IO.puts("")
+  
+  MyTest.AssertionError.start_link([])
+  IO.puts("MyTest.AssertionError started")
   
   IO.puts("Run: mix test")
 end
 ```
+
+
 
 ## Benchmark
 

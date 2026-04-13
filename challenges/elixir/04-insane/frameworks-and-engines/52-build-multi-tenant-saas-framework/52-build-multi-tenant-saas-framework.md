@@ -742,13 +742,18 @@ end
 
 ```elixir
 def main do
-  IO.puts("======== 52 build multi tenant saas framework ========")
-  IO.puts("Demonstrating core functionality")
+  IO.puts("======== 52-build-multi-tenant-saas-framework ========")
+  IO.puts("Build multi tenant saas framework")
   IO.puts("")
+  
+  TenantFramework.Repo.start_link([])
+  IO.puts("TenantFramework.Repo started")
   
   IO.puts("Run: mix test")
 end
 ```
+
+
 
 ## Benchmark
 

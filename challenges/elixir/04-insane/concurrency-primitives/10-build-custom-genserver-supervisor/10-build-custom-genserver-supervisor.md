@@ -549,13 +549,36 @@ Each supervisor spawns children with `:proc_lib.start_link/3` and monitors them;
 
 ```elixir
 def main do
-  IO.puts("======== 10 build custom genserver supervisor ========")
-  IO.puts("Demonstrating core functionality")
+  IO.puts("======== 10-build-custom-genserver-supervisor ========")
+  IO.puts("Build custom genserver supervisor")
   IO.puts("")
+  
+defmodule Counter do
+    def init(n), do: {:ok, n}
+    def handle_call(:get, _from, n), do: {:reply, n, n}
+    def handle_call(:inc, _from, n), do: {:reply, n + 1, n + 1}
+    def handle_cast(:reset, _n), do: {:noreply, 0}
+    def handle_info(_, s), do: {:noreply, s}
+  end
+  
+  {:ok, sup} = MyGenServer.Supervisor.start_link([
+    %{id: :w1, start: {Counter, 0}, restart: :permanent},
+    %{id: :w2, start: {Counter, 100}, restart: :permanent}
+  ], strategy: :one_for_one)
+  IO.puts("Supervisor started with 2 workers")
+  
+  {:ok, w1} = MyGenServer.Supervisor.child_pid(:w1)
+  v1 = MyGenServer.call(w1, :get)
+  IO.puts("Worker 1 initial state: #{v1}")
+  
+  v2 = MyGenServer.call(w1, :inc)
+  IO.puts("After :inc: #{v2}")
   
   IO.puts("Run: mix test")
 end
 ```
+
+
 
 ## Benchmark
 

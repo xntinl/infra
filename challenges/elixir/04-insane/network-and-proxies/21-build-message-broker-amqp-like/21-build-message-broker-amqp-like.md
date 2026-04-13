@@ -524,13 +524,18 @@ The broker tracks each consumer's unacked set in ETS and only pushes up to `pref
 
 ```elixir
 def main do
-  IO.puts("======== 21 build message broker amqp like ========")
-  IO.puts("Demonstrating core functionality")
+  IO.puts("======== 21-build-message-broker-amqp-like ========")
+  IO.puts("Build message broker amqp like")
   IO.puts("")
+  
+  Brokex.Frame.start_link([])
+  IO.puts("Brokex.Frame started")
   
   IO.puts("Run: mix test")
 end
 ```
+
+
 
 ## Benchmark
 

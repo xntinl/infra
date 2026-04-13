@@ -686,13 +686,18 @@ The design separates concerns along their real axes: what must be correct (the s
 
 ```elixir
 def main do
-  IO.puts("======== 39 build service mesh proxy ========")
-  IO.puts("Demonstrating core functionality")
+  IO.puts("======== 39-build-service-mesh-proxy ========")
+  IO.puts("Build service mesh proxy")
   IO.puts("")
+  
+  Meshex.CircuitBreaker.start_link([])
+  IO.puts("Meshex.CircuitBreaker started")
   
   IO.puts("Run: mix test")
 end
 ```
+
+
 
 ## Benchmark
 

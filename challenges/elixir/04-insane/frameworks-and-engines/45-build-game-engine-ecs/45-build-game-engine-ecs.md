@@ -791,13 +791,18 @@ end
 
 ```elixir
 def main do
-  IO.puts("======== 45 build game engine ecs ========")
-  IO.puts("Demonstrating core functionality")
+  IO.puts("======== 45-build-game-engine-ecs ========")
+  IO.puts("Build game engine ecs")
   IO.puts("")
+  
+  GameEngine.Components.Position.start_link([])
+  IO.puts("GameEngine.Components.Position started")
   
   IO.puts("Run: mix test")
 end
 ```
+
+
 
 ## Benchmark
 

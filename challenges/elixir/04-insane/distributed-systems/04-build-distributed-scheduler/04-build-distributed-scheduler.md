@@ -546,116 +546,18 @@ This is a single-dispatcher implementation. For distributed deployment:
 4. **Add fair-share**: track per-user CPU/memory consumption and cap submissions
 
 ---
-
-
 ## Main Entry Point
 
 ```elixir
 def main do
-  IO.puts("======== 04 build distributed scheduler ========")
-  IO.puts("Demonstrating core functionality")
+  IO.puts("======== 04-build-distributed-scheduler ========")
+  IO.puts("Build Distributed Scheduler")
   IO.puts("")
+  
+  Helios.Job.start_link([])
+  IO.puts("Helios.Job started")
   
   IO.puts("Run: mix test")
 end
 ```
 
-## Benchmark
-
-**Target**: 10,000 jobs/second enqueued and dispatched end-to-end on a 3-shard localhost cluster.
-
-```bash
-mix run bench/placement_bench.exs
-```
-
-```elixir
-# bench/placement_bench.exs
-nodes = for i <- 1..50 do
-  %{id: :"node_#{i}", available_cpu: 32, available_memory_mb: 64_000}
-end
-
-jobs = for _ <- 1..1_000 do
-  %{cpu: :rand.uniform(8), memory_mb: :rand.uniform(8_000) * 512}
-end
-
-Benchee.run(
-  %{
-    "bin-pack — 1000 jobs x 50 nodes" => fn ->
-      Enum.each(jobs, fn job -> Helios.BinPacker.place(nodes, job) end)
-    end
-  },
-  time: 5,
-  warmup: 2,
-  formatters: [Benchee.Formatters.Console]
-)
-```
-
----
-
-## Why this works
-
-Each job is owned by exactly one shard (determined by consistent hashing on the job key), and each shard has exactly one leader that emits it. A leader lease tied to heartbeats guarantees that only one leader exists at a time, so a job is never executed twice.
-
----
-
-## Key Concepts: Consensus and Distributed Agreement
-
-The core challenge in distributed systems is reaching agreement across multiple nodes when some may fail, be slow, or partition from the network. Consensus algorithms formalize three properties:
-
-1. **Safety**: All nodes that decide must decide the same value.
-2. **Liveness**: Every non-faulty node eventually decides.
-3. **Fault tolerance**: The system tolerates up to F faulty nodes out of 2F+1 total.
-
-Raft achieves this via a leader-based approach: the leader serializes writes through a log, and quorum commit ensures no data loss across failures. The log-up-to-date vote rule prevents stale nodes from becoming leader, and the "commit only current-term entries" rule prevents committed entries from being overwritten.
-
-This contrasts with leaderless protocols (e.g., CRDTs) that sacrifice strong consistency for eventual consistency, enabling offline-first systems. For the BEAM, Raft fits naturally into the GenServer + OTP supervision model: each node is a GenServer with local state (log, term, vote), and RPCs are asynchronous messages that do not block the caller.
-
-**Production insight**: Raft's safety depends on three invariants holding simultaneously. A single violated invariant (e.g., committing an entry from a previous term by index alone) causes data loss on specific failure patterns that may never surface in testing. This is why production systems use formal verification or extensive failure injection (Jepsen tests) to validate safety, not just positive test cases.
-
----
-
-## Trade-off analysis
-
-| Aspect | Best-fit decreasing | First-fit decreasing | Random placement |
-|--------|--------------------|--------------------|-----------------|
-| Utilization | high (tight fit) | medium | low |
-| Placement time | O(N log N) | O(N) | O(1) |
-| Fragmentation | low | moderate | high |
-| Preemption frequency | lower (fits more) | moderate | higher |
-| Implementation complexity | moderate | simple | trivial |
-
-After running the benchmark, record your measured placement latency (p50, p99) for direct comparison across strategies.
-
-**Architectural question**: the Omega paper (Schwarzkopf et al.) proposes optimistic scheduling with conflict detection instead of pessimistic locking of the cluster state. Under what workload conditions does optimistic scheduling outperform the pessimistic approach you built?
-
----
-
-## Common production mistakes
-
-**1. Overcommitting on the scheduling decision**
-Placement assigns a job to a node, but the node's available capacity is not decremented until the job actually starts. A window exists where multiple jobs are assigned to the same node before any of them start, causing overcommit. Decrement capacity at assignment time, not at execution time.
-
-**2. Preemption without guaranteed requeue**
-Before evicting a low-priority job, verify there is a node where it can be rescheduled. If no node can accept the evicted job and the high-priority job, you have evicted a job for nothing. Check requeue feasibility before committing to the eviction.
-
-**3. Fair-share measured at point-in-time only**
-A user's fair-share consumption should be measured over a rolling window, not instantaneously. A user who ran 100% of cluster for 1 second and 0% for the next 59 seconds should be counted differently from one who ran 100% for 60 seconds. Use a sliding window EMA.
-
-**4. Heartbeat timeout too aggressive**
-Setting the heartbeat timeout too low causes frequent false-positive node failures, triggering unnecessary job requeues and disrupting running work. Calibrate the timeout based on your network's p99 round-trip time, not its p50.
-
----
-
-## Reflection
-
-- If one shard leader is network-partitioned from the rest but still holds its lease, what guarantees do you lose? How would you shorten the blast radius?
-- Compare your scheduler to Oban (Postgres-backed). At what scale does the Postgres lock-based approach stop being competitive with sharded leaders?
-
----
-
-## Resources
-
-- Hindman, B. et al. (2011). *Mesos: A Platform for Fine-Grained Resource Sharing in the Data Center* — section 3 (architecture) and section 4 (two-level scheduling)
-- Schwarzkopf, M. et al. (2013). *Omega: Flexible, Scalable Schedulers for Large Compute Clusters* — shared-state scheduling and conflict resolution
-- Ghodsi, A. et al. (2011). *Dominant Resource Fairness: Fair Allocation of Multiple Resource Types* — multi-resource fair sharing
-- [Plug documentation](https://hexdocs.pm/plug/) — `Plug.Router`, `Plug.Parsers`, and the Plug specification

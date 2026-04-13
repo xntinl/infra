@@ -584,13 +584,18 @@ The design separates concerns along their real axes: what must be correct (the v
 
 ```elixir
 def main do
-  IO.puts("======== 36 build video streaming server ========")
-  IO.puts("Demonstrating core functionality")
+  IO.puts("======== 36-build-video-streaming-server ========")
+  IO.puts("Build video streaming server")
   IO.puts("")
+  
+  HLSServer.Segmenter.start_link([])
+  IO.puts("HLSServer.Segmenter started")
   
   IO.puts("Run: mix test")
 end
 ```
+
+
 
 ## Benchmark
 

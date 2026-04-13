@@ -522,36 +522,25 @@ Benchee.run(
 Target: 500k checks/second on a 3-node cluster with P99 < 1ms.
 
 ---
-
-
 ## Main Entry Point
 
 ```elixir
 def main do
-  IO.puts("======== 24 build distributed rate limiter ========")
-  IO.puts("Demonstrating core functionality")
+  IO.puts("======== 24-build-distributed-rate-limiter ========")
+  IO.puts("Build Distributed Rate Limiter")
   IO.puts("")
+  
+{:ok, limiter} = RateLimiter.start_link(requests_per_second: 10)
+  IO.puts("Rate limiter started (10 req/sec)")
+  
+  results = Enum.map(1..15, fn _ ->
+    RateLimiter.allow?(limiter)
+  end)
+  
+  allowed = Enum.count(results, & &1)
+  IO.puts("Allowed #{allowed}/15 requests")
   
   IO.puts("Run: mix test")
 end
 ```
 
-## Reflection
-
-1. **Lease size tradeoff**: If you acquire a lease for K tokens over T seconds, what happens if two nodes acquire leases for the same account during the same epoch?
-   - **Answer**: Both nodes can approve up to K requests. Total: 2K. Mitigation: leases must have overlapping "held by" semantics, e.g., (account_id, node_id, epoch). If the same epoch, only one node can hold the lease at a time.
-
-2. **Clock skew impact**: If node A's clock is 500ms ahead of node B, how does this affect lease expiry?
-   - **Answer**: Node A may issue a lease that node B already thinks has expired. Mitigation: add a "skew buffer" of ~1000ms to lease expiry checks.
-
-3. **Burst tolerance under quorum failure**: If your system guarantees 100 req/min but loses quorum for 10 seconds, how many extra requests are allowed?
-   - **Answer**: In the worst case, all nodes independently approve the limit. With 3 nodes and quorum=2, one node down means the other two can each approve the full limit independently — burst is 2x for 10 seconds. Mitigation: lower per-node local limits when nodes are down.
-
----
-
-## Resources
-
-- Cloudflare Engineering Blog — *How We Built Rate Limiting Capable of Scaling to Millions of Domains*.
-- Stripe Engineering Blog — *Idempotency and rate limiting*.
-- [Riak Core documentation](https://github.com/basho/riak_core) — consistent hashing background.
-- [Erlang `:atomics` and `:counters`](https://www.erlang.org/doc/man/atomics.html) — lock-free counters for high-throughput rate limiting.

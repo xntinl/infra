@@ -196,76 +196,23 @@ mix test test/locksmith/ --trace
 
 ```elixir
 def main do
-  IO.puts("======== 50 build distributed lock service ========")
-  IO.puts("Demonstrating core functionality")
+  IO.puts("======== 50-build-distributed-lock-service ========")
+  IO.puts("Build Distributed Lock Service")
   IO.puts("")
+  
+{{:ok, locks}} = LockService.start_link([])
+  IO.puts("Lock service started")
+  
+  {{:ok, lock_id}} = LockService.acquire(locks, "resource:1", timeout: 1000)
+  IO.puts("Lock acquired: #{lock_id}")
+  
+  {{:error, :already_locked}} = LockService.acquire(locks, "resource:1", timeout: 100)
+  IO.puts("Lock properly blocking second attempt")
+  
+  :ok = LockService.release(locks, lock_id)
+  IO.puts("Lock released")
   
   IO.puts("Run: mix test")
 end
 ```
 
-## Benchmark
-
-**Objective**: Quantify contention and latency under load so lock fairness and throughput stay measured.
-
-```elixir
-# bench/contention.exs
-@lock_count 100
-@holders_per_lock 10
-
-def run do
-  IO.puts("Benchmark: #{@lock_count} locks, #{@holders_per_lock} concurrent acquires each")
-
-  {time_us, results} = :timer.tc(fn ->
-    tasks = for lock_i <- 1..@lock_count do
-      Task.async(fn ->
-        name = "bench-lock-#{lock_i}"
-        for _ <- 1..@holders_per_lock do
-          {us, result} = :timer.tc(fn -> Locksmith.Quorum.acquire(name, self(), 5_000) end)
-          case result do
-            {:ok, lease} -> Locksmith.Quorum.release(lease)
-            _ -> :ok
-          end
-          us
-        end
-      end)
-    end
-    Task.await_many(tasks, 30_000) |> List.flatten()
-  end)
-
-  latencies = Enum.map(results, fn us -> us / 1000.0 end)
-  sorted = Enum.sort(latencies)
-  n = length(sorted)
-  p50 = Enum.at(sorted, div(n, 2))
-  p99 = Enum.at(sorted, trunc(n * 0.99))
-
-  IO.puts("P50 acquire latency: #{Float.round(p50, 2)} ms")
-  IO.puts("P99 acquire latency: #{Float.round(p99, 2)} ms")
-  IO.puts("Total time: #{Float.round(time_us / 1000, 0)} ms")
-end
-```
-
-Target: P99 acquire latency < 50ms on a 3-node localhost cluster.
-
----
-
-## Reflection
-
-1. **Fencing token correctness**: A process acquires a lock with token T=5. It pauses for 30 seconds (GC or partition). The lease expires at T+10s, and another process acquires with token T=6. The original process wakes up and writes with token 5. Will the storage reject it?
-   - **Answer**: Yes, if the storage maintains highest_token ≥ 6. Any write with token < 6 is rejected. This is why fencing tokens are critical.
-
-2. **Quorum size under node failures**: If one node is permanently down, can a 3-node cluster still acquire locks?
-   - **Answer**: Yes, quorum is 2/3. If one node is down, the remaining 2 nodes form a quorum. But if a second node fails, the remaining 1 node cannot form a quorum. The system becomes unavailable.
-
-3. **Lease expiry and grace periods**: If a process's lease expires 10ms ago but the process still holds the lock in its own memory, can it write?
-   - **Answer**: If it writes to storage, the storage's fencing token check will reject it. If it writes to local state (not storage), nothing prevents it. Design your application to avoid local writes during the lease window.
-
----
-
-## Resources
-
-- Hunt, P. et al. (2010). *ZooKeeper: Wait-free Coordination for Internet-scale Systems*. USENIX ATC.
-- Burrows, M. (2006). *The Chubby Lock Service for Loosely-Coupled Distributed Systems*. OSDI.
-- Kleppmann, M. (2016). *How to do distributed locking*. https://martin.kleppmann.com/2016/02/08/how-to-do-distributed-locking.html
-- Kleppmann, M. (2017). *Designing Data-Intensive Applications*. O'Reilly, Chapters 8–9.
-- Takada, M. *Distributed Systems for Fun and Profit*. http://book.mixu.net/distsys/

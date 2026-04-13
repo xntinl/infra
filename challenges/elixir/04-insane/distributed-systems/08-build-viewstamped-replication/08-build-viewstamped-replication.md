@@ -941,37 +941,18 @@ Benchee.run(
 Target: 5,000 linearizable operations/second on a 5-replica cluster; view-change latency under 500ms.
 
 ---
-
-
 ## Main Entry Point
 
 ```elixir
 def main do
-  IO.puts("======== 08 build viewstamped replication ========")
-  IO.puts("Demonstrating core functionality")
+  IO.puts("======== 08-build-viewstamped-replication ========")
+  IO.puts("Build Viewstamped Replication")
   IO.puts("")
+  
+  VrReplica.Cluster.start_link([])
+  IO.puts("VrReplica.Cluster started")
   
   IO.puts("Run: mix test")
 end
 ```
 
-## Reflection
-
-1. Under a steady stream of primary crashes, VR rotates primaries deterministically. Does this ever produce a worse outcome than Raft's log-comparison election? Give an example.
-   - **Answer**: Yes. If replica 0 is repeatedly slow (GC pauses, CPU contention), Raft's election can skip it. VR's `view mod N` eventually rotates it back to primary. Mitigation: implement "node health tracking" so repeatedly-unhealthy nodes recuse themselves from the rotation.
-
-2. If you had to support reconfiguration (adding/removing nodes), would you bolt it on as a special op, or redesign view change entirely?
-   - **Answer**: Bolt it on as a special op in the log (like Raft does). When a RECONFIG op is committed, all future view-changes use the new replica set. The tricky part: during the transition, primary may need to know about both old and new replica sets to determine when a quorum is reached.
-
-3. What is the worst-case latency of a single client request under optimal conditions (no failures, no load)?
-   - **Answer**: ~5-10ms on localhost. Breakdown: client RPC to primary (1ms), primary appends to log and broadcasts PREPARE (1ms), primary receives f+1 PREPARE-OKs and broadcasts COMMIT (2ms), backup receives COMMIT and applies (1ms), primary applies and replies to client (1ms). Add network jitter and GC pauses in production: plan for 20-50ms.
-
----
-
-## Resources
-
-- Liskov, B. & Cowling, J. (2012). *Viewstamped Replication Revisited*. MIT-CSAIL-TR-2012-021. Figures 1, 2, 3 are the complete protocol.
-- Ongaro, D. (2014). *Consensus: Bridging Theory and Practice*. PhD Thesis, Stanford. Chapter 2 compares VR, Paxos, Raft.
-- Lamport, L. (1998). *The Part-Time Parliament*. ACM TOCS 26(2). The original Paxos paper; read for context.
-- [Apache ZooKeeper]: Atomic Broadcast Protocol (Zab) is inspired by VR.
-- [etcd]: Uses Raft, but documentation explains where Raft differs from VR.

@@ -690,13 +690,18 @@ The design separates concerns along their real axes: what must be correct (the l
 
 ```elixir
 def main do
-  IO.puts("======== 35 build load balancer ========")
-  IO.puts("Demonstrating core functionality")
+  IO.puts("======== 35-build-load-balancer ========")
+  IO.puts("Build load balancer")
   IO.puts("")
+  
+  Balancer.Proxy.start_link([])
+  IO.puts("Balancer.Proxy started")
   
   IO.puts("Run: mix test")
 end
 ```
+
+
 
 ## Benchmark
 

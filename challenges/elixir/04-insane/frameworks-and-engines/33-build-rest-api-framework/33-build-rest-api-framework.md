@@ -802,13 +802,18 @@ The design separates concerns along their real axes: what must be correct (the R
 
 ```elixir
 def main do
-  IO.puts("======== 33 build rest api framework ========")
-  IO.puts("Demonstrating core functionality")
+  IO.puts("======== 33-build-rest-api-framework ========")
+  IO.puts("Build rest api framework")
   IO.puts("")
+  
+  Restkit.Resource.start_link([])
+  IO.puts("Restkit.Resource started")
   
   IO.puts("Run: mix test")
 end
 ```
+
+
 
 ## Benchmark
 

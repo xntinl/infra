@@ -575,144 +575,29 @@ Target: start + finish span < 5µs per operation at p99 on a warm collector.
 Hashing the trace-id to decide sampling means every service makes the same decision without coordination, so a sampled trace is never half-dropped. The span processor batches writes and flushes on size or age, bounding memory and disk I/O regardless of traffic.
 
 ---
-
-
 ## Main Entry Point
 
 ```elixir
 def main do
-  IO.puts("======== 06 build distributed tracing system ========")
-  IO.puts("Demonstrating core functionality")
+  IO.puts("======== 06-build-distributed-tracing-system ========")
+  IO.puts("Build Distributed Tracing System")
   IO.puts("")
+  
+{:ok, tracer} = Tracer.start_link()
+  IO.puts("Tracer started")
+  
+  span1 = Tracer.start_span("request", %{"service" => "api"})
+  Process.sleep(50)
+  Tracer.end_span(span1)
+  
+  span2 = Tracer.start_span("db-query", %{"service" => "postgres"})
+  Process.sleep(30)
+  Tracer.end_span(span2)
+  
+  spans = Tracer.get_spans()
+  IO.puts("Recorded #{length(spans)} spans")
   
   IO.puts("Run: mix test")
 end
 ```
 
-## Benchmark
-
-```elixir
-# bench/tracer_bench.exs
-alias Tracer.{Span, Sampling, Collector, Aggregator}
-
-# Setup: warm up the collector
-{:ok, _} = Collector.start_link()
-{:ok, _} = Aggregator.start_link()
-Sampling.configure(:head, rate: 1.0)
-
-# Populate with realistic trace volumes
-setup_traces = fn ->
-  for _ <- 1..1_000 do
-    s = Span.start_span("request")
-    for _ <- 1..3, do: Span.start_span("child")
-    Span.finish_span(s)
-  end
-end
-
-setup_traces.()
-
-Benchee.run(
-  %{
-    "span start + finish (sampled)" => fn ->
-      s = Span.start_span("traced_op")
-      Span.finish_span(s)
-    end,
-    "span start + finish (dropped by sampler)" => fn ->
-      Sampling.configure(:head, rate: 0.0)
-      s = Span.start_span("dropped")
-      Span.finish_span(s)
-    end,
-    "parent-child propagation (3 levels)" => fn ->
-      parent = Span.start_span("root_op")
-      child1 = Span.start_span("child_1")
-      child2 = Span.start_span("child_2")
-      Span.finish_span(child2)
-      Span.finish_span(child1)
-      Span.finish_span(parent)
-    end,
-    "10k spans in sequence" => fn ->
-      for i <- 1..10_000 do
-        s = Span.start_span("seq_#{i}")
-        Span.finish_span(s)
-      end
-    end
-  },
-  parallel: 4,
-  time: 10,
-  warmup: 3,
-  formatters: [Benchee.Formatters.Console]
-)
-```
-
-Target: 50,000 spans/second ingested on a single node; p99 record overhead < 20 µs (< 100ns for sampled drops).
-
----
-
-## Key Concepts: Distributed Tracing, Sampling, and Span Propagation
-
-**Trace structure**: A trace is a directed acyclic graph (DAG) of spans connected by causality. Each span represents a single operation (RPC, query, handler invocation). A 128-bit trace ID binds all spans in one user request together; parent-child links encode the call graph.
-
-- **Trace ID**: Unique per user request, shared across all services that handle it. Deterministic from a hash of request metadata so retry logic doesn't create phantom traces.
-- **Span ID**: Unique within the trace, identifies one operation. The BEAM's 64-bit span IDs fit comfortably in Erlang integer range.
-- **Parent Span ID**: The span ID of the operation that invoked this one. Nil for root spans.
-
-**Causal propagation**: The hardest part of tracing is threading context through asynchronous boundaries. In Elixir:
-- Process dictionary (`Process.put/get`) carries trace context implicitly across synchronous calls.
-- For async or cross-node calls, manually extract context, send as a message header, and restore it in the callee.
-- W3C TraceContext (HTTP header standard) defines the serialization format: `traceparent: 00-{trace-id-32hex}-{span-id-16hex}-{flags-2hex}`.
-
-**Sampling strategies and trade-offs**:
-- **Head-based probabilistic**: Decide at trace root (entry point) whether to keep the entire trace. All downstream services see the same decision because it's propagated in the context. O(1) memory, deterministic per trace, but cannot retroactively keep a trace that turned out to be slow.
-- **Tail-based dynamic**: Buffer all spans locally, examine when the root completes, decide retroactively. Guarantees capture of slow/error traces at the cost of unbounded memory during the trace's lifetime.
-- **Hybrid**: Head-based by default (99% keep everything), tail-based override for error conditions (100% keep errors).
-
-**Why monotonic time for spans**: `System.os_time/1` can jump backward after NTP correction. Span durations must use `System.monotonic_time(:microsecond)` — a clock that never goes backward, only forward. Start and finish timestamps MUST use the same clock source.
-
-**Observability for observability**: A tracer that fails silently is worse than no tracer. Always emit:
-- Dropped span count per node (overload detection).
-- Aggregator table fill percentage (memory pressure warning).
-- Propagation errors (context corruption detection).
-
----
-
-## Trade-off analysis
-
-| Aspect | Head-based sampling | Tail-based sampling | No sampling |
-|--------|--------------------|--------------------|-------------|
-| Memory per trace | constant (decision at entry) | full trace buffered | full trace kept |
-| Error trace retention | probabilistic | guaranteed | guaranteed |
-| Latency overhead | negligible | timeout-dependent | high at scale |
-| Implementation complexity | trivial | significant (buffer + timeout) | trivial |
-| Suitable for | high-volume, low-error services | error analysis, SLA debugging | low-volume only |
-
-Reflection: tail-based sampling requires a trace buffer that times out if the root span never finishes. What is the correct behavior when the timeout fires — flush, drop, or sample probabilistically?
-
----
-
-## Common production mistakes
-
-**1. Using wall-clock time for span duration**
-`System.os_time/1` can go backward after NTP adjustment. Span durations must use `System.monotonic_time(:microsecond)`. The start and finish must use the same clock.
-
-**2. Not clearing trace context after the request**
-If the process is reused (pooled processes, long-lived GenServers), residual context from the previous request leaks into the next. Always clear the process dictionary context in a `try/after` block around the callback wrapper.
-
-**3. Tail-based sampling without a root span detector**
-The tail sampler must know which span is the root to know when the trace is complete. If you buffer spans without tracking which trace they belong to, you can never make the flush decision.
-
-**4. Blocking the hot path with Jaeger export**
-The Jaeger exporter performs HTTP requests or binary encoding. This must happen in a background process (the aggregator or a dedicated exporter process), never in the span finish path.
-
-## Reflection
-
-- If you need to guarantee that every trace containing a 5xx response is retained, would you keep head sampling and add an error-override channel, or switch to tail sampling? Compare memory costs.
-- How would your design change for mobile clients where samples must be uploaded in bursts and bandwidth is metered?
-
----
-
-## Resources
-
-- Sigelman, B. et al. (2010). *Dapper, a Large-Scale Distributed Systems Tracing Infrastructure* — section 3 (infrastructure) and section 4 (instrumentation) are the foundational reference
-- [OpenTelemetry Specification](https://opentelemetry.io/docs/specs/) — Trace API, SDK, and Data Model sections
-- [W3C TraceContext specification](https://www.w3.org/TR/trace-context/) — standard for cross-service context propagation
-- [Jaeger Thrift IDL](https://github.com/jaegertracing/jaeger-idl/blob/main/thrift/jaeger.thrift) — the schema for the Thrift binary format your exporter must emit

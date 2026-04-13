@@ -1231,153 +1231,18 @@ defmodule InferenceEngine.EngineTest do
   end
 end
 ```
-
-
 ## Main Entry Point
 
 ```elixir
 def main do
-  IO.puts("======== 43 build ai inference engine ========")
-  IO.puts("Demonstrating core functionality")
+  IO.puts("======== 43-build-ai-inference-engine ========")
+  IO.puts("Build Ai Inference Engine")
   IO.puts("")
+  
+  InferenceEngine.Tensor.start_link([])
+  IO.puts("InferenceEngine.Tensor started")
   
   IO.puts("Run: mix test")
 end
 ```
 
-## Benchmark
-
-```elixir
-# bench/forward_pass.exs
-# Run with: mix run bench/forward_pass.exs
-alias InferenceEngine.{Tensor, Model, Engine}
-
-# Build a 5-layer convolutional model:
-# Conv(3,64,stride=1,pad=1) → BN → ReLU → Conv(64,128,stride=2,pad=1) → BN → ReLU
-# → Flatten → Dense(128*56*56→256) → Dense(256→10) → Softmax
-# Using random weights; correct shapes matter, correct values do not
-random_kernel = fn shape ->
-  n = Enum.product(shape)
-  Tensor.from_list(Enum.map(1..n, fn _ -> :rand.normal() * 0.01 end), shape)
-end
-
-const_tensor = fn val, shape ->
-  Tensor.from_list(List.duplicate(val, Enum.product(shape)), shape)
-end
-
-layers = [
-  {:conv2d,
-   %{kernel: random_kernel.([3, 3, 3, 32])},
-   %{stride: 1, padding: 1, activation: :relu}},
-  {:batch_norm,
-   %{gamma: const_tensor.(1.0, [32]), beta: const_tensor.(0.0, [32]),
-     mean: const_tensor.(0.0, [32]), var: const_tensor.(1.0, [32])},
-   %{}},
-  {:relu, %{}, %{}},
-  {:conv2d,
-   %{kernel: random_kernel.([3, 3, 32, 64])},
-   %{stride: 2, padding: 1, activation: :relu}},
-  {:flatten, %{}, %{}},
-  {:dense,
-   %{kernel: random_kernel.([64 * 112 * 112, 10]),
-     bias: const_tensor.(0.0, [10])},
-   %{activation: nil}},
-  {:softmax, %{}, %{}}
-]
-
-model = %Model{input_shape: [1, 224, 224, 3], layers: layers}
-input = Tensor.from_list(List.duplicate(0.5, 224 * 224 * 3), [1, 224, 224, 3])
-
-# Warmup
-Engine.forward_pass(model, input)
-
-# Measure 10 iterations
-times =
-  Enum.map(1..10, fn _ ->
-    {us, _} = :timer.tc(fn -> Engine.forward_pass(model, input) end)
-    us / 1000.0
-  end)
-
-sorted = Enum.sort(times)
-median = Enum.at(sorted, 4)
-p95 = Enum.at(sorted, 9)  # with only 10 samples, p95 ≈ max
-
-IO.puts("Median: #{Float.round(median, 1)} ms")
-IO.puts("P95:    #{Float.round(p95, 1)} ms")
-IO.puts("Target: < 100 ms")
-IO.puts("Pass:   #{if median < 100, do: "YES", else: "NO — consider NIF for matmul"}")
-```
-
-## Quick start
-
-To run the inference engine:
-
-```bash
-# Set up the project
-mix new inference_engine
-cd inference_engine
-mkdir -p lib/inference_engine test bench
-
-# Install dependencies
-mix deps.get
-
-# Run tests
-mix test
-
-# Run benchmark
-mix run bench/forward_pass.exs
-```
-
-Expected output: All tests pass, including Conv2D correctness against NumPy baseline, quantization error under 1% on CIFAR-10, and forward pass of a 5-layer CNN on a 224×224×3 image in under 100ms.
-
-## Deep Dive: Neural Network Inference in Pure Elixir
-
-Building an ML inference engine in Elixir means threading the needle between correctness (tensors must match NumPy exactly), performance (100ms for a forward pass is tight), and maintainability (the code must be self-contained and auditable for safety-critical fraud detection).
-
-**Why not just call Python?** Every network call adds 30–80ms latency. In Elixir, the model and inference logic live in the same BEAM process, sharing memory. This eliminates serialization, TCP round-trips, and the operational complexity of managing two runtimes.
-
-**Why not use Nx/EXLA?** Nx is powerful and the path to production TensorFlow integration. For a learning exercise and a fraud detector that must ship in a single Elixir cluster, a focused implementation of five operators (Conv2D, Dense, BatchNorm, ReLU, Softmax) is more auditable and faster to debug than wrestling with the Nx/EXLA stack. Trade-off: you give up automatic differentiation (but inference does not need it) and GPU support (but int8 matmul on CPU with cache locality can keep up).
-
-**Why im2col?** A naive Conv2D is four nested loops. `im2col` transforms it into a single matrix multiply, which benefits from cache locality and parallelization. The cost: 3–5× memory during the forward pass. For a single inference request, this is acceptable.
-
-**Why int8 quantization?** Float32 weights are 4 bytes each. Int8 weights are 1 byte. A 500MB model becomes 125MB. More weights fit in L3 cache, so fewer RAM round-trips. Integer multiply is cheaper than float multiply on most CPUs. Accuracy loss is typically under 1% on calibration data. For a fraud detector that relies on confidence thresholds, this trade-off is favorable.
-
-**Key invariant**: the output of a forward pass must match NumPy's output to within floating-point rounding error. If your Conv2D produces a different result than PyTorch given the same weights and input, quantization error will compound through layers and destroy accuracy. Tests lock this down.
-
----
-
-## Trade-off analysis
-
-| Approach | Throughput | Memory | Accuracy | Complexity |
-|---|---|---|---|---|
-| Pure Elixir floats | Low (baseline) | Moderate | Exact float32 | Low |
-| im2col + matmul | 3–5× over naive | 3–5× higher (column matrix) | Exact float32 | Medium |
-| Task.async_stream batching | ~N× for batch N | Linear in batch size | Same as single | Low |
-| int8 symmetric quantization | ~2× matmul speed | 4× smaller weights | 98–99% of float32 | Medium |
-| Rustler NIF for matmul | 10–50× over pure Elixir | Same | Exact float32 | High |
-| Full Nx/EXLA | Maximum | CUDA-dependent | Same | Low (but external dep) |
-
-## Common production mistakes
-
-**Returning tensors with stale data references.** A common bug is returning a sub-binary view that holds a reference to a large parent binary, preventing GC. Use `:binary.copy/1` when the parent binary is a large loaded model file and you only need a small slice.
-
-**Ignoring NHWC vs NCHW layout mismatches.** PyTorch defaults to NCHW; TensorFlow and ONNX often use NHWC. Feeding an NCHW tensor to an NHWC kernel silently produces wrong results with no error. Encode layout as part of the tensor struct and validate on every operator boundary.
-
-**Not fusing Conv + BN + ReLU.** Running three separate passes over the output of a convolutional layer is 3× memory bandwidth. At inference time, batch norm parameters are constant and can be folded into the conv kernel (absorbed into weights and bias). This fusion eliminates the BN pass entirely.
-
-**Quantizing activations with the wrong range.** Symmetric quantization assumes the distribution is centered at zero. For activations after ReLU (range [0, ∞)), asymmetric quantization (zero-point + scale) gives half the error for the same bit width. Using symmetric int8 for ReLU outputs wastes half the representable range.
-
-**Using `Task.async_stream` with `ordered: true` when you don't need order.** `ordered: true` buffers completed tasks until all preceding tasks in the stream finish. For large batches with uneven compute times, this serializes collection. Use `ordered: false` and sort by a tag if order matters.
-
-## Reflection
-
-You can run a 7B-parameter model on one GPU. A single request takes 500ms. At 100 req/s, what's your queuing strategy — batch, dedicated-replica-per-request, or speculative decoding? Pick one and defend.
-
-## Resources
-
-- ONNX Operator Specification — https://onnx.ai/onnx/operators/ (reference for Conv, Gemm, BatchNormalization exact semantics)
-- Goodfellow, Bengio, Courville — "Deep Learning" Chapter 9: Convolutional Networks (im2col derivation)
-- Nagel et al. — "A White Paper on Neural Network Quantization" (2021) — Qualcomm Research (symmetric vs asymmetric, per-channel vs per-tensor)
-- Chellapilla et al. — "High Performance Convolutional Neural Networks for Document Processing" (2006) — original im2col paper
-- Brendan Gregg — "Systems Performance" Chapter 6: CPUs (cache locality and why matmul layout matters)
-- Elixir `<<>>` binary syntax — https://hexdocs.pm/elixir/Kernel.SpecialForms.html#%3C%3C%3E%3E/1

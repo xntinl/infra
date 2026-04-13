@@ -752,145 +752,18 @@ Benchee.run(
 ### Why this works
 
 The design separates concerns along their real axes: what must be correct (the log aggregation invariants), what must be fast (the hot path isolated from slow paths), and what must be evolvable (external contracts kept narrow). Each module has one job and fails loudly when given inputs outside its contract, so bugs surface near their source instead of as mysterious downstream symptoms. The tests exercise the invariants directly rather than implementation details, which keeps them useful across refactors.
-
-
 ## Main Entry Point
 
 ```elixir
 def main do
-  IO.puts("======== 28 build log aggregation system ========")
-  IO.puts("Demonstrating core functionality")
+  IO.puts("======== 28-build-log-aggregation-system ========")
+  IO.puts("Build Log Aggregation System")
   IO.puts("")
+  
+  Logplex.TDigest.start_link([])
+  IO.puts("Logplex.TDigest started")
   
   IO.puts("Run: mix test")
 end
 ```
 
-## Benchmark
-
-```elixir
-# bench/logplex_bench.exs
-alias Logplex
-
-# Warm up: populate a realistic dataset
-IO.puts("Populating benchmark data...")
-for i <- 1..50_000 do
-  Logplex.ingest("prod_app", %{
-    level: Enum.random(["debug", "info", "warn", "error"]),
-    message: "request_#{i} path=/api/users status=#{Enum.random([200, 400, 500])} duration=#{:rand.uniform(5000)}ms",
-    timestamp: DateTime.utc_now()
-  })
-end
-
-IO.puts("Running benchmarks...")
-
-Benchee.run(
-  %{
-    "ingest single entry (ETS insert + tokenize)" => fn ->
-      Logplex.ingest("prod_app", %{
-        level: "info",
-        message: "request #{:rand.uniform(100_000)} path=/api/resource status=#{Enum.random([200, 404, 500])}",
-        timestamp: DateTime.utc_now()
-      })
-    end,
-    "full-text search (1 term) over 50k" => fn ->
-      Logplex.search("prod_app", "error")
-    end,
-    "full-text search (2 terms) over 50k" => fn ->
-      Logplex.search("prod_app", "request error")
-    end,
-    "aggregate p99 latency via T-Digest" => fn ->
-      Logplex.aggregate("prod_app", :p99, :duration_ms)
-    end,
-    "T-Digest add 10k values + quantile" => fn ->
-      digest = Enum.reduce(1..10_000, Logplex.TDigest.new(100), fn i, d ->
-        Logplex.TDigest.add(d, :rand.uniform(10000))
-      end)
-      Logplex.TDigest.quantile(digest, 0.99)
-    end,
-    "merge two T-Digests with 5k values each" => fn ->
-      d1 = Enum.reduce(1..5_000, Logplex.TDigest.new(100), fn i, d ->
-        Logplex.TDigest.add(d, :rand.uniform(10000))
-      end)
-      d2 = Enum.reduce(1..5_000, Logplex.TDigest.new(100), fn i, d ->
-        Logplex.TDigest.add(d, :rand.uniform(10000))
-      end)
-      Logplex.TDigest.merge(d1, d2)
-    end
-  },
-  parallel: 4,
-  time: 10,
-  warmup: 3,
-  formatters: [Benchee.Formatters.Console]
-)
-
-IO.puts("\nBenchmark complete. Expected:")
-IO.puts("  - ingest: < 50 µs")
-IO.puts("  - 1-term search: < 1 ms")
-IO.puts("  - 2-term search: < 2 ms (smaller result set)")
-IO.puts("  - T-Digest p99: < 500 µs")
-```
-
-Target: ingest path <50µs per entry; 2-term search <2ms over 50k entries; T-Digest quantile < 500µs with bounded memory (< 200 centroids regardless of input size).
-
-## Key Concepts: Log Parsing, Indexing, and Streaming Quantiles
-
-**Log parsing and pattern extraction**: Raw logs are unstructured text. To make them queryable, parse them into structured fields using regex patterns. The grok format (popularized by Logstash) defines named captures: `(?<field_name>pattern)`. When a line matches, extract field values into a map. Non-matching lines fall through to a default "raw message" entry.
-
-- **Built-in patterns**: `nginx_access`, `postgres`, `json` autodetect HTTP and database logs without configuration.
-- **Custom patterns**: Register domain-specific regexes at runtime for business logs.
-- **Auto-detection**: If the line is JSON, parse as JSON. Else try built-in patterns. Else store as raw message.
-
-**Inverted index for full-text search**: A naive search that scans every log line is O(n). An inverted index pre-computes which log entries contain each word (token). Search becomes set intersection: find entries containing "error" AND "database" by intersecting their posting lists. Trade memory (one entry per token occurrence) for query speed (sub-millisecond searches).
-
-- **Tokenization**: Lowercase, split on non-word chars, filter stopwords (the, a, and).
-- **Per-tenant isolation**: One ETS table per tenant for raw logs, one for the index. Cross-tenant queries are structurally impossible because they reference different tables.
-
-**Streaming quantile estimation (T-Digest)**: Computing exact percentiles requires storing every value. On unbounded streams (50k logs/min forever), this is infeasible. T-Digest maintains a small sorted list of weighted centroids that approximate the full distribution. Key properties:
-- **Bounded memory**: O(compression_factor) centroids regardless of input size. Compression=100 typically yields 100-200 centroids.
-- **Accuracy**: P50/P99 estimates are within 1% of the true percentile over realistic (non-adversarial) data.
-- **Mergeability**: Two T-Digests can be merged into one, enabling multi-node percentile aggregation.
-
----
-
-## Trade-off analysis
-
-| Aspect | ETS inverted index (this impl) | Elasticsearch | PostgreSQL full-text |
-|--------|-------------------------------|---------------|----------------------|
-| Search latency | sub-ms (in-process ETS) | 5-50ms (network) | 10-100ms (disk) |
-| Durability | none (restart = empty) | full | full ACID |
-| Horizontal scale | single node | distributed shards | read replicas |
-| Percentile computation | T-Digest streaming | percentile aggregation | not built-in |
-| Multi-tenancy | ETS table per tenant | index-per-tenant | schema-per-tenant |
-
-Reflection: the ETS inverted index loses all data on restart. What is the minimum change needed to make the index durable? Compare DETS, writing posting lists to disk on insert, and periodic snapshot approaches.
-
----
-
-## Common production mistakes
-
-**1. Ingestion pipeline blocking on index write**
-The ingestor must write to a bounded buffer and return immediately; a separate indexer process drains the buffer.
-
-**2. Posting list growing unboundedly for common tokens**
-Cap posting lists at `max_results * 10` entries (drop oldest).
-
-**3. T-Digest not reset between time windows**
-Use a separate T-Digest per time bucket and query only relevant buckets.
-
-**4. Alert not firing on first evaluation**
-Store the previous state explicitly; treat `nil` (never evaluated) as `normal`.
-
----
-
-## Reflection
-
-If tenants range from 10 entries/day to 100k entries/second, would you still keep one ETS table per tenant, or would you tier storage by volume? Justify how you would detect a "hot" tenant and migrate it.
-
-## Resources
-
-- RFC 5424: The Syslog Protocol
-- Dunning, T. — *T-Digest: Computing Accurate Quantiles Using Clusters* — [arxiv.org/abs/1902.04023](https://arxiv.org/abs/1902.04023)
-- Elastic — [Inverted Index documentation](https://www.elastic.co/guide/en/elasticsearch/reference/current/inverted-index.html)
-- Logstash Grok Filter — [elastic.co grok plugins](https://www.elastic.co/guide/en/logstash/current/plugins-filters-grok.html)
-- Bourgon, P. — *Logs vs. Metrics vs. Traces*

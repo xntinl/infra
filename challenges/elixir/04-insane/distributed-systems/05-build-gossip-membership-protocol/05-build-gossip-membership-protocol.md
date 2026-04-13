@@ -650,116 +650,18 @@ For production deployment:
 4. **Fanout tuning**: set K based on desired convergence rounds and N
 
 ---
-
-
 ## Main Entry Point
 
 ```elixir
 def main do
-  IO.puts("======== 05 build gossip membership protocol ========")
-  IO.puts("Demonstrating core functionality")
+  IO.puts("======== 05-build-gossip-membership-protocol ========")
+  IO.puts("Build Gossip Membership Protocol")
   IO.puts("")
+  
+  Swimlane.Membership.start_link([])
+  IO.puts("Swimlane.Membership started")
   
   IO.puts("Run: mix test")
 end
 ```
 
-## Benchmark
-
-**Target**: Convergence under 2 seconds for a 100-node localhost cluster after a single join; O(log N) round count.
-
-```bash
-mix run bench/gossip_bench.exs
-```
-
-```elixir
-# bench/gossip_bench.exs
-sim = Swimlane.Simulation.start(node_count: 100, fanout: 3, round_interval_ms: 0)
-
-Benchee.run(
-  %{
-    "single gossip round — 100 nodes" => fn ->
-      Swimlane.Simulation.run_round(sim)
-    end,
-    "membership merge — 100 events" => fn ->
-      events = Swimlane.Simulation.random_events(sim, 100)
-      Swimlane.Membership.merge_all(%{}, events)
-    end
-  },
-  time: 10,
-  warmup: 3,
-  formatters: [Benchee.Formatters.Console]
-)
-```
-
----
-
-## Why this works
-
-Each node probes one peer per period; if the direct probe fails, it asks K peers for indirect probes before marking the peer suspect. Suspicion is itself gossiped, so every live node converges on the membership view in expected O(log N) rounds.
-
----
-
-## Key Concepts: Consensus and Distributed Agreement
-
-The core challenge in distributed systems is reaching agreement across multiple nodes when some may fail, be slow, or partition from the network. Consensus algorithms formalize three properties:
-
-1. **Safety**: All nodes that decide must decide the same value.
-2. **Liveness**: Every non-faulty node eventually decides.
-3. **Fault tolerance**: The system tolerates up to F faulty nodes out of 2F+1 total.
-
-Raft achieves this via a leader-based approach: the leader serializes writes through a log, and quorum commit ensures no data loss across failures. The log-up-to-date vote rule prevents stale nodes from becoming leader, and the "commit only current-term entries" rule prevents committed entries from being overwritten.
-
-This contrasts with leaderless protocols (e.g., CRDTs) that sacrifice strong consistency for eventual consistency, enabling offline-first systems. For the BEAM, Raft fits naturally into the GenServer + OTP supervision model: each node is a GenServer with local state (log, term, vote), and RPCs are asynchronous messages that do not block the caller.
-
-**Production insight**: SWIM gives you eventually consistent membership, not strongly consistent. What applications can tolerate a 2-round window where a node is incorrectly marked suspect before being refuted?
-
----
-
-## Trade-off analysis
-
-| Aspect | SWIM (your impl) | `:net_kernel` / epmd | Paxos-based membership |
-|--------|-----------------|---------------------|----------------------|
-| Coordinator required | none | epmd daemon | leader node |
-| Convergence | O(log N) rounds | event-driven | quorum-dependent |
-| False positive rate | tunable via indirect probes | low (TCP-based) | none (consensus) |
-| Network overhead | O(K) messages per round per node | O(N) on topology change | O(N) per decision |
-| Partition behavior | eventual consistency | BEAM node isolation | blocks minority |
-| Suitable scale | thousands of nodes | hundreds of nodes | dozens of nodes |
-
-**Reflection**: SWIM gives you eventually consistent membership, not strongly consistent. What applications can tolerate a 2-round window where a node is incorrectly marked suspect before being refuted?
-
----
-
-## Common production mistakes
-
-**1. Marking a node dead after the first failed probe**
-A single direct probe failure is not sufficient evidence of death. Congestion, GC pauses, and momentary packet loss cause false direct-probe failures. The indirect probe step exists precisely for this. Skipping it dramatically increases your false positive rate.
-
-**2. Gossip fanout K too low**
-With K=1, convergence is O(N) rounds in the worst case. The O(log N) bound requires K ≥ 2; K=3 is the practical minimum for a 100-node cluster. Derive K from the convergence formula before choosing a value.
-
-**3. Embedding metrics collection in the gossip hot path**
-Incrementing counters or writing to ETS on every gossip message adds latency to the round interval. Metrics must be sampled by a separate process, not instrumented inline.
-
-**4. Not bounding the event buffer**
-Gossip events accumulate indefinitely if not pruned. After `ceil(log(N))` disseminations, an event has reached all nodes with high probability. Drop it from the outbound buffer. An unbounded buffer causes memory growth proportional to cluster churn rate.
-
-**5. Using wall-clock time for suspicion timeouts**
-Use `System.monotonic_time/1` for all timeout calculations. NTP adjustments can cause wall-clock time to jump backward, extending or collapsing suspicion windows unexpectedly.
-
----
-
-## Reflection
-
-- If your deployment had asymmetric network partitions (A→B works, B→A drops), would the indirect-probe mechanism still detect failures correctly? Walk through an example.
-- Suppose you add 10 new nodes per minute at steady state. At what churn rate does SWIM's suspicion window start producing false positives, and what parameters would you tune first?
-
----
-
-## Resources
-
-- Das, A., Gupta, I. & Motivala, A. (2002). *SWIM: Scalable Weakly-Consistent Infection-Style Process Group Membership Protocol* — the primary source; implement the protocol exactly as described
-- Van Renesse, R. et al. (1998). *A Gossip-Style Failure Detection Service* — the predecessor to SWIM; read it to understand what SWIM improves upon
-- [Hashicorp memberlist](https://github.com/hashicorp/memberlist) — `memberlist.go`, `state.go`, `suspicion.go` — production Go implementation with extensive comments on protocol choices
-- [Apache Cassandra gossip](https://github.com/apache/cassandra/tree/trunk/src/java/org/apache/cassandra/gms) — real-world adaptation for database cluster management

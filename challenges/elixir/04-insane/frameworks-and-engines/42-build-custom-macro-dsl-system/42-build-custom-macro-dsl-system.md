@@ -517,13 +517,18 @@ The design separates concerns along their real axes: what must be correct (the m
 
 ```elixir
 def main do
-  IO.puts("======== 42 build custom macro dsl system ========")
-  IO.puts("Demonstrating core functionality")
+  IO.puts("======== 42-build-custom-macro-dsl-system ========")
+  IO.puts("Build custom macro dsl system")
   IO.puts("")
+  
+  DslKit.StateMachine.start_link([])
+  IO.puts("DslKit.StateMachine started")
   
   IO.puts("Run: mix test")
 end
 ```
+
+
 
 ## Benchmark
 

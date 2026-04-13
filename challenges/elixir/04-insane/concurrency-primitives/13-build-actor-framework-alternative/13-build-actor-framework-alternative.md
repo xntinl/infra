@@ -451,13 +451,18 @@ Each actor runs a custom `:proc_lib` process with a hand-written receive loop th
 
 ```elixir
 def main do
-  IO.puts("======== 13 build actor framework alternative ========")
-  IO.puts("Demonstrating core functionality")
+  IO.puts("======== 13-build-actor-framework-alternative ========")
+  IO.puts("Build actor framework alternative")
   IO.puts("")
+  
+  TypedActors.Actor.start_link([])
+  IO.puts("TypedActors.Actor started")
   
   IO.puts("Run: mix test")
 end
 ```
+
+
 
 ## Benchmark
 

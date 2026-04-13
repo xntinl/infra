@@ -447,182 +447,26 @@ Target: 100,000 reads/second and 50,000 writes/second with AOF enabled and R=2 q
 Each key maps to exactly one primary owner on the ring, and replicas follow the next R-1 vnodes clockwise. Because vnodes are hash-distributed, adding a node moves only its share of keys, and reads can fall back to replicas without violating the ownership invariant.
 
 ---
-
-
 ## Main Entry Point
 
 ```elixir
 def main do
-  IO.puts("======== 03 build distributed cache redis like ========")
-  IO.puts("Demonstrating core functionality")
+  IO.puts("======== 03-build-distributed-cache-redis-like ========")
+  IO.puts("Build Distributed Cache Redis Like")
   IO.puts("")
+  
+{:ok, cache} = Cache.start_link([])
+  IO.puts("Cache started")
+  
+  :ok = Cache.set(cache, "user:1", %{name: "Alice", age: 30})
+  {:ok, val} = Cache.get(cache, "user:1")
+  IO.puts("Cached user:1: #{inspect(val)}")
+  
+  :ok = Cache.delete(cache, "user:1")
+  {:error, :not_found} = Cache.get(cache, "user:1")
+  IO.puts("Key deleted successfully")
   
   IO.puts("Run: mix test")
 end
 ```
 
-## Benchmark
-
-```elixir
-# bench/cache_bench.exs — Distributed cache benchmark with latency percentiles
-# Prerequisites: iex -S mix (starts krebs server)
-# Then: mix run bench/cache_bench.exs
-
-defmodule KrebsBench do
-  @doc "Measures cache operations with latency percentiles (p50, p99)."
-  def run do
-    # Warm up: ensure TCP connection and ring are populated
-    for i <- 1..1_000 do
-      Redix.command!(:redix, ["SET", "warmup_#{i}", "val"])
-    end
-
-    Benchee.run(
-      %{
-        "GET — cache hit (single node)" => fn ->
-          key = "key_#{:rand.uniform(10_000)}"
-          {:ok, _val} = Redix.command(:redix, ["GET", key])
-        end,
-        "SET — no replication (single write)" => fn ->
-          key = "key_#{:rand.uniform(10_000)}"
-          {:ok, _} = Redix.command(:redix, ["SET", key, "value_#{System.system_time(:millisecond)}"])
-        end,
-        "SET — with R=2 quorum (replicated write)" => fn ->
-          key = "key_#{:rand.uniform(10_000)}"
-          {:ok, _} = Redix.command(:redix, ["SET", key, "replicated_#{System.system_time(:millisecond)}", "EX", "3600"])
-        end,
-        "DEL — delete with hinted handoff" => fn ->
-          key = "key_#{:rand.uniform(10_000)}"
-          {:ok, _} = Redix.command(:redix, ["DEL", key])
-        end,
-        "MGET — batch read (10 keys)" => fn ->
-          keys = for i <- 1..10, do: "key_#{:rand.uniform(10_000)}"
-          {:ok, _vals} = Redix.command(:redix, ["MGET" | keys])
-        end,
-        "SUBSCRIBE — pub/sub subscription" => fn ->
-          Redix.command(:redix, ["SUBSCRIBE", "channel_#{:rand.uniform(100)}"])
-        end
-      },
-      parallel: 8,
-      time: 10,
-      warmup: 3,
-      pre_check: true,
-      memory_time: 2,
-      formatters: [
-        {Benchee.Formatters.Console, extended_statistics: true},
-        {Benchee.Formatters.JSON, file: "bench_results.json"}
-      ]
-    )
-
-    IO.puts("\n=== Latency Percentiles (measured separately) ===")
-    measure_latencies()
-  end
-
-  defp measure_latencies do
-    latencies = for _ <- 1..100_000 do
-      start = System.monotonic_time(:millisecond)
-      {:ok, _} = Redix.command(:redix, ["GET", "key_#{:rand.uniform(10_000)}"])
-      System.monotonic_time(:millisecond) - start
-    end
-
-    sorted = Enum.sort(latencies)
-    p50 = Enum.at(sorted, div(length(sorted), 2))
-    p99 = Enum.at(sorted, trunc(length(sorted) * 0.99))
-    p999 = Enum.at(sorted, trunc(length(sorted) * 0.999))
-    max_latency = Enum.max(sorted)
-
-    IO.puts("GET latency — p50: #{p50}ms, p99: #{p99}ms, p999: #{p999}ms, max: #{max_latency}ms")
-  end
-end
-
-KrebsBench.run()
-```
-
-### Benchmark targets (v3 standard)
-
-| Metric | Target | Notes |
-|--------|--------|-------|
-| **GET throughput (cache hit)** | 100,000 ops/s | Single-node lookup via consistent hash ring |
-| **SET throughput (no replication)** | 50,000 ops/s | WAL write + memtable insert |
-| **SET with R=2 quorum** | 30,000 ops/s | Quorum writes to R replicas, slower due to coordination |
-| **GET latency p50** | < 0.5 ms | In-memory lookup, no disk I/O |
-| **GET latency p99** | < 2 ms | Handles occasional ring rebalance or GC pause |
-| **GET latency p999** | < 5 ms | Worst-case: cache eviction triggered |
-| **Memory per entry** | < 200 bytes | 16-byte key + 16-byte value + LRU overhead |
-| **Replication lag (hinted handoff)** | < 100 ms | Time for hint to forward after replica recovery |
-
-### Interpretation guide
-
-**Throughput baseline (100k GET/s)**: This assumes:
-- 8 parallel clients (connection pooling)
-- Keys uniformly distributed across 150 vnodes
-- Zero cache evictions (working set fits in memory)
-- Network latency negligible (localhost)
-
-**With eviction pressure**: Throughput drops when the LRU list needs to scan for victims. If working set > memory, monitor eviction rate and tune shard size / vnode count.
-
-**Replication cost**: R=2 quorum writes are ~2–3x slower than single-node because the handler must wait for a replica ACK. Use R=1 (no replication) for throughput-critical caches, R=2+ only where durability matters.
-
----
-
-## Deep Dive: LSM Trees vs. B-Trees for Different Workloads
-
-LSM (Log-Structured Merge) trees power RocksDB and LevelDB. They invert how data is organized compared to traditional B-trees:
-
-**LSM**: Writes go to an in-memory buffer (memtable). When full, the memtable is flushed to disk as an immutable Level 0 file. Periodically, files are merged across levels (compaction), reducing the number of files to search during reads. Reads check memtable, then each level in order.
-
-**B-tree**: Writes update the tree in-place via seeks to the correct leaf. Reads traverse from root to leaf. Requires a write-ahead log for crash safety.
-
-LSM wins dramatically for write-heavy workloads: sequential flushes are much faster than random seeks (10–100x on rotating disks, 3–5x on SSDs). But LSM reads must check multiple levels (O(log N) files instead of O(log N) tree height), making point reads slower. For 80/20 read/write workloads, B-tree point reads dominate.
-
-Compaction is LSM's hidden cost: periodically, all data must be rewritten to compact levels. During compaction, read latency spikes. High-performance systems (RocksDB) use rate-limiting to smooth this spike, but aggressive rate-limiting increases write latency.
-
-A critical LSM tuning parameter is key distribution. Random writes across a large space cause many files per level, making compaction expensive. Sequential writes (e.g., time-series data) cause few files, fast compaction. Similarly, range scans benefit from compacted levels' better locality.
-
-**Production patterns**: Time-series databases (InfluxDB, Prometheus) use LSM because writes are sequential (time order) and reads are range scans (past N hours). Document stores (MongoDB with WiredTiger) use LSM for write throughput. OLTP databases (PostgreSQL) stick with B-trees because point reads and ACID transactions are more critical than write throughput.
-
----
-
-## Trade-off analysis
-
-| Aspect | Strict quorum (R + W > N) | Sloppy quorum + hinted handoff | Single-node (no replication) |
-|--------|--------------------------|-------------------------------|------------------------------|
-| Write availability | requires R live replicas | always writes to any node | always available |
-| Read consistency | strong | eventual (until handoff completes) | strong |
-| Failure tolerance | minority partition | sloppy -- survives any minority | none |
-| Handoff complexity | none | must track hints, forward on recovery | none |
-| Consistency model | linearizable reads | read-your-writes eventually | linearizable |
-
-Reflection: in what scenarios does sloppy quorum return a stale value even after hinted handoff completes?
-
----
-
-## Common production mistakes
-
-**1. Parsing RESP inline vs multibulk incorrectly**
-redis-cli sends commands as multibulk arrays (`*N\r\n$len\r\nword\r\n...`). Some clients send inline commands (`PING\r\n`). Both must parse correctly. A parser that only handles one will fail silently on the other.
-
-**2. LRU eviction using `:ordered_set` access time**
-ETS `:ordered_set` orders by key, not by access time. To implement LRU, you must maintain a separate doubly-linked structure that tracks access order. Sorting all entries to find the LRU is O(n) and will not meet the benchmark.
-
-**3. One timer per key for TTL**
-`Process.send_after` per key does not scale to millions of entries. Use a clock wheel or bucket expiration: group keys by their expiration second into ETS buckets. A single sweeper wakes up each second and evicts all keys in the current bucket.
-
-**4. Forgetting to handle partial TCP writes**
-`:gen_tcp.send/2` may not send the full binary in one call. Accumulate bytes in the connection process state until a complete RESP message is parsed.
-
-**5. Blocking the accept loop**
-The accept loop must only call `:gen_tcp.accept/1` and spawn a handler process. Any work beyond that blocks new connections. Each connection runs in its own process.
-
-## Reflection
-
-- If you had to guarantee linearizable reads (not just eventual), would you keep the replica-fallback read path? Prove your answer with a concrete interleaving.
-- Suppose 1% of your keys drive 50% of traffic. Would vnode count alone fix the hot-spot problem, or would you add per-key replication / request coalescing? Justify.
-
----
-
-## Resources
-
-- DeCandia, G. et al. (2007). *Dynamo: Amazon's Highly Available Key-Value Store* -- sections on consistent hashing, quorum, and hinted handoff
-- [Redis RESP2 protocol specification](https://redis.io/docs/reference/protocol-spec) -- study the wire encoding in full detail
-- [Redis `dict.c`](https://github.com/redis/redis/blob/unstable/src/dict.c), [`aof.c`](https://github.com/redis/redis/blob/unstable/src/aof.c) -- reference C implementations
-- Karger, D. et al. (1997). *Consistent Hashing and Random Trees* -- the original MIT paper

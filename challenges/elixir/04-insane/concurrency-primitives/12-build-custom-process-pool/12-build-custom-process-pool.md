@@ -530,13 +530,18 @@ Workers register with the pool when idle and deregister when busy; `checkout/1` 
 
 ```elixir
 def main do
-  IO.puts("======== 12 build custom process pool ========")
-  IO.puts("Demonstrating core functionality")
+  IO.puts("======== 12-build-custom-process-pool ========")
+  IO.puts("Build custom process pool")
   IO.puts("")
+  
+  Poolex.PoolServer.start_link([])
+  IO.puts("Poolex.PoolServer started")
   
   IO.puts("Run: mix test")
 end
 ```
+
+
 
 ## Benchmark
 

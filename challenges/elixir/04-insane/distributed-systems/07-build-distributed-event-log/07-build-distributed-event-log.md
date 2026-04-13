@@ -482,113 +482,18 @@ For production deployment:
 4. **Offset indexing**: build sparse indices for faster offset lookup within large segments
 
 ---
-
-
 ## Main Entry Point
 
 ```elixir
 def main do
-  IO.puts("======== 07 build distributed event log ========")
-  IO.puts("Demonstrating core functionality")
+  IO.puts("======== 07-build-distributed-event-log ========")
+  IO.puts("Build Distributed Event Log")
   IO.puts("")
+  
+  Klog.TestCluster.start_link([])
+  IO.puts("Klog.TestCluster started")
   
   IO.puts("Run: mix test")
 end
 ```
 
-## Benchmark
-
-**Target**: 500,000 messages/second write throughput (`acks=1`), 1M messages/second read throughput.
-
-```bash
-mix run bench/klog_bench.exs
-```
-
-```elixir
-# bench/klog_bench.exs
-{:ok, broker} = Klog.Broker.start_link(data_dir: System.tmp_dir!())
-:ok = Klog.create_topic(broker, "bench", partitions: 1, replication: 1)
-
-Benchee.run(
-  %{
-    "produce — acks=1" => fn ->
-      Klog.produce(broker, "bench", 0, "", :rand.uniform(1_000_000), acks: 1)
-    end,
-    "consume — sequential read" => fn ->
-      Klog.consume(broker, "bench", 0, from_offset: 0, max_messages: 1_000)
-    end
-  },
-  parallel: 1,
-  time: 10,
-  warmup: 3,
-  formatters: [Benchee.Formatters.Console]
-)
-```
-
----
-
-## Why this works
-
-Each partition is a sequence of append-only segments; writes are serialized per partition via a GenServer, and offsets are monotonic by construction. Readers seek by offset into a segment index, so reads never contend with the active segment's writer.
-
----
-
-## Key Concepts: Consensus and Distributed Agreement
-
-The core challenge in distributed systems is reaching agreement across multiple nodes when some may fail, be slow, or partition from the network. Consensus algorithms formalize three properties:
-
-1. **Safety**: All nodes that decide must decide the same value.
-2. **Liveness**: Every non-faulty node eventually decides.
-3. **Fault tolerance**: The system tolerates up to F faulty nodes out of 2F+1 total.
-
-Raft achieves this via a leader-based approach: the leader serializes writes through a log, and quorum commit ensures no data loss across failures. The log-up-to-date vote rule prevents stale nodes from becoming leader, and the "commit only current-term entries" rule prevents committed entries from being overwritten.
-
-This contrasts with leaderless protocols (e.g., CRDTs) that sacrifice strong consistency for eventual consistency, enabling offline-first systems. For the BEAM, Raft fits naturally into the GenServer + OTP supervision model: each node is a GenServer with local state (log, term, vote), and RPCs are asynchronous messages that do not block the caller.
-
-**Production insight**: The high-watermark is the critical invariant. Never return a message to a consumer unless it is below the HW. If you do, a failover can make that message disappear, breaking exactly-once semantics.
-
----
-
-## Trade-off analysis
-
-| Aspect | ISR quorum (your impl) | Simple majority quorum | No replication |
-|--------|----------------------|----------------------|----------------|
-| Throughput with slow follower | unaffected (slow follower removed from ISR) | degraded until majority responds | maximum |
-| Durability guarantee | all ISR members have the data | majority have the data | none |
-| ISR shrink on failure | no wait; ISR shrinks immediately | must wait for timeout | n/a |
-| Min replicas for commit | 1 (ISR can shrink to leader only) | always majority | 1 |
-| Recovery after follower restart | follower catches up, re-joins ISR | automatic | n/a |
-
-**Reflection**: when ISR shrinks to just the leader (all followers are lagging), commits succeed but durability is zero — the leader holds the only copy. What is the correct production setting to prevent this?
-
----
-
-## Common production mistakes
-
-**1. High-watermark not updated on ISR membership change**
-When a follower is removed from the ISR, the high-watermark must be recalculated using only the remaining ISR members' offsets. Failing to do this can advance the HW past what the new ISR can guarantee.
-
-**2. Consumer group rebalance without a generation counter**
-Two rebalances can overlap: consumer A is acting on generation 2 assignment while consumer B has already moved to generation 3. Without a generation counter, partition A is double-consumed. Every assignment carries a generation; consumers must reject assignments from stale generations.
-
-**3. Segment rotation without index update**
-When a segment is rotated (a new segment file is created), the in-memory list of segment filenames must be updated atomically. A reader that picks up the old list will miss newly written segments.
-
-**4. Idempotent deduplication window too small**
-Deduplication by (producer_id, sequence) is only effective within a session. If the producer_id is recycled across restarts and the sequence resets, a retry that looks like a new message will be applied. Use a persistent producer_id (UUID at startup, stored to disk) rather than a generated PID.
-
----
-
-## Reflection
-
-- If you moved from fsync-every-10ms to fsync-per-append, what fraction of throughput would you lose, and what durability guarantee would you gain? Be quantitative.
-- How does your design compare to Kafka's ISR replication? What safety property would you need to add to claim equivalent durability?
-
----
-
-## Resources
-
-- Kreps, J. (2013). *The Log: What every software engineer should know about unification* — LinkedIn Engineering Blog — read the full post, not summaries
-- Kreps, J., Narkhede, N. & Rao, J. (2011). *Kafka: a Distributed Messaging System for Log Processing*
-- [Apache Kafka Replication documentation](https://kafka.apache.org/documentation/#replication)
-- [Kafka binary protocol reference](https://kafka.apache.org/protocol.html)

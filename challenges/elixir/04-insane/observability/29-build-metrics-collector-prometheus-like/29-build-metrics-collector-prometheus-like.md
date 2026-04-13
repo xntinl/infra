@@ -624,150 +624,18 @@ Expected: `inc no-label` should exceed 5 million ops/second on modern hardware (
 ### Why this works
 
 The design separates concerns along their real axes: what must be correct (the Prometheus-compatible metrics invariants), what must be fast (the hot path isolated from slow paths), and what must be evolvable (external contracts kept narrow). Each module has one job and fails loudly when given inputs outside its contract, so bugs surface near their source instead of as mysterious downstream symptoms. The tests exercise the invariants directly rather than implementation details, which keeps them useful across refactors.
-
-
 ## Main Entry Point
 
 ```elixir
 def main do
-  IO.puts("======== 29 build metrics collector prometheus like ========")
-  IO.puts("Demonstrating core functionality")
+  IO.puts("======== 29-build-metrics-collector-prometheus-like ========")
+  IO.puts("Build Metrics Collector Prometheus Like")
   IO.puts("")
+  
+  MetricsCollector.Registry.start_link([])
+  IO.puts("MetricsCollector.Registry started")
   
   IO.puts("Run: mix test")
 end
 ```
 
-## Benchmark
-
-```elixir
-# bench/counter_bench.exs
-alias MetricsCollector.Types.{Counter, Histogram, Gauge}
-
-# Setup: create realistic metric sets
-counter = Counter.new(:http_requests_total, "HTTP requests", [:method, :status])
-histogram = Histogram.new(:http_latency_ms, "Latency", [:endpoint])
-gauge = Gauge.new(:queue_size, "Queue length", [])
-
-label_sets = [
-  %{method: "GET", status: "200"},
-  %{method: "GET", status: "404"},
-  %{method: "POST", status: "201"},
-  %{method: "POST", status: "400"},
-  %{method: "DELETE", status: "204"}
-]
-
-endpoints = ["GET /users", "POST /users", "GET /users/:id", "DELETE /users/:id"]
-
-IO.puts("Warming up...")
-# Warm up with 100k operations
-Enum.each(1..100_000, fn _ ->
-  Counter.inc(counter, Enum.random(label_sets), 1)
-  Histogram.observe(histogram, :rand.uniform(5000), %{endpoint: Enum.random(endpoints)})
-end)
-
-IO.puts("Running throughput benchmarks...")
-
-Benchee.run(
-  %{
-    "counter.inc (no labels)" => fn ->
-      Counter.inc(counter, %{}, 1)
-    end,
-    "counter.inc (5-label set)" => fn ->
-      Counter.inc(counter, Enum.random(label_sets), 1)
-    end,
-    "counter.get (no labels)" => fn ->
-      Counter.get(counter, %{})
-    end,
-    "histogram.observe" => fn ->
-      Histogram.observe(histogram, :rand.uniform(5000), %{endpoint: Enum.random(endpoints)})
-    end,
-    "histogram.get (10 buckets)" => fn ->
-      Histogram.get(histogram, %{endpoint: "GET /users"})
-    end,
-    "gauge.set" => fn ->
-      Gauge.set(gauge, :rand.uniform(1000))
-    end,
-    "gauge.get" => fn ->
-      Gauge.get(gauge)
-    end
-  },
-  parallel: 8,
-  time: 10,
-  warmup: 3,
-  formatters: [Benchee.Formatters.Console]
-)
-
-IO.puts("\nExpected performance targets:")
-IO.puts("  - counter.inc: < 50 ns (single atomic CAS)")
-IO.puts("  - counter.get: < 50 ns")
-IO.puts("  - histogram.observe: < 2 µs (O(bucket_count) atomics ops)")
-IO.puts("  - histogram.get: < 500 ns")
-IO.puts("  - throughput: > 5M inc/s on modern hardware at parallel:8")
-```
-
-Target: <50ns per counter increment (single atomic compare-and-swap); <2µs per histogram observation; >5M increments/second at parallel:8 proving `:atomics` scales across scheduler threads.
-
-## Key Concepts: Time-Series Metrics, Cardinality, and Label Dimensions
-
-**The four metric types**: Each type answers a different question.
-- **Counter**: monotonically increasing value. Query: "how many requests total?" or rate. Example: `http_requests_total`. Cannot decrease; reset is a restart counter or a new time series.
-- **Gauge**: arbitrary value, can go up or down. Query: "current queue depth?" Example: `queue_size`, `memory_usage_bytes`, `temperature_celsius`.
-- **Histogram**: samples a distribution across buckets. Query: "what is the p99 latency?" Stores `_bucket`, `_count`, `_sum` variants automatically. Example: `http_latency_ms_bucket{le="1.0"}`.
-- **Summary**: streaming quantile approximation (like T-Digest). Loses histogram buckets but cheaper to compute. Example: older Prometheus clients.
-
-**Cardinality explosion**: A metric with N label names can have M values per label, yielding M^N distinct time series. If a service labels requests with user_id and request_id (which are unbounded), you get M^2 time series per API endpoint. At 1M users and 1k requests per user, that is 1 billion time series, which OOMs the node. Guard cardinality at registration time by enforcing a max label set count per metric.
-
-**Time-series database (TSDB) storage**: Floats are 8 bytes each. A service producing 100 metrics at 100 Hz over 1 year is 100 × 100 × 86400 × 365 = 315 billion samples = 2.5 TB uncompressed. Compression is mandatory:
-- Gorilla/XOR encoding: exploit the fact that real-world samples are correlated. Encode deltas (sample N - sample N-1) in variable-width bits. Decode at memory-bandwidth speed.
-- Time-series chunks: group samples into immutable blocks (e.g., 2-hour chunks) for compaction and compression. Old chunks are never updated, only read or deleted by retention policy.
-
-**Lock-free counters via `:atomics`**: A naïve counter is a GenServer that serializes every increment. Under high load (50k req/s), the counter becomes a bottleneck before the application logic. Erlang's `:atomics` primitive uses CPU compare-and-swap instructions to allow millions of concurrent increments without process context switching. Trade-off: limited to 64-bit integers, no persistence, no cross-node aggregation without a central query layer.
-
----
-
-## Trade-off analysis
-
-| Aspect | `:atomics` counter | GenServer counter | Redis counter |
-|--------|-------------------|-------------------|---------------|
-| Increment throughput | ~50M ops/s | ~200K ops/s | ~300K ops/s |
-| Cross-node aggregation | not possible (node-local) | possible via call | native |
-| Memory per time series | fixed array slot | map entry | key + overhead |
-| Survives node crash | no | no | yes (if persisted) |
-| Float precision | int only (workarounds needed) | native float | string repr |
-| Cardinality control | manual (your registry) | manual | none by default |
-
-Reflection: histogram `_sum` is a float. `:atomics` only stores integers. Document your approach to this problem and its precision implications.
-
----
-
-## Common production mistakes
-
-**1. Storing label sets as map keys without cardinality limits**
-A misbehaving service labelling with request IDs creates a new time series per request. 1M requests = 1M time series = OOM. Your registry must enforce `@max_label_cardinality` and return an error before inserting.
-
-**2. `rate()` on a gauge**
-`rate()` assumes monotonically increasing counters. Applied to a gauge it produces nonsense. The registry type metadata exists for this validation.
-
-**3. Histogram buckets that don't match your distribution**
-If 99% of requests are under 10ms and your smallest bucket is 100ms, every request lands in the first bucket. You cannot interpolate within a bucket that contains the entire distribution. Size buckets to spread observations across at least 5–6 buckets.
-
-**4. XOR encoding bugs at chunk boundaries**
-The first sample in a chunk has no previous sample to XOR against. Store it raw. A common bug is applying XOR encoding to the first sample, producing garbage on decode.
-
-**5. Alert state machine skipping the pending period**
-An alert that fires immediately on first threshold breach causes notification storms during transient spikes. The `for: 5m` pending state means the condition must hold continuously for 5 minutes before transitioning to `firing`. Implement this as a state machine with a `pending_since` timestamp.
-
----
-
-## Reflection
-
-At what cardinality (unique label combinations per metric) does the lock-free counter approach start to hurt, and what would you change to survive a runaway label-cardinality incident in production?
-
-## Resources
-
-- [Prometheus Data Model](https://prometheus.io/docs/concepts/data_model/) — understand metric names, label sets, and time series before writing a line of code
-- [Prometheus Text Exposition Format 0.0.4](https://prometheus.io/docs/instrumenting/exposition_formats/) — the exact format your `/metrics` endpoint must produce
-- [Gorilla: A Fast, Scalable, In-Memory Time Series Database](http://www.vldb.org/pvldb/vol8/p1816-teller.pdf) — Pelkonen et al., VLDB 2015 — XOR encoding paper
-- [`:atomics` — Erlang/OTP documentation](https://www.erlang.org/doc/man/atomics.html) — read the section on memory ordering guarantees
-- [PromQL documentation](https://prometheus.io/docs/prometheus/latest/querying/basics/) — understand instant vectors, range vectors, and the evaluation model before implementing the evaluator

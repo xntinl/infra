@@ -938,13 +938,18 @@ end
 
 ```elixir
 def main do
-  IO.puts("======== 46 build liveview clone ========")
-  IO.puts("Demonstrating core functionality")
+  IO.puts("======== 46-build-liveview-clone ========")
+  IO.puts("Build liveview clone")
   IO.puts("")
+  
+  Vivo.Socket.start_link([])
+  IO.puts("Vivo.Socket started")
   
   IO.puts("Run: mix test")
 end
 ```
+
+
 
 ## Benchmark
 

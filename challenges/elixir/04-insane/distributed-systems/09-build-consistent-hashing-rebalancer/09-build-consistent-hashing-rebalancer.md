@@ -660,36 +660,18 @@ Benchee.run(
 Target: `lookup/2` < 1µs per call with 10 physical nodes and V=150.
 
 ---
-
-
 ## Main Entry Point
 
 ```elixir
 def main do
-  IO.puts("======== 09 build consistent hashing rebalancer ========")
-  IO.puts("Demonstrating core functionality")
+  IO.puts("======== 09-build-consistent-hashing-rebalancer ========")
+  IO.puts("Build Consistent Hashing Rebalancer")
   IO.puts("")
+  
+  ChordRing.Ring.start_link([])
+  IO.puts("ChordRing.Ring started")
   
   IO.puts("Run: mix test")
 end
 ```
 
-## Reflection
-
-1. **Load imbalance vs vnode count**: How does doubling V from 75 to 150 affect the standard deviation of key counts per node? Run the distribution test at both V levels.
-   - **Answer**: Standard deviation is proportional to `1/sqrt(V)`. Doubling V reduces stddev by ~29%.
-
-2. **Migration cost analysis**: If you have 1M keys and add a node, and migration rate is 1000 keys/sec, how long does rebalancing take? Does this time scale linearly with cluster size?
-   - **Answer**: ~1000 seconds (16 minutes) for 1M keys. Time scales linearly with total key count, not cluster size — this is why lazy migration helps.
-
-3. **Hotspot detection tradeoff**: Sample 1 in 100 requests for access frequency (1% overhead). How accurate is the P99 estimate with this sampling rate?
-   - **Answer**: Accuracy is within ±10% at 95% confidence for true access frequency > 0.01. Below that threshold, sampling false positives increase.
-
----
-
-## Resources
-
-- DeCandia, G. et al. (2007). *Dynamo: Amazon's Highly Available Key-Value Store*. Sections 4.1 (Partitioning), 4.2 (Replication), 4.7 (Membership).
-- Stoica, I. et al. (2001). *Chord: A Scalable Peer-to-Peer Lookup Service for Internet Applications*.
-- Karger, D. et al. (1997). *Consistent Hashing and Random Trees*. MIT Technical Report. The original consistent hashing paper.
-- [Apache Cassandra: Data Distribution and Replication](https://cassandra.apache.org/doc/latest/cassandra/architecture/dynamo.html). Production vnode implementation.

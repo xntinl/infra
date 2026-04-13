@@ -781,13 +781,18 @@ end
 
 ```elixir
 def main do
-  IO.puts("======== 48 build compile time type system ========")
-  IO.puts("Demonstrating core functionality")
+  IO.puts("======== 48-build-compile-time-type-system ========")
+  IO.puts("Build compile time type system")
   IO.puts("")
+  
+  TypeCheck.Types.start_link([])
+  IO.puts("TypeCheck.Types started")
   
   IO.puts("Run: mix test")
 end
 ```
+
+
 
 ## Benchmark
 

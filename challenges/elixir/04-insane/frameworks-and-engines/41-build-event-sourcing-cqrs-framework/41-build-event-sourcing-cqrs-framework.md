@@ -540,13 +540,18 @@ The design separates concerns along their real axes: what must be correct (the e
 
 ```elixir
 def main do
-  IO.puts("======== 41 build event sourcing cqrs framework ========")
-  IO.puts("Demonstrating core functionality")
+  IO.puts("======== 41-build-event-sourcing-cqrs-framework ========")
+  IO.puts("Build event sourcing cqrs framework")
   IO.puts("")
+  
+  Eventsource.Store.EventStore.start_link([])
+  IO.puts("Eventsource.Store.EventStore started")
   
   IO.puts("Run: mix test")
 end
 ```
+
+
 
 ## Benchmark
 

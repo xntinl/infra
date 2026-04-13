@@ -748,13 +748,18 @@ The design separates concerns along their real axes: what must be correct (the P
 
 ```elixir
 def main do
-  IO.puts("======== 32 build web framework phoenix like ========")
-  IO.puts("Demonstrating core functionality")
+  IO.puts("======== 32-build-web-framework-phoenix-like ========")
+  IO.puts("Build web framework phoenix like")
   IO.puts("")
+  
+  Nova.Conn.start_link([])
+  IO.puts("Nova.Conn started")
   
   IO.puts("Run: mix test")
 end
 ```
+
+
 
 ## Benchmark
 

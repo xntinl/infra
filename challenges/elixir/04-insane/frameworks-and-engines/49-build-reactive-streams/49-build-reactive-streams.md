@@ -929,13 +929,18 @@ The design isolates correctness-critical invariants from latency-critical paths 
 
 ```elixir
 def main do
-  IO.puts("======== 49 build reactive streams ========")
-  IO.puts("Demonstrating core functionality")
+  IO.puts("======== 49-build-reactive-streams ========")
+  IO.puts("Build reactive streams")
   IO.puts("")
+  
+  RStreams.Publisher.start_link([])
+  IO.puts("RStreams.Publisher started")
   
   IO.puts("Run: mix test")
 end
 ```
+
+
 
 ## Benchmark
 

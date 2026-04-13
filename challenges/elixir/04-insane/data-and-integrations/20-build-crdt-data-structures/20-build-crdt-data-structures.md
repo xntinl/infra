@@ -632,142 +632,24 @@ mix run bench/crdts_bench.exs
 ```
 
 Expected output: All lattice law tests pass (commutativity, associativity, idempotency), and the 5-node convergence test completes within 1 second after network healing.
-
-
 ## Main Entry Point
 
 ```elixir
 def main do
-  IO.puts("======== 20 build crdt data structures ========")
-  IO.puts("Demonstrating core functionality")
+  IO.puts("======== 20-build-crdt-data-structures ========")
+  IO.puts("Build Crdt Data Structures")
   IO.puts("")
+  
+{:ok, counter} = CRDT.Counter.start_link([])
+  IO.puts("CRDT Counter started")
+  
+  :ok = CRDT.Counter.increment(counter, node1, 5)
+  :ok = CRDT.Counter.increment(counter, node2, 3)
+  
+  total = CRDT.Counter.value(counter)
+  IO.puts("Counter total: #{total}")
   
   IO.puts("Run: mix test")
 end
 ```
 
-## Benchmark
-
-```elixir
-# bench/crdts_bench.exs
-# Full Benchee harness for CRDT operations at scale
-
-Benchee.run(
-  %{
-    "GCounter increment (1k existing)" => fn ->
-      counter = Enum.reduce(1..1_000, CRDTs.GCounter.new(), fn _, c ->
-        CRDTs.GCounter.increment(c, :node_a)
-      end)
-      CRDTs.GCounter.increment(counter, :node_b)
-    end,
-    "GCounter merge (1k per node, 5 nodes)" => fn ->
-      c1 = Enum.reduce(1..1_000, CRDTs.GCounter.new(), fn _, c ->
-        CRDTs.GCounter.increment(c, :node_a)
-      end)
-      c2 = Enum.reduce(1..1_000, CRDTs.GCounter.new(), fn _, c ->
-        CRDTs.GCounter.increment(c, :node_b)
-      end)
-      CRDTs.GCounter.merge(c1, c2)
-    end,
-    "ORSet add (1k existing)" => fn ->
-      or_set = Enum.reduce(1..1_000, CRDTs.ORSet.new(), fn i, s ->
-        CRDTs.ORSet.add(s, "item_#{i}", :node_a)
-      end)
-      CRDTs.ORSet.add(or_set, "new_item", :node_b)
-    end,
-    "ORSet merge (1k per set)" => fn ->
-      s1 = Enum.reduce(1..1_000, CRDTs.ORSet.new(), fn i, s ->
-        CRDTs.ORSet.add(s, "item_a_#{i}", :node_a)
-      end)
-      s2 = Enum.reduce(1..1_000, CRDTs.ORSet.new(), fn i, s ->
-        CRDTs.ORSet.add(s, "item_b_#{i}", :node_b)
-      end)
-      CRDTs.ORSet.merge(s1, s2)
-    end,
-    "LWW register merge (HLC ordering)" => fn ->
-      r1 = CRDTs.LWWRegister.new("value_1", :node_a)
-      r1_updated = CRDTs.LWWRegister.update(r1, "value_2")
-      r2 = CRDTs.LWWRegister.new("value_3", :node_b)
-      CRDTs.LWWRegister.merge(r1_updated, r2)
-    end
-  },
-  time: 5,
-  warmup: 2,
-  memory_time: 2,
-  formatters: [
-    Benchee.Formatters.Console,
-    {Benchee.Formatters.JSON, file: "bench/results.json"}
-  ]
-)
-```
-
-**Benchmark targets:**
-- GCounter increment: <1 µs (map update is O(1) amortized)
-- GCounter merge (1k nodes): <50 µs (slot-wise max is O(N) per node count)
-- ORSet add: <10 µs (MapSet insertion is O(log n))
-- ORSet merge (1k elements): <200 µs (union of dot sets per element)
-- LWW register merge: <1 µs (HLC comparison is O(1))
-- **Convergence**: 5-node network reaches consensus within 50 ms after partition heals (gossip interval 50 ms, 1-2 rounds sufficient)
-
----
-
-## Deep Dive: Conflict-Free Replicated Data Types (CRDTs) and Eventual Consistency
-
-CRDTs are data structures designed so that concurrent updates from multiple replicas always converge to the same state without explicit coordination or consensus.
-
-**How it works**: Traditional merge requires agreement: if replica A says "x = 5" and replica B says "x = 10", which is correct? A CRDT avoids this by defining a merge operation that is commutative, associative, and idempotent. Given these properties, nodes can merge state in any order and always converge.
-
-**Example: G-Counter (grow-only counter)**. Each node maintains a vector of counters, one per node. To increment, increment your own entry. Total is the sum of all entries. To merge two G-Counters, take element-wise max. This is commutative, associative, and idempotent: two nodes incrementing independently then merging always produce the same total, regardless of merge order.
-
-**Trade-off: state size**. A G-Counter with 100 nodes is a 100-element vector. Decrement support (PN-Counter) requires 100 elements for increments and 100 for decrements (200 total). As the cluster grows, CRDT state balloons. Compaction (summing old entries into a delta) is necessary.
-
-**CRDT vs. Consensus**: Raft is strong consistency (all nodes agree on exact state, ordered updates). CRDTs are eventual consistency (nodes may disagree temporarily, then converge). CRDTs excel in offline-first scenarios (mobile app syncing later); Raft is better for systems requiring immediate agreement (bank transfers).
-
-**Gotcha**: Just because a CRDT converges does not mean it is correct for your application. A multi-user text document where two users edit the same location must use a CRDT that preserves intent (e.g., CRDT with unique node IDs). A naive counter cannot distinguish "User A inserted at position 10" from "User B inserted at position 10"—they both see increments and may converge to the wrong document.
-
-**Production patterns**: CRDTs shine for collaborative editing (Google Docs, Figma) and offline-first apps (mobile). For backends requiring strong consistency (databases, ledgers), Raft or other consensus is necessary. Many systems use both: CRDTs for user-facing edits, Raft for backend state.
-
----
-
-## Trade-off analysis
-
-| CRDT | Merge cost | Space cost | Semantics | Suitable for |
-|------|-----------|------------|-----------|-------------|
-| G-Counter | O(N) per-node slots | O(N) | monotonic increment | view counts, likes |
-| PN-Counter | O(N) | O(2N) | increment and decrement | inventory, balances |
-| OR-Set | O(elements x dots) | O(elements x dots) | add-wins | shopping cart, tag sets |
-| LWW-Register | O(1) | O(1) | last-write-wins | settings, config |
-| RGA | O(sequence length) | O(sequence length) | insertion order | collaborative text |
-
-Reflection: OR-Set has add-wins semantics. Design a remove-wins variant. What changes to the merge function and the add/remove operations? What use cases prefer remove-wins over add-wins?
-
----
-
-## Common production mistakes
-
-**1. Using physical timestamps instead of HLC for LWW**
-Physical clocks can go backward. An NTP adjustment on node A might make its timestamp earlier than node B's, causing node B's older write to "win." HLC prevents this by advancing the logical component when physical time is tied.
-
-**2. OR-Set dots not unique across nodes**
-If two nodes use the same sequence generator, they can generate the same dot. The actor component of the dot must be unique per node.
-
-**3. RGA not handling concurrent inserts at the same anchor**
-Two nodes insert at the same position concurrently. Without a deterministic tie-breaking rule (e.g., higher actor ID wins), the two nodes produce different orderings after merge.
-
-**4. Gossip not accounting for partial state exchange**
-State-based gossip sends the full CRDT state to a random peer. For a large ORSet with millions of elements, this is expensive. Delta-CRDT gossip sends only the changes since the last exchange.
-
-## Reflection
-
-- Why can't OR-set removals be implemented as plain deletes? Walk through a concurrent add/remove example.
-- When would you reach for an op-based CRDT instead of a δ-CRDT? Name a workload and justify.
-
----
-
-## Resources
-
-- Shapiro, M. et al. (2011). *A Comprehensive Study of Convergent and Commutative Replicated Data Types* — INRIA RR-7506
-- Preguica, N. et al. (2010). *Dotted Version Vectors: Logical Clocks for Optimistic Replication*
-- Kulkarni, S. et al. (2014). *Logical Physical Clocks and Consistent Snapshots in Globally Distributed Databases*
-- [Automerge](https://github.com/automerge/automerge) — JavaScript CRDT library with RGA implementation
-- [riak_dt](https://github.com/basho/riak_dt) — Erlang/Elixir CRDT reference

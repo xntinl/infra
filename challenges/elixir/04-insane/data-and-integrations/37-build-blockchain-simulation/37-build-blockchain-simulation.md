@@ -699,164 +699,18 @@ mix run bench/mining_bench.exs
 ```
 
 Expected output: All cryptographic tests pass (genesis consistency, signature round-trips, deterministic hashing), wallet generation produces unique addresses, and the consensus test shows two nodes converging to the same chain after a fork within 100ms.
-
-
 ## Main Entry Point
 
 ```elixir
 def main do
-  IO.puts("======== 37 build blockchain simulation ========")
-  IO.puts("Demonstrating core functionality")
+  IO.puts("======== 37-build-blockchain-simulation ========")
+  IO.puts("Build Blockchain Simulation")
   IO.puts("")
+  
+  Chainex.Block.start_link([])
+  IO.puts("Chainex.Block started")
   
   IO.puts("Run: mix test")
 end
 ```
 
-## Benchmark
-
-```elixir
-# bench/mining_bench.exs — comprehensive mining and validation benchmarks
-
-Benchee.run(
-  %{
-    "genesis block creation" => fn ->
-      Chainex.Block.genesis()
-    end,
-    "block hash computation (empty txs)" => fn ->
-      block = %Chainex.Block{
-        index: 1,
-        timestamp: System.system_time(:second),
-        transactions: [],
-        previous_hash: String.duplicate("0", 64),
-        nonce: 0
-      }
-      Chainex.Block.compute_hash(block)
-    end,
-    "PoW validation (difficulty 2)" => fn ->
-      block = Chainex.Block.genesis()
-      Chainex.Block.valid_pow?(block, 2)
-    end,
-    "wallet generation (ECDSA secp256k1)" => fn ->
-      Chainex.Wallet.generate()
-    end,
-    "transaction signing and verification" => fn ->
-      w = Chainex.Wallet.generate()
-      data = "transaction_data"
-      sig = Chainex.Wallet.sign(w, data)
-      Chainex.Wallet.verify(data, sig, w.public_key)
-    end,
-    "mine block (difficulty 2, ~256 avg iterations)" => fn ->
-      Chainex.Miner.mine_block(%{
-        index: 1,
-        transactions: [],
-        previous_hash: String.duplicate("0", 64),
-        difficulty: 2
-      })
-    end,
-    "mine block (difficulty 3, ~4096 avg iterations)" => fn ->
-      Chainex.Miner.mine_block(%{
-        index: 1,
-        transactions: [],
-        previous_hash: String.duplicate("0", 64),
-        difficulty: 3
-      })
-    end,
-    "mine block (difficulty 4, ~65536 avg iterations)" => fn ->
-      Chainex.Miner.mine_block(%{
-        index: 1,
-        transactions: [],
-        previous_hash: String.duplicate("0", 64),
-        difficulty: 4
-      })
-    end,
-    "block validation pipeline (hash, PoW, linkage)" => fn ->
-      genesis = Chainex.Block.genesis()
-      block = %Chainex.Block{
-        index: 1,
-        timestamp: System.system_time(:second),
-        transactions: [],
-        previous_hash: genesis.hash,
-        nonce: 0
-      }
-      hash = Chainex.Block.compute_hash(block)
-      block_with_hash = %{block | hash: hash}
-      Chainex.Block.valid_pow?(block_with_hash, 2)
-    end,
-    "node receives and broadcasts block" => fn ->
-      # Measure block propagation cost (not mining time)
-      {:ok, node} = Chainex.Node.start_link(difficulty: 1)
-      block = Chainex.Block.genesis()
-      Chainex.Node.receive_block(node, block)
-      GenServer.stop(node)
-    end
-  },
-  time: 5,
-  warmup: 2,
-  memory_time: 2,
-  formatters: [
-    Benchee.Formatters.Console,
-    {Benchee.Formatters.JSON, file: "bench/results.json"}
-  ]
-)
-```
-
-**Benchmark targets:**
-- Genesis block: <100 µs (deterministic, no hashing iterations)
-- Block hash computation (empty): <1 ms (double SHA-256 is fast)
-- PoW validation: <1 µs (string prefix check only, hash already computed)
-- Wallet generation: <10 ms (ECDSA key generation is the bottleneck)
-- Signing + verification round-trip: <50 ms (ECDSA operations on secp256k1)
-- Mining difficulty 2: <5 ms avg (256 nonce iterations at SHA-256 speed)
-- Mining difficulty 3: <100 ms avg (4,096 iterations)
-- Mining difficulty 4: <2 sec avg (65,536 iterations)
-- Block validation pipeline: <2 ms (hash + PoW check + linkage)
-- **Fork resolution**: two mining nodes on different chains converge within 100ms of receiving the longest valid chain
-
----
-
-## Trade-off analysis
-
-| Aspect | Proof of Work (your impl) | Proof of Stake | Practical Byzantine Fault Tolerance |
-|--------|--------------------------|----------------|-------------------------------------|
-| Sybil resistance | hardware cost | coin stake | identity/membership required |
-| Energy | high | low | low |
-| Finality | probabilistic | can be instant | instant |
-| Fork possibility | yes | reduced | no (single canonical block) |
-| Required connectivity | asynchronous P2P | structured network | all-to-all known validators |
-| Implementation complexity | moderate | high | high |
-
-Reflection: in your simulation, two nodes mining simultaneously always creates a temporary fork. What is the probability of a permanent fork (a "double-spend attack") given N honest nodes and one attacker controlling M% of the hash power? (Hint: this is the core of Bitcoin's 51% attack analysis.)
-
----
-
-## Common production mistakes
-
-**1. Using `System.os_time` for block timestamps**
-`os_time` can go backward (NTP adjustments). Use `System.monotonic_time` for relative timing within the simulation. For block timestamps that must be globally meaningful, use `System.system_time(:second)` but document the wall-clock drift risk.
-
-**2. Non-canonical block encoding**
-If two nodes compute the hash of the same block differently (e.g., different field ordering in the binary encoding), they will never agree on validity. Define a canonical encoding function once and use it everywhere. Test that `compute_hash(block)` is identical across fresh processes.
-
-**3. Orphaned transactions not returning to mempool**
-When a fork is resolved and your chain switches to the longer version, blocks from your old chain become orphaned. Any transactions in those blocks that are not in the winning chain must return to the mempool. Forgetting this causes transactions to be "lost" — they existed in an orphaned block but are not in the current chain and are no longer pending.
-
-**4. Mining Task not cancellable**
-When a peer sends a longer valid block, mining the current nonce range is wasted work. Your `Miner` must use `Task.async` and `Task.shutdown/2` so the current mining attempt can be cancelled immediately on block receipt.
-
-**5. ECDSA signature over non-canonical data**
-If your transaction signing function signs `inspect(transaction)` (which includes Elixir struct metadata), the signature will vary across BEAM versions. Sign a canonical binary encoding — never string representations of Elixir terms.
-
----
-
-## Reflection
-
-If two miners produce valid blocks 50ms apart, your node receives them in some order. Walk through the state transitions under longest-chain rule vs GHOST and note where a naive implementation double-counts transactions.
-
-## Resources
-
-- [Bitcoin Whitepaper](https://bitcoin.org/bitcoin.pdf) — Nakamoto (2008) — sections 4-11 cover PoW, the blockchain data structure, and the fork resolution rule directly
-- ["Mastering Bitcoin"](https://github.com/bitcoinbook/bitcoinbook) — Antonopoulos — chapters 6-10 on mining, consensus, and the network; free on GitHub
-- [Erlang `:crypto` module](https://www.erlang.org/doc/man/crypto.html) — read the ECDH and ECDSA sections; the `generate_key/2`, `sign/4`, and `verify/5` functions are your entire cryptography layer
-- [RFC 5480 — Elliptic Curve Cryptography Subject Public Key Information](https://www.rfc-editor.org/rfc/rfc5480) — the DER encoding format for ECDSA signatures and keys
-- [Ethereum Yellow Paper](https://ethereum.github.io/yellowpaper/paper.pdf) — for comparison: the account-based model vs. the UTXO model your simulation uses

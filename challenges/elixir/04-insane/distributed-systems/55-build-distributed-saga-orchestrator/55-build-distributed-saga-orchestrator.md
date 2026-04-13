@@ -227,67 +227,26 @@ mix test test/saga_engine/ --trace
 
 ```elixir
 def main do
-  IO.puts("======== 55 build distributed saga orchestrator ========")
-  IO.puts("Demonstrating core functionality")
+  IO.puts("======== 55-build-distributed-saga-orchestrator ========")
+  IO.puts("Build Distributed Saga Orchestrator")
   IO.puts("")
+  
+  {:ok, _} = SagaEngine.start_link([])
+  IO.puts("Saga engine started")
+  
+  saga_def = {:payment_saga, [
+    {:charge_card, %{amount: 100}},
+    {:confirm_order, %{order_id: 1}},
+    {:notify_user, %{email: "user@example.com"}}
+  ]}
+  
+  {:ok, saga_id} = SagaEngine.execute(saga_def)
+  IO.puts("Saga executed: #{saga_id}")
+  
+  {:ok, status} = SagaEngine.get_status(saga_id)
+  IO.puts("Saga status: #{status}")
   
   IO.puts("Run: mix test")
 end
 ```
 
-## Benchmark
-
-**Objective**: Quantify saga throughput under load so orchestration overhead stays measured.
-
-```elixir
-# bench/throughput.exs
-@saga_count 1_000
-@concurrency 50
-
-def run do
-  backend = SagaEngine.Backends.ETS.new()
-  IO.puts("Running #{@saga_count} sagas with concurrency #{@concurrency}")
-  t0 = System.monotonic_time(:millisecond)
-
-  results =
-    1..@saga_count
-    |> Task.async_stream(fn i ->
-      saga_id = "bench-#{i}"
-      {:ok, _} = SagaEngine.Orchestrator.start_link(saga_id: saga_id, backend: backend)
-      SagaEngine.Orchestrator.run(saga_id, OrderSaga, :place_order, %{order_id: i})
-    end, max_concurrency: @concurrency, timeout: 60_000)
-    |> Enum.to_list()
-
-  elapsed_ms = System.monotonic_time(:millisecond) - t0
-  completed = Enum.count(results, fn {:ok, r} -> match?({:ok, _}, r) end)
-  failed = @saga_count - completed
-
-  IO.puts("Completed: #{completed}, Failed: #{failed}")
-  IO.puts("Throughput: #{Float.round(@saga_count / (elapsed_ms / 1000), 0)} sagas/s")
-end
-```
-
-Target: 100+ sagas/second on a single node; end-to-end latency < 5 seconds for a 4-step saga.
-
----
-
-## Reflection
-
-1. **Idempotency and retries**: A saga retries `charge_payment` on timeout. The payment service supports idempotency keys. If the original request succeeded but the response was lost, the retry returns "already charged." But your saga still advances to the next step (it thinks the charge just now happened). Is this correct?
-   - **Answer**: Yes, if you treat the idempotency key as evidence that the step succeeded. The payment happened during the first request; the retry just confirmed it. Advance to the next step.
-
-2. **Compensation failure and manual intervention**: A saga fails at step 3 and begins compensating. Compensation of step 2 fails (payment service is down). The saga goes to dead-letter. What information do operators need to resolve this?
-   - **Answer**: The event log (full transaction history), the failed step, the reason for failure, and a replay mechanism to resume compensation once the payment service is back online.
-
-3. **Eventual consistency window**: Between step 1 (reserve inventory) succeeding and step 2 (charge payment) failing, the inventory is reserved but not charged. An observer checking inventory sees it's reserved, but the order is not complete. Design your UI to handle this.
-
----
-
-## Resources
-
-- Garcia-Molina, H. & Salem, K. (1987). *Sagas*. ACM SIGMOD. Original paper.
-- Richardson, C. (2018). *Microservices Patterns* Chapter 4: Managing transactions with Sagas. Manning.
-- Kleppmann, M. (2017). *Designing Data-Intensive Applications*. O'Reilly, Chapter 9: Consistency and Consensus.
-- Temporal documentation — https://docs.temporal.io (production saga orchestration reference).
-- Fowler, M. *Event Sourcing* — https://martinfowler.com/eaaDev/EventSourcing.html
-- Horde library — https://github.com/derekkraan/horde (distributed process registry and supervisor).

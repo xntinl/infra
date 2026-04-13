@@ -699,261 +699,29 @@ Targets: 100k sequential writes/second, 200k random reads/second (warm Bloom fil
 Writes hit an in-memory skiplist; when it fills, it's flushed as an immutable SSTable. Compaction merges overlapping SSTables into larger levels, which bounds the number of files a read must consult and amortizes disk work.
 
 ---
-
-
 ## Main Entry Point
 
 ```elixir
 def main do
-  IO.puts("======== 15 build lsm tree storage engine ========")
-  IO.puts("Demonstrating core functionality")
+  IO.puts("======== 15-build-lsm-tree-storage-engine ========")
+  IO.puts("Build Lsm Tree Storage Engine")
   IO.puts("")
+  
+  {:ok, db} = Lsmex.Engine.open("/tmp/lsmex_demo")
+  IO.puts("LSM engine opened")
+  
+  Enum.each(1..100, fn i ->
+    Lsmex.Engine.put(db, "key#{i}", "value#{i}")
+  end)
+  IO.puts("Wrote 100 key-value pairs")
+  
+  {:ok, val} = Lsmex.Engine.get(db, "key50")
+  IO.puts("Read key50: #{val}")
+  
+  :ok = Lsmex.Engine.close(db)
+  IO.puts("Engine closed cleanly")
   
   IO.puts("Run: mix test")
 end
 ```
 
-## Benchmark
-
-```elixir
-# bench/lsmex_bench.exs — LSM-tree comprehensive benchmark with write amplification
-# mix run bench/lsmex_bench.exs
-
-defmodule LsmexBench do
-  @doc "Measures LSM throughput, compaction cost, and write amplification."
-  def run do
-    dir = System.tmp_dir!() <> "/lsmex_bench_#{:erlang.unique_integer([:positive])}"
-    File.mkdir_p!(dir)
-    {:ok, engine} = Lsmex.Engine.start_link(data_dir: dir)
-
-    IO.puts("=== LSM-Tree Benchmark (v3 standard) ===\n")
-
-    # Phase 1: Sequential write throughput (memtable)
-    IO.puts("Phase 1: Sequential write throughput")
-    measure_sequential_writes(engine)
-
-    # Phase 2: Random write throughput (compaction pressure)
-    IO.puts("\nPhase 2: Random write throughput (mixed with compaction)")
-    measure_random_writes(engine)
-
-    # Phase 3: Random read throughput (warm Bloom filter)
-    IO.puts("\nPhase 3: Random read latency (warm Bloom filter)")
-    measure_random_reads(engine)
-
-    # Phase 4: Non-existent key reads (Bloom filter skip rate)
-    IO.puts("\nPhase 4: Non-existent key reads (Bloom filter effectiveness)")
-    measure_bloom_skip(engine)
-
-    # Phase 5: Range scan performance
-    IO.puts("\nPhase 5: Range scan performance")
-    measure_range_scan(engine)
-
-    # Cleanup
-    GenServer.stop(engine)
-    File.rm_rf!(dir)
-  end
-
-  defp measure_sequential_writes(engine) do
-    Benchee.run(
-      %{
-        "sequential write (append-only)" => fn ->
-          key = :crypto.strong_rand_bytes(8) |> Base.encode16()
-          value = :rand.bytes(256)
-          Lsmex.Engine.put(engine, key, value)
-        end
-      },
-      parallel: 1,
-      time: 5,
-      warmup: 1,
-      formatters: [{Benchee.Formatters.Console, extended_statistics: true}]
-    )
-  end
-
-  defp measure_random_writes(engine) do
-    # Pre-populate with 100k keys to trigger compaction
-    for i <- 1..100_000 do
-      Lsmex.Engine.put(engine, "key_#{String.pad_leading("#{i}", 6, "0")}", "val_#{i}")
-    end
-
-    Benchee.run(
-      %{
-        "random write (with compaction)" => fn ->
-          key = "rnd_#{:rand.uniform(1_000_000)}"
-          value = "value_#{System.system_time(:millisecond)}"
-          Lsmex.Engine.put(engine, key, value)
-        end
-      },
-      parallel: 1,
-      time: 5,
-      warmup: 1,
-      formatters: [{Benchee.Formatters.Console, extended_statistics: true}]
-    )
-  end
-
-  defp measure_random_reads(engine) do
-    latencies = []
-    times = []
-
-    Enum.reduce(1..10_000, {latencies, times}, fn _i, {lats, tms} ->
-      start = System.monotonic_time(:microsecond)
-      key = "key_#{String.pad_leading("#{:rand.uniform(100_000)}", 6, "0")}"
-      {:ok, _val} = Lsmex.Engine.get(engine, key)
-      elapsed = System.monotonic_time(:microsecond) - start
-      {[elapsed | lats], [elapsed | tms]}
-    end)
-
-    Benchee.run(
-      %{
-        "random read (existing key)" => fn ->
-          key = "key_#{String.pad_leading("#{:rand.uniform(100_000)}", 6, "0")}"
-          {:ok, _val} = Lsmex.Engine.get(engine, key)
-        end
-      },
-      parallel: 2,
-      time: 5,
-      warmup: 1,
-      formatters: [{Benchee.Formatters.Console, extended_statistics: true}]
-    )
-
-    # Compute percentiles
-    sorted = Enum.sort(times)
-    p50 = Enum.at(sorted, div(length(sorted), 2)) / 1_000
-    p99 = Enum.at(sorted, trunc(length(sorted) * 0.99)) / 1_000
-    p999 = Enum.at(sorted, trunc(length(sorted) * 0.999)) / 1_000
-
-    IO.puts("\nLatency percentiles (warm Bloom filter):")
-    IO.puts("  p50:  #{Float.round(p50, 2)}ms")
-    IO.puts("  p99:  #{Float.round(p99, 2)}ms")
-    IO.puts("  p999: #{Float.round(p999, 2)}ms")
-  end
-
-  defp measure_bloom_skip(engine) do
-    Benchee.run(
-      %{
-        "read — non-existent key (Bloom filter skip)" => fn ->
-          key = "absent_#{:rand.uniform(10_000_000)}"
-          {:error, :not_found} = Lsmex.Engine.get(engine, key)
-        end
-      },
-      parallel: 2,
-      time: 5,
-      warmup: 1,
-      formatters: [{Benchee.Formatters.Console, extended_statistics: true}]
-    )
-  end
-
-  defp measure_range_scan(engine) do
-    Benchee.run(
-      %{
-        "range scan — 1000 keys [key_000001, key_001000]" => fn ->
-          from = "key_000001"
-          to = "key_001000"
-          Lsmex.Engine.scan(engine, from, to) |> Enum.count()
-        end
-      },
-      parallel: 1,
-      time: 5,
-      warmup: 1,
-      formatters: [{Benchee.Formatters.Console, extended_statistics: true}]
-    )
-  end
-end
-
-LsmexBench.run()
-```
-
-### Benchmark targets (v3 standard) — Write Amplification Focus
-
-| Metric | Target | Interpretation |
-|--------|--------|-----------------|
-| **Sequential write** | 500k–800k ops/s | Memtable append (no compaction yet) |
-| **Random write (with compaction)** | 50k–100k ops/s | Drops due to background compaction rewriting data |
-| **Random read (existing key, warm Bloom)** | 200k–300k ops/s | Multiple SSTable reads; Bloom filter eliminates 99% of disk hits |
-| **Random read latency p50** | < 0.5 ms | Memtable hit (no disk) |
-| **Random read latency p99** | < 5 ms | SSTable binary search + disk read |
-| **Random read latency p999** | < 20 ms | Compaction running; temporary I/O stall |
-| **Non-existent key read** | 500k–1M ops/s | Bloom filter says "not found"; zero disk I/O |
-| **Range scan** | 100k–200k keys/s | Sequential SSTable scan; limited by disk bandwidth |
-| **Write amplification ratio** | 5–10x | Every write may be rewritten 5–10 times during compaction |
-| **Bloom false positive rate** | < 1% | At target_fp=0.01 |
-
-### Write Amplification Deep Dive
-
-LSM's hidden cost is **write amplification**: one logical write may be rewritten multiple times as SSTables are compacted across levels.
-
-**Example**: 1 GB of new data → flush to Level 0 (1 write). Level 0 merges to Level 1 (1 read + 1 write). Level 1 merges to Level 2 (1 read + 1 write). With 3 levels, the same data is written 3 times total, giving ~3x write amplification.
-
-**How to measure**:
-- Count total bytes written to disk (including compaction) over the benchmark run
-- Divide by total bytes of unique data inserted
-- Ratio > 5 means tuning: increase memtable size, decrease level growth ratio, or switch to size-tiered compaction
-
-**Tuning knobs**:
-- **Memtable size**: 64 MB → 256 MB reduces compaction frequency (slower writes per memtable flush) but increases memory pressure
-- **Level multiplier**: default 10x means Level 0 is 10 MB, Level 1 is 100 MB, Level 2 is 1 GB. Increase to 20x to reduce compaction fanout
-- **Compaction strategy**: LevelDB uses leveled (merge one L0 file into L1 per write); RocksDB adds size-tiered (batch L0 files before merge) — test both
-
----
-
-## Deep Dive: LSM Trees vs. B-Trees for Different Workloads
-
-LSM (Log-Structured Merge) trees power RocksDB and LevelDB. They invert how data is organized compared to traditional B-trees:
-
-**LSM**: Writes go to an in-memory buffer (memtable). When full, the memtable is flushed to disk as an immutable Level 0 file. Periodically, files are merged across levels (compaction), reducing the number of files to search during reads. Reads check memtable, then each level in order.
-
-**B-tree**: Writes update the tree in-place via seeks to the correct leaf. Reads traverse from root to leaf. Requires a write-ahead log for crash safety.
-
-LSM wins dramatically for write-heavy workloads: sequential flushes are much faster than random seeks (10–100x on rotating disks, 3–5x on SSDs). But LSM reads must check multiple levels (O(log N) files instead of O(log N) tree height), making point reads slower. For 80/20 read/write workloads, B-tree point reads dominate.
-
-Compaction is LSM's hidden cost: periodically, all data must be rewritten to compact levels. During compaction, read latency spikes. High-performance systems (RocksDB) use rate-limiting to smooth this spike, but aggressive rate-limiting increases write latency.
-
-A critical LSM tuning parameter is key distribution. Random writes across a large space cause many files per level, making compaction expensive. Sequential writes (e.g., time-series data) cause few files, fast compaction. Similarly, range scans benefit from compacted levels' better locality.
-
-**Production patterns**: Time-series databases (InfluxDB, Prometheus) use LSM because writes are sequential (time order) and reads are range scans (past N hours). Document stores (MongoDB with WiredTiger) use LSM for write throughput. OLTP databases (PostgreSQL) stick with B-trees because point reads and ACID transactions are more critical than write throughput.
-
----
-
-## Trade-off analysis
-
-| Aspect | LSM-tree (your impl) | B-tree | Hash map (pure in-memory) |
-|--------|---------------------|--------|--------------------------|
-| Write throughput | high (sequential) | moderate (random) | maximum |
-| Read throughput | moderate (multi-level) | high (O(log N)) | maximum |
-| Disk space amplification | moderate (tombstones until compaction) | low | none |
-| Write amplification | high (compaction rewrites) | low | none |
-| Range scan | efficient (sorted) | efficient (sorted) | depends on ordering |
-| Crash recovery | WAL replay | B-tree journaling | none (in-memory) |
-
-Fill in measured throughput from your benchmark.
-
-Reflection: the compaction process rewrites every key that was ever deleted. A workload with 80% deletes will have very high write amplification. What compaction strategy would you use to minimize write amplification for delete-heavy workloads?
-
----
-
-## Common production mistakes
-
-**1. Not fsyncing the WAL before updating the MemTable**
-The fsync guarantees that the WAL record is on disk before the in-memory state changes. Without it, a crash after the MemTable update but before the WAL disk write leaves the WAL behind the MemTable, and replay will miss the write.
-
-**2. Reading from multiple SSTables without merging correctly**
-The same key may appear in multiple SSTables (different write versions). When scanning, you must merge all SSTable iterators with the MemTable iterator and return the latest version for each key. Returning the first match without checking all levels gives stale data.
-
-**3. Bloom filter not persisted with the SSTable**
-If the Bloom filter is built only in memory, a process restart requires reading every SSTable to rebuild it. Persist the Bloom filter in a sidecar file (`.bloom`) alongside each SSTable. Load it on startup.
-
-**4. Compaction running while snapshots are active**
-Compaction must not discard a tombstone if any active snapshot could still see the key before the tombstone. Track the minimum snapshot sequence number and only compact below it.
-
-## Reflection
-
-- Under uniform-random reads vs hot-key reads, which compaction policy (size-tiered vs leveled) wins, and why?
-- How would you tune the memtable size and compaction triggers if disk I/O were 10x slower (e.g., spinning disks)?
-
----
-
-## Resources
-
-- O'Neil, P. et al. (1996). *The Log-Structured Merge-Tree* — Acta Informatica
-- [LevelDB implementation notes](https://github.com/google/leveldb/blob/main/doc/impl.md) — the reference implementation
-- [RocksDB tuning guide](https://github.com/facebook/rocksdb/wiki/RocksDB-Tuning-Guide) — production compaction strategies
-- Kleppmann, M. — *Designing Data-Intensive Applications* — Chapter 3 (Storage Engines)

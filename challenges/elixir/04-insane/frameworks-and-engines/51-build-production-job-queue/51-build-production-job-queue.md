@@ -698,13 +698,18 @@ end
 
 ```elixir
 def main do
-  IO.puts("======== 51 build production job queue ========")
-  IO.puts("Demonstrating core functionality")
+  IO.puts("======== 51-build-production-job-queue ========")
+  IO.puts("Build production job queue")
   IO.puts("")
+  
+  JobQueue.Repo.Migrations.CreateJobs.start_link([])
+  IO.puts("JobQueue.Repo.Migrations.CreateJobs started")
   
   IO.puts("Run: mix test")
 end
 ```
+
+
 
 ## Benchmark
 

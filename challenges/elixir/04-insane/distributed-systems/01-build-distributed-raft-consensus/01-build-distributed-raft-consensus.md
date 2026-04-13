@@ -988,120 +988,29 @@ This is a educational, single-node simulation. For distributed deployment:
 4. Monitor production: instrument term transitions, election frequency, commit lag
 
 ---
-
-
 ## Main Entry Point
 
 ```elixir
 def main do
-  IO.puts("======== 01 build distributed raft consensus ========")
-  IO.puts("Demonstrating core functionality")
+  IO.puts("======== 01-build-distributed-raft-consensus ========")
+  IO.puts("Raft consensus: leader election, log replication, crash recovery")
   IO.puts("")
+  
+  {:ok, _} = RaftConsensus.Cluster.start_cluster(nodes: [1, 2, 3])
+  IO.puts("3-node Raft cluster started")
+  
+  Process.sleep(500)
+  
+  leader = RaftConsensus.Cluster.get_leader()
+  IO.puts("Leader elected: node #{leader}")
+  
+  :ok = RaftConsensus.Cluster.put(leader, "key1", "value1")
+  IO.puts("Replicated key1=value1 to all nodes")
+  
+  {:ok, val} = RaftConsensus.Cluster.get(leader, "key1")
+  IO.puts("Retrieved: key1 = #{val}")
   
   IO.puts("Run: mix test")
 end
 ```
 
-## Benchmark
-
-**Target**: 10,000 linearizable writes/second on a 5-node localhost cluster; p99 < 20 ms.
-
-```bash
-mix run bench/raft_bench.exs
-```
-
-```elixir
-# bench/raft_bench.exs
-{:ok, cluster} = RaftConsensus.Cluster.start_cluster(nodes: 5)
-Process.sleep(2_000)
-
-Benchee.run(
-  %{
-    "put — serialized" => fn ->
-      RaftConsensus.Cluster.put(cluster, "bench_#{:rand.uniform(100)}", :rand.uniform(1_000_000))
-    end,
-    "get — linearizable" => fn ->
-      RaftConsensus.Cluster.get(cluster, "bench_#{:rand.uniform(100)}")
-    end
-  },
-  parallel: 10,
-  time: 10,
-  warmup: 3,
-  formatters: [Benchee.Formatters.Console]
-)
-```
-
----
-
-## Why this works
-
-The leader serializes every write through a single log, so there is exactly one order of operations per term. Quorum commit guarantees that any future leader has every committed entry (by the log-up-to-date vote rule), so no committed data is ever lost. Randomized election timeouts make split votes self-correct in one or two rounds, and `maybe_step_down/2` keeps every node on the highest term it has seen — which is what makes the safety argument hold without a global clock.
-
----
-
-## Key Concepts: Consensus and Distributed Agreement
-
-The core challenge in distributed systems is reaching agreement across multiple nodes when some may fail, be slow, or partition from the network. Consensus algorithms formalize three properties:
-
-1. **Safety**: All nodes that decide must decide the same value.
-2. **Liveness**: Every non-faulty node eventually decides.
-3. **Fault tolerance**: The system tolerates up to F faulty nodes out of 2F+1 total.
-
-Raft achieves this via a leader-based approach: the leader serializes writes through a log, and quorum commit ensures no data loss across failures. The log-up-to-date vote rule prevents stale nodes from becoming leader, and the "commit only current-term entries" rule prevents committed entries from being overwritten.
-
-This contrasts with leaderless protocols (e.g., CRDTs) that sacrifice strong consistency for eventual consistency, enabling offline-first systems. For the BEAM, Raft fits naturally into the GenServer + OTP supervision model: each node is a GenServer with local state (log, term, vote), and RPCs are asynchronous messages that do not block the caller.
-
-**Production insight**: Raft's safety depends on three invariants holding simultaneously. A single violated invariant (e.g., committing an entry from a previous term by index alone) causes data loss on specific failure patterns that may never surface in testing. This is why production systems use formal verification or extensive failure injection (Jepsen tests) to validate safety, not just positive test cases.
-
----
-
-## Trade-off analysis
-
-| Aspect | Raft (your impl) | Multi-Paxos | Viewstamped Replication |
-|--------|-----------------|-------------|------------------------|
-| Leader election | log comparison vote | any quorum member | deterministic rotation |
-| Log commit rule | quorum on current-term entries | phase 2 acceptance | commit_number broadcast |
-| View change | term + log comparison | ballot + accept | two-phase DO_VIEW_CHANGE |
-| Membership change | joint consensus | varies | reconfiguration op |
-| Snapshot protocol | InstallSnapshot RPC | implementation-defined | recovery RPC |
-| Understandability | designed for clarity | historically harder | comparable to Raft |
-
-After running the benchmark, record your measured latency (p50, p99) and throughput (ops/sec) for direct comparison across protocols.
-
-**Architectural question**: Raft forbids committing entries from previous terms by index alone. Why? Construct a 3-node scenario where doing so would violate safety. Draw the log state on each node step by step.
-
----
-
-## Common production mistakes
-
-**1. Committing entries from previous terms by index**
-The most commonly misimplemented rule. A new leader must not mark an old entry committed by seeing it on a majority — it must first replicate and commit an entry from its own term, which transitively commits all previous entries. Violating this causes data loss after a specific sequence of leader crashes.
-
-**2. Not resetting the election timer on AppendEntries**
-If the timer is only reset on non-empty AppendEntries, the node will call an election even though a live leader is sending heartbeats. The timer must reset on every valid AppendEntries, including no-op heartbeats.
-
-**3. Stale RPC responses updating state**
-A response to a RequestVote or AppendEntries from a previous term must be discarded. Check the term in every response; if it is higher than your current term, convert to follower immediately.
-
-**4. Blocking :erpc calls inside the GenServer**
-The Raft node must not block its own message loop waiting for RPCs. Fire RPCs from Task processes, collect results via cast or monitor.
-
-**5. Using wall-clock time for election timeouts**
-Use `System.monotonic_time/1`. Wall-clock time can jump backward after NTP correction, causing spurious elections.
-
----
-
-## Reflection
-
-- If your cluster grew from 5 to 50 nodes, would you keep Raft as-is, shard into multiple Raft groups (à la CockroachDB / TiKV), or switch to a leaderless protocol? Justify in terms of write latency and failure blast radius.
-- Suppose 2 of 5 nodes are in a slow data center adding 80 ms of RTT. Would you change the quorum composition, tune election timeouts per-node, or accept the latency hit? Back your answer with the quorum-commit rule.
-
----
-
-## Resources
-
-- Ongaro, D. & Ousterhout, J. (2014). *In Search of an Understandable Consensus Algorithm (Extended Version)* — Figure 2 is the complete specification; implement it exactly
-- Ongaro, D. (2014). *Consensus: Bridging Theory and Practice* (PhD dissertation) — chapters 3-6 cover safety proofs and membership change
-- [etcd `raft/` package](https://github.com/etcd-io/etcd/tree/main/raft) — the reference Go implementation; study the structure, not the wrapper
-- [TiKV Raft](https://github.com/tikv/raft-rs) — Rust implementation with extensive correctness comments
-- [Jepsen analyses](https://jepsen.io) — Kyle Kingsbury's linearizability violation reports; understand how violations are detected before you claim your implementation is safe

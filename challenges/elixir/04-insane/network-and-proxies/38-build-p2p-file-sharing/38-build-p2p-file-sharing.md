@@ -526,119 +526,18 @@ mix test test/swarm/ --trace
 ### Why this works
 
 The design separates concerns along their real axes: what must be correct (the P2P file sharing (BitTorrent-like) invariants), what must be fast (the hot path isolated from slow paths), and what must be evolvable (external contracts kept narrow). Each module has one job and fails loudly when given inputs outside its contract, so bugs surface near their source instead of as mysterious downstream symptoms. The tests exercise the invariants directly rather than implementation details, which keeps them useful across refactors.
-
-
 ## Main Entry Point
 
 ```elixir
 def main do
-  IO.puts("======== 38 build p2p file sharing ========")
-  IO.puts("Demonstrating core functionality")
+  IO.puts("======== 38-build-p2p-file-sharing ========")
+  IO.puts("Build P2p File Sharing")
   IO.puts("")
+  
+  Swarm.Metadata.start_link([])
+  IO.puts("Swarm.Metadata started")
   
   IO.puts("Run: mix test")
 end
 ```
 
-## Benchmark
-
-```elixir
-# bench/swarm_bench.exs
-data = :crypto.strong_rand_bytes(10_000_000)  # 10MB file
-meta = Swarm.Metadata.from_binary("test.bin", data, 256 * 1024)
-
-{:ok, pm} = Swarm.PieceManager.start_link(num_pieces: Swarm.Metadata.num_pieces(meta))
-{:ok, rl} = Swarm.RateLimiter.start_link(capacity: 5_000_000, rate: 1_000_000)
-
-Benchee.run(%{
-  "rarest_piece_selection_10peers" => fn ->
-    for i <- 0..9 do
-      pieces = MapSet.new([i, i+1, i+2])
-      Swarm.PieceManager.update_peer_bitfield(pm, "peer#{i}", pieces)
-    end
-    Swarm.PieceManager.select_piece(pm, "peer0")
-  end,
-  "rate_limiter_token_bucket" => fn ->
-    Swarm.RateLimiter.consume(rl, "peer0", 65536)
-  end,
-  "metadata_piece_range" => fn ->
-    Swarm.Metadata.piece_range(meta, rem(:rand.uniform(1000), Swarm.Metadata.num_pieces(meta)))
-  end
-}, time: 10, warmup: 3)
-```
-
-## Quick start
-
-```bash
-# Start the application
-mix deps.get
-mix test
-
-# Or run the benchmark:
-mix run bench/swarm_bench.exs
-```
-
-Target: swarm of 100 peers should saturate available bandwidth within 30s of first-piece exchange.
-
-## Key Concepts: P2P Protocols and Distributed Hash Tables
-
-P2P systems have no central authority. Peers discover each other through a DHT and negotiate transfers using message protocols.
-
-**Kademlia DHT**: A distributed hash table organizing nodes in a 160-bit keyspace. Each node has a unique 160-bit ID. Distance between nodes is XOR (not geographic). The routing table has 160 k-buckets; bucket i holds contacts whose IDs differ in the i-th bit. Lookups are iterative: ask the closest nodes for closer contacts, halving distance each step. O(log n) hops to find any key in a network of n nodes.
-
-**XOR metric and triangle inequality**: XOR distance is critical. For any three points A, B, C, the XOR triangle inequality `dist(A,C) ≤ dist(A,B) ⊕ dist(B,C)` holds. This guarantees that each lookup step halves the maximum remaining distance, preventing dead ends.
-
-**Rarest-first piece selection**: Pieces that fewer peers have are downloaded first. This maximizes piece diversity. If 90% of peers request popular pieces first, rare pieces become extremely scarce, and peers cannot bootstrap off each other. Rarest-first distributes rare pieces first, enabling the swarm to propagate all pieces.
-
-**Tit-for-tat choking algorithm**: Upload to peers who upload to you. This incentivizes contribution and prevents free-riding. Every 10 seconds, unchoke the top N uploaders (measured by recent download rate) and one random peer (optimistic unchoking, for exploration). Choke peers with low upload rate.
-
-**Token bucket for rate limiting**: Tokens accumulate at a fixed rate. Each transfer consumes tokens proportional to bytes sent. With capacity C and rate R tokens/sec, sustained throughput is capped at R, but bursts up to C are allowed. If rate is 1MB/s and capacity is 5MB, a peer can send 5MB immediately, then must wait 4 seconds for the next 5MB batch.
-
-**Production insight**: P2P systems are vulnerable to sybil attacks (one attacker runs many peers), eclipse attacks (attacker becomes the only neighbor), and free-riding. Rarest-first, tit-for-tat, and diversity in k-bucket selection mitigate these but don't eliminate them.
-
----
-
-## Trade-off analysis
-
-| Aspect | Kademlia DHT | Central tracker | mDNS/local discovery |
-|--------|-------------|-----------------|---------------------|
-| Single point of failure | none | tracker is critical | none |
-| Discovery latency | O(log n) hops | O(1) with tracker | broadcast (LAN only) |
-| Network size | millions of nodes | limited by tracker | LAN only |
-| Implementation complexity | high | low | low |
-| Privacy | pseudonymous (node ID) | tracker logs IPs | LAN visible |
-
-Reflection: Kademlia routes through O(log n) nodes to find a value. With 1000 nodes in your simulation, that is about 10 hops. What is the main failure mode when nodes join and leave frequently (churn), and how does Kademlia's k-bucket structure mitigate it?
-
----
-
-## Common production mistakes
-
-**1. Requesting the same piece from two peers simultaneously (outside endgame)**
-Without the `requested` set in `PieceManager`, two peers both receive a request for piece 5, both transfer it, and one transfer is wasted. Track `requested` separately from `have` and only request a piece from one peer at a time (except in endgame mode).
-
-**2. Not verifying piece integrity after download**
-If a peer sends corrupted data and you write it to the assembled file without verifying the SHA-256, the final file hash will not match. Always verify each piece against `meta.pieces[index]` before marking it as received. Corrupt peers should be disconnected and the piece re-requested.
-
-**3. Blocking the peer connection process in `consume/3`**
-If `rate_limiter.consume/3` uses `Process.sleep` to wait for tokens, the peer connection GenServer is blocked and cannot process incoming messages (including `have` announcements from the peer). Instead, return `{:wait, ms}` and use `Process.send_after/3` to schedule a retry.
-
-**4. XOR distance computed on raw binaries vs. integers**
-Kademlia XOR distance is defined over integers, not over binary strings. `<<a::160>> XOR <<b::160>>` in Elixir gives the binary XOR, which is correct only if you then interpret the result as a 160-bit integer for comparison. Verify that your distance comparison orders nodes correctly.
-
-**5. Choking interval using `Process.sleep` instead of `send_after`**
-The choker re-evaluates every 10 seconds which peers to unchoke. Using `Process.sleep(10_000)` in a loop blocks the entire process, preventing it from handling incoming upload speed updates. Use `Process.send_after(self(), :rechoke, 10_000)` and handle it in `handle_info`.
-
----
-
-## Reflection
-
-What happens to swarm health when 80% of peers are free-riders who download without uploading? Which of tit-for-tat, optimistic unchoking, or super-seeding would you implement first, and why?
-
-## Resources
-
-- [BitTorrent Protocol Specification BEP-3](http://www.bittorrent.org/beps/bep_0003.html) — the handshake, messages (`bitfield`, `have`, `request`, `piece`, `choke`, `unchoke`), and endgame algorithm
-- [BEP-5 — DHT Protocol](http://www.bittorrent.org/beps/bep_0005.html) — Kademlia implementation details including k-bucket structure and iterative lookup
-- [Kademlia: A Peer-to-peer Information System Based on the XOR Metric](https://pdos.csail.mit.edu/~petar/papers/maymounkov-kademlia-lncs.pdf) — Maymounkov and Mazieres (2002) — the original paper; short and readable
-- [BitTorrent Economics Paper](http://bittorrent.org/bittorrentecon.pdf) — Bram Cohen's tit-for-tat analysis; explains why unchoke incentivizes uploading
-- [Erlang `:crypto` documentation](https://www.erlang.org/doc/man/crypto.html) — for SHA-1 and SHA-256 piece hashing

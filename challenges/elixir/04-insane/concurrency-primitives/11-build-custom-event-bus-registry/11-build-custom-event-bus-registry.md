@@ -559,13 +559,18 @@ Subscriptions are rows in an ETS `:bag` keyed by topic, so lookup is O(1) and co
 
 ```elixir
 def main do
-  IO.puts("======== 11 build custom event bus registry ========")
-  IO.puts("Demonstrating core functionality")
+  IO.puts("======== 11-build-custom-event-bus-registry ========")
+  IO.puts("Build custom event bus registry")
   IO.puts("")
+  
+  Nexus.Application.start_link([])
+  IO.puts("Nexus.Application started")
   
   IO.puts("Run: mix test")
 end
 ```
+
+
 
 ## Benchmark
 

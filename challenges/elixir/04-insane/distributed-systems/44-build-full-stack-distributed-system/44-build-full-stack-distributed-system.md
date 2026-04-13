@@ -132,37 +132,24 @@ If you batch telemetry events and crash before sending the batch, the events are
 5. **Storage compaction time**: how long does each compaction take?
 
 ---
-
-
 ## Main Entry Point
 
 ```elixir
 def main do
-  IO.puts("======== 44 build full stack distributed system ========")
-  IO.puts("Demonstrating core functionality")
+  IO.puts("======== 44-build-full-stack-distributed-system ========")
+  IO.puts("Build Full Stack Distributed System")
   IO.puts("")
+  
+  {:ok, _} = Platform.start_link([])
+  IO.puts("Platform started")
+  
+  {:ok, _} = Platform.Gateway.start_link([])
+  IO.puts("Gateway started")
+  
+  {:ok, result} = Platform.Gateway.submit_request(%{user_id: "user123", data: "test"})
+  IO.puts("Request result: #{inspect(result)}")
   
   IO.puts("Run: mix test")
 end
 ```
 
-## Reflection
-
-1. **Cascading failure chain**: Trace through the cascade scenario above. At what point would you intervene, and how?
-   - **Answer**: Intervene at step 1 by adding a background process that monitors compaction time and triggers compaction more frequently (before it blocks reads). Or add a read cache that serves stale data if Storage is unavailable.
-
-2. **Rate limiter burst window**: Your rate limiter allows bursts up to capacity C. Under a sudden traffic spike, what prevents the entire capacity from being consumed by one client?
-   - **Answer**: Nothing — a single client can burst their quota if they're fast. Mitigation: per-client quotas are separate from the aggregate quota, or use a sliding window instead of token bucket to prevent bursts.
-
-3. **Leader election latency under network partition**: The Coordinator uses Raft for election. If the leader is partitioned away, how long before a new leader is elected?
-   - **Answer**: Election timeout is randomized between 150-300ms. If the partition is sudden, the followers will timeout and elect a new leader within ~300ms. Worst case: 300ms + network RTT.
-
----
-
-## Resources
-
-- Lamport, L. (2001). *Paxos Made Simple*. ACM SIGOPS Oper. Syst. Rev. (consensus background).
-- Ongaro, D. (2014). *Consensus: Bridging Theory and Practice*. PhD Thesis, Stanford (Raft specification and failure modes).
-- Rosenthal, C. (2003). *High Availability MySQL*. O'Reilly (replication and failover patterns).
-- Petrov, A. (2019). *Designing Data-Intensive Applications*. O'Reilly Chapters 8-9 (distributed system failure modes).
-- Jepsen Blog — various posts on partition tolerance and correctness testing: https://jepsen.io

@@ -580,13 +580,18 @@ end
 
 ```elixir
 def main do
-  IO.puts("======== 53 build real time collaboration engine ========")
-  IO.puts("Demonstrating core functionality")
+  IO.puts("======== 53-build-real-time-collaboration-engine ========")
+  IO.puts("Build real time collaboration engine")
   IO.puts("")
+  
+  Collab.OT.Operation.start_link([])
+  IO.puts("Collab.OT.Operation started")
   
   IO.puts("Run: mix test")
 end
 ```
+
+
 
 ## Benchmark
 

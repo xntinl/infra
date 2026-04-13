@@ -727,123 +727,18 @@ For a production deployment:
 4. **Deadlock detection**: implement a separate process for cycle detection in the wait-for graph
 
 ---
-
-
 ## Main Entry Point
 
 ```elixir
 def main do
-  IO.puts("======== 02 build distributed transaction coordinator ========")
-  IO.puts("Demonstrating core functionality")
+  IO.puts("======== 02-build-distributed-transaction-coordinator ========")
+  IO.puts("Build Distributed Transaction Coordinator")
   IO.puts("")
+  
+  Dtx.Storage.start_link([])
+  IO.puts("Dtx.Storage started")
   
   IO.puts("Run: mix test")
 end
 ```
 
-## Benchmark
-
-**Target**: 1,000 cross-partition transactions/second on a 3-partition localhost cluster; p99 < 30 ms.
-
-```bash
-mix run bench/dtx_bench.exs
-```
-
-```elixir
-# bench/dtx_bench.exs
-{:ok, db} = Dtx.start(partitions: 3)
-
-Benchee.run(
-  %{
-    "single-partition transaction" => fn ->
-      txn = Dtx.Transaction.begin(db)
-      Dtx.Transaction.write(txn, :partition_1, "bench", :rand.uniform(1_000_000))
-      Dtx.Transaction.commit(txn)
-    end,
-    "cross-partition transaction (2 partitions)" => fn ->
-      txn = Dtx.Transaction.begin(db)
-      Dtx.Transaction.write(txn, :partition_1, "bench_a", :rand.uniform())
-      Dtx.Transaction.write(txn, :partition_2, "bench_b", :rand.uniform())
-      Dtx.Transaction.commit(txn)
-    end
-  },
-  parallel: 20,
-  time: 10,
-  warmup: 3,
-  formatters: [Benchee.Formatters.Console]
-)
-```
-
----
-
-## Why this works
-
-The WAL makes the commit point a single durable write: every participant either sees `:commit` or `:abort`, and a crashed coordinator resumes from exactly that record. MVCC on participants means prepared writes stay invisible until the commit record lands, so readers never observe a half-applied transaction.
-
----
-
-## Key Concepts: Consensus and Distributed Agreement
-
-The core challenge in distributed systems is reaching agreement across multiple nodes when some may fail, be slow, or partition from the network. Consensus algorithms formalize three properties:
-
-1. **Safety**: All nodes that decide must decide the same value.
-2. **Liveness**: Every non-faulty node eventually decides.
-3. **Fault tolerance**: The system tolerates up to F faulty nodes out of 2F+1 total.
-
-Raft achieves this via a leader-based approach: the leader serializes writes through a log, and quorum commit ensures no data loss across failures. The log-up-to-date vote rule prevents stale nodes from becoming leader, and the "commit only current-term entries" rule prevents committed entries from being overwritten.
-
-This contrasts with leaderless protocols (e.g., CRDTs) that sacrifice strong consistency for eventual consistency, enabling offline-first systems. For the BEAM, Raft fits naturally into the GenServer + OTP supervision model: each node is a GenServer with local state (log, term, vote), and RPCs are asynchronous messages that do not block the caller.
-
-**Production insight**: 2PC's safety depends on the WAL surviving the coordinator crash. If you skip writing to the WAL before sending the decision, or if the WAL is on a volatile medium (memory only), then a coordinator crash can leave participants in a prepared state permanently.
-
----
-
-## Trade-off analysis
-
-| Aspect | 2PC (your impl) | Paxos Commit | Spanner TrueTime |
-|--------|----------------|--------------|-----------------|
-| Blocking condition | coordinator crash after prepare | never blocks (Paxos per participant) | never blocks (TrueTime bounds) |
-| Latency | 2 round trips + fsync | 2+ round trips | 2 round trips + TrueTime wait |
-| Clock dependency | none | none | atomic clocks required |
-| Failure tolerance | coordinator WAL required | f+1 failures tolerated | globally distributed |
-| Implementation complexity | moderate | high | impractical without atomic clocks |
-
-After running the benchmark, record your measured latency (p50, p99) and throughput (txn/sec) for direct comparison across protocols.
-
-**Architectural question**: 3PC was proposed to solve 2PC's blocking problem. Explain why 3PC still blocks under network partitions. Why does the industry still use 2PC despite this?
-
----
-
-## Common production mistakes
-
-**1. Not fsyncing the WAL before voting YES**
-If a participant votes YES without persisting that decision, a crash and restart leaves it in an unknown state. It cannot reconstruct whether it voted YES and must conservatively abort — breaking atomicity.
-
-**2. Coordinator sends decision before writing to WAL**
-If the coordinator writes COMMIT to participants but crashes before writing it to its own WAL, a restart will not know whether to commit or abort. This is the classic coordinator failure scenario.
-
-**3. Giving up on phase 2 message delivery**
-Once the coordinator has decided (written to WAL), it must keep retrying phase 2 until all participants acknowledge. A participant stuck in `prepared` state must eventually be resolved. There is no timeout that is safe to abort after.
-
-**4. Deadlock detector on the critical path**
-Running deadlock detection synchronously on lock acquisition blocks every transaction waiting for a lock. The detector must run asynchronously on a timer, sampling the wait-for graph at configurable intervals.
-
-**5. MVCC without garbage collection**
-Old row versions accumulate indefinitely. In a long-running system with many short transactions, this becomes a memory leak. Track the oldest active snapshot and periodically purge versions invisible to all active transactions.
-
----
-
-## Reflection
-
-- If the coordinator crashed with 1000 transactions prepared-but-not-committed, how long would your recovery take, and what upper bound can you prove on participant blocking?
-- Would you move to Paxos Commit if the dominant workload shifted to geo-distributed cross-region transactions? Quantify the RTT threshold where the switch pays for itself.
-
----
-
-## Resources
-
-- Gray, J. & Lamport, L. — *Consensus on Transaction Commit* — formal analysis of 2PC and Paxos Commit as an alternative
-- Gray, J. & Reuter, A. — *Transaction Processing: Concepts and Techniques* (1992) — chapters 7-9 on 2PC, locking, and recovery are the canonical reference
-- Corbett, J. et al. (2012). *Spanner: Google's Globally Distributed Database* — how TrueTime enables external consistency without 2PC blocking
-- [PostgreSQL `twophase.c`](https://github.com/postgres/postgres/blob/master/src/backend/access/transam/twophase.c) — reference implementation of coordinator-side 2PC with WAL
-- Bernstein, P. & Goodman, N. (1983). *Multiversion Concurrency Control* — the original MVCC paper
