@@ -99,7 +99,43 @@ defmodule FeedLive.MixProject do
 end
 ```
 
+### Dependencies (mix.exs)
+
+```elixir
+```elixir
+defmodule FeedLive.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :feed_live,
+      version: "0.1.0",
+      elixir: "~> 1.16",
+      deps: deps()
+    ]
+  end
+
+  def application do
+    [mod: {FeedLive.Application, []}, extra_applications: [:logger]]
+  end
+
+  defp deps do
+    [
+      {:phoenix, "~> 1.7.14"},
+      {:phoenix_live_view, "~> 1.0"},
+      {:phoenix_html, "~> 4.1"},
+      {:jason, "~> 1.4"},
+      {:plug_cowboy, "~> 2.7"},
+      {:floki, "~> 0.36", only: :test},
+      {:benchee, "~> 1.3", only: :dev}
+    ]
+  end
+end
+```
+
 ### Step 1: Context — `lib/feed_live/posts.ex`
+
+**Objective**: Build the context layer: lib/feed_live/posts.ex.
 
 ```elixir
 defmodule FeedLive.Posts do
@@ -128,6 +164,8 @@ end
 ```
 
 ### Step 2: Row component — `lib/feed_live_web/components/post_component.ex`
+
+**Objective**: Build the row component layer: lib/feed_live_web/components/post_component.ex.
 
 ```elixir
 defmodule FeedLiveWeb.PostComponent do
@@ -178,6 +216,8 @@ end
 ```
 
 ### Step 3: Parent LiveView — `lib/feed_live_web/live/feed_live.ex`
+
+**Objective**: Build the parent liveview layer: lib/feed_live_web/live/feed_live.ex.
 
 ```elixir
 defmodule FeedLiveWeb.FeedLive do
@@ -260,6 +300,8 @@ end
 ```
 
 ### Step 4: Wire the router — `lib/feed_live_web/router.ex`
+
+**Objective**: Build the wire the router layer: lib/feed_live_web/router.ex.
 
 ```elixir
 defmodule FeedLiveWeb.Router do
@@ -372,6 +414,23 @@ IO.puts("stream delta (words):  #{Bench.stream_variant()}")
 ```
 
 **Expected**: stream delta < 500 words (flat), assign delta > 50_000 words (grows with list size).
+
+## Advanced Considerations: LiveView Real-Time Patterns and Pubsub Scale
+
+LiveView bridges the browser and BEAM via WebSocket, allowing server-side renders to push incremental DOM diffs to the client. A LiveView process is long-lived, receiving events (clicks, form submissions) and broadcasting updates. For real-time features (collaborative editing, live notifications), LiveView processes subscribe to PubSub topics and receive broadcast messages.
+
+Phoenix.PubSub partitions topics across a pool of processes, allowing horizontal scaling. By default, `:local` mode uses in-memory ETS; `:redis` mode distributes across nodes via Redis. At scale (thousands of concurrent LiveViews), topic fanout can bottleneck: broadcasting to a million subscribers means delivering one million messages. The BEAM handles this, but the network cost matters on multi-node deployments.
+
+`Presence` module tracks which users are viewing which pages, syncing state via PubSub. A presence join/leave is broadcast to all nodes, allowing real-time "who's online" updates. Under partition, presence state can diverge; the library uses unique presence keys to detect and reconcile. Operationally, watching presence on every page load can amplify server load if users are flaky (mobile networks, browser reloads). Consider presence only for features where it's user-facing (collaborative editors, live sports scoreboards).
+
+---
+
+
+## Deep Dive: Streaming Patterns and Production Implications
+
+Stream-based pipelines in Elixir achieve backpressure and composability by deferring computation until consumption. Unlike eager list operations that allocate all intermediate structures, Streams are lazy chains that produce one element at a time, reducing memory footprint and enabling infinite sequences. The BEAM scheduler yields between Stream operations, allowing multiple concurrent pipelines to interleave fairly. At scale (processing millions of rows or events), the difference between eager and lazy evaluation becomes the difference between consistent latency and garbage collection pauses. Production systems benefit most when Streams are composed at library boundaries, not scattered across the codebase.
+
+---
 
 ## Trade-offs and production gotchas
 

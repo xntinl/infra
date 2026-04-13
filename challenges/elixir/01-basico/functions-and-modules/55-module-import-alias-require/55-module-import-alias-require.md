@@ -2,9 +2,6 @@
 
 **Project**: `plugin_dispatcher` — loads and invokes plugin modules by name at runtime
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project structure
@@ -45,6 +42,28 @@ plugin_dispatcher/
 
 ---
 
+## Why a behaviour + `use` macro and not a plain module list
+
+- Keeping a global `@plugins [Upcase, Reverse]` list works, but loses compile-time checks that every plugin implements `call/1` and `name/0`.
+- A behaviour documents the contract; `use PluginDispatcher.Plugin` injects the boilerplate (`@behaviour`, default `name/0`) so plugin authors can't forget it.
+- Protocols are another option, but protocols dispatch on **data type**, not module name — not the right shape here.
+
+---
+
+## Design decisions
+
+**Option A — each plugin registers itself via `@on_load` or a compile-time hook**
+- Pros: truly pluggable; adding a file is enough.
+- Cons: hidden magic; harder to debug when a plugin doesn't show up; requires `Code.ensure_loaded/1` dance.
+
+**Option B — static registry map in the dispatcher + behaviour enforced by `use`** (chosen)
+- Pros: one canonical place lists every plugin; compiler warns if a plugin is missing a callback; tests trivially enumerate plugins.
+- Cons: adding a plugin requires editing `dispatcher.ex`.
+
+→ Chose **B** because explicit registration beats auto-discovery in small-to-medium systems. When the plugin count exceeds ~20, reconsider.
+
+---
+
 ## Why a plugin dispatcher
 
 A dispatcher loads plugin modules by atom name and invokes a well-known callback on each.
@@ -59,7 +78,30 @@ It is the smallest realistic example that hits all four directives:
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"plug", "~> 1.0"},
+  ]
+end
+```
+
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  # No runtime deps — stdlib only. Logger ships with Elixir.
+  []
+end
+```
+
 ### Step 1 — Create the project
+
+**Objective**: Split the dispatcher, behaviour, and plugins into distinct files so `alias`, `require`, and `use` each have a natural place to appear.
 
 ```bash
 mix new plugin_dispatcher
@@ -68,6 +110,8 @@ mkdir -p lib/plugin_dispatcher/plugins
 ```
 
 ### Step 2 — `lib/plugin_dispatcher/plugin.ex`
+
+**Objective**: Combine `@callback` and a `use` macro so every plugin is forced to declare `@behaviour`, making missing callbacks a compile-time error.
 
 ```elixir
 defmodule PluginDispatcher.Plugin do
@@ -107,6 +151,8 @@ end
 
 ### Step 3 — `lib/plugin_dispatcher/plugins/upcase.ex`
 
+**Objective**: Provide a concrete plugin that demonstrates `use PluginDispatcher.Plugin` wiring up the behaviour contract automatically.
+
 ```elixir
 defmodule PluginDispatcher.Plugins.Upcase do
   # `use` triggers Plugin.__using__/1 — injects @behaviour and name/0.
@@ -119,6 +165,8 @@ end
 
 ### Step 4 — `lib/plugin_dispatcher/plugins/reverse.ex`
 
+**Objective**: Add a second plugin to show how `alias` in the dispatcher resolves multiple implementations without hardcoding their full module paths.
+
 ```elixir
 defmodule PluginDispatcher.Plugins.Reverse do
   use PluginDispatcher.Plugin
@@ -129,6 +177,8 @@ end
 ```
 
 ### Step 5 — `lib/plugin_dispatcher/dispatcher.ex`
+
+**Objective**: Resolve plugins at runtime via atom dispatch so new plugins register declaratively without editing the core dispatcher.
 
 ```elixir
 defmodule PluginDispatcher.Dispatcher do
@@ -166,6 +216,8 @@ end
 ```
 
 ### Step 6 — `test/plugin_dispatcher_test.exs`
+
+**Objective**: Assert the dispatcher handles unknown plugin names with an explicit error tuple rather than a raw `UndefinedFunctionError`.
 
 ```elixir
 defmodule PluginDispatcherTest do
@@ -205,11 +257,53 @@ end
 
 ### Step 7 — Run the tests
 
+**Objective**: Run the suite to confirm the `use`-driven behaviour contract catches missing callbacks at compile, not at first invocation.
+
 ```bash
 mix test
 ```
 
 All 6 tests pass.
+
+### Why this works
+
+`alias` is pure lexical rename — no runtime cost. `require Logger` forces Logger's compiled `.beam` to be loaded before the macro expands, so `Logger.info/1` can compile to a conditional call gated by the log level. `use PluginDispatcher.Plugin` injects the `@behaviour` attribute and a default `name/0` implementation at compile time; `defoverridable` lets plugins replace it. Module dispatch via `module.call(input)` is a regular BEAM remote call — not reflection, not slow.
+
+---
+
+
+## Key Concepts
+
+### 1. `alias` Creates a Shorthand
+`alias MyApp.User` lets you write `User` instead of `MyApp.User`. `alias` does not import functions; it only shortens the module name.
+
+### 2. `import` Brings Functions into Local Scope
+`import Enum` lets you write `map([1,2,3], &(&1 * 2))` instead of `Enum.map`. `import` is powerful but can cause name collisions. Use sparingly.
+
+### 3. `require` Ensures Compile-Time Code
+Macros are compile-time code. `require` ensures the module is loaded before the macro is invoked. Without `require`, macros fail.
+
+---
+## Benchmark
+
+```elixir
+# bench/dispatch.exs
+{t_static, _} = :timer.tc(fn ->
+  Enum.each(1..1_000_000, fn _ ->
+    PluginDispatcher.Plugins.Upcase.call("hello")
+  end)
+end)
+
+{t_dynamic, _} = :timer.tc(fn ->
+  Enum.each(1..1_000_000, fn _ ->
+    PluginDispatcher.Dispatcher.dispatch(:upcase, "hello")
+  end)
+end)
+
+IO.puts("direct: #{t_static} µs   via dispatcher: #{t_dynamic} µs")
+```
+
+Target: dispatcher overhead < 2 µs per call (map lookup + `Logger.info/1` macro + remote call). If `Logger` is disabled, the macro compiles out and the gap narrows to the map lookup only.
 
 ---
 
@@ -248,6 +342,13 @@ Keep `__using__` macros leaf-like: they inject code, they do not pull in other `
 **5. Alias collisions**
 `alias MyApp.User; alias Accounts.User` — the second wins silently. Rename with
 `alias Accounts.User, as: AccountUser` to avoid ambiguity.
+
+---
+
+## Reflection
+
+- A new team member keeps reaching for `use` where `alias` would do. What rubric would you hand them to decide in three seconds which directive to pick?
+- You want plugins to live in a separate OTP application and be loaded at runtime (true plug-ins, not compile-time). What changes in the dispatcher, and why does the `@registry` map stop being viable?
 
 ---
 

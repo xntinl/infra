@@ -1,8 +1,6 @@
 # Deep Dive into `:trap_exit` Semantics
 
 **Project**: `trap_exit_deep` — mastering exit signal propagation, `:kill` vs `:killed`, and supervisor interactions.
-**Difficulty**: ★★★★☆
-**Estimated time**: 4–6 hours
 
 ---
 
@@ -177,9 +175,35 @@ Legitimate reasons for a non-supervisor to trap exits:
 
 ---
 
+## Design decisions
+
+**Option A — use `Process.monitor/1` for "I want to know when X dies"**
+- Pros: no trap overhead; unidirectional; does not change the crash propagation of either process.
+- Cons: you do not receive the exit reason in the form supervisors expect; no bidirectional lifecycle tie.
+
+**Option B — enable `:trap_exit` and handle `{:EXIT, pid, reason}` explicitly** (chosen for supervisor-like code)
+- Pros: required for resource owners and supervisor implementations; gives full control over reacting to child exits including `:normal`.
+- Cons: adds a small per-signal overhead; easy to abuse in regular workers, turning "let it crash" into "handle every error badly".
+
+→ Chose **B** only for processes whose role *is* lifecycle management. Regular workers stay on monitor or do not observe lifecycle at all.
+
+---
+
 ## Implementation
 
 ### Step 1: `mix.exs`
+
+**Objective**: Bootstrap project with OTP app config so trap_exit workers start under supervision.
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
 
 ```elixir
 defmodule TrapExitDeep.MixProject do
@@ -190,6 +214,8 @@ end
 ```
 
 ### Step 2: `lib/trap_exit_deep/signal_matrix.ex`
+
+**Objective**: Build signal matrix GenServer tracking :EXIT signals and link/monitor state.
 
 ```elixir
 defmodule TrapExitDeep.SignalMatrix do
@@ -276,6 +302,8 @@ end
 
 ### Step 3: `lib/trap_exit_deep/trapping_worker.ex`
 
+**Objective**: Implement trapping worker so :trap_exit on/off behaviors differ measurably under link chains.
+
 ```elixir
 defmodule TrapExitDeep.TrappingWorker do
   @moduledoc """
@@ -318,6 +346,8 @@ end
 
 ### Step 4: `lib/trap_exit_deep/application.ex`
 
+**Objective**: Wire supervision tree so signal matrix and workers start hierarchically.
+
 ```elixir
 defmodule TrapExitDeep.Application do
   @moduledoc false
@@ -331,6 +361,8 @@ end
 ```
 
 ### Step 5: `test/trap_exit_deep/signal_matrix_test.exs`
+
+**Objective**: Test signal matrix tracks EXIT signals correctly under various trap_exit and link combinations.
 
 ```elixir
 defmodule TrapExitDeep.SignalMatrixTest do
@@ -384,6 +416,8 @@ end
 
 ### Step 6: `test/trap_exit_deep/trapping_worker_test.exs`
 
+**Objective**: Test trapping worker behavior with/without :trap_exit shows signal propagation differences.
+
 ```elixir
 defmodule TrapExitDeep.TrappingWorkerTest do
   use ExUnit.Case, async: true
@@ -424,6 +458,23 @@ defmodule TrapExitDeep.TrappingWorkerTest do
   end
 end
 ```
+
+---
+
+## Advanced Considerations: Supervision and Hot Code Upgrade Patterns
+
+The OTP supervision tree is the backbone of Elixir's fault tolerance. A DynamicSupervisor can spawn workers on demand and track them, but if a worker crashes before it's supervised, messages to it drop silently. Equally, a `:temporary` worker that crashes is restarted zero times — useful for one-off tasks, but requires the caller to handle crashes. `:transient` restarts on non-normal exits; `:permanent` always restarts.
+
+`handle_continue` callbacks and `:hibernate` reduce memory overhead in long-lived processes. After initializing, a GenServer can return `{:noreply, state, {:continue, :do_work}}` to defer expensive work past the `init/1` call, keeping the supervisor's synchronous startup fast. Hibernation moves a process's heap to disk, freeing RAM at the cost of latency when the process receives its next message.
+
+Hot code upgrades via `sys:replace_state/2` or `:sys.replace_state/3` allow changing code without restarting the VM, but only if state structure is forward- and backward-compatible. In practice, code changes that alter state shape (adding or removing fields) require a migration function. The `:code.purge/1` and `:code.load_file/1` cycle reloads the module, but old pids still run old code until they return to the scheduler. Design for graceful degradation: code that cannot upgrade hot should acknowledge that in docs and operational runbooks.
+
+---
+
+
+## Deep Dive: Otp Patterns and Production Implications
+
+OTP primitives (GenServer, Supervisor, Application) are tested through their public interfaces, not by inspecting internal state. This discipline forces correct design: if you can't test a behavior without peeking into the server's state, the behavior is not public. Production systems with tight integration tests on GenServer internals are fragile and hard to refactor.
 
 ---
 
@@ -475,9 +526,13 @@ stop. Let it crash. The supervisor handles recovery. `trap_exit` is
 only correct for supervisor-like processes, resource owners, and
 well-understood async-reply patterns.
 
+### Why this works
+
+Exit signals are not messages — they arrive as asynchronous signals and, by default, terminate the receiver unless the reason is `:normal`. `:trap_exit` is a flag that tells the VM to convert those signals into `{:EXIT, pid, reason}` messages, putting them in the receive queue where user code can react. The special `:kill` reason is non-trappable: it becomes `:killed` on the wire and terminates the target regardless of the flag, which is what makes brutal termination actually brutal.
+
 ---
 
-## Performance notes
+## Benchmark
 
 `trap_exit` enables a message-conversion path in the VM. The overhead
 per received exit signal is small but nonzero:
@@ -491,6 +546,15 @@ For a supervisor juggling thousands of short-lived children, the
 difference is usually dwarfed by process creation cost. For a long-lived
 worker under high child churn (pool manager with 10k/s child turnover),
 the trap overhead is visible and you may want `monitor` instead.
+
+Target: trap_exit overhead ≤ 200 ns per exit signal on modern hardware; ≤ 3× the non-trapping baseline.
+
+---
+
+## Reflection
+
+1. A colleague enables `trap_exit` in a `GenServer` so they can "log every crash and recover". What invariant are they breaking, and what is the minimum change that recovers reliability without losing the crash log?
+2. Under what failure profile does `monitor` produce strictly better diagnostics than `trap_exit`, and vice versa? Construct a concrete scenario for each.
 
 ---
 

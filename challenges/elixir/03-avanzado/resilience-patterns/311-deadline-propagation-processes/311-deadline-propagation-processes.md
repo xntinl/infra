@@ -66,6 +66,16 @@ so the await itself never outlives the request.
 
 ### Dependencies (`mix.exs`)
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
+
 ```elixir
 defmodule RpcDeadlines.MixProject do
   use Mix.Project
@@ -75,6 +85,8 @@ end
 ```
 
 ### Step 1: Deadline (`lib/rpc_deadlines/deadline.ex`)
+
+**Objective**: Represent deadlines as absolute monotonic timestamps so all descendants inherit min(parent, local) via process dictionary without nested timeouts extending budget.
 
 ```elixir
 defmodule RpcDeadlines.Deadline do
@@ -91,6 +103,8 @@ end
 ```
 
 ### Step 2: Context (`lib/rpc_deadlines/context.ex`)
+
+**Objective**: Store deadline in Process.put/get so descendants read budget without modifying function signatures across libraries and legacy code.
 
 ```elixir
 defmodule RpcDeadlines.Context do
@@ -119,6 +133,8 @@ end
 ```
 
 ### Step 3: Deadline-aware Task spawner (`lib/rpc_deadlines/task_sup.ex`)
+
+**Objective**: Bridge process boundaries by copying parent deadline to child's process dictionary before user function runs so Tasks inherit remaining budget.
 
 ```elixir
 defmodule RpcDeadlines.TaskSup do
@@ -165,6 +181,8 @@ end
 ```
 
 ### Step 4: Example nested work (`lib/rpc_deadlines/pricing.ex`)
+
+**Objective**: Check Context.expired?/0 before compute and inside async_stream so workers abort when deadline closes instead of burning CPU on doomed tasks.
 
 ```elixir
 defmodule RpcDeadlines.Pricing do
@@ -291,6 +309,23 @@ IO.puts("avg: #{t / 1_000_000} µs per check")
 ```
 
 Expected: < 0.1µs. Process-dict + monotonic subtraction.
+
+## Advanced Considerations: Circuit Breakers and Bulkheads in Production
+
+A circuit breaker monitors downstream service health and rejects new requests when failures exceed a threshold, failing fast instead of queuing indefinitely. States: `:closed` (normal), `:open` (fast-fail), `:half_open` (testing recovery). A timeout-based pattern monitors; once requests succeed again, the circuit closes. Half-open tests with a single request; if it succeeds, all requests resume.
+
+Bulkheads isolate resource pools so one slow endpoint doesn't starve others. A GenServer pool with a bounded queue (e.g., `:queue.len(state) >= 100`) can return `{:error, :overloaded}` immediately, preventing queue buildup. Combined with exponential backoff on the client (caller retries with increasing delays), this creates a natural circuit breaker behavior without explicit state.
+
+Graceful degradation means serving stale data or reduced functionality when a service is slow. A cached value with a 5-minute TTL is acceptable for many reads; serve it if the live source is timing out. Feature flags allow disabling expensive operations at runtime. Cascading timeout windows (outer service times out after 5s, inner calls must complete in 3s) prevent unbounded waiting. The cost is complexity: tracking degradation modes, testing failure scenarios, and ensuring data consistency under partial failures.
+
+---
+
+
+## Deep Dive: Resilience Patterns and Production Implications
+
+Resilience patterns (circuit breakers, timeouts, retries) are easy to implement but hard to test. The insight is that resilience patterns must be tested under failure: timeouts matter only when calls actually take time, retries matter only when transient failures occur. Production systems with untested resilience patterns often fail gracefully in test and catastrophically in production.
+
+---
 
 ## Trade-offs and production gotchas
 

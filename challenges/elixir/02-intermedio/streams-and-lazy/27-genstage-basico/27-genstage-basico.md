@@ -107,6 +107,9 @@ end
 
 ### Step 1: Create the project
 
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
+
 ```bash
 mix new genstage_intro --sup
 cd genstage_intro
@@ -114,6 +117,9 @@ mix deps.get
 ```
 
 ### Step 2: `lib/genstage_intro/producer.ex`
+
+**Objective**: Implement `producer.ex` — the lazy operator whose resource and memory profile only becomes visible when the stream is actually run.
+
 
 ```elixir
 defmodule GenstageIntro.Producer do
@@ -144,6 +150,9 @@ end
 ```
 
 ### Step 3: `lib/genstage_intro/consumer.ex`
+
+**Objective**: Implement `consumer.ex` — the lazy operator whose resource and memory profile only becomes visible when the stream is actually run.
+
 
 ```elixir
 defmodule GenstageIntro.Consumer do
@@ -179,6 +188,9 @@ end
 
 ### Step 4: `lib/genstage_intro.ex` — start the pipeline
 
+**Objective**: Edit `genstage_intro.ex` — start the pipeline, exposing the lazy operator whose resource and memory profile only becomes visible when the stream is actually run.
+
+
 ```elixir
 defmodule GenstageIntro do
   @moduledoc """
@@ -198,6 +210,9 @@ end
 ```
 
 ### Step 5: `test/genstage_intro_test.exs`
+
+**Objective**: Write `genstage_intro_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
 
 ```elixir
 defmodule GenstageIntroTest do
@@ -243,6 +258,9 @@ end
 
 ### Step 6: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -253,7 +271,15 @@ The consumer subscribes with `max_demand: 10`, which sends an initial `{:"$gen_p
 
 ---
 
-<!-- benchmark N/A: GenStage throughput depends heavily on downstream work; measured in later exercises -->
+<!-- benchmark N/A: GenStage throughput depends heavily on downstream work; measure in your own environment with different workloads -->
+
+
+## Key Concepts: Producer-Consumer Pipelines with Backpressure
+
+GenStage is a framework for building multi-stage pipelines where each stage is a GenServer that either produces events (producer), consumes them (consumer), or both (producer-consumer). The key innovation is **demand-driven backpressure**: a consumer tells its upstream producer how many events it can handle, and the producer respects that limit.
+
+Without backpressure, a fast producer can overwhelm a slow consumer, causing unbounded memory growth. GenStage's solution: consumers request events explicitly, and the producer only delivers up to that demand. This requires thinking differently from simple message passing: instead of sending and hoping the receiver is ready, you coordinate. Real-world use cases: streaming files from disk, processing message queues, or splitting a large dataset across worker processes. The learning curve is steeper than Enum/Stream, but for production data pipelines, it's essential.
+
 
 ## Trade-offs and production gotchas
 
@@ -309,3 +335,20 @@ pipeline, not a fresh `GenStage`.
 - [José Valim — "Announcing GenStage"](https://elixir-lang.org/blog/2016/07/14/announcing-genstage/) — original blog post with design rationale
 - [`Flow`](https://hexdocs.pm/flow/Flow.html) — high-level, parallel pipelines on top of GenStage
 - [`Broadway`](https://hexdocs.pm/broadway/Broadway.html) — data ingestion built on GenStage
+
+
+## Deep Dive
+
+Streams are lazy, composable data pipelines that process one element at a time without materializing intermediate collections. This is fundamentally different from Enum, which materializes the entire dataset before the next operation.
+
+**Lazy evaluation semantics:**
+Stream operations return a `%Stream{}` struct containing a function. The actual computation is deferred until consumed by a terminal operation (`.run()`, `Enum.to_list()`, etc.). This allows streams to:
+- Chain indefinite sequences (e.g., `Stream.iterate(0, &(&1 + 1))`)
+- Transform without memory bloat (e.g., processing multi-gigabyte files)
+- Compose reusable pipelines as first-class values
+
+**Resource lifecycle in streams:**
+Streams wrapping resources (`Stream.resource/3`) must define cleanup functions. A stream created from a file remains "open" (in terms of the lambda) until the consumer finishes or errors. If the consumer crashes or stops early, the cleanup function still runs — critical for proper file/socket/port management.
+
+**Backpressure and demand:**
+Unlike streams in other languages, Elixir's synchronous streams don't inherently implement backpressure. Backpressure is demand-based: the consumer pulls data at its own pace. `GenStage` and `Flow` add explicit backpressure — the producer waits for the consumer to request more elements. This is why benchmarking matters: a naive stream consumer can overwhelm memory if the pipeline produces faster than it consumes.

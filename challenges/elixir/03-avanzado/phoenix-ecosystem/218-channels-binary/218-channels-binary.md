@@ -1,8 +1,6 @@
 # Phoenix Channels with Binary MessagePack Serialization
 
 **Project**: `channels_binary` — trading-desk WebSocket fanout with a bespoke wire format.
-**Difficulty**: ★★★★☆
-**Estimated time**: 4–6 hours
 
 ---
 
@@ -45,6 +43,12 @@ channels_binary/
 │   └── encode_bench.exs
 └── mix.exs
 ```
+
+---
+
+## Why binary frames and not JSON
+
+JSON is the right default for most channels. Binary wins specifically when payloads are repetitive and high-volume — game state, telemetry, live market data — where per-message overhead dominates.
 
 ---
 
@@ -122,9 +126,25 @@ then passed by reference to every subscriber socket.
 
 ---
 
+## Design decisions
+
+**Option A — JSON over channels**
+- Pros: ubiquitous, debuggable, trivially inspected in browser dev tools.
+- Cons: every payload pays an encode/decode tax and wire bytes for keys and quotes.
+
+**Option B — binary frames (MsgPack, Protobuf, custom)** (chosen)
+- Pros: 30-70% smaller on the wire; faster encode/decode.
+- Cons: not human-readable; harder to debug; needs schema sharing with client.
+
+→ Chose **B** because for high-volume, schema-stable payloads the bandwidth and CPU savings are worth the tooling cost.
+
+---
+
 ## Implementation
 
 ### Step 1: `mix.exs`
+
+**Objective**: Declare the project, dependencies, and OTP application in `mix.exs`.
 
 ```elixir
 defmodule ChannelsBinary.MixProject do
@@ -156,7 +176,42 @@ defmodule ChannelsBinary.MixProject do
 end
 ```
 
+### Dependencies (mix.exs)
+
+```elixir
+```elixir
+defmodule ChannelsBinary.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :channels_binary,
+      version: "0.1.0",
+      elixir: "~> 1.16",
+      deps: deps()
+    ]
+  end
+
+  def application do
+    [mod: {ChannelsBinary.Application, []}, extra_applications: [:logger]]
+  end
+
+  defp deps do
+    [
+      {:phoenix, "~> 1.7"},
+      {:phoenix_pubsub, "~> 2.1"},
+      {:jason, "~> 1.4"},
+      {:msgpax, "~> 2.4"},
+      {:bandit, "~> 1.5"},
+      {:benchee, "~> 1.3", only: :dev}
+    ]
+  end
+end
+```
+
 ### Step 2: `lib/channels_binary/serializers/msgpack_serializer.ex`
+
+**Objective**: Implement the module in `lib/channels_binary/serializers/msgpack_serializer.ex`.
 
 ```elixir
 defmodule ChannelsBinary.Serializers.MsgpackSerializer do
@@ -222,6 +277,8 @@ server compatible with mixed fleets during a rolling migration.
 
 ### Step 3: `lib/channels_binary/socket.ex`
 
+**Objective**: Implement the module in `lib/channels_binary/socket.ex`.
+
 ```elixir
 defmodule ChannelsBinary.Socket do
   use Phoenix.Socket
@@ -237,6 +294,8 @@ end
 ```
 
 ### Step 4: `lib/channels_binary/endpoint.ex`
+
+**Objective**: Implement the module in `lib/channels_binary/endpoint.ex`.
 
 ```elixir
 defmodule ChannelsBinary.Endpoint do
@@ -262,6 +321,8 @@ preserve the V2 frame layout.
 
 ### Step 5: `lib/channels_binary/channels/book_channel.ex`
 
+**Objective**: Implement the module in `lib/channels_binary/channels/book_channel.ex`.
+
 ```elixir
 defmodule ChannelsBinary.Channels.BookChannel do
   use Phoenix.Channel
@@ -280,6 +341,8 @@ end
 
 ### Step 6: `lib/channels_binary/application.ex`
 
+**Objective**: Define the OTP application and supervision tree in `lib/channels_binary/application.ex`.
+
 ```elixir
 defmodule ChannelsBinary.Application do
   use Application
@@ -297,6 +360,8 @@ end
 ```
 
 ### Step 7: Tests
+
+**Objective**: Add tests that cover the expected behavior and edge cases.
 
 ```elixir
 # test/channels_binary/serializers/msgpack_serializer_test.exs
@@ -404,6 +469,8 @@ end
 
 ### Step 8: Browser-side decoder (reference)
 
+**Objective**: Implement Browser-side decoder (reference).
+
 ```javascript
 // assets/js/socket.js
 import { Socket, Serializer } from "phoenix"
@@ -428,6 +495,10 @@ const socket = new Socket("/socket", {
 })
 socket.connect()
 ```
+
+### Why this works
+
+Phoenix.Socket supports a custom `serializer` behaviour. The serializer encodes outgoing messages into binary frames and decodes incoming ones. The client uses a matching decoder. The protocol framing stays identical; only the payload changes.
 
 ---
 
@@ -473,6 +544,23 @@ where MessagePack shines (many small floats/ints, few strings).
 
 ---
 
+## Advanced Considerations: LiveView Real-Time Patterns and Pubsub Scale
+
+LiveView bridges the browser and BEAM via WebSocket, allowing server-side renders to push incremental DOM diffs to the client. A LiveView process is long-lived, receiving events (clicks, form submissions) and broadcasting updates. For real-time features (collaborative editing, live notifications), LiveView processes subscribe to PubSub topics and receive broadcast messages.
+
+Phoenix.PubSub partitions topics across a pool of processes, allowing horizontal scaling. By default, `:local` mode uses in-memory ETS; `:redis` mode distributes across nodes via Redis. At scale (thousands of concurrent LiveViews), topic fanout can bottleneck: broadcasting to a million subscribers means delivering one million messages. The BEAM handles this, but the network cost matters on multi-node deployments.
+
+`Presence` module tracks which users are viewing which pages, syncing state via PubSub. A presence join/leave is broadcast to all nodes, allowing real-time "who's online" updates. Under partition, presence state can diverge; the library uses unique presence keys to detect and reconcile. Operationally, watching presence on every page load can amplify server load if users are flaky (mobile networks, browser reloads). Consider presence only for features where it's user-facing (collaborative editors, live sports scoreboards).
+
+---
+
+
+## Deep Dive: Phoenix Patterns and Production Implications
+
+Phoenix's conn struct represents an HTTP request/response in flight, accumulating transformations through middleware and handler code. Testing a Phoenix endpoint end-to-end (not just the controller) catches middleware order bugs, header mismatches, and plug composition issues. The trade-off is that full integration tests are slower and harder to parallelize than unit tests. Production bugs in auth, CORS, or session handling are often due to middleware assumptions that live tests reveal.
+
+---
+
 ## Trade-offs and production gotchas
 
 **1. Version skew during rollout.** You cannot flip the serializer atomically across a
@@ -508,6 +596,13 @@ prose), MessagePack's size win collapses to ~5% because strings serialize byte-f
 The encode-speed advantage still holds, but the operational cost of binary frames
 (debugging, client-library choice, tcpdump legibility) is rarely worth a 5% bandwidth
 cut. Stick with JSON for text-heavy channels.
+
+---
+
+## Reflection
+
+- Your payloads are 95% small strings and 5% large blobs. Does binary framing still win across the board, or would you mix formats? How?
+- When a browser debugger cannot read your frames, what tooling do you ship to make debugging survivable?
 
 ---
 

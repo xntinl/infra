@@ -60,7 +60,7 @@ size  > 64 bytes → refc binary in the shared binary heap  (reference-counted)
 A process holding a single 32-byte sub-binary view into a 1 GB refc
 parent keeps the entire 1 GB alive until GC. This is the #1 source of
 "memory high, no growth in :memory" in production — known as a binary
-leak (exercise 149).
+leak.
 
 ### 2. Sub-binaries
 
@@ -137,6 +137,8 @@ Rules of thumb that enable it:
 
 ### Step 1: project
 
+**Objective**: Scaffold app with `bench/` directory so V1/V2/V3 scanner variants compare against same synthetic nginx-log blob.
+
 ```bash
 mix new binary_perf
 cd binary_perf
@@ -144,6 +146,8 @@ mkdir -p bench
 ```
 
 ### Step 2: `mix.exs`
+
+**Objective**: Pin `:benchee` dev-only so scanner variants compare without benchmark harness inflating release artifacts.
 
 ```elixir
 defmodule BinaryPerf.MixProject do
@@ -156,6 +160,8 @@ end
 ```
 
 ### Step 3: `lib/binary_perf/fixture.ex`
+
+**Objective**: Generate N MB nginx-style log via `:lists.duplicate` so fixture generation cost never contaminates scanner benchmarks.
 
 ```elixir
 defmodule BinaryPerf.Fixture do
@@ -173,6 +179,8 @@ end
 ```
 
 ### Step 4: `lib/binary_perf/scanner_v1.ex`
+
+**Objective**: Implement naive String.split + Regex so list allocation + regex dispatch overhead baseline quantifies visibly.
 
 ```elixir
 defmodule BinaryPerf.ScannerV1 do
@@ -203,6 +211,8 @@ end
 ```
 
 ### Step 5: `lib/binary_perf/scanner_v2.ex`
+
+**Objective**: Match in function heads with state machine so BEAM reuses match context across recursion, eliminating intermediate allocation.
 
 ```elixir
 defmodule BinaryPerf.ScannerV2 do
@@ -260,6 +270,8 @@ end
 ```
 
 ### Step 6: `lib/binary_perf/scanner_v3.ex`
+
+**Objective**: Copy sliced tokens with :binary.copy/1 so consumers never hold refc references keeping 100 MB parent alive.
 
 ```elixir
 defmodule BinaryPerf.ScannerV3 do
@@ -365,6 +377,8 @@ see the trap of losing the source reference.
 
 ### Step 7: tests
 
+**Objective**: Validate V1/V2 count equivalence and verify :binary.referenced_byte_size/1 indicates refc parent retention before :binary.copy/1.
+
 ```elixir
 # test/binary_perf/scanner_test.exs
 defmodule BinaryPerf.ScannerTest do
@@ -378,30 +392,34 @@ defmodule BinaryPerf.ScannerTest do
   127.0.0.1 - - [x] "GET /c HTTP/1.1" 200 10
   """
 
-  test "V1 and V2 produce identical status counts" do
-    v1 = ScannerV1.count_status(@blob)
-    v2 = ScannerV2.count_status(@blob)
-    assert v1 == v2
-    assert v1[200] == 2
-    assert v1[404] == 1
-  end
+  describe "BinaryPerf.Scanner" do
+    test "V1 and V2 produce identical status counts" do
+      v1 = ScannerV1.count_status(@blob)
+      v2 = ScannerV2.count_status(@blob)
+      assert v1 == v2
+      assert v1[200] == 2
+      assert v1[404] == 1
+    end
 
-  test "V3 extracts paths and copies them off the parent" do
-    paths = Canonical.extract_paths(@blob)
-    assert paths == ["/a", "/b", "/c"]
-    # copies — each is independent of the source blob
-    assert Enum.all?(paths, fn p -> :binary.referenced_byte_size(p) == byte_size(p) end)
-  end
+    test "V3 extracts paths and copies them off the parent" do
+      paths = Canonical.extract_paths(@blob)
+      assert paths == ["/a", "/b", "/c"]
+      # copies — each is independent of the source blob
+      assert Enum.all?(paths, fn p -> :binary.referenced_byte_size(p) == byte_size(p) end)
+    end
 
-  test "scales to 1 MB fixture without errors" do
-    blob = Fixture.generate(1)
-    assert ScannerV2.count_status(blob) |> Map.fetch!(200) > 0
-    assert Canonical.extract_paths(blob) |> length() > 0
+    test "scales to 1 MB fixture without errors" do
+      blob = Fixture.generate(1)
+      assert ScannerV2.count_status(blob) |> Map.fetch!(200) > 0
+      assert Canonical.extract_paths(blob) |> length() > 0
+    end
   end
 end
 ```
 
 ### Step 8: benchmark
+
+**Objective**: Run V1 vs V2 on a 20 MB blob so the match-context advantage shows up as order-of-magnitude memory and time deltas.
 
 ```elixir
 # bench/scanner_bench.exs
@@ -447,6 +465,46 @@ IO.puts("avg: #{time_us / 10_000} µs/op")
 ```
 
 Target: operation should complete in the low-microsecond range on modern hardware; deviations by >2× indicate a regression worth investigating.
+
+## Deep Dive: BEAM Scheduler Tuning and Memory Profiling in Production
+
+The BEAM scheduler is not "magic" — it's a preemptive work-stealing scheduler that divides CPU time 
+into reductions (bytecode instructions). Understanding scheduler tuning is critical when you suspect 
+latency spikes in production.
+
+**Key concepts**:
+- **Reductions budget**: By default, a process gets ~2000 reductions before yielding to another process.
+  Heavy CPU work (binary matching, list recursion) can exhaust the budget and cause tail latency.
+- **Dirty schedulers**: If a process does CPU-intensive work (crypto, compression, numerical), it blocks 
+  the main scheduler. Use dirty NIFs or `spawn_opt(..., [{:fullsweep_after, 0}])` for GC tuning.
+- **Heap tuning per process**: `Process.flag(:min_heap_size, ...)` reserves heap upfront, reducing GC 
+  pauses. Measure; don't guess.
+
+**Memory profiling workflow**:
+1. Run `recon:memory/0` in iex; identify top 10 memory consumers by type (atoms, binaries, ets).
+2. If binaries dominate, check for refc binary leaks (binary held by process that should have been freed).
+3. Use `eprof` or `fprof` for function-level CPU attribution; `recon:proc_window/3` for process memory trends.
+
+**Production pattern**: Deploy with `+K true` (async IO), `-env ERL_MAX_PORTS 65536` (port limit), 
+`+T 9` (async threads). Measure GC time with `erlang:statistics(garbage_collection)` — if >5% of uptime, 
+tune heap or reduce allocation pressure. Never assume defaults are optimal for YOUR workload.
+
+---
+
+## Advanced Considerations
+
+Understanding BEAM internals at production scale requires deep knowledge of scheduler behavior, memory models, and garbage collection dynamics. The soft real-time guarantees of BEAM only hold under specific conditions — high system load, uneven process distribution across schedulers, or GC pressure can break predictable latency completely. Monitor `erlang:statistics(run_queue)` in production to catch scheduler saturation before it degrades latency significantly. The difference between immediate, offheap, and continuous GC garbage collection strategies can significantly impact tail latencies in systems with millions of messages per second and sustained memory pressure.
+
+Process reductions and the reduction counter affect scheduler fairness fundamentally. A process that runs for extended periods without yielding can starve other processes, even though the scheduler treats it fairly by reduction count per scheduling interval. This is especially critical in pipelines processing large data structures or performing recursive computations where yielding points are infrequent and difficult to predict. The BEAM's preemption model is deterministic per reduction, making performance testing reproducible but sometimes hiding race conditions that only manifest under specific load patterns and GC interactions.
+
+The interaction between ETS, Mnesia, and process message queues creates subtle bottlenecks in distributed systems. ETS reads don't block other processes, but writes require acquiring locks; understanding when your workload transitions from read-heavy to write-heavy is crucial for capacity planning. Port drivers and NIFs bypass the BEAM scheduler entirely, which can lead to unexpected priority inversions if not carefully managed. Always profile with `eprof` and `fprof` in realistic production-like environments before deployment to catch performance surprises.
+
+
+## Deep Dive: Otp Patterns and Production Implications
+
+OTP primitives (GenServer, Supervisor, Application) are tested through their public interfaces, not by inspecting internal state. This discipline forces correct design: if you can't test a behavior without peeking into the server's state, the behavior is not public. Production systems with tight integration tests on GenServer internals are fragile and hard to refactor.
+
+---
 
 ## Trade-offs and production gotchas
 
@@ -528,3 +586,13 @@ overhead; memory dominated by the line-list allocation.
 - ["All about Binaries in the BEAM" — Saša Jurić](https://www.theerlangelist.com/article/binaries)
 - [JIT impact on binary matching — OTP blog](https://www.erlang.org/blog/a-first-look-at-the-jit/)
 - [`:binary.copy/1` docs](https://www.erlang.org/doc/man/binary.html#copy-1)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

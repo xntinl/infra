@@ -113,9 +113,28 @@ they don't see each other's groups. Membership is *not* transitive.
 
 ---
 
+### Dependencies (`mix.exs`)
+
+```elixir
+def deps do
+  [
+    {DOWN},
+    {exunit},
+    {got},
+    {kafka},
+    {pg},
+    {pg_broadcast},
+    {phoenix},
+    {ready},
+  ]
+end
+```
 ## Implementation
 
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
 
 ```bash
 mix new pg_groups_demo --sup
@@ -123,6 +142,9 @@ cd pg_groups_demo
 ```
 
 ### Step 2: `lib/pg_groups_demo/application.ex`
+
+**Objective**: Wire `application.ex` to start the supervision tree that starts the Registry before any via-tuple lookup can happen.
+
 
 ```elixir
 defmodule PgGroupsDemo.Application do
@@ -147,6 +169,9 @@ end
 ```
 
 ### Step 3: `lib/pg_groups_demo.ex`
+
+**Objective**: Implement `pg_groups_demo.ex` — the naming/lookup strategy that decides how processes are addressed under concurrency and failure.
+
 
 ```elixir
 defmodule PgGroupsDemo do
@@ -189,6 +214,9 @@ end
 ```
 
 ### Step 4: `test/pg_groups_demo_test.exs`
+
+**Objective**: Write `pg_groups_demo_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
 
 ```elixir
 defmodule PgGroupsDemoTest do
@@ -284,11 +312,17 @@ end
 
 ### Step 5: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
 
 ### Step 6 (optional): Try a cluster
+
+**Objective**: Provide (optional): Try a cluster — these are the supporting fixtures the main module depends on to make its concept demonstrable.
+
 
 ```bash
 iex --sname a@localhost -S mix
@@ -386,3 +420,15 @@ Horde), not a pg group.
 - [Maxim Fedorov — "pg, the distributed process groups of OTP 23"](https://www.erlang.org/blog/pg2-is-deprecated/)
 - [Phoenix.PubSub.PG2 source](https://github.com/phoenixframework/phoenix_pubsub/blob/main/lib/phoenix/pubsub/pg2.ex) — production use of `:pg`
 - [libcluster](https://hexdocs.pm/libcluster/readme.html) — how to keep the cluster mesh alive so `:pg` can see everyone
+
+
+## Key Concepts
+
+Registry patterns in Elixir provide distributed name resolution through a central registry process. Unlike traditional naming services, Elixir registries are per-node by default but can be partitioned globally. Process name resolution follows a lookup chain: local registry → distributed registry (if configured) → `:global` → fallback mechanisms.
+
+**Critical concepts:**
+- **Via tuple pattern** `{:via, module, name}`: Enables pluggable naming backends. The registry module intercepts `:whereis`, `:register`, `:unregister` calls, allowing both local and distributed strategies.
+- **Partitioned registries** (`Registry.start_link(partitions: 8)`): Reduce contention by sharding the registry across multiple ETS tables. Each partition handles independent name lookups, improving throughput under high concurrency.
+- **Clustering implications**: Global registries across nodes require consensus. Elixir's registry design favors availability (CAP theorem) — a node can register locally and replicate asynchronously. This is why `:global` exists separately from local registries.
+
+**Senior-level gotcha**: Mixing local and global registration without explicit sync logic can cause "phantom" processes — a process registered locally appears available to local callers but fails remote calls. Always make registry scope explicit in your architecture.

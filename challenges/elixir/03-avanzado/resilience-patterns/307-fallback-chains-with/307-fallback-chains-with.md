@@ -32,6 +32,16 @@ profile_resolver/
 
 Nested `case` pyramids grow one level per source. Five sources become five nested cases, 25 lines of indentation. `with` is linear:
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
+
 ```elixir
 with {:error, :miss} <- Cache.get(id),
      {:error, _} <- Primary.get(id),
@@ -91,6 +101,8 @@ end
 
 ### Step 1: Profile struct (`lib/profile_resolver/profile.ex`)
 
+**Objective**: Tag profiles with source provenance and staleness so callers route to refresh jobs or warn users based on data freshness without re-querying ancestry.
+
 ```elixir
 defmodule ProfileResolver.Profile do
   defstruct [:id, :name, :plan, :flags, source: nil, stale?: false]
@@ -107,6 +119,8 @@ end
 ```
 
 ### Step 2: Source behaviour and implementations
+
+**Objective**: Define uniform @callback get/1 signature across all sources so `with` can chain them linearly without nested case pyramids or source-specific dispatch logic.
 
 ```elixir
 defmodule ProfileResolver.Sources.Source do
@@ -192,6 +206,8 @@ end
 ```
 
 ### Step 3: Resolver (`lib/profile_resolver/resolver.ex`)
+
+**Objective**: Use `with` to walk the fallback chain cache→primary→replica→upstream→stale so the first successful source wins and later ones are short-circuited.
 
 ```elixir
 defmodule ProfileResolver.Resolver do
@@ -313,6 +329,23 @@ IO.puts("avg: #{t / 100_000} µs")
 ```
 
 Expected: < 2µs. `:persistent_term.get/2` is O(1) with no copy.
+
+## Advanced Considerations: Circuit Breakers and Bulkheads in Production
+
+A circuit breaker monitors downstream service health and rejects new requests when failures exceed a threshold, failing fast instead of queuing indefinitely. States: `:closed` (normal), `:open` (fast-fail), `:half_open` (testing recovery). A timeout-based pattern monitors; once requests succeed again, the circuit closes. Half-open tests with a single request; if it succeeds, all requests resume.
+
+Bulkheads isolate resource pools so one slow endpoint doesn't starve others. A GenServer pool with a bounded queue (e.g., `:queue.len(state) >= 100`) can return `{:error, :overloaded}` immediately, preventing queue buildup. Combined with exponential backoff on the client (caller retries with increasing delays), this creates a natural circuit breaker behavior without explicit state.
+
+Graceful degradation means serving stale data or reduced functionality when a service is slow. A cached value with a 5-minute TTL is acceptable for many reads; serve it if the live source is timing out. Feature flags allow disabling expensive operations at runtime. Cascading timeout windows (outer service times out after 5s, inner calls must complete in 3s) prevent unbounded waiting. The cost is complexity: tracking degradation modes, testing failure scenarios, and ensuring data consistency under partial failures.
+
+---
+
+
+## Deep Dive: Resilience Patterns and Production Implications
+
+Resilience patterns (circuit breakers, timeouts, retries) are easy to implement but hard to test. The insight is that resilience patterns must be tested under failure: timeouts matter only when calls actually take time, retries matter only when transient failures occur. Production systems with untested resilience patterns often fail gracefully in test and catastrophically in production.
+
+---
 
 ## Trade-offs and production gotchas
 

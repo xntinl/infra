@@ -118,9 +118,27 @@ third leg.
 
 ---
 
+### Dependencies (`mix.exs`)
+
+```elixir
+def deps do
+  [
+    {exunit},
+    {genserver},
+    {noreply},
+    {observer},
+    {ok},
+    {reply},
+    {spawn},
+  ]
+end
+```
 ## Implementation
 
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
 
 ```bash
 mix new observable_app --sup
@@ -131,6 +149,9 @@ cd observable_app
 tree ready to edit.
 
 ### Step 2: `lib/observable_app/worker.ex` — a slightly busy GenServer
+
+**Objective**: Edit `worker.ex` — a slightly busy GenServer, exposing code whose shape is chosen to exercise the tool's capabilities, not to solve a domain problem.
+
 
 ```elixir
 defmodule ObservableApp.Worker do
@@ -170,6 +191,9 @@ end
 
 ### Step 3: `lib/observable_app/cache.ex` — an ETS owner
 
+**Objective**: Edit `cache.ex` — an ETS owner, exposing code whose shape is chosen to exercise the tool's capabilities, not to solve a domain problem.
+
+
 ```elixir
 defmodule ObservableApp.Cache do
   @moduledoc """
@@ -202,6 +226,9 @@ end
 
 ### Step 4: `lib/observable_app/application.ex`
 
+**Objective**: Wire `application.ex` to start the runtime wiring needed so the tool under study has something real to inspect, format, or report on.
+
+
 ```elixir
 defmodule ObservableApp.Application do
   @moduledoc false
@@ -232,6 +259,9 @@ end
 
 ### Step 5: A simple API so tests have something to hit
 
+**Objective**: Provide A simple API so tests have something to hit — these are the supporting fixtures the main module depends on to make its concept demonstrable.
+
+
 ```elixir
 # lib/observable_app.ex
 defmodule ObservableApp do
@@ -247,6 +277,9 @@ end
 ```
 
 ### Step 6: `test/observable_app_test.exs`
+
+**Objective**: Write `observable_app_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
 
 ```elixir
 defmodule ObservableAppTest do
@@ -273,6 +306,9 @@ end
 ```
 
 ### Step 7: Run it
+
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
 
 ```bash
 mix test
@@ -369,3 +405,20 @@ Don't open your prod cookie over the public internet. Tunnel through SSH
 - [Distribution Protocol — Erlang](https://www.erlang.org/doc/apps/erts/erl_dist_protocol.html) — how remote connections work
 - [`:ets.info/1`](https://www.erlang.org/doc/man/ets.html#info-1) — what Observer's Table Viewer shows
 - [`:runtime_tools`](https://www.erlang.org/doc/man/runtime_tools.html) — Observer depends on this; loaded via `extra_applications`
+
+
+## Deep Dive
+
+Elixir's tooling ecosystem extends beyond the language into DevOps, profiling, and observability. Understanding each tool's role prevents misuse and false optimizations.
+
+**Mix tasks and releases:**
+Custom mix tasks (`mix myapp.setup`, `mix myapp.migrate`) encapsulate operational knowledge. Tasks run in the host environment (not the compiled app), so they're ideal for setup, teardown, or scripting. Releases, built with `mix release`, create self-contained OTP applications deployable without Elixir installed. They're immutable: no source code changes after release — all config comes from environment variables or runtime files.
+
+**Debugging and profiling tools:**
+- `:observer` (GUI): real-time process tree, metrics, and port inspection
+- `Recon`: production-safe introspection (stable even under high load)
+- `:eprof`: function-level timing; lower overhead than `:fprof`
+- `:fprof`: detailed trace analysis; use only in staging
+
+**Profiling approaches:**
+Ceiling profiling (e.g., "which modules consume CPU?") is cheap; go there first with `perf` or `eprof`. Floor profiling (e.g., "which lines in this function are slow?") is expensive; reserve for specific functions. In production, prefer metrics (Prometheus, New Relic) over profiling — continuous profiling has overhead. Store profiling data for post-mortem analysis, not real-time dashboards.

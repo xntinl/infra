@@ -84,6 +84,8 @@ end
 
 ### Step 1: Application supervision tree
 
+**Objective**: Order PubSub, Endpoint, and Absinthe.Subscription in the supervision tree so the ingest registry exists before socket connections wake.
+
 ```elixir
 defmodule LiveTicker.Application do
   use Application
@@ -103,6 +105,8 @@ end
 `Absinthe.Subscription` MUST be supervised by the endpoint — it reads the PubSub name from `endpoint.config(:pubsub_server)`.
 
 ### Step 2: Endpoint and socket wiring
+
+**Objective**: Mix Absinthe.Phoenix.Endpoint for broadcast/publish helpers and use Absinthe.Phoenix.Socket to extract auth tokens into resolver context without per-channel duplication.
 
 ```elixir
 defmodule LiveTickerWeb.Endpoint do
@@ -138,6 +142,8 @@ end
 
 ### Step 3: Schema with `subscription` root
 
+**Objective**: Declare subscription :ticks keyed by symbol argument so publish(tick) triggers only matching subscribers and resolve can transform before delivery.
+
 ```elixir
 defmodule LiveTickerWeb.Graphql.Schema do
   use Absinthe.Schema
@@ -169,6 +175,8 @@ end
 ```
 
 ### Step 4: Publisher from the ingest loop
+
+**Objective**: Emit ticks from the market module via Absinthe.Subscription.publish/3 so ingest pipelines stay decoupled from GraphQL schema contracts.
 
 ```elixir
 defmodule LiveTicker.Market do
@@ -283,6 +291,50 @@ IO.puts("1 publish → 1000 deliveries in #{t_us} µs")
 
 **Expected**: under 10 ms total on a 4-core laptop, i.e. < 10 µs per delivery amortized.
 
+## Deep Dive: Query Complexity and N+1 Prevention Patterns
+
+GraphQL's flexibility is a double-edged sword. A query like `{ users { posts { comments { author { email } } } } }`
+becomes a DDoS vector if unchecked: a resolver that loads each post's comments naively yields 1000 database 
+queries for a 100-user query.
+
+**Three strategies to prevent N+1**:
+1. **Dataloader batching** (Absinthe-native): Queue fields in phase 1 (`load/3`), flush in phase 2 (`run/1`).
+   Single database call per level. Works across HTTP boundaries via custom sources.
+2. **Ecto select/5 eager loading** (preload): Best when schema relationships are known at resolver definition time.
+   Fine-grained control; requires discipline in your types.
+3. **Complexity analysis** (persisted queries): Assign a "weight" to each field (users=2, posts=5, comments=10).
+   Reject queries exceeding a threshold BEFORE execution. Prevents runaway queries entirely.
+
+**Production gotcha**: Complexity analysis doesn't prevent slow queries — it prevents expensive queries.
+A query that hits 50,000 database rows but under the complexity limit still runs. Combine with database 
+query timeouts and active monitoring.
+
+**Subscription patterns** (real-time): Subscriptions over PubSub break traditional Dataloader batching 
+because events arrive asynchronously. Use a separate resolver that doesn't call the loader; instead, 
+publish (source) and subscribe (sink) directly. This keeps subscriptions cheap and doesn't starve 
+the dataloader queue.
+
+**Field-level authorization**: Dataloader sources can enforce per-user visibility rules at load time, 
+not in the resolver. This is cleaner than filtering after the fact and reduces unnecessary database 
+queries for unauthorized fields.
+
+---
+
+## Advanced Considerations
+
+API implementations at scale require careful consideration of request handling, error responses, and the interaction between multiple clients with different performance expectations. The distinction between public APIs and internal APIs affects error reporting granularity, versioning strategies, and backwards compatibility guarantees fundamentally. Versioning APIs through headers, paths, or query parameters each have trade-offs in terms of maintenance burden, client complexity, and developer experience across multiple client versions. When deprecating API endpoints, the migration window and support period must balance client migration costs with infrastructure maintenance costs and team capacity constraints.
+
+GraphQL adds complexity around query costs, depth limits, and the interaction between nested resolvers and N+1 query problems. A deeply nested GraphQL query can trigger hundreds of database queries if not carefully managed with proper preloading and query analysis. Implementing query cost analysis prevents malicious or poorly-written queries from starving resources and degrading service for other clients. The caching layer becomes more complex with GraphQL because the same data may be accessed through multiple query paths, each with different caching semantics and TTL requirements that must be carefully coordinated at the application level.
+
+Error handling and status codes require careful design to balance information disclosure with security concerns. Too much detail in error messages helps attackers; too little detail frustrates legitimate users. Implement structured error responses with specific error codes that clients can use to handle different failure scenarios intelligently and retry appropriately. Rate limiting, circuit breakers, and backpressure mechanisms prevent API overload but require careful configuration based on expected traffic patterns and SLA requirements.
+
+
+## Deep Dive: Apis Patterns and Production Implications
+
+API testing requires testing schema validation, error messages, pagination, and rate limiting—not just happy paths. The mistake is testing only the happy path and assuming error handling works. Production APIs with weak error handling become support nightmares.
+
+---
+
 ## Trade-offs and production gotchas
 
 **1. Subscribers are processes — slow resolvers block their own socket**
@@ -313,3 +365,13 @@ Your ingest loop publishes 2k ticks/sec. Each tick fans out to 500 subscribers o
 - [`Absinthe.Phoenix` README](https://github.com/absinthe-graphql/absinthe_phoenix)
 - [`Phoenix.PubSub` internals](https://hexdocs.pm/phoenix_pubsub/Phoenix.PubSub.html)
 - [Keathley — "Running GraphQL subscriptions in production"](https://keathley.io/blog/reducing-memory-use.html)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

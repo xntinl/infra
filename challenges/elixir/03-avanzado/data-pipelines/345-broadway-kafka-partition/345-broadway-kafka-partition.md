@@ -136,6 +136,8 @@ end
 
 ### Step 1: Pipeline
 
+**Objective**: Hash `user_id` via `partition_by` so events for the same user serialise on one processor while peers parallelise freely.
+
 ```elixir
 defmodule UserEventsConsumer.Pipeline do
   use Broadway
@@ -201,6 +203,8 @@ end
 ```
 
 ### Step 2: Per-user processor
+
+**Objective**: Apply events without locks — `partition_by` guarantees single-writer per `user_id`, so no CAS or mutex is needed.
 
 ```elixir
 defmodule UserEventsConsumer.Processor do
@@ -321,6 +325,24 @@ Benchee.run(%{
 **Target**: 20k–40k events/sec on an 8-core host with the stub processor.
 Real throughput is bounded by downstream writes.
 
+## Deep Dive
+
+Data pipelines in Elixir leverage the Actor model to coordinate work across producer, consumer, and batcher stages. GenStage provides the foundation—a demand-driven backpressure mechanism that prevents memory bloat when producers exceed consumer capacity. Broadway abstracts this further, handling subscriptions, acknowledgments, and error propagation automatically. Understanding pipeline topology is critical at scale: a misconfigured batcher can serialize work and kill throughput; conversely, excessive partitioning fragments state and increases GC pressure. In production systems, always measure latency and memory per stage—Broadway's metrics integration with Telemetry makes this traceable. Consider exactly-once delivery semantics early; most pipelines require idempotency keys or deduplication at the consumer boundary. For high-volume Kafka scenarios, partition alignment (matching Broadway partitions to Kafka partitions) is essential to avoid rebalancing storms.
+## Advanced Considerations
+
+Data pipeline implementations at scale require careful consideration of backpressure, memory buffering, and failure recovery semantics. Broadway and Genstage provide demand-driven processing, but understanding the exact flow of backpressure through your pipeline is essential to avoid either starving producers or overwhelming buffers. The interaction between batcher timeouts and consumer demand can create unexpected latencies when tuples are held waiting for either a size threshold or time threshold to be reached. In systems processing millions of events, even a 100ms batch timeout can impact end-to-end latency dramatically.
+
+Idempotency and exactly-once semantics are not automatic — they require architectural decisions about checkpointing and deduplication strategies. Writing checkpoints too frequently becomes a bottleneck; writing them too infrequently means lost progress on failure and potential duplicates. The choice between in-process ETS-based deduplication versus external stores (Redis, database) changes your failure recovery story fundamentally. Broadway's acknowledgment system is flexible but requires explicit design; missing acknowledgments can cause data loss or duplicates in production environments where failures are common.
+
+When handling external systems (databases, message queues, APIs), transient failures and circuit-breaker patterns become essential. A single slow downstream service can cause backpressure to ripple through your entire pipeline catastrophically. Consider implementing bulkhead patterns where certain pipeline stages have isolated pools of workers to prevent cascading failures. For ETL pipelines combining Ecto with streaming, managing database connection pools and transaction contexts requires careful coordination to prevent connection exhaustion.
+
+
+## Deep Dive: Streaming Patterns and Production Implications
+
+Stream-based pipelines in Elixir achieve backpressure and composability by deferring computation until consumption. Unlike eager list operations that allocate all intermediate structures, Streams are lazy chains that produce one element at a time, reducing memory footprint and enabling infinite sequences. The BEAM scheduler yields between Stream operations, allowing multiple concurrent pipelines to interleave fairly. At scale (processing millions of rows or events), the difference between eager and lazy evaluation becomes the difference between consistent latency and garbage collection pauses. Production systems benefit most when Streams are composed at library boundaries, not scattered across the codebase.
+
+---
+
 ## Trade-offs and production gotchas
 
 **1. `partition_by` must use the SAME hash as the Kafka producer.**
@@ -370,3 +392,13 @@ preserving per-user ordering?
 - [Broadway `partition_by:` docs](https://hexdocs.pm/broadway/Broadway.html#start_link/2-processors-options)
 - [brod — Erlang Kafka client](https://github.com/kafka4beam/brod)
 - [Kafka Consumer Group protocol](https://kafka.apache.org/documentation/#consumerconfigs)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

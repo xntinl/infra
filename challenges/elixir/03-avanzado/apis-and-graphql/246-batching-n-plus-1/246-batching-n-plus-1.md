@@ -126,6 +126,8 @@ N items (Postgres is comfy with 10k, some REST APIs break at 100).
 
 ### Step 1: HTTP clients (plain Tesla-free HTTP mocks for clarity)
 
+**Objective**: Expose `get_plans/1` and `bulk_usage/2` as bulk endpoints so Dataloader has a single round-trip target instead of per-id fan-out.
+
 ```elixir
 # lib/graphql_batching/billing_client.ex
 defmodule GraphqlBatching.BillingClient do
@@ -163,6 +165,8 @@ end
 
 ### Step 2: `Dataloader.KV` sources
 
+**Objective**: Key batches by `{op, args}` in KV sources so identical lookups deduplicate and concurrency caps protect upstream services from stampedes.
+
 ```elixir
 # lib/graphql_batching/sources/http_source.ex
 defmodule GraphqlBatching.Sources.HttpSource do
@@ -199,6 +203,8 @@ end
 ```
 
 ### Step 3: Schema using the sources
+
+**Objective**: Resolve fields via `Dataloader.load + on_load` so sibling resolvers enqueue into the same batch and flush between resolution phases.
 
 ```elixir
 # lib/graphql_batching/graphql/types/account_types.ex
@@ -275,6 +281,8 @@ end
 
 ### Step 4: Tests
 
+**Objective**: Assert a 50-account query triggers exactly one billing call via telemetry counters, locking the N+1 regression guard into CI.
+
 ```elixir
 # test/graphql_batching/http_source_test.exs
 defmodule GraphqlBatching.HttpSourceTest do
@@ -282,26 +290,28 @@ defmodule GraphqlBatching.HttpSourceTest do
 
   alias GraphqlBatching.Sources.HttpSource
 
-  test "billing source batches plan lookups into one call" do
-    counter = :counters.new(1, [])
+  describe "GraphqlBatching.HttpSource" do
+    test "billing source batches plan lookups into one call" do
+      counter = :counters.new(1, [])
 
-    handler = fn _event, %{count: count}, _meta, _ ->
-      :counters.add(counter, 1, count)
+      handler = fn _event, %{count: count}, _meta, _ ->
+        :counters.add(counter, 1, count)
+      end
+      :telemetry.attach("count-billing", [:billing_client, :get_plans], handler, nil)
+
+      loader =
+        HttpSource.loader()
+        |> Dataloader.load(:billing, {:plans}, "plan_free")
+        |> Dataloader.load(:billing, {:plans}, "plan_pro")
+        |> Dataloader.load(:billing, {:plans}, "plan_pro")  # dedup
+        |> Dataloader.run()
+
+      assert %{tier: "free"} = Dataloader.get(loader, :billing, {:plans}, "plan_free")
+      assert %{tier: "pro"} = Dataloader.get(loader, :billing, {:plans}, "plan_pro")
+
+      :telemetry.detach("count-billing")
+      assert :counters.get(counter, 1) in [2, 3], "batched into one call (2 unique ids)"
     end
-    :telemetry.attach("count-billing", [:billing_client, :get_plans], handler, nil)
-
-    loader =
-      HttpSource.loader()
-      |> Dataloader.load(:billing, {:plans}, "plan_free")
-      |> Dataloader.load(:billing, {:plans}, "plan_pro")
-      |> Dataloader.load(:billing, {:plans}, "plan_pro")  # dedup
-      |> Dataloader.run()
-
-    assert %{tier: "free"} = Dataloader.get(loader, :billing, {:plans}, "plan_free")
-    assert %{tier: "pro"} = Dataloader.get(loader, :billing, {:plans}, "plan_pro")
-
-    :telemetry.detach("count-billing")
-    assert :counters.get(counter, 1) in [2, 3], "batched into one call (2 unique ids)"
   end
 end
 ```
@@ -311,23 +321,25 @@ end
 defmodule GraphqlBatching.SchemaBatchingTest do
   use ExUnit.Case, async: false
 
-  test "50-account query batches billing into ≤ 1 call and metrics into ≤ 1 call" do
-    billing_calls = :counters.new(1, [])
-    metrics_calls = :counters.new(1, [])
+  describe "GraphqlBatching.SchemaBatching" do
+    test "50-account query batches billing into ≤ 1 call and metrics into ≤ 1 call" do
+      billing_calls = :counters.new(1, [])
+      metrics_calls = :counters.new(1, [])
 
-    :telemetry.attach("bc", [:billing_client, :get_plans],
-      fn _, _, _, _ -> :counters.add(billing_calls, 1, 1) end, nil)
-    :telemetry.attach("mc", [:metrics_client, :bulk_usage],
-      fn _, _, _, _ -> :counters.add(metrics_calls, 1, 1) end, nil)
+      :telemetry.attach("bc", [:billing_client, :get_plans],
+        fn _, _, _, _ -> :counters.add(billing_calls, 1, 1) end, nil)
+      :telemetry.attach("mc", [:metrics_client, :bulk_usage],
+        fn _, _, _, _ -> :counters.add(metrics_calls, 1, 1) end, nil)
 
-    query = "{ accounts(limit: 50) { id plan { tier } usageMetric(window: \"7d\") } }"
-    assert {:ok, %{data: _}} = Absinthe.run(query, GraphqlBatching.Graphql.Schema)
+      query = "{ accounts(limit: 50) { id plan { tier } usageMetric(window: \"7d\") } }"
+      assert {:ok, %{data: _}} = Absinthe.run(query, GraphqlBatching.Graphql.Schema)
 
-    :telemetry.detach("bc")
-    :telemetry.detach("mc")
+      :telemetry.detach("bc")
+      :telemetry.detach("mc")
 
-    assert :counters.get(billing_calls, 1) == 1
-    assert :counters.get(metrics_calls, 1) == 1
+      assert :counters.get(billing_calls, 1) == 1
+      assert :counters.get(metrics_calls, 1) == 1
+    end
   end
 end
 ```
@@ -338,6 +350,50 @@ end
 ### Why this works
 
 The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
+
+## Deep Dive: Query Complexity and N+1 Prevention Patterns
+
+GraphQL's flexibility is a double-edged sword. A query like `{ users { posts { comments { author { email } } } } }`
+becomes a DDoS vector if unchecked: a resolver that loads each post's comments naively yields 1000 database 
+queries for a 100-user query.
+
+**Three strategies to prevent N+1**:
+1. **Dataloader batching** (Absinthe-native): Queue fields in phase 1 (`load/3`), flush in phase 2 (`run/1`).
+   Single database call per level. Works across HTTP boundaries via custom sources.
+2. **Ecto select/5 eager loading** (preload): Best when schema relationships are known at resolver definition time.
+   Fine-grained control; requires discipline in your types.
+3. **Complexity analysis** (persisted queries): Assign a "weight" to each field (users=2, posts=5, comments=10).
+   Reject queries exceeding a threshold BEFORE execution. Prevents runaway queries entirely.
+
+**Production gotcha**: Complexity analysis doesn't prevent slow queries — it prevents expensive queries.
+A query that hits 50,000 database rows but under the complexity limit still runs. Combine with database 
+query timeouts and active monitoring.
+
+**Subscription patterns** (real-time): Subscriptions over PubSub break traditional Dataloader batching 
+because events arrive asynchronously. Use a separate resolver that doesn't call the loader; instead, 
+publish (source) and subscribe (sink) directly. This keeps subscriptions cheap and doesn't starve 
+the dataloader queue.
+
+**Field-level authorization**: Dataloader sources can enforce per-user visibility rules at load time, 
+not in the resolver. This is cleaner than filtering after the fact and reduces unnecessary database 
+queries for unauthorized fields.
+
+---
+
+## Advanced Considerations
+
+API implementations at scale require careful consideration of request handling, error responses, and the interaction between multiple clients with different performance expectations. The distinction between public APIs and internal APIs affects error reporting granularity, versioning strategies, and backwards compatibility guarantees fundamentally. Versioning APIs through headers, paths, or query parameters each have trade-offs in terms of maintenance burden, client complexity, and developer experience across multiple client versions. When deprecating API endpoints, the migration window and support period must balance client migration costs with infrastructure maintenance costs and team capacity constraints.
+
+GraphQL adds complexity around query costs, depth limits, and the interaction between nested resolvers and N+1 query problems. A deeply nested GraphQL query can trigger hundreds of database queries if not carefully managed with proper preloading and query analysis. Implementing query cost analysis prevents malicious or poorly-written queries from starving resources and degrading service for other clients. The caching layer becomes more complex with GraphQL because the same data may be accessed through multiple query paths, each with different caching semantics and TTL requirements that must be carefully coordinated at the application level.
+
+Error handling and status codes require careful design to balance information disclosure with security concerns. Too much detail in error messages helps attackers; too little detail frustrates legitimate users. Implement structured error responses with specific error codes that clients can use to handle different failure scenarios intelligently and retry appropriately. Rate limiting, circuit breakers, and backpressure mechanisms prevent API overload but require careful configuration based on expected traffic patterns and SLA requirements.
+
+
+## Deep Dive: Apis Patterns and Production Implications
+
+API testing requires testing schema validation, error messages, pagination, and rate limiting—not just happy paths. The mistake is testing only the happy path and assuming error handling works. Production APIs with weak error handling become support nightmares.
+
+---
 
 ## Trade-offs and production gotchas
 
@@ -407,3 +463,13 @@ overhead of `load/run/get` is comparable to direct calls.
 - [Absinthe + Dataloader guide](https://hexdocs.pm/absinthe/dataloader.html)
 - [Dashbit — "Demand-driven architectures" by José Valim](https://dashbit.co/blog/demand-driven-architectures-with-elixir)
 - [Finch — low-latency HTTP client for batched upstreams](https://hexdocs.pm/finch/Finch.html)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

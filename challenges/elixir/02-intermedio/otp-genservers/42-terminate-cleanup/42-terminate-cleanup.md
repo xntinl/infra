@@ -115,12 +115,18 @@ end
 
 ### Step 1: Create the project
 
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
+
 ```bash
 mix new terminate_cleanup_gs
 cd terminate_cleanup_gs
 ```
 
 ### Step 2: `lib/terminate_cleanup_gs.ex`
+
+**Objective**: Implement `terminate_cleanup_gs.ex` — the GenServer callback shape that determines blocking vs fire-and-forget semantics and state invariants.
+
 
 ```elixir
 defmodule TerminateCleanupGs do
@@ -196,6 +202,9 @@ end
 
 ### Step 3: `test/terminate_cleanup_gs_test.exs`
 
+**Objective**: Write `terminate_cleanup_gs_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+
 ```elixir
 defmodule TerminateCleanupGsTest do
   use ExUnit.Case, async: true
@@ -265,6 +274,9 @@ end
 
 ### Step 4: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -274,6 +286,14 @@ mix test
 ### Why this works
 
 The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+
+## Key Concepts: Process Shutdown and Resource Cleanup
+
+`terminate/2` is called when a GenServer shuts down (supervisor kills it, `GenServer.stop/1`, or `:kill` signal). Use it to close files, flush buffers, cancel timers, or unregister names. Return `:ok` (normal shutdown) or `{:error, reason}` (failed cleanup—though this doesn't change the outcome).
+
+Gotcha: `terminate/2` has limited time to finish (supervisor's `shutdown` timeout, default 5 seconds). Long-running cleanup will be forcefully killed. For critical cleanup, do it incrementally in `handle_cast` or design the state to not need cleanup (e.g., let the OS close files when the process exits).
 
 
 ## Benchmark

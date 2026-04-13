@@ -70,6 +70,16 @@ umbrella_services/
 
 Umbrella children are listed in the umbrella's `deps:` via `in_umbrella: true`. At release time, the tool looks at each app's `application` spec and its `applications:` list, does a topological sort, and boots in dependency order.
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
+
 ```elixir
 # apps/pricing/mix.exs
 def application do
@@ -163,6 +173,8 @@ The root project declares no runtime deps — children declare their own. Each c
 
 ### Step 1: Root `mix.exs`
 
+**Objective**: Implement Root mix.exs.
+
 ```elixir
 # mix.exs
 defmodule UmbrellaServices.MixProject do
@@ -196,6 +208,8 @@ end
 ```
 
 ### Step 2: `catalog` app
+
+**Objective**: Implement catalog app.
 
 ```elixir
 # apps/catalog/mix.exs
@@ -266,6 +280,8 @@ end
 
 ### Step 3: `pricing` app (depends on catalog)
 
+**Objective**: Implement pricing app (depends on catalog).
+
 ```elixir
 # apps/pricing/mix.exs
 defmodule Pricing.MixProject do
@@ -320,6 +336,8 @@ end
 ```
 
 ### Step 4: `checkout` app
+
+**Objective**: Implement checkout app.
 
 ```elixir
 # apps/checkout/mix.exs
@@ -383,6 +401,8 @@ end
 
 ### Step 5: Shared config
 
+**Objective**: Implement Shared config.
+
 ```elixir
 # config/config.exs
 import Config
@@ -396,19 +416,23 @@ config :logger, :default_formatter,
 
 ### Step 6: Tests per app
 
+**Objective**: Write tests for per app.
+
 ```elixir
 # apps/pricing/test/pricing/calculator_test.exs
 defmodule Pricing.CalculatorTest do
   use ExUnit.Case, async: true
 
-  test "quote uses catalog base price + margin" do
-    assert {:ok, total} = Pricing.Calculator.quote("SKU-A", 2)
-    # base 1000 * qty 2 * 115 / 100 = 2300
-    assert total == 2_300
-  end
+  describe "Pricing.Calculator" do
+    test "quote uses catalog base price + margin" do
+      assert {:ok, total} = Pricing.Calculator.quote("SKU-A", 2)
+      # base 1000 * qty 2 * 115 / 100 = 2300
+      assert total == 2_300
+    end
 
-  test "returns catalog error" do
-    assert {:error, :not_found} = Pricing.Calculator.quote("NOPE", 1)
+    test "returns catalog error" do
+      assert {:error, :not_found} = Pricing.Calculator.quote("NOPE", 1)
+    end
   end
 end
 
@@ -416,16 +440,18 @@ end
 defmodule Checkout.ApiTest do
   use ExUnit.Case, async: false
 
-  test "end-to-end checkout across 3 apps" do
-    assert {:ok, order} = Checkout.Api.checkout("SKU-B", 3)
-    assert order.sku == "SKU-B"
-    assert order.name == "Gadget"
-    # 2500 * 3 * 115 / 100 = 8625
-    assert order.total == 8_625
-  end
+  describe "Checkout.Api" do
+    test "end-to-end checkout across 3 apps" do
+      assert {:ok, order} = Checkout.Api.checkout("SKU-B", 3)
+      assert order.sku == "SKU-B"
+      assert order.name == "Gadget"
+      # 2500 * 3 * 115 / 100 = 8625
+      assert order.total == 8_625
+    end
 
-  test "propagates not_found from catalog" do
-    assert {:error, :not_found} = Checkout.Api.checkout("MISSING", 1)
+    test "propagates not_found from catalog" do
+      assert {:error, :not_found} = Checkout.Api.checkout("MISSING", 1)
+    end
   end
 end
 ```
@@ -443,6 +469,8 @@ Each child's `application.ex` declares its `applications:` list; this is the sin
 
 ### Step 7: Building the release
 
+**Objective**: Implement Building the release.
+
 ```bash
 MIX_ENV=prod mix release umbrella_services
 _build/prod/rel/umbrella_services/bin/umbrella_services start
@@ -457,6 +485,23 @@ Boot log (abridged):
 ```
 
 Order is guaranteed by `extra_applications`. If `pricing` starts before `catalog`, that's your `mix.exs` wrong — fix it.
+
+---
+
+## Advanced Considerations: Partitioned Supervisors and Custom Restart Strategies
+
+A standard Supervisor is a single process managing a static tree. For thousands of children, a single supervisor becomes a bottleneck: all supervisor callbacks run on one process, and supervisor restart logic is sequential. PartitionSupervisor (OTP 25+) spawns N independent supervisors, each managing a subset of children. Hashing the child ID determines which partition supervises it, distributing load and enabling horizontal scaling.
+
+Custom restart strategies (via `Supervisor.init/2` callback) allow logic beyond the defaults. A strategy might prioritize restarting dependent services in a specific order, or apply backoff based on restart frequency. The downside is complexity: custom logic is harder to test and reason about, and mistakes cascade. Start with defaults and profile before adding custom behavior.
+
+Selective restart via `:rest_for_one` or `:one_for_all` affects failure isolation. `:one_for_all` restarts all children when one fails (simulating a total system failure), which can be necessary for consistency but is expensive. `:rest_for_one` restarts the failed child and any started after it, balancing isolation and dependencies. Understanding which strategy fits your architecture prevents cascading failures and unnecessary restarts.
+
+---
+
+
+## Deep Dive: Property Patterns and Production Implications
+
+Property-based testing inverts the testing mindset: instead of writing examples, you state invariants (properties) and let a generator find counterexamples. StreamData's shrinking capability is its superpower—when a property fails on a 10,000-element list, the framework reduces it to the minimal list that still fails, cutting debugging time from hours to minutes. The trade-off is that properties require rigorous thinking about domain constraints, and not every invariant is worth expressing as a property. Teams that adopt property testing often find bugs in specifications themselves, not just implementations.
 
 ---
 

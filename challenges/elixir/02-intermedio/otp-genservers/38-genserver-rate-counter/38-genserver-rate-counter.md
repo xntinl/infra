@@ -118,12 +118,18 @@ end
 
 ### Step 1: Create the project
 
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
+
 ```bash
 mix new rate_counter_gs
 cd rate_counter_gs
 ```
 
 ### Step 2: `lib/rate_counter_gs.ex`
+
+**Objective**: Implement `rate_counter_gs.ex` — the GenServer callback shape that determines blocking vs fire-and-forget semantics and state invariants.
+
 
 ```elixir
 defmodule RateCounterGs do
@@ -222,6 +228,9 @@ end
 
 ### Step 3: `test/rate_counter_gs_test.exs`
 
+**Objective**: Write `rate_counter_gs_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+
 ```elixir
 defmodule RateCounterGsTest do
   use ExUnit.Case, async: true
@@ -284,6 +293,9 @@ end
 
 ### Step 4: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -293,6 +305,15 @@ mix test
 ### Why this works
 
 The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Deep Dive: Self-Scheduling Cadence and Window Rotation Under Load
+
+The self-scheduling pattern (rescheduling the tick inside the handler) decouples the GenServer's processing capacity from the timer's delivery rate. Unlike `:timer.send_interval/2`, which fires independently and can overload a slow handler, `send_after` + self-reschedule naturally throttles: if the handler takes 100ms and the interval is 1_000ms, the next tick fires 1_100ms after the previous *start*, not 1_000ms after the previous *fire*. This prevents cascading ticks from queueing up.
+
+The two-bucket rotation (prev/curr) is elegant but has subtle semantics: rate reported right after a tick spans ~2 seconds of history (the rotated-out bucket still counts), while rate reported just before a tick spans ~1 second. For applications needing consistent window size, use `N`-bucket rotation (e.g., 10 × 100ms buckets) and track a monotonic counter to determine which bucket is current. This adds complexity but provides precise windows at the cost of more state and bookkeeping per tick.
+
+Under extreme hit rates (millions per second), even `cast` + state mutation becomes a bottleneck: the mailbox fills faster than the GenServer drains. Production systems back this with lock-free counters (`:counters` module) per scheduler, and use the GenServer solely for tick dispatch and aggregation. This separates the hot path (lock-free increments from any process) from the cool path (periodic window rotation in a single GenServer). Benchmarking early reveals whether you need this optimization or whether GenServer alone suffices.
 
 
 ## Benchmark

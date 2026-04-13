@@ -79,6 +79,8 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ### Step 1: `mix.exs`
 
+**Objective**: Pin `nerves`, `circuits_gpio`, and `circuits_i2c` — these bind the BEAM to hardware; `shoehorn` adds boot-time fault tolerance on-device.
+
 ```elixir
 defp deps do
   [
@@ -95,6 +97,8 @@ end
 ```
 
 ### Step 2: `lib/api_gateway/sensor/store.ex`
+
+**Objective**: Back the ring buffer with an `:ordered_set` keyed by monotonic time — history queries stay O(log n) and eviction always drops the oldest entry.
 
 ```elixir
 defmodule ApiGateway.Sensor.Store do
@@ -160,6 +164,8 @@ The store uses `System.monotonic_time(:millisecond)` as the ETS key — monotoni
 Eviction is handled asynchronously via `GenServer.cast/2`. This means `insert/1` returns immediately after the ETS write. The small window where the table has 101 entries is acceptable — it is bounded and resolved on the next message.
 
 ### Step 3: `lib/api_gateway/sensor/bme280.ex`
+
+**Objective**: Own the I2C bus ref inside a GenServer and back off on read errors — the process is the unit of failure for a flaky sensor.
 
 ```elixir
 defmodule ApiGateway.Sensor.BME280 do
@@ -249,6 +255,8 @@ end
 
 ### Step 4: `lib/api_gateway/indicator/led.ex`
 
+**Objective**: Encode device state as a blink pattern on GPIO 18 — the LED is the only observable surface when there is no console attached.
+
 ```elixir
 defmodule ApiGateway.Indicator.LED do
   @moduledoc """
@@ -330,6 +338,8 @@ end
 
 ### Step 5: `lib/api_gateway/device_api.ex`
 
+**Objective**: Expose readings and system info over a local Plug router — the edge device is queryable on the LAN without cloud dependencies.
+
 ```elixir
 defmodule ApiGateway.DeviceAPI do
   @moduledoc """
@@ -384,6 +394,8 @@ end
 
 ### Step 6: `lib/api_gateway/application.ex` — target-aware tree
 
+**Objective**: Branch children on `MIX_TARGET` — hardware-owning processes only start on-device; host keeps the test loop fast and crash-free.
+
 ```elixir
 defmodule ApiGateway.Application do
   @moduledoc """
@@ -422,6 +434,8 @@ end
 
 ### Step 7: Given tests — must pass without modification
 
+**Objective**: Implement: Given tests — must pass without modification.
+
 ```elixir
 # test/api_gateway/sensor_store_test.exs
 defmodule ApiGateway.Sensor.StoreTest do
@@ -432,39 +446,43 @@ defmodule ApiGateway.Sensor.StoreTest do
     :ok
   end
 
-  test "latest returns nil with empty store" do
-    assert ApiGateway.Sensor.Store.latest() == nil
-  end
-
-  test "insert and latest" do
-    reading = %{temperature_c: 22.5, humidity_pct: 60.0, pressure_hpa: 1013.2}
-    ApiGateway.Sensor.Store.insert(reading)
-    assert ApiGateway.Sensor.Store.latest() == reading
-  end
-
-  test "history returns newest first" do
-    for i <- 1..5 do
-      ApiGateway.Sensor.Store.insert(%{temperature_c: i * 1.0})
-      Process.sleep(1)
+  describe "ApiGateway.Sensor.Store" do
+    test "latest returns nil with empty store" do
+      assert ApiGateway.Sensor.Store.latest() == nil
     end
 
-    history = ApiGateway.Sensor.Store.history(3)
-    assert length(history) == 3
-    assert hd(history).temperature_c == 5.0
-  end
-
-  test "eviction keeps store at max 100 entries" do
-    for i <- 1..110 do
-      ApiGateway.Sensor.Store.insert(%{temperature_c: i * 1.0})
+    test "insert and latest" do
+      reading = %{temperature_c: 22.5, humidity_pct: 60.0, pressure_hpa: 1013.2}
+      ApiGateway.Sensor.Store.insert(reading)
+      assert ApiGateway.Sensor.Store.latest() == reading
     end
 
-    Process.sleep(20)
-    assert length(ApiGateway.Sensor.Store.history(200)) <= 100
+    test "history returns newest first" do
+      for i <- 1..5 do
+        ApiGateway.Sensor.Store.insert(%{temperature_c: i * 1.0})
+        Process.sleep(1)
+      end
+
+      history = ApiGateway.Sensor.Store.history(3)
+      assert length(history) == 3
+      assert hd(history).temperature_c == 5.0
+    end
+
+    test "eviction keeps store at max 100 entries" do
+      for i <- 1..110 do
+        ApiGateway.Sensor.Store.insert(%{temperature_c: i * 1.0})
+      end
+
+      Process.sleep(20)
+      assert length(ApiGateway.Sensor.Store.history(200)) <= 100
+    end
   end
 end
 ```
 
 ### Step 8: Run tests on host (no hardware needed)
+
+**Objective**: Run the code to validate the full workflow end-to-end.
 
 ```bash
 MIX_TARGET=host mix test test/api_gateway/sensor_store_test.exs --trace
@@ -477,6 +495,26 @@ MIX_TARGET=host mix test test/api_gateway/sensor_store_test.exs --trace
 
 The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
 
+## Deep Dive
+
+Specialized frameworks like Ash (business logic), Commanded (event sourcing), and Nx (numerical computing) abstract away common infrastructure but impose architectural constraints. Ash's declarative resource definitions simplify authorization and querying at the cost of reduced flexibility—deeply nested association policies can degrade query performance. Commanded's event store and aggregate roots enforce event sourcing discipline, making audit trails and temporal queries natural, but require careful snapshot strategy to avoid replaying years of events. Nx brings numerical computing to Elixir, but JIT compilation and lazy evaluation introduce latency; production models benefit from ahead-of-time compilation for inference. For IoT (Nerves), firmware updates must be atomic and resumable—OTA rollback on failure is non-negotiable. Choose frameworks that align with your scaling assumptions: Ash scales horizontally via read replicas; Commanded scales via sharding; Nx scales via distributed training.
+
+---
+
+## Advanced Considerations
+
+Framework choices like Ash, Commanded, and Nerves create significant architectural constraints that are difficult to change later. Ash's powerful query builder and declarative approach simplify common patterns but can be opaque when debugging complex permission logic or custom filters at scale. Event sourcing with Commanded is powerful for audit trails but creates a different mental model for state management — replaying events to derive current state has CPU and latency costs that aren't apparent in traditional CRUD systems.
+
+Nerves requires understanding the full embedded system stack — from bootloader configuration to over-the-air update mechanisms. A Nerves system that works on your development board may fail in production due to hardware variations, network conditions, or power supply issues. NX's numerical computing is powerful but requires understanding GPU acceleration trade-offs and memory management for large datasets. Livebook provides interactive development but shouldn't be used for production deployments without careful containerization and resource isolation.
+
+The integration between these frameworks and traditional BEAM patterns (supervisors, processes, GenServers) requires careful design. A Commanded projection that rebuilds state from the event log can consume all available CPU, starving other services. NX autograd computations can create unexpected memory usage if not carefully managed. Nerves systems are memory-constrained; performance assumptions from desktop Elixir don't hold. Always prototype these frameworks in realistic environments before committing to them in production systems to validate assumptions.
+
+
+## Deep Dive: Domain Patterns and Production Implications
+
+Domain-specific frameworks enforce module dependencies and architectural boundaries. Testing domain isolation ensures that constraints are maintained as the codebase grows. Production systems without boundary enforcement often become monolithic and hard to test.
+
+---
 ## Trade-off analysis
 
 | Aspect | Nerves (BEAM on Linux) | RTOS (FreeRTOS) | Bare metal C |
@@ -532,3 +570,13 @@ Target: operation should complete in the low-microsecond range on modern hardwar
 - [Circuits.I2C](https://hexdocs.pm/circuits_i2c) — I2C bus communication
 - [NervesHub](https://www.nerves-hub.org/) — OTA firmware distribution
 - [Toolshed](https://hexdocs.pm/toolshed) — IEx utilities for debugging on-device
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

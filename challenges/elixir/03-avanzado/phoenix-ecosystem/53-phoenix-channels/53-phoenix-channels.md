@@ -2,9 +2,6 @@
 
 **Project**: `channels_deep` — a multi-tenant chat backend where native mobile clients connect directly to Phoenix Channels.
 
-**Difficulty**: ★★★★☆
-**Estimated time**: 4–6 hours
-
 ---
 
 ## Project context
@@ -52,6 +49,12 @@ channels_deep/
         └── channels/
             └── room_channel_test.exs
 ```
+
+---
+
+## Why channels and not raw WebSockets
+
+Channels give you topic-based pub/sub, presence, reconnection, and auth in one opinionated package. Replacing that with a raw WebSocket means reinventing all of it badly.
 
 ---
 
@@ -137,14 +140,30 @@ You defend by:
 2. Counting events per user and returning `{:reply, {:error, :rate_limited}, socket}` once over budget.
 3. Keeping channel state bounded — no growing in-memory history in `socket.assigns`.
 
-We reuse the ETS rate limiter from exercise 71 conceptually; here we keep it
+We reuse the ETS rate limiter idea conceptually; here we keep it
 simple with a counter in socket assigns and a periodic reset.
+
+---
+
+## Design decisions
+
+**Option A — plain WebSocket handler**
+- Pros: no framework; full control over protocol.
+- Cons: no routing, no presence, no PubSub; rebuilding Phoenix poorly.
+
+**Option B — Phoenix.Channel** (chosen)
+- Pros: topics, auth, presence, and PubSub come for free; cluster-aware.
+- Cons: framing protocol is fixed; custom wire protocols need serializers.
+
+→ Chose **B** because channels solve the problems every real-time app hits; rolling your own is almost never justified.
 
 ---
 
 ## Implementation
 
 ### Step 1: Create the project
+
+**Objective**: Use `--no-html --no-ecto` so the app is pure WebSocket surface — fewer moving parts during Channel testing.
 
 ```bash
 mix phx.new channels_deep --no-ecto --no-mailer --no-html
@@ -153,8 +172,20 @@ cd channels_deep
 
 ### Step 2: Authorization — `lib/channels_deep/authorization.ex`
 
+**Objective**: Centralize tenant/room ACL lookup so channels call one predicate, not scattered pattern matches.
+
 In production this would be a DB-backed check. For the exercise we hardcode
 an ACL that the tests will use:
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
 
 ```elixir
 defmodule ChannelsDeep.Authorization do
@@ -179,6 +210,8 @@ end
 
 ### Step 3: Auth — `lib/channels_deep/auth.ex`
 
+**Objective**: Wrap `Phoenix.Token.sign/verify` with a fixed salt and `max_age` so stale tokens are rejected uniformly.
+
 Use `Phoenix.Token` — symmetric, HMAC over the Endpoint secret:
 
 ```elixir
@@ -202,6 +235,8 @@ end
 ```
 
 ### Step 4: UserSocket — `lib/channels_deep_web/channels/user_socket.ex`
+
+**Objective**: Authenticate in `connect/3` and set `id/1` per user so `Endpoint.broadcast` can force-disconnect on logout.
 
 ```elixir
 defmodule ChannelsDeepWeb.UserSocket do
@@ -233,6 +268,8 @@ kicks all sockets for that user. Use it for logout, password change, or
 revoked tokens.
 
 ### Step 5: RoomChannel — `lib/channels_deep_web/channels/room_channel.ex`
+
+**Objective**: Enforce topic-bound authorization, payload size caps, and a sliding-window rate limit inside the channel process itself.
 
 ```elixir
 defmodule ChannelsDeepWeb.RoomChannel do
@@ -318,6 +355,8 @@ end
 
 ### Step 6: Endpoint wiring
 
+**Objective**: Declare the WebSocket transport with `max_frame_size` and `compress` so malformed frames are dropped at the transport boundary.
+
 ```elixir
 # lib/channels_deep_web/endpoint.ex
 socket "/socket", ChannelsDeepWeb.UserSocket,
@@ -330,6 +369,8 @@ socket "/socket", ChannelsDeepWeb.UserSocket,
 ```
 
 ### Step 7: Tests — `test/channels_deep_web/channels/room_channel_test.exs`
+
+**Objective**: Use `ChannelCase`'s `connect/subscribe_and_join` to exercise auth, ACL, payload caps, and rate limiting end-to-end.
 
 ```elixir
 defmodule ChannelsDeepWeb.RoomChannelTest do
@@ -412,6 +453,27 @@ end
 mix test
 ```
 
+### Why this works
+
+A channel is a process per subscription per user. The socket multiplexes many channels over one WebSocket. Phoenix.PubSub fans out broadcasts across the cluster. The client library handles reconnection and replay.
+
+---
+
+## Advanced Considerations: LiveView Real-Time Patterns and Pubsub Scale
+
+LiveView bridges the browser and BEAM via WebSocket, allowing server-side renders to push incremental DOM diffs to the client. A LiveView process is long-lived, receiving events (clicks, form submissions) and broadcasting updates. For real-time features (collaborative editing, live notifications), LiveView processes subscribe to PubSub topics and receive broadcast messages.
+
+Phoenix.PubSub partitions topics across a pool of processes, allowing horizontal scaling. By default, `:local` mode uses in-memory ETS; `:redis` mode distributes across nodes via Redis. At scale (thousands of concurrent LiveViews), topic fanout can bottleneck: broadcasting to a million subscribers means delivering one million messages. The BEAM handles this, but the network cost matters on multi-node deployments.
+
+`Presence` module tracks which users are viewing which pages, syncing state via PubSub. A presence join/leave is broadcast to all nodes, allowing real-time "who's online" updates. Under partition, presence state can diverge; the library uses unique presence keys to detect and reconcile. Operationally, watching presence on every page load can amplify server load if users are flaky (mobile networks, browser reloads). Consider presence only for features where it's user-facing (collaborative editors, live sports scoreboards).
+
+---
+
+
+## Deep Dive: Phoenix Patterns and Production Implications
+
+Phoenix's conn struct represents an HTTP request/response in flight, accumulating transformations through middleware and handler code. Testing a Phoenix endpoint end-to-end (not just the controller) catches middleware order bugs, header mismatches, and plug composition issues. The trade-off is that full integration tests are slower and harder to parallelize than unit tests. Production bugs in auth, CORS, or session handling are often due to middleware assumptions that live tests reveal.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -419,7 +481,7 @@ mix test
 **1. Per-user vs. per-socket rate limits**
 Our limiter is per-channel-process. A user who opens 50 channels from a single
 socket can send 50 × 20 = 1000 events per window. For a stricter limit, move
-the counter into a shared ETS keyed by `user_id` (see exercise 71).
+the counter into a shared ETS keyed by `user_id`.
 
 **2. `:reset_rate` timer drift after GC pauses**
 If the channel process is suspended 2 seconds, the timer fires late. Over hours,
@@ -475,6 +537,25 @@ Expected on a modest dev box: 5k connections with 1 msg/s sustained, p99
 broadcast latency < 50ms. The main limits you'll hit before the BEAM caps out
 are (1) kernel FD limits (`ulimit -n`) and (2) Cowboy's process-per-connection
 overhead at very high connection counts (consider `Bandit` as the HTTP adapter).
+
+---
+
+## Benchmark
+
+```elixir
+# :timer.tc / Benchee measurement sketch
+{time_us, _} = :timer.tc(fn -> :ok end)
+IO.puts("elapsed: #{time_us} us")
+```
+
+Target: channel message round-trip under 1 ms locally; fan-out scales linearly with subscriber count per topic.
+
+---
+
+## Reflection
+
+- You need a binary framing format for one specific topic but JSON everywhere else. Can channels do both simultaneously, and at what cost?
+- At 1M simultaneous connections, what breaks first — BEAM schedulers, PubSub, or the load balancer? How do you find out before production does?
 
 ---
 

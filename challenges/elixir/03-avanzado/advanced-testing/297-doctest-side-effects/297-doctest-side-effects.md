@@ -91,6 +91,8 @@ Chosen: **Option C**.
 
 ### Step 1: pure helpers — full doctest coverage
 
+**Objective**: Write pure formatting helpers where every public function carries executable doctests — proving the examples in the docs stay in sync with behaviour.
+
 ```elixir
 # lib/invoice_numbering/format.ex
 defmodule InvoiceNumbering.Format do
@@ -145,6 +147,8 @@ end
 ```
 
 ### Step 2: side-effecting module — curated doctests
+
+**Objective**: In a stateful GenServer, doctest only the pure slices and explicitly exclude side-effecting functions to keep examples reliable without faking state.
 
 ```elixir
 # lib/invoice_numbering/numbering.ex
@@ -204,6 +208,8 @@ end
 ```
 
 ### Step 3: test files
+
+**Objective**: Split doctests across async and non-async test files using `doctest Module, only: [...]` so pure modules run in parallel while stateful ones stay serial.
 
 ```elixir
 # test/invoice_numbering/format_test.exs
@@ -293,6 +299,21 @@ IO.puts("doctest suite #{t}µs")
 
 Target: entire doctest surface of a module < 20ms.
 
+## Deep Dive: Doctest Patterns and Production Implications
+
+Doctests embed executable examples in documentation, keeping docs in sync with code. The danger is that doctests can have side effects (they modify modules, send HTTP requests, write files) that don't show in the docstring. Isolating doctests from the main test suite and running them under controlled conditions is essential. Production code with untested doctests often has stale examples that users copy and fail on.
+
+---
+
+## Advanced Considerations
+
+Production testing strategies require careful attention to resource management and test isolation across multiple concurrent test processes. In large codebases, tests can consume significant memory and CPU resources, especially when using concurrent testing without proper synchronization and cleanup. The BEAM scheduler's preemptive nature means test processes may interfere with each other if shared resources aren't properly isolated at the process boundary. Pay careful attention to how Ecto's sandbox mode interacts with your supervision tree — if you have GenServers that hold state across tests, the sandbox rollback mechanism may leave phantom processes in your monitoring systems that continue consuming resources until forced cleanup occurs.
+
+When scaling tests to production-grade test suites, consider the cost of stub verification and the memory overhead of generated test cases. Each property-based test invocation can create thousands of synthetic test cases, potentially causing garbage collection pressure that's invisible during local testing but becomes critical in CI/CD pipelines running long test suites continuously. The interaction between concurrent tests and ETS tables (often used in caches and registry patterns) requires explicit `inherited: true` options to prevent unexpected sharing between test processes, which can cause mysterious failures when tests run in different orders or under load.
+
+For distributed testing scenarios using tools like `Peer`, network simulation can mask real latency issues and failure modes. Test timeouts that work locally may fail in CI due to scheduler contention and GC pauses. Always include substantial buffers for timeout values and monitor actual execution times under load. The coordination between multiple test nodes requires careful cleanup — a failure in test coordination can leave zombie processes consuming resources indefinitely. Implement proper telemetry hooks within your test helpers to diagnose production-like scenarios and capture performance characteristics.
+
+
 ## Trade-offs and production gotchas
 
 **1. Doctesting functions with randomness**
@@ -337,3 +358,13 @@ accuracy, and the two goals diverge?
 - [`doctest` macro](https://hexdocs.pm/ex_unit/ExUnit.DocTest.html#doctest/2)
 - [Elixir docs — writing good examples](https://hexdocs.pm/elixir/writing-documentation.html)
 - [José Valim — documenting Elixir code](https://elixir-lang.org/blog/2014/10/08/writing-documentation/)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

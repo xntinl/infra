@@ -131,9 +131,23 @@ the author leaves.
 
 ---
 
+### Dependencies (`mix.exs`)
+
+```elixir
+def deps do
+  [
+    {exunit},
+    {mix},
+    {mix_shell},
+  ]
+end
+```
 ## Implementation
 
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
 
 ```bash
 mix new my_mix_task
@@ -141,6 +155,9 @@ cd my_mix_task
 ```
 
 ### Step 2: The minimal task — `lib/mix/tasks/hello.ex`
+
+**Objective**: Provide The minimal task — `lib/mix/tasks/hello.ex` — these are the supporting fixtures the main module depends on to make its concept demonstrable.
+
 
 ```elixir
 defmodule Mix.Tasks.Hello do
@@ -165,6 +182,9 @@ end
 swap the shell out and capture messages (see the test in step 5).
 
 ### Step 3: A real task — `lib/mix/tasks/my_mix_task.greet.ex`
+
+**Objective**: Provide A real task — `lib/mix/tasks/my_mix_task.greet.ex` — these are the supporting fixtures the main module depends on to make its concept demonstrable.
+
 
 ```elixir
 defmodule Mix.Tasks.MyMixTask.Greet do
@@ -220,6 +240,9 @@ end
 
 ### Step 4: The library function it uses — `lib/my_mix_task.ex`
 
+**Objective**: Provide The library function it uses — `lib/my_mix_task.ex` — these are the supporting fixtures the main module depends on to make its concept demonstrable.
+
+
 ```elixir
 defmodule MyMixTask do
   @moduledoc """
@@ -249,6 +272,9 @@ end
 ```
 
 ### Step 5: Tests
+
+**Objective**: Tests.
+
 
 `test/my_mix_task_test.exs`:
 
@@ -320,6 +346,9 @@ end
 ```
 
 ### Step 6: Run
+
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
 
 ```bash
 mix test
@@ -414,3 +443,20 @@ which you own — don't ship `mix build` in a published Hex package).
 - [`OptionParser`](https://hexdocs.pm/elixir/OptionParser.html) — every detail of argument parsing
 - [`Mix.Shell`](https://hexdocs.pm/mix/Mix.Shell.html) and [`Mix.Shell.Process`](https://hexdocs.pm/mix/Mix.Shell.Process.html) — testable task I/O
 - ["Writing a Mix task"](https://hexdocs.pm/mix/Mix.Task.html#module-examples) — the canonical walkthrough
+
+
+## Deep Dive
+
+Elixir's tooling ecosystem extends beyond the language into DevOps, profiling, and observability. Understanding each tool's role prevents misuse and false optimizations.
+
+**Mix tasks and releases:**
+Custom mix tasks (`mix myapp.setup`, `mix myapp.migrate`) encapsulate operational knowledge. Tasks run in the host environment (not the compiled app), so they're ideal for setup, teardown, or scripting. Releases, built with `mix release`, create self-contained OTP applications deployable without Elixir installed. They're immutable: no source code changes after release — all config comes from environment variables or runtime files.
+
+**Debugging and profiling tools:**
+- `:observer` (GUI): real-time process tree, metrics, and port inspection
+- `Recon`: production-safe introspection (stable even under high load)
+- `:eprof`: function-level timing; lower overhead than `:fprof`
+- `:fprof`: detailed trace analysis; use only in staging
+
+**Profiling approaches:**
+Ceiling profiling (e.g., "which modules consume CPU?") is cheap; go there first with `perf` or `eprof`. Floor profiling (e.g., "which lines in this function are slow?") is expensive; reserve for specific functions. In production, prefer metrics (Prometheus, New Relic) over profiling — continuous profiling has overhead. Store profiling data for post-mortem analysis, not real-time dashboards.

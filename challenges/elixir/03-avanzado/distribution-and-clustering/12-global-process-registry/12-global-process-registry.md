@@ -135,12 +135,16 @@ end)
 
 ### Step 1: Create the project
 
+**Objective**: Bootstrap supervised app so :global.register_name/2 two-phase lock can start on first boot."""
+
 ```bash
 mix new global_registry --sup
 cd global_registry
 ```
 
 ### Step 2: `mix.exs`
+
+**Objective**: Keep deps empty so :global linearizability and cluster-wide locking semantics are naked."""
 
 ```elixir
 defmodule GlobalRegistry.MixProject do
@@ -160,6 +164,8 @@ end
 
 ### Step 3: `lib/global_registry/application.ex`
 
+**Objective**: Start DynamicSupervisor so TenantWorkers can be added on-demand without explicit node targeting."""
+
 ```elixir
 defmodule GlobalRegistry.Application do
   @moduledoc false
@@ -177,6 +183,8 @@ end
 ```
 
 ### Step 4: `lib/global_registry/conflict_resolver.ex`
+
+**Objective**: Compare start_ts on name collision and kill younger duplicate so only oldest survives partition heal."""
 
 ```elixir
 defmodule GlobalRegistry.ConflictResolver do
@@ -219,6 +227,8 @@ end
 ```
 
 ### Step 5: `lib/global_registry/tenant_worker.ex`
+
+**Objective**: Register via :global with conflict resolver so :global.register_name/3 enforces singleton invariant across nodes."""
 
 ```elixir
 defmodule GlobalRegistry.TenantWorker do
@@ -287,6 +297,8 @@ end
 
 ### Step 6: `lib/global_registry/tenant_supervisor.ex`
 
+**Objective**: Provide start_tenant/stop_tenant facade to hide :global registration details from callers."""
+
 ```elixir
 defmodule GlobalRegistry.TenantSupervisor do
   @moduledoc "Thin wrapper around DynamicSupervisor for starting TenantWorkers."
@@ -311,6 +323,8 @@ end
 
 ### Step 7: Tests
 
+**Objective**: Assert whereis/1 returns singleton and extra start_tenant calls hit :already_started without registering duplicates."""
+
 ```elixir
 # test/global_registry/tenant_worker_test.exs
 defmodule GlobalRegistry.TenantWorkerTest do
@@ -328,29 +342,33 @@ defmodule GlobalRegistry.TenantWorkerTest do
     :ok
   end
 
-  test "registers a singleton and resolves it via whereis/1" do
-    {:ok, pid} = TenantSupervisor.start_tenant("tenant_a")
-    assert TenantWorker.whereis("tenant_a") == pid
-  end
+  describe "GlobalRegistry.TenantWorker" do
+    test "registers a singleton and resolves it via whereis/1" do
+      {:ok, pid} = TenantSupervisor.start_tenant("tenant_a")
+      assert TenantWorker.whereis("tenant_a") == pid
+    end
 
-  test "returns {:error, :not_found} for missing tenants" do
-    assert TenantWorker.do_work("missing_tenant", :noop) == {:error, :not_found}
-  end
+    test "returns {:error, :not_found} for missing tenants" do
+      assert TenantWorker.do_work("missing_tenant", :noop) == {:error, :not_found}
+    end
 
-  test "second start_link for the same tenant returns {:error, {:already_started, pid}}" do
-    {:ok, pid1} = TenantSupervisor.start_tenant("tenant_b")
-    assert {:error, {:already_started, ^pid1}} = TenantSupervisor.start_tenant("tenant_b")
-  end
+    test "second start_link for the same tenant returns {:error, {:already_started, pid}}" do
+      {:ok, pid1} = TenantSupervisor.start_tenant("tenant_b")
+      assert {:error, {:already_started, ^pid1}} = TenantSupervisor.start_tenant("tenant_b")
+    end
 
-  test "do_work routes to the owning pid and returns node()" do
-    {:ok, _pid} = TenantSupervisor.start_tenant("tenant_c")
-    assert {:ok, {:processed_on, n, :payload, 0}} = TenantWorker.do_work("tenant_c", :payload)
-    assert n == node()
+    test "do_work routes to the owning pid and returns node()" do
+      {:ok, _pid} = TenantSupervisor.start_tenant("tenant_c")
+      assert {:ok, {:processed_on, n, :payload, 0}} = TenantWorker.do_work("tenant_c", :payload)
+      assert n == node()
+    end
   end
 end
 ```
 
 ### Step 8: Multi-node experiment
+
+**Objective**: Observe :global linearizable registration and partition/heal resolution on real inter-node calls."""
 
 Run two named nodes. From node A:
 
@@ -385,6 +403,29 @@ GlobalRegistry.TenantWorker.whereis("shared")
 ### Why this works
 
 The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
+
+
+## Key Concepts: Global Name Registration Across Nodes
+
+`:global` module provides cluster-wide process naming: you register a name on any node, and any node can look it up. This is like `Registry` but cross-node.
+
+Gotcha: `:global` uses a two-phase commit protocol for consistency, which can be slow. For high-throughput scenarios, Horde.Registry is faster (eventual consistency). For critical services needing strong consistency, `:global` is safer but expect latency.
+
+
+## Deep Dive: Cluster Patterns and Production Implications
+
+Clustering distributes computation across nodes using Erlang's distribution protocol. Testing clusters requires simulating node failures, network partitions, and message delays—challenges that single-node tests don't expose. Production clusters fail in ways that cluster tests reveal: nodes can become isolated (stuck), messages can be reordered, and consensus is expensive.
+
+---
+
+## Advanced Considerations
+
+Distributed Elixir systems require careful consideration of network partitions, consistent hashing for distributed state, and the interaction between clustering libraries and node discovery mechanisms. Network partitions are not rare edge cases; they happen regularly in cloud deployments due to maintenance windows and infrastructure issues. A system that works perfectly during local testing but fails under network partitions indicates insufficient failure handling throughout the codebase. Split-brain scenarios where multiple network partitions lead to different cluster views require explicit recovery mechanisms that are often business-specific and context-dependent.
+
+Horde and distributed registries provide eventual consistency guarantees, but "eventual" can mean minutes during network partitions. Applications must handle the case where the same name is registered on multiple nodes simultaneously without coordination. Consistent hashing for distributed services requires understanding rebalancing costs — a single node failure can cause significant key redistribution and thundering herd problems if not carefully managed. The cost of distributed consensus using algorithms like Raft is high; choose it only when consistency is more important than availability and can afford the performance cost.
+
+Global state replication across nodes creates synchronization challenges at scale. Choosing between replicating everywhere versus replicating to specific nodes affects both consistency latency and network bandwidth utilization fundamentally. Node monitoring and heartbeat mechanisms require careful timeout tuning — too aggressive and you get false positives during network hiccups; too conservative and you don't detect actual failures quickly enough for recovery. The EPMD (Erlang Port Mapper Daemon) is a critical component that can become a bottleneck in large clusters and requires careful capacity planning.
+
 
 ## Trade-offs and production gotchas
 
@@ -456,3 +497,13 @@ Compare to `Horde.Registry` at ~100 µs irrespective of cluster size (asynchrono
 - [Horde README — comparison with :global](https://github.com/derekkraan/horde#why-not-just-use-global) — Derek Kraan's design notes
 - [Fred Hébert — "Erlang in Anger", ch. 5](https://www.erlang-in-anger.com/) — partitions and `:global`
 - [swarm library — discussion of :global pitfalls](https://github.com/bitwalker/swarm) — historical context
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

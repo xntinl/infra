@@ -79,8 +79,7 @@ is roughly one function call. When the counter hits zero, the scheduler
 preempts the process and moves on.
 
 This is why BEAM stays responsive under CPU load: no single process can hog
-a scheduler for more than ~1ms of wall time on modern hardware. See
-exercise 148 for a deep dive.
+a scheduler for more than ~1ms of wall time on modern hardware.
 
 ### 3. `scheduler_wall_time`: the only honest utilization metric
 
@@ -140,12 +139,16 @@ the rest of the system waits. Examples from production:
 
 ### Step 1: create the project
 
+**Objective**: Scaffold supervised app so boot-time `:scheduler_wall_time` flip persists safely across application restarts without manual toggle.
+
 ```bash
 mix new schedulers_deep --sup
 cd schedulers_deep
 ```
 
 ### Step 2: `mix.exs`
+
+**Objective**: Pin `:recon` runtime so bounded proc_count/proc_window avoid Process.list/0 heap allocation blowup on 500k-process nodes.
 
 ```elixir
 defmodule SchedulersDeep.MixProject do
@@ -175,6 +178,8 @@ end
 ```
 
 ### Step 3: `lib/schedulers_deep/reporter.ex`
+
+**Objective**: Delta `:scheduler_wall_time` pairs across fixed window so aggregate and per-scheduler utilization % surface without nanosecond drift.
 
 ```elixir
 defmodule SchedulersDeep.Reporter do
@@ -236,6 +241,8 @@ end
 
 ### Step 4: `lib/schedulers_deep/run_queue.ex`
 
+**Objective**: Extract run queue lengths and max:min ratio so imbalance > 3.0 flags scheduler starvation or broken work-stealing migration.
+
 ```elixir
 defmodule SchedulersDeep.RunQueue do
   @moduledoc """
@@ -266,6 +273,8 @@ end
 ```
 
 ### Step 5: `lib/schedulers_deep/reductions.ex`
+
+**Objective**: Delta reductions across window snapshot so top-N processes ranked by burn rate surfaces CPU hogs independent of process age.
 
 ```elixir
 defmodule SchedulersDeep.Reductions do
@@ -325,6 +334,8 @@ end
 
 ### Step 6: `lib/schedulers_deep/load_gen.ex`
 
+**Objective**: Spawn N busy-loop processes with wall-clock timeout so controlled saturation in tests avoids flaky timing-dependent assertions.
+
 ```elixir
 defmodule SchedulersDeep.LoadGen do
   @moduledoc """
@@ -365,6 +376,8 @@ end
 
 ### Step 7: `lib/schedulers_deep/application.ex`
 
+**Objective**: Call `Reporter.enable()` at boot so `:scheduler_wall_time` flag activates before any process runs, avoiding stale baseline.
+
 ```elixir
 defmodule SchedulersDeep.Application do
   @moduledoc false
@@ -380,6 +393,8 @@ end
 
 ### Step 8: tests
 
+**Objective**: Validate scheduler_wall_time percentages, run-queue imbalance detection, and reductions ranking under synthetic CPU load.
+
 ```elixir
 # test/schedulers_deep/reporter_test.exs
 defmodule SchedulersDeep.ReporterTest do
@@ -393,30 +408,32 @@ defmodule SchedulersDeep.ReporterTest do
     :ok
   end
 
-  test "sample/1 returns one entry per scheduler" do
-    util = Reporter.sample(200)
-    assert map_size(util) == :erlang.system_info(:schedulers)
-    assert Enum.all?(util, fn {_id, pct} -> pct >= 0.0 and pct <= 100.0 end)
-  end
+  describe "SchedulersDeep.Reporter" do
+    test "sample/1 returns one entry per scheduler" do
+      util = Reporter.sample(200)
+      assert map_size(util) == :erlang.system_info(:schedulers)
+      assert Enum.all?(util, fn {_id, pct} -> pct >= 0.0 and pct <= 100.0 end)
+    end
 
-  test "loaded schedulers show non-zero utilization" do
-    parent = self()
+    test "loaded schedulers show non-zero utilization" do
+      parent = self()
 
-    spawn_link(fn ->
-      LoadGen.run(:erlang.system_info(:schedulers) * 2, 300)
-      send(parent, :load_done)
-    end)
+      spawn_link(fn ->
+        LoadGen.run(:erlang.system_info(:schedulers) * 2, 300)
+        send(parent, :load_done)
+      end)
 
-    util = Reporter.sample(200)
-    assert_receive :load_done, 2_000
-    assert Enum.any?(util, fn {_id, pct} -> pct > 5.0 end)
-  end
+      util = Reporter.sample(200)
+      assert_receive :load_done, 2_000
+      assert Enum.any?(util, fn {_id, pct} -> pct > 5.0 end)
+    end
 
-  test "scheduler_counts/0 returns positive normal count" do
-    counts = Reporter.scheduler_counts()
-    assert counts.normal > 0
-    assert counts.dirty_cpu >= 0
-    assert counts.dirty_io >= 0
+    test "scheduler_counts/0 returns positive normal count" do
+      counts = Reporter.scheduler_counts()
+      assert counts.normal > 0
+      assert counts.dirty_cpu >= 0
+      assert counts.dirty_io >= 0
+    end
   end
 end
 ```
@@ -428,24 +445,28 @@ defmodule SchedulersDeep.ReductionsTest do
 
   alias SchedulersDeep.Reductions
 
-  test "top/2 returns processes sorted by reductions" do
-    spawn(fn -> Enum.reduce(1..1_000_000, 0, fn i, a -> a + i end) end)
-    results = Reductions.top(5, 100)
-    assert length(results) <= 5
-    deltas = Enum.map(results, & &1.reductions)
-    assert deltas == Enum.sort(deltas, :desc)
-  end
+  describe "SchedulersDeep.Reductions" do
+    test "top/2 returns processes sorted by reductions" do
+      spawn(fn -> Enum.reduce(1..1_000_000, 0, fn i, a -> a + i end) end)
+      results = Reductions.top(5, 100)
+      assert length(results) <= 5
+      deltas = Enum.map(results, & &1.reductions)
+      assert deltas == Enum.sort(deltas, :desc)
+    end
 
-  test "top/2 entries have expected shape" do
-    [first | _] = Reductions.top(3, 50)
-    assert is_pid(first.pid)
-    assert is_integer(first.reductions)
-    assert match?({_m, _f, _a}, first.initial_call) or is_nil(first.initial_call)
+    test "top/2 entries have expected shape" do
+      [first | _] = Reductions.top(3, 50)
+      assert is_pid(first.pid)
+      assert is_integer(first.reductions)
+      assert match?({_m, _f, _a}, first.initial_call) or is_nil(first.initial_call)
+    end
   end
 end
 ```
 
 ### Step 9: smoke run
+
+**Objective**: Execute mix test, then iex to capture live scheduler_wall_time/run_queue/reductions snapshots during LoadGen CPU burn.
 
 ```bash
 mix test
@@ -475,6 +496,46 @@ IO.puts("avg: #{time_us / 10_000} µs/op")
 ```
 
 Target: operation should complete in the low-microsecond range on modern hardware; deviations by >2× indicate a regression worth investigating.
+
+## Deep Dive: BEAM Scheduler Tuning and Memory Profiling in Production
+
+The BEAM scheduler is not "magic" — it's a preemptive work-stealing scheduler that divides CPU time 
+into reductions (bytecode instructions). Understanding scheduler tuning is critical when you suspect 
+latency spikes in production.
+
+**Key concepts**:
+- **Reductions budget**: By default, a process gets ~2000 reductions before yielding to another process.
+  Heavy CPU work (binary matching, list recursion) can exhaust the budget and cause tail latency.
+- **Dirty schedulers**: If a process does CPU-intensive work (crypto, compression, numerical), it blocks 
+  the main scheduler. Use dirty NIFs or `spawn_opt(..., [{:fullsweep_after, 0}])` for GC tuning.
+- **Heap tuning per process**: `Process.flag(:min_heap_size, ...)` reserves heap upfront, reducing GC 
+  pauses. Measure; don't guess.
+
+**Memory profiling workflow**:
+1. Run `recon:memory/0` in iex; identify top 10 memory consumers by type (atoms, binaries, ets).
+2. If binaries dominate, check for refc binary leaks (binary held by process that should have been freed).
+3. Use `eprof` or `fprof` for function-level CPU attribution; `recon:proc_window/3` for process memory trends.
+
+**Production pattern**: Deploy with `+K true` (async IO), `-env ERL_MAX_PORTS 65536` (port limit), 
+`+T 9` (async threads). Measure GC time with `erlang:statistics(garbage_collection)` — if >5% of uptime, 
+tune heap or reduce allocation pressure. Never assume defaults are optimal for YOUR workload.
+
+---
+
+## Advanced Considerations
+
+Understanding BEAM internals at production scale requires deep knowledge of scheduler behavior, memory models, and garbage collection dynamics. The soft real-time guarantees of BEAM only hold under specific conditions — high system load, uneven process distribution across schedulers, or GC pressure can break predictable latency completely. Monitor `erlang:statistics(run_queue)` in production to catch scheduler saturation before it degrades latency significantly. The difference between immediate, offheap, and continuous GC garbage collection strategies can significantly impact tail latencies in systems with millions of messages per second and sustained memory pressure.
+
+Process reductions and the reduction counter affect scheduler fairness fundamentally. A process that runs for extended periods without yielding can starve other processes, even though the scheduler treats it fairly by reduction count per scheduling interval. This is especially critical in pipelines processing large data structures or performing recursive computations where yielding points are infrequent and difficult to predict. The BEAM's preemption model is deterministic per reduction, making performance testing reproducible but sometimes hiding race conditions that only manifest under specific load patterns and GC interactions.
+
+The interaction between ETS, Mnesia, and process message queues creates subtle bottlenecks in distributed systems. ETS reads don't block other processes, but writes require acquiring locks; understanding when your workload transitions from read-heavy to write-heavy is crucial for capacity planning. Port drivers and NIFs bypass the BEAM scheduler entirely, which can lead to unexpected priority inversions if not carefully managed. Always profile with `eprof` and `fprof` in realistic production-like environments before deployment to catch performance surprises.
+
+
+## Deep Dive: Otp Patterns and Production Implications
+
+OTP primitives (GenServer, Supervisor, Application) are tested through their public interfaces, not by inspecting internal state. This discipline forces correct design: if you can't test a behavior without peeking into the server's state, the behavior is not public. Production systems with tight integration tests on GenServer internals are fragile and hard to refactor.
+
+---
 
 ## Trade-offs and production gotchas
 
@@ -548,3 +609,13 @@ Use `:recon.proc_count(:reductions, N)` for large nodes.
 - [`:recon.scheduler_usage/1`](https://ferd.github.io/recon/recon.html#scheduler_usage-1) — source implementation of the same idea
 - ["A Brief BEAM Primer" — Rickard Green](https://www.erlang.org/blog/a-brief-beam-primer/) — Erlang/OTP core developer
 - [Phoenix LiveDashboard source — Home page](https://github.com/phoenixframework/phoenix_live_dashboard/blob/main/lib/phoenix/live_dashboard/pages/home_page.ex)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

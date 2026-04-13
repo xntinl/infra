@@ -79,6 +79,8 @@ prod.exs                                  |
 
 ### Step 1: `config/runtime.exs`
 
+**Objective**: Read DATABASE_URL, SECRET_KEY_BASE, and JWT_SECRET from environment at boot so secrets never bake into binary.
+
 All production secrets are read at startup from environment variables. Missing required
 variables raise immediately with a descriptive message.
 
@@ -136,6 +138,8 @@ end
 
 ### Step 2: `lib/gateway_core/config_validator.ex`
 
+**Objective**: Validate all required config keys present at startup so boot crashes fast with clear messages.
+
 Validates that all required configuration is present before the application accepts
 traffic. Called in `Application.start/2`.
 
@@ -185,6 +189,8 @@ end
 ```
 
 ### Step 3: `lib/gateway_api_web/plugs/health_check.ex`
+
+**Objective**: Expose /health/live (always 200) and /health/ready (503 when draining) for Kubernetes probes.
 
 Health check plug registered BEFORE the Phoenix router. Kubernetes uses `/health/live`
 for liveness and `/health/ready` for readiness. During graceful shutdown, `/health/ready`
@@ -251,6 +257,8 @@ end
 
 ### Step 4: `lib/gateway_core/shutdown_handler.ex`
 
+**Objective**: Handle SIGTERM via :os.set_signal and set :persistent_term draining flag so /health/ready returns 503.
+
 Handles SIGTERM for graceful shutdown during rolling deploys.
 
 ```elixir
@@ -294,6 +302,8 @@ end
 
 ### Step 5: `lib/gateway_core/release.ex`
 
+**Objective**: Provide migrate/0 and rollback/1 for Ecto migrations callable via release eval command.
+
 Migration runner for releases. Called via `eval` in deployment scripts.
 
 ```elixir
@@ -327,6 +337,8 @@ end
 
 ### Step 6: `rel/vm.args.eex`
 
+**Objective**: Configure BEAM process limits (+P/+Q), crash dumps, and distributed node name from environment variables.
+
 Erlang VM arguments control process limits, crash dump behavior, and distributed Erlang.
 
 ```
@@ -350,6 +362,8 @@ The design leans on BEAM guarantees (process isolation, mailbox ordering, superv
 ```
 
 ### Step 7: Dockerfile (multi-stage)
+
+**Objective**: Build release in Alpine (compiler deps), then copy binary to Debian runtime so final image excludes build toolchain.
 
 The multi-stage build separates compilation from the runtime image. The first stage
 compiles the release; the second copies only the compiled release into a minimal image.
@@ -406,6 +420,8 @@ CMD ["start"]
 ```
 
 ### Step 8: `k8s/deployment.yaml`
+
+**Objective**: Configure rolling deployment with /health/ready and /health/live probes, graceful preStop, resource requests/limits.
 
 ```yaml
 apiVersion: apps/v1
@@ -465,6 +481,8 @@ spec:
 
 ### Step 9: Tests
 
+**Objective**: Validate config validator raises on missing env vars and health checks respond correctly to draining state.
+
 ```elixir
 # test/gateway_core/config_validator_test.exs
 defmodule GatewayCore.ConfigValidatorTest do
@@ -472,19 +490,21 @@ defmodule GatewayCore.ConfigValidatorTest do
 
   alias GatewayCore.ConfigValidator
 
-  test "validate! passes with all required config present" do
-    assert :ok = ConfigValidator.validate!()
-  end
-
-  test "validate! raises with descriptive message when config is missing" do
-    original = Application.get_env(:gateway_core, :jwt_secret)
-    Application.put_env(:gateway_core, :jwt_secret, nil)
-
-    assert_raise RuntimeError, ~r/jwt_secret/, fn ->
-      ConfigValidator.validate!()
+  describe "GatewayCore.ConfigValidator" do
+    test "validate! passes with all required config present" do
+      assert :ok = ConfigValidator.validate!()
     end
 
-    Application.put_env(:gateway_core, :jwt_secret, original)
+    test "validate! raises with descriptive message when config is missing" do
+      original = Application.get_env(:gateway_core, :jwt_secret)
+      Application.put_env(:gateway_core, :jwt_secret, nil)
+
+      assert_raise RuntimeError, ~r/jwt_secret/, fn ->
+        ConfigValidator.validate!()
+      end
+
+      Application.put_env(:gateway_core, :jwt_secret, original)
+    end
   end
 end
 ```
@@ -494,27 +514,31 @@ end
 defmodule GatewayApiWeb.Plugs.HealthCheckTest do
   use GatewayApiWeb.ConnCase
 
-  test "GET /health/live returns 200" do
-    conn = get(build_conn(), "/health/live")
-    assert conn.status == 200
-    assert %{"status" => "ok"} = json_response(conn, 200)
-  end
+  describe "GatewayApiWeb.Plugs.HealthCheck" do
+    test "GET /health/live returns 200" do
+      conn = get(build_conn(), "/health/live")
+      assert conn.status == 200
+      assert %{"status" => "ok"} = json_response(conn, 200)
+    end
 
-  test "GET /health/ready returns 200 when DB is up" do
-    conn = get(build_conn(), "/health/ready")
-    assert conn.status == 200
-  end
+    test "GET /health/ready returns 200 when DB is up" do
+      conn = get(build_conn(), "/health/ready")
+      assert conn.status == 200
+    end
 
-  test "GET /health/ready returns 503 when draining" do
-    :persistent_term.put(:app_draining, true)
-    conn = get(build_conn(), "/health/ready")
-    assert conn.status == 503
-    :persistent_term.put(:app_draining, false)
+    test "GET /health/ready returns 503 when draining" do
+      :persistent_term.put(:app_draining, true)
+      conn = get(build_conn(), "/health/ready")
+      assert conn.status == 503
+      :persistent_term.put(:app_draining, false)
+    end
   end
 end
 ```
 
 ### Step 10: Build and run the release
+
+**Objective**: Implement: Build and run the release.
 
 ```bash
 MIX_ENV=prod mix release
@@ -528,6 +552,40 @@ MIX_ENV=prod mix release
 ```
 
 ---
+
+## Deep Dive: BEAM Scheduler Tuning and Memory Profiling in Production
+
+The BEAM scheduler is not "magic" — it's a preemptive work-stealing scheduler that divides CPU time 
+into reductions (bytecode instructions). Understanding scheduler tuning is critical when you suspect 
+latency spikes in production.
+
+**Key concepts**:
+- **Reductions budget**: By default, a process gets ~2000 reductions before yielding to another process.
+  Heavy CPU work (binary matching, list recursion) can exhaust the budget and cause tail latency.
+- **Dirty schedulers**: If a process does CPU-intensive work (crypto, compression, numerical), it blocks 
+  the main scheduler. Use dirty NIFs or `spawn_opt(..., [{:fullsweep_after, 0}])` for GC tuning.
+- **Heap tuning per process**: `Process.flag(:min_heap_size, ...)` reserves heap upfront, reducing GC 
+  pauses. Measure; don't guess.
+
+**Memory profiling workflow**:
+1. Run `recon:memory/0` in iex; identify top 10 memory consumers by type (atoms, binaries, ets).
+2. If binaries dominate, check for refc binary leaks (binary held by process that should have been freed).
+3. Use `eprof` or `fprof` for function-level CPU attribution; `recon:proc_window/3` for process memory trends.
+
+**Production pattern**: Deploy with `+K true` (async IO), `-env ERL_MAX_PORTS 65536` (port limit), 
+`+T 9` (async threads). Measure GC time with `erlang:statistics(garbage_collection)` — if >5% of uptime, 
+tune heap or reduce allocation pressure. Never assume defaults are optimal for YOUR workload.
+
+---
+
+## Advanced Considerations
+
+Understanding BEAM internals at production scale requires deep knowledge of scheduler behavior, memory models, and garbage collection dynamics. The soft real-time guarantees of BEAM only hold under specific conditions — high system load, uneven process distribution across schedulers, or GC pressure can break predictable latency completely. Monitor `erlang:statistics(run_queue)` in production to catch scheduler saturation before it degrades latency significantly. The difference between immediate, offheap, and continuous GC garbage collection strategies can significantly impact tail latencies in systems with millions of messages per second and sustained memory pressure.
+
+Process reductions and the reduction counter affect scheduler fairness fundamentally. A process that runs for extended periods without yielding can starve other processes, even though the scheduler treats it fairly by reduction count per scheduling interval. This is especially critical in pipelines processing large data structures or performing recursive computations where yielding points are infrequent and difficult to predict. The BEAM's preemption model is deterministic per reduction, making performance testing reproducible but sometimes hiding race conditions that only manifest under specific load patterns and GC interactions.
+
+The interaction between ETS, Mnesia, and process message queues creates subtle bottlenecks in distributed systems. ETS reads don't block other processes, but writes require acquiring locks; understanding when your workload transitions from read-heavy to write-heavy is crucial for capacity planning. Port drivers and NIFs bypass the BEAM scheduler entirely, which can lead to unexpected priority inversions if not carefully managed. Always profile with `eprof` and `fprof` in realistic production-like environments before deployment to catch performance surprises.
+
 
 ## Trade-off analysis
 
@@ -588,3 +646,13 @@ Target: operation should complete in the low-microsecond range on modern hardwar
 - [Mix Release docs](https://hexdocs.pm/mix/Mix.Tasks.Release.html) -- comprehensive release configuration
 - [Kubernetes probes](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/) -- liveness vs readiness
 - [hexpm/elixir Docker images](https://hub.docker.com/r/hexpm/elixir) -- official multi-arch images
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

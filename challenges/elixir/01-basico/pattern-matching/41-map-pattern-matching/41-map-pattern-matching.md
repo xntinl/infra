@@ -74,6 +74,18 @@ unrelated fields (timestamps, IDs, metadata) that vary wildly.
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"jason", "~> 1.0"},
+  ]
+end
+```
+
+
 ### `lib/webhook_event_router.ex`
 
 ```elixir
@@ -303,6 +315,32 @@ mix test
 
 The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
 
+
+
+---
+## Key Concepts
+
+### 1. Maps Match Partial Keys
+
+```elixir
+%{"name" => name} = %{"name" => "Bob", "age" => 30}
+```
+
+Only keys you pattern-match on need to be present. Extra keys are ignored. This makes maps flexible for APIs where you don't control all fields.
+
+### 2. Atom Keys vs String Keys
+
+`%{name: "Bob"}` creates atom keys. `%{"name" => "Bob"}` creates string keys. Pattern matching must match the key type exactly. A common gotcha: API responses use string keys, but your pattern expects atoms.
+
+### 3. Guards Work with Maps
+
+```elixir
+def process(%{age: age} = person) when age >= 18, do: person
+```
+
+You can extract and guard simultaneously, making complex logic clear.
+
+---
 ## Benchmark
 
 ```elixir

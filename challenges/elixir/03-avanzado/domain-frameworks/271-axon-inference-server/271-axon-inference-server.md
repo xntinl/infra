@@ -113,6 +113,8 @@ Emit `:telemetry.execute([:axon_inference, :predict, :stop], measurements, metad
 
 ### Step 1: `mix.exs`
 
+**Objective**: Pin `axon`, `exla`, and `plug_cowboy` — Axon ships the model, EXLA the JIT, Cowboy the HTTP front; telemetry instruments the seam between them.
+
 ```elixir
 defmodule AxonInference.MixProject do
   use Mix.Project
@@ -140,6 +142,8 @@ end
 
 ### Step 2: `config/config.exs`
 
+**Objective**: Set EXLA as the default backend and `defn` compiler — serving compiles once at boot, then every request runs on the JITed graph.
+
 ```elixir
 import Config
 config :nx, default_backend: EXLA.Backend
@@ -147,6 +151,8 @@ config :nx, :default_defn_options, compiler: EXLA
 ```
 
 ### Step 3: `lib/axon_inference/model.ex`
+
+**Objective**: Declare the Axon graph and load weights from disk — keep topology and parameters separate so the same model can hot-swap checkpoints.
 
 ```elixir
 defmodule AxonInference.Model do
@@ -189,6 +195,8 @@ end
 ```
 
 ### Step 4: `lib/axon_inference/serving.ex`
+
+**Objective**: Wrap the model in `Nx.Serving` with a 32-sample batch — batching amortizes GPU launch cost; the supervisor gives us a stable inference worker.
 
 ```elixir
 defmodule AxonInference.Serving do
@@ -256,6 +264,8 @@ end
 
 ### Step 5: `lib/axon_inference/predictor.ex`
 
+**Objective**: Enforce a per-request timeout and emit telemetry — the predictor is the only place callers touch; overload and timeout stay explicit errors.
+
 ```elixir
 defmodule AxonInference.Predictor do
   @moduledoc """
@@ -300,6 +310,8 @@ end
 
 ### Step 6: `lib/axon_inference/router.ex`
 
+**Objective**: Validate input shape at the HTTP edge — mapping `:timeout → 504` and `:overload → 503` keeps failure semantics honest to operators.
+
 ```elixir
 defmodule AxonInference.Router do
   use Plug.Router
@@ -328,6 +340,8 @@ end
 
 ### Step 7: `lib/axon_inference/application.ex`
 
+**Objective**: Start Serving before Cowboy — the HTTP listener must not accept traffic until the inference worker is ready to batch.
+
 ```elixir
 defmodule AxonInference.Application do
   use Application
@@ -345,6 +359,8 @@ end
 
 ### Step 8: Tests
 
+**Objective**: Cover the HTTP contract and the predictor's error paths — shape validation, timeout mapping, and the happy path through Serving.
+
 ```elixir
 # test/axon_inference/serving_test.exs
 defmodule AxonInference.ServingTest do
@@ -355,24 +371,26 @@ defmodule AxonInference.ServingTest do
     :ok
   end
 
-  test "single prediction returns valid probability vector" do
-    input = for _ <- 1..AxonInference.Model.input_size(), do: 0.1
-    assert {:ok, probs} = AxonInference.Predictor.predict(input)
-    assert length(probs) == AxonInference.Model.num_classes()
-    sum = Enum.sum(probs)
-    assert_in_delta sum, 1.0, 1.0e-4
-  end
+  describe "AxonInference.Serving" do
+    test "single prediction returns valid probability vector" do
+      input = for _ <- 1..AxonInference.Model.input_size(), do: 0.1
+      assert {:ok, probs} = AxonInference.Predictor.predict(input)
+      assert length(probs) == AxonInference.Model.num_classes()
+      sum = Enum.sum(probs)
+      assert_in_delta sum, 1.0, 1.0e-4
+    end
 
-  test "concurrent predictions all succeed (exercises batching)" do
-    input = for _ <- 1..AxonInference.Model.input_size(), do: 0.0
+    test "concurrent predictions all succeed (exercises batching)" do
+      input = for _ <- 1..AxonInference.Model.input_size(), do: 0.0
 
-    tasks =
-      for _ <- 1..64 do
-        Task.async(fn -> AxonInference.Predictor.predict(input) end)
-      end
+      tasks =
+        for _ <- 1..64 do
+          Task.async(fn -> AxonInference.Predictor.predict(input) end)
+        end
 
-    results = Task.await_many(tasks, 5_000)
-    assert Enum.all?(results, &match?({:ok, _}, &1))
+      results = Task.await_many(tasks, 5_000)
+      assert Enum.all?(results, &match?({:ok, _}, &1))
+    end
   end
 end
 ```
@@ -387,16 +405,20 @@ defmodule AxonInference.PredictorTest do
     :ok
   end
 
-  test "timeout when serving is unavailable" do
-    # Send an input with wrong shape — it will raise inside serving, Task exits
-    :ok = Process.sleep(10)
-    # No easy way to simulate load without actually loading; document alternatives in README.
-    assert {:ok, _} = AxonInference.Predictor.predict(List.duplicate(0.0, AxonInference.Model.input_size()))
+  describe "AxonInference.Predictor" do
+    test "timeout when serving is unavailable" do
+      # Send an input with wrong shape — it will raise inside serving, Task exits
+      :ok = Process.sleep(10)
+      # No easy way to simulate load without actually loading; document alternatives in README.
+      assert {:ok, _} = AxonInference.Predictor.predict(List.duplicate(0.0, AxonInference.Model.input_size()))
+    end
   end
 end
 ```
 
 ### Step 9: Throughput benchmark
+
+**Objective**: Measure steady-state throughput after warm-up — the first call pays JIT cost; the real number is what happens once batches saturate.
 
 ```elixir
 # bench/throughput_bench.exs
@@ -440,6 +462,24 @@ IO.puts("avg: #{time_us / 10_000} µs/op")
 ```
 
 Target: operation should complete in the low-microsecond range on modern hardware; deviations by >2× indicate a regression worth investigating.
+
+## Deep Dive
+
+Specialized frameworks like Ash (business logic), Commanded (event sourcing), and Nx (numerical computing) abstract away common infrastructure but impose architectural constraints. Ash's declarative resource definitions simplify authorization and querying at the cost of reduced flexibility—deeply nested association policies can degrade query performance. Commanded's event store and aggregate roots enforce event sourcing discipline, making audit trails and temporal queries natural, but require careful snapshot strategy to avoid replaying years of events. Nx brings numerical computing to Elixir, but JIT compilation and lazy evaluation introduce latency; production models benefit from ahead-of-time compilation for inference. For IoT (Nerves), firmware updates must be atomic and resumable—OTA rollback on failure is non-negotiable. Choose frameworks that align with your scaling assumptions: Ash scales horizontally via read replicas; Commanded scales via sharding; Nx scales via distributed training.
+## Advanced Considerations
+
+Framework choices like Ash, Commanded, and Nerves create significant architectural constraints that are difficult to change later. Ash's powerful query builder and declarative approach simplify common patterns but can be opaque when debugging complex permission logic or custom filters at scale. Event sourcing with Commanded is powerful for audit trails but creates a different mental model for state management — replaying events to derive current state has CPU and latency costs that aren't apparent in traditional CRUD systems.
+
+Nerves requires understanding the full embedded system stack — from bootloader configuration to over-the-air update mechanisms. A Nerves system that works on your development board may fail in production due to hardware variations, network conditions, or power supply issues. NX's numerical computing is powerful but requires understanding GPU acceleration trade-offs and memory management for large datasets. Livebook provides interactive development but shouldn't be used for production deployments without careful containerization and resource isolation.
+
+The integration between these frameworks and traditional BEAM patterns (supervisors, processes, GenServers) requires careful design. A Commanded projection that rebuilds state from the event log can consume all available CPU, starving other services. NX autograd computations can create unexpected memory usage if not carefully managed. Nerves systems are memory-constrained; performance assumptions from desktop Elixir don't hold. Always prototype these frameworks in realistic environments before committing to them in production systems to validate assumptions.
+
+
+## Deep Dive: Domain Patterns and Production Implications
+
+Domain-specific frameworks enforce module dependencies and architectural boundaries. Testing domain isolation ensures that constraints are maintained as the codebase grows. Production systems without boundary enforcement often become monolithic and hard to test.
+
+---
 
 ## Trade-offs and production gotchas
 
@@ -489,3 +529,13 @@ The knee of the curve is between batch 32 and 64. Setting `batch_size: 32, batch
 - [Axon inference guide](https://hexdocs.pm/axon/onnx_to_axon.html) — building servings from ONNX-imported graphs.
 - [`telemetry_metrics_prometheus` hexdocs](https://hexdocs.pm/telemetry_metrics_prometheus/) — exporting the metrics emitted here.
 - [TorchServe design doc](https://docs.pytorch.org/serve) — useful contrast for dynamic-batching semantics.
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

@@ -2,9 +2,6 @@
 
 **Project**: `router_dsl` — build a miniature HTTP router DSL with `scope`, `pipe_through`, and `get/post/put/delete` declarations that compile into efficient pattern-matched `dispatch/2` clauses.
 
-**Difficulty**: ★★★★☆
-**Estimated time**: 5–6 hours
-
 ---
 
 ## Project context
@@ -12,6 +9,16 @@
 You are writing a lightweight embedded HTTP router for an internal admin dashboard —
 you do not want to pull Phoenix + Plug, but you do want the familiar declarative
 ergonomics:
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
 
 ```elixir
 defmodule Admin.Router do
@@ -56,6 +63,12 @@ router_dsl/
 
 ---
 
+## Why compile-time routing and not runtime dispatch
+
+A runtime dispatcher walks a list of patterns for every request. Compile-time routing emits one pattern-matched clause per route, letting the BEAM decide dispatch in a single jump. Phoenix itself takes this approach for exactly this reason.
+
+---
+
 ## Core concepts
 
 ### 1. Scopes are compile-time stacks
@@ -94,9 +107,25 @@ ones — we preserve insertion order by reversing the accumulator at the end.
 
 ---
 
+## Design decisions
+
+**Option A — literal list of routes and a runtime dispatcher**
+- Pros: simple; editable at runtime; trivially hot-reloaded.
+- Cons: one lookup per request; no compile-time check for overlapping patterns.
+
+**Option B — DSL that emits `def dispatch/2` clauses** (chosen)
+- Pros: direct jump table; compile-time overlap detection possible.
+- Cons: recompile to change routes; path-pattern compilation is nontrivial.
+
+→ Chose **B** because routes are effectively static per deploy; the hot path benefits and the tooling story (docs, introspection) improves.
+
+---
+
 ## Implementation
 
 ### Step 1: `lib/router_dsl/route.ex`
+
+**Objective**: Define Route struct to model verb, path_segments, controller, action, pipelines uniformly.
 
 ```elixir
 defmodule RouterDSL.Route do
@@ -115,6 +144,8 @@ end
 ```
 
 ### Step 2: `lib/router_dsl/scope_stack.ex`
+
+**Objective**: Parse paths to segment lists, merge scope prefixes, build_match_ast for guard patterns and params map AST.
 
 ```elixir
 defmodule RouterDSL.ScopeStack do
@@ -156,6 +187,8 @@ end
 ```
 
 ### Step 3: `lib/router_dsl/router.ex`
+
+**Objective**: Implement __using__, scope/1, get/post/put/delete, pipeline, pipe_through, emit dispatch clauses with pattern matching.
 
 ```elixir
 defmodule RouterDSL do
@@ -289,6 +322,8 @@ end
 
 ### Step 4: Example router
 
+**Objective**: Define Sample.Admin router with pipeline, scopes, nested scopes, and HTTP verbs for integration testing.
+
 ```elixir
 defmodule RouterDSL.Sample.Admin do
   use RouterDSL
@@ -314,6 +349,8 @@ end
 ```
 
 ### Step 5: Tests
+
+**Objective**: Assert static/dynamic routes match, verb matters, scopes nest, not_found fallback works, __routes__/0 introspection accurate.
 
 ```elixir
 defmodule RouterDSLTest do
@@ -372,6 +409,27 @@ defmodule RouterDSLTest do
 end
 ```
 
+### Why this works
+
+Each `get/post/...` macro accumulates a route tuple. `@before_compile` compiles every path into a pattern AST, then emits a clause that matches `{method, path_pattern}` and binds dynamic segments to named parameters. The BEAM turns the clauses into a jump table.
+
+---
+
+## Advanced Considerations: Macro Hygiene and Compile-Time Validation
+
+Macros execute at compile time, walking the AST and returning new AST. That power is easy to abuse: a macro that generates variables can shadow outer scope bindings, or a quote block that references variables directly can fail if the macro is used in a context where those variables don't exist. The `unquote` mechanism is the escape hatch, but misusing it leads to hard-to-debug compile errors.
+
+Macro hygiene is about capturing intent correctly. A `defmacro` that takes `:my_option` and uses it directly might match an unrelated `:my_option` from the caller's scope. The idiomatic pattern is to use `unquote` for values that should be "from the outside" and keep AST nodes quoted for safety. The `quote` block's binding of `var!` and `binding!` provides escape valves for the rare case when shadowing is intentional.
+
+Compile-time validation unlocks errors that would otherwise surface at runtime. A macro can call functions to validate input, generate code conditionally, or fail the build with `IO.warn`. Schema libraries like `Ecto` and `Ash` use macros to define fields at compile time, so runtime queries are guaranteed type-safe. The cost is cognitive load: developers must reason about both the code as written and the code generated.
+
+---
+
+
+## Deep Dive: Metaprogramming Patterns and Production Implications
+
+Metaprogramming (macros, AST manipulation) requires testing at compile time and runtime. The challenge is that macro tests often involve parsing and expanding code, which couples tests to compiler internals. Production bugs in macros can corrupt entire modules; testing macros rigorously is non-negotiable.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -423,6 +481,13 @@ Benchee.run(%{
 ```
 
 Expect ~80–200 ns per dispatch — the BEAM pattern-matching jump.
+
+---
+
+## Reflection
+
+- Your app acquires a plugin system where third parties contribute routes at runtime. Can the compile-time DSL survive, or do you bolt on a runtime layer? What are the implications for precedence?
+- How do you detect two routes that overlap (e.g. `/users/:id` and `/users/me`) at compile time? Which one should win, and why?
 
 ---
 

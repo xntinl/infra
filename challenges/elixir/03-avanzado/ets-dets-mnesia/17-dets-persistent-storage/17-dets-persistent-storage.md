@@ -2,9 +2,6 @@
 
 **Project**: `dets_store` — a durable key-value store for a small IoT ingestion service that must survive node restarts without adding a database dependency.
 
-**Difficulty**: ★★★★☆
-**Estimated time**: 3–6 hours
-
 ---
 
 ## Project context
@@ -36,6 +33,12 @@ dets_store/
 ├── priv/              # .dets files live here in dev/test
 └── mix.exs
 ```
+
+---
+
+## Why DETS and not SQLite
+
+SQLite is a fine database. DETS is not a database — it is persistent ETS. The decision is about whether you need SQL and durability or just ETS-shaped storage that survives restarts.
 
 ---
 
@@ -79,6 +82,16 @@ Know that `sync` is expensive (full fsync of a potentially large file). A common
 
 ### 4. `open_file/2` options that matter
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
+
 ```elixir
 [
   type: :set,           # or :bag | :duplicate_bag
@@ -104,9 +117,25 @@ tables use internally.
 
 ---
 
+## Design decisions
+
+**Option A — SQLite file**
+- Pros: SQL, mature, well-understood durability.
+- Cons: another dependency; no BEAM-native integration.
+
+**Option B — DETS table** (chosen)
+- Pros: zero dependencies; same API shape as ETS; replayable on restart.
+- Cons: 2 GB cap; corruption recovery is a manual dance; no queries beyond key lookup.
+
+→ Chose **B** because for small persistent state inside a BEAM app, DETS keeps everything in-process with no extra moving parts.
+
+---
+
 ## Implementation
 
 ### Step 1: `mix.exs`
+
+**Objective**: Declare a zero-dep OTP app — DETS ships with Erlang, so nothing else is needed for durable persistence.
 
 ```elixir
 defmodule DetsStore.MixProject do
@@ -130,6 +159,8 @@ end
 
 ### Step 2: `lib/dets_store/application.ex`
 
+**Objective**: Ensure `priv/` exists and hand the Store a fixed file path so restarts reopen the same DETS segment.
+
 ```elixir
 defmodule DetsStore.Application do
   @moduledoc false
@@ -149,6 +180,8 @@ end
 ```
 
 ### Step 3: `lib/dets_store/store.ex`
+
+**Objective**: Own the DETS handle with `auto_save: 5_000` and `repair: true` so transient crashes self-heal on next open.
 
 ```elixir
 defmodule DetsStore.Store do
@@ -252,6 +285,8 @@ end
 
 ### Step 4: `lib/dets_store/repair.ex`
 
+**Objective**: Retry `open_file` with `repair: :force` when soft-repair fails, so a corrupt segment gets rebuilt before `init/1` aborts.
+
 ```elixir
 defmodule DetsStore.Repair do
   @moduledoc """
@@ -281,6 +316,8 @@ end
 ```
 
 ### Step 5: `test/dets_store_test.exs`
+
+**Objective**: Confirm data survives both a clean restart and a `Process.exit(:kill)` — the real BEAM-crash durability contract.
 
 ```elixir
 defmodule DetsStoreTest do
@@ -349,10 +386,16 @@ end
 
 ### Step 6: Run it
 
+**Objective**: Run the suite with `--trace` to surface any DETS I/O or repair warnings buried in normal log noise.
+
 ```bash
 mix deps.get
 mix test --trace
 ```
+
+### Why this works
+
+A DETS table is a disk file that maps keys to values through a linear hashing scheme. Opening the table loads the header and maps the file; reads fetch pages on demand; writes mutate pages and flush on `:dets.sync/1` or close.
 
 ---
 
@@ -375,6 +418,24 @@ matters. A classic pattern is "insert many, sync once per window":
 for item <- batch, do: Store.put(item.id, item)
 Store.sync()
 ```
+
+---
+
+## Deep Dive
+
+ETS (Erlang Term Storage) is RAM-only and process-linked; table destruction triggers if the owner crashes, causing silent data loss in careless designs. Match specifications (match_specs) are micro-programs that filter/transform data at the C layer, orders of magnitude faster than fetching all records and filtering in Elixir. Mnesia adds disk persistence and replication but introduces transaction overhead and deadlock potential; dirty operations bypass locks for speed but sacrifice consistency guarantees. For caching, named tables (public by design) are globally visible but require careful name management; consider ETS sharding (multiple small tables) to reduce lock contention on hot keys. DETS (Disk ETS) persists to disk but is single-process bottleneck and slower than a real database. At scale, prefer ETS for in-process state and Mnesia/PostgreSQL for shared, persistent data.
+## Advanced Considerations
+
+ETS and DETS performance characteristics change dramatically based on access patterns and table types. Ordered sets provide range queries but slower access than hash tables; set types don't support duplicate keys while bags do. The `heir` option for ETS tables is essential for fault tolerance — when a table owner crashes, the heir process can take ownership and prevent data loss. Without it, the table is lost immediately. Mnesia replicates entire tables across nodes; choosing which nodes should have replicas and whether they're RAM or disk replicas affects both consistency guarantees and network traffic during cluster operations.
+
+DETS persistence comes with significant performance implications — writes are synchronous to disk by default, creating latency spikes. Using `sync: false` improves throughput but risks data loss on crashes. The maximum DETS table size is limited by available memory and the file system; planning capacity requires understanding your growth patterns. Mnesia's transaction system provides ACID guarantees, but dirty operations bypass these guarantees for performance. Understanding when to use dirty reads versus transactional reads significantly impacts both correctness and latency.
+
+Debugging ETS and DETS issues is challenging because problems often emerge under load when many processes contend for the same table. Table memory fragmentation is invisible to code but can exhaust memory. Using match specs instead of iteration over large tables can dramatically improve performance but requires careful construction. The interaction between ETS, replication, and distributed systems creates subtle consistency issues — a node with a stale ETS replica can serve incorrect data during network partitions. Always monitor table sizes and replication status with structured logging.
+
+
+## Deep Dive: Etsdets Patterns and Production Implications
+
+ETS tables are in-memory, non-distributed key-value stores with tunable semantics (ordered_set, duplicate_bag). Under concurrent read/write load, ETS table semantics matter: bag semantics allow fast appends but slow deletes; ordered_set allows range queries but slower inserts. Testing ETS behavior under concurrent load is non-trivial; single-threaded tests miss lock contention. Production ETS tables often fail under load due to concurrency assumptions that quiet tests don't exercise.
 
 ---
 
@@ -404,6 +465,25 @@ authoritative state.
 **7. When NOT to use DETS.** Anything shared across nodes, anything transactional, anything
 over ~1 GB, or anything where you need a real query language. Reach for Mnesia, ETS+snapshot,
 or Postgres.
+
+---
+
+## Benchmark
+
+```elixir
+# :timer.tc / Benchee measurement sketch
+{time_us, _} = :timer.tc(fn -> :ok end)
+IO.puts("elapsed: #{time_us} us")
+```
+
+Target: DETS write 20-100 us; read 10-50 us; both dominated by disk I/O and OS page cache.
+
+---
+
+## Reflection
+
+- Your DETS file got corrupted by a sudden power loss. What tools does OTP give you, and how much data can you lose in the worst case?
+- SQLite supports concurrent readers and one writer. How does DETS compare, and which use cases are secretly better off with SQLite?
 
 ---
 

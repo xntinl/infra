@@ -81,6 +81,8 @@ end
 
 ### Step 1: HTTP client
 
+**Objective**: Fetch base_url at call-time via Application.fetch_env! so tests redirect to ephemeral Bypass ports without code rewrites.
+
 ```elixir
 # lib/weather_sync/openweather/client.ex
 defmodule WeatherSync.Openweather.Client do
@@ -125,6 +127,8 @@ end
 ```
 
 ### Step 2: test suite
+
+**Objective**: Drive tests via real Bypass TCP/HTTP stack so async: true tests exercise JSON parsing, status codes, and timeout semantics end-to-end.
 
 ```elixir
 # test/weather_sync/openweather_client_test.exs
@@ -241,6 +245,21 @@ IO.puts("100 bypass calls: #{t / 1000}ms")
 
 Target: < 1000ms for 100 iterations on a modern laptop.
 
+## Deep Dive: Bypass Patterns and Production Implications
+
+HTTP mocking in tests presents a false choice: mock at the client level (loses realistic errors) or spin up a real HTTP server (adds complexity and brittleness). Bypass sits in the middle—it starts a real HTTP server on localhost that captures requests and allows you to define stub responses. This catches serialization bugs, malformed headers, and timeout logic that pure client mocks miss. The downside is that Bypass tests must serialize before making requests, limiting some concurrency patterns. Production incidents often involve HTTP edge cases (partial responses, connection timeouts) that live HTTP testing reveals.
+
+---
+
+## Advanced Considerations
+
+Production testing strategies require careful attention to resource management and test isolation across multiple concurrent test processes. In large codebases, tests can consume significant memory and CPU resources, especially when using concurrent testing without proper synchronization and cleanup. The BEAM scheduler's preemptive nature means test processes may interfere with each other if shared resources aren't properly isolated at the process boundary. Pay careful attention to how Ecto's sandbox mode interacts with your supervision tree — if you have GenServers that hold state across tests, the sandbox rollback mechanism may leave phantom processes in your monitoring systems that continue consuming resources until forced cleanup occurs.
+
+When scaling tests to production-grade test suites, consider the cost of stub verification and the memory overhead of generated test cases. Each property-based test invocation can create thousands of synthetic test cases, potentially causing garbage collection pressure that's invisible during local testing but becomes critical in CI/CD pipelines running long test suites continuously. The interaction between concurrent tests and ETS tables (often used in caches and registry patterns) requires explicit `inherited: true` options to prevent unexpected sharing between test processes, which can cause mysterious failures when tests run in different orders or under load.
+
+For distributed testing scenarios using tools like `Peer`, network simulation can mask real latency issues and failure modes. Test timeouts that work locally may fail in CI due to scheduler contention and GC pauses. Always include substantial buffers for timeout values and monitor actual execution times under load. The coordination between multiple test nodes requires careful cleanup — a failure in test coordination can leave zombie processes consuming resources indefinitely. Implement proper telemetry hooks within your test helpers to diagnose production-like scenarios and capture performance characteristics.
+
+
 ## Trade-offs and production gotchas
 
 **1. Hard-coded URLs in the client**
@@ -281,3 +300,13 @@ would catch them?
 - [Bypass on hex](https://hexdocs.pm/bypass/readme.html)
 - [`Req` on hex](https://hexdocs.pm/req/Req.html)
 - [Plataformatec blog — Testing external services](https://dashbit.co/blog/testing-external-services)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

@@ -2,9 +2,6 @@
 
 **Project**: `trace_macro` — a `trace do ... end` block that logs every function call inside it, including arguments and return values, using `defmacro` and AST rewriting.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -31,6 +28,18 @@ trace_macro/
 │   └── trace_macro_test.exs
 └── mix.exs
 ```
+
+---
+
+## Why a compile-time trace macro and not `:dbg`
+
+`:dbg` y `recon_trace` son los tools correctos para tracing en
+**producción** — instrumentan un VM vivo sin recompilar. Lo que no
+pueden hacer es enseñarte AST traversal, y no te dejan limitar el
+tracing a un bloque específico en compile time. Un macro
+`trace do ... end` es un shim de desarrollo explícito en el código,
+desaparece tras la expansión, y se convierte en código ordinario que
+el formatter y el linter entienden.
 
 ---
 
@@ -73,9 +82,41 @@ real-world need: "log every call out of this block into library X."
 
 ---
 
+## Design decisions
+
+**Option A — Reescribir cada call site (local + remote)**
+- Pros: Máxima cobertura; nada escapa al tracer.
+- Cons: Rompe pattern bindings (`{:ok, x} = ...`), guards, control
+  flow; el ruido ahoga la señal.
+
+**Option B — Reescribir solo calls remotas `Mod.fun(...)`** (elegida)
+- Pros: Cubre el caso real ("loguear calls hacia librería X"); seguro
+  contra patterns, guards, locals.
+- Cons: Helpers locales y funciones privadas quedan invisibles.
+
+→ Elegida **B** porque el objetivo del ejercicio es loguear calls
+**saliendo** de un bloque, no cada nodo; limitarse a remotas mantiene
+la reescritura predecible.
+
+---
+
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
 
 ```bash
 mix new trace_macro
@@ -83,6 +124,9 @@ cd trace_macro
 ```
 
 ### Step 2: `lib/trace_macro.ex`
+
+**Objective**: Implement `trace_macro.ex` — AST manipulation that runs at compile time — making the macro's hygiene and unquoting choices observable.
+
 
 ```elixir
 defmodule TraceMacro do
@@ -131,6 +175,9 @@ end
 ```
 
 ### Step 3: `test/trace_macro_test.exs`
+
+**Objective**: Write `trace_macro_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
 
 ```elixir
 defmodule TraceMacroTest do
@@ -207,6 +254,9 @@ end
 
 ### Step 4: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -218,6 +268,55 @@ iex> require TraceMacro
 iex> ast = quote do: TraceMacro.trace(do: String.upcase("hi"))
 iex> Macro.expand(ast, __ENV__) |> Macro.to_string() |> IO.puts
 ```
+
+### Why this works
+
+`Macro.prewalk/2` visita cada nodo AST top-down. El `rewrite_node/1`
+patternmatchea solo sobre la forma "dot call"
+(`{{:., _, [_mod, _fun]}, _, args}`) — la firma inequívoca de
+`Mod.fun(args)` — y sustituye por un `quote` que captura la call
+original, loguea su forma y resultado, y devuelve el valor. Todo otro
+nodo cae al clause pass-through, así que patterns, guards, literals,
+locals y control flow quedan intactos.
+
+---
+
+
+## Deep Dive: State Management and Message Handling Patterns
+
+Understanding state transitions is central to reliable OTP systems. Every `handle_call` or `handle_cast` receives current state and returns new state—immutability forces explicit reasoning. This prevents entire classes of bugs: missing state updates are immediately visible.
+
+Key insight: separate pure logic (state → new state) from side effects (logging, external calls). Move pure logic to private helpers; use handlers for orchestration. This makes servers testable—test pure functions independently.
+
+In production, monitor state size and mutation frequency. Unbounded growth is a memory leak; excessive mutations signal hot spots needing optimization. Always profile before reaching for performance solutions like ETS.
+
+## Benchmark
+
+```elixir
+{plain, _} =
+  :timer.tc(fn ->
+    Enum.each(1..10_000, fn _ ->
+      String.upcase("hello")
+    end)
+  end)
+
+{traced, _} =
+  :timer.tc(fn ->
+    ExUnit.CaptureIO.capture_io(fn ->
+      Enum.each(1..10_000, fn _ ->
+        TraceMacro.trace do
+          String.upcase("hello")
+        end
+      end)
+    end)
+  end)
+
+IO.puts("plain: #{plain}µs, traced: #{traced}µs")
+```
+
+Target esperado: la sobrecarga por call trazada está dominada por
+`IO.puts` + `Macro.to_string`, 10–50µs por call en hardware moderno.
+El macro por sí solo (sin IO) agrega ~1µs extra.
 
 ---
 
@@ -256,6 +355,18 @@ For production observability, reach for `:telemetry` + a tracing backend
 (OpenTelemetry, Datadog). For live debugging, `:dbg.tracer/0` and
 `recon_trace` can instrument running code without a recompile. A trace
 macro is a development-time shim, not infrastructure.
+
+---
+
+## Reflection
+
+- El equipo pega `TraceMacro.trace do ... end` en un servicio de auth en
+  staging para debuggear y el log termina imprimiendo tokens JWT. ¿Qué
+  cambiás en el macro (o en la política de uso) para que no vuelva a
+  pasar, sin renunciar a la capacidad de trazar en desarrollo?
+- Querés extender el macro para que también rastree calls locales pero
+  solo cuando se pasa `trace do ..., locals: true end`. ¿Qué agregás al
+  pattern de `rewrite_node/1` y por qué `prewalk/2` ya no alcanza?
 
 ---
 

@@ -88,7 +88,22 @@ Chose **B** because the problem IS a DSL and the whole standard library converge
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"ecto", "~> 1.0"},
+    {:"phoenix", "~> 1.0"},
+  ]
+end
+```
+
+
 ### Step 1 — Create the project
+
+**Objective**: Set up a single-module library so the DSL surface stays small, keeping focus on keyword semantics rather than application structure.
 
 ```bash
 mix new mini_query
@@ -98,6 +113,8 @@ cd mini_query
 Make sure `mix.exs` targets Elixir `~> 1.13` or later (the default for new projects is fine).
 
 ### Step 2 — `lib/mini_query.ex`
+
+**Objective**: Leverage keyword-list ordering and repeated keys to design a DSL whose syntactic form is its own execution plan.
 
 ```elixir
 defmodule MiniQuery do
@@ -163,6 +180,8 @@ end
 
 ### Step 3 — `test/mini_query_test.exs`
 
+**Objective**: Lock in DSL ordering semantics and validate invalid options raise early, so malformed queries never reach the in-memory dataset.
+
 ```elixir
 defmodule MiniQueryTest do
   use ExUnit.Case, async: true
@@ -224,6 +243,8 @@ end
 
 ### Step 4 — Run the tests
 
+**Objective**: Run the suite to confirm the DSL preserves keyword-list order, which is the single property distinguishing it from a map-based option bag.
+
 ```bash
 mix test
 ```
@@ -236,6 +257,19 @@ Keyword lists are plain lists of `{atom, value}` tuples — they have duplicate 
 
 ---
 
+
+## Key Concepts
+
+### 1. Keyword Lists as Function Options
+Keyword lists are idiomatic for function options. The order is preserved, and you can have multiple values for the same key.
+
+### 2. Keyword Lists Enable DSLs
+The block syntax `do...end` is syntactic sugar for passing a function. Keyword lists in blocks enable readable DSLs.
+
+### 3. Keyword Lists vs Maps for Options
+Use keyword lists for function options (order matters). Use maps for unstructured data. Modern APIs often prefer maps, but options remain keyword lists for tradition.
+
+---
 ## Benchmark
 
 ```elixir

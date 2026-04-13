@@ -60,6 +60,18 @@ Process dictionary breaks referential transparency and makes code untestable. Re
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"plug", "~> 1.0"},
+  ]
+end
+```
+
+
 ### `lib/config_reloader_demo.ex`
 
 ```elixir
@@ -229,6 +241,24 @@ mix test
 
 The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
 
+
+
+---
+## Key Concepts
+
+### 1. Rebinding Creates a New Binding, Not Mutation
+
+The second `x = x + 1` does not mutate; it creates a new variable `x` in the same scope that shadows the old binding. The old `x` is still there if a function captured it. Closures capture by reference, not by value. If you rely on mutation after binding, you will have bugs.
+
+### 2. Scope Follows Function Boundaries, Not Blocks
+
+Unlike JavaScript or Python, scope in Elixir is determined by function definitions, not by `if`, `case`, or loops. Both branches of an `if` statement bind to the same variable at the function level. This prevents "variable shadowing in one branch" bugs that plague block-scoped languages.
+
+### 3. Pattern Matching is Rebinding
+
+When you write `{x, y} = {1, 2}`, you are binding new variables. If `x` was already bound, pattern matching will attempt to unify (with the pin operator `^`) or create a new binding. Understanding the scoping rules prevents subtle rebinding bugs.
+
+---
 ## Benchmark
 
 <!-- benchmark N/A: tema conceptual -->

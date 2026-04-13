@@ -75,6 +75,8 @@ end
 
 ### Step 1: the GenServer emits events at meaningful points
 
+**Objective**: Instrument internal state transitions with telemetry so tests can observe timing and causality without poking into GenServer state or sleeping.
+
 ```elixir
 # lib/ingest_pipeline/buffer.ex
 defmodule IngestPipeline.Buffer do
@@ -143,6 +145,8 @@ end
 
 ### Step 2: helper — forward telemetry to the test pid
 
+**Objective**: Bridge telemetry events into the test process mailbox with unique handler IDs so async tests can attach to the same event without colliding.
+
 ```elixir
 # test/support/telemetry_helper.ex (or inline inside the test file)
 defmodule IngestPipeline.TelemetryHelper do
@@ -168,6 +172,8 @@ end
 ```
 
 ### Step 3: tests without a single `Process.sleep`
+
+**Objective**: Replace timing-based waits with assert_receive on telemetry events so tests run at the speed of the code and remain deterministic under load.
 
 ```elixir
 # test/ingest_pipeline/buffer_test.exs
@@ -277,6 +283,21 @@ IO.puts("suite #{t / 1000}ms")
 Target: per-test median under 10ms when `interval_ms` is not the bottleneck. Contrast with
 the same test written with `Process.sleep(600)` — 30s median.
 
+## Deep Dive: Telemetry Patterns and Production Implications
+
+Telemetry decouples event emission from consumption, allowing system components to broadcast facts without coupling to logging, metrics, or observability code. GenServer processes are natural telemetry publishers—each lifecycle event (init, cast, call) is an opportunity to emit metrics. The architectural benefit is that test suites can attach telemetry handlers to verify internal state transitions without coupling tests to implementation details. Production systems build observability atop telemetry; testing it early catches assumptions about causality that are false at scale.
+
+---
+
+## Advanced Considerations
+
+Production testing strategies require careful attention to resource management and test isolation across multiple concurrent test processes. In large codebases, tests can consume significant memory and CPU resources, especially when using concurrent testing without proper synchronization and cleanup. The BEAM scheduler's preemptive nature means test processes may interfere with each other if shared resources aren't properly isolated at the process boundary. Pay careful attention to how Ecto's sandbox mode interacts with your supervision tree — if you have GenServers that hold state across tests, the sandbox rollback mechanism may leave phantom processes in your monitoring systems that continue consuming resources until forced cleanup occurs.
+
+When scaling tests to production-grade test suites, consider the cost of stub verification and the memory overhead of generated test cases. Each property-based test invocation can create thousands of synthetic test cases, potentially causing garbage collection pressure that's invisible during local testing but becomes critical in CI/CD pipelines running long test suites continuously. The interaction between concurrent tests and ETS tables (often used in caches and registry patterns) requires explicit `inherited: true` options to prevent unexpected sharing between test processes, which can cause mysterious failures when tests run in different orders or under load.
+
+For distributed testing scenarios using tools like `Peer`, network simulation can mask real latency issues and failure modes. Test timeouts that work locally may fail in CI due to scheduler contention and GC pauses. Always include substantial buffers for timeout values and monitor actual execution times under load. The coordination between multiple test nodes requires careful cleanup — a failure in test coordination can leave zombie processes consuming resources indefinitely. Implement proper telemetry hooks within your test helpers to diagnose production-like scenarios and capture performance characteristics.
+
+
 ## Trade-offs and production gotchas
 
 **1. Reusing a handler id across async tests**
@@ -318,3 +339,13 @@ the handler-id uniqueness trick actually prevent it?
 - [`ExUnit.Assertions` — assert_receive](https://hexdocs.pm/ex_unit/ExUnit.Assertions.html#assert_receive/3)
 - [Dashbit — Instrumenting Phoenix with telemetry](https://dashbit.co/blog/telemetry-for-all)
 - [`ExUnit.Callbacks.start_supervised!/1`](https://hexdocs.pm/ex_unit/ExUnit.Callbacks.html#start_supervised!/1)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

@@ -105,6 +105,8 @@ ReceiveMessage, DeleteMessage). ExAws can be pointed at it via
 
 ### Step 1: Deps
 
+**Objective**: Pin `broadway_sqs` with ExAws and Req so long-poll fetches and webhook POSTs share one supervised HTTP stack.
+
 ```elixir
 defp deps do
   [
@@ -120,6 +122,8 @@ end
 ```
 
 ### Step 2: LocalStack via docker-compose
+
+**Objective**: Run SQS locally via LocalStack so visibility-timeout and DLQ behaviour are exercised without paying AWS for every test run.
 
 ```yaml
 # docker-compose.yml
@@ -142,6 +146,8 @@ aws --endpoint-url=http://localhost:4566 sqs create-queue --queue-name webhook-d
 ```
 
 ### Step 3: Pipeline
+
+**Objective**: Long-poll SQS with 20s waits and 60s visibility so failed deliveries redrive naturally instead of hammering the queue.
 
 ```elixir
 defmodule BroadwaySqsRetry.Pipeline do
@@ -204,6 +210,8 @@ end
 
 ### Step 4: Webhook dispatcher
 
+**Objective**: Treat non-2xx and transport errors as transient so SQS visibility timeout — not app code — owns the retry cadence.
+
 ```elixir
 defmodule BroadwaySqsRetry.WebhookDispatcher do
   @spec deliver(String.t(), map() | binary()) :: :ok | {:error, term()}
@@ -218,6 +226,8 @@ end
 ```
 
 ### Step 5: Application
+
+**Objective**: Read the queue URL from env so the same supervised pipeline drops into LocalStack tests and real AWS without code changes.
 
 ```elixir
 defmodule BroadwaySqsRetry.Application do
@@ -234,6 +244,8 @@ end
 ```
 
 ### Step 6: Tests
+
+**Objective**: Drive success and failure flows against Bypass+LocalStack so ack and visibility-timeout redrive are asserted, not inferred.
 
 ```elixir
 defmodule BroadwaySqsRetry.PipelineTest do
@@ -266,42 +278,45 @@ defmodule BroadwaySqsRetry.PipelineTest do
   end
 
   @tag :localstack
-  test "delivers a successful webhook and acks from queue", %{url: url} do
-    bypass = Bypass.open()
-    Bypass.expect_once(bypass, fn conn -> Plug.Conn.resp(conn, 200, "ok") end)
 
-    payload = %{url: "http://localhost:#{bypass.port}/hook", body: %{event: "x"}}
+  describe "BroadwaySqsRetry.Pipeline" do
+    test "delivers a successful webhook and acks from queue", %{url: url} do
+      bypass = Bypass.open()
+      Bypass.expect_once(bypass, fn conn -> Plug.Conn.resp(conn, 200, "ok") end)
 
-    {:ok, _} =
-      SQS.send_message(url, Jason.encode!(payload)) |> ExAws.request(@config)
+      payload = %{url: "http://localhost:#{bypass.port}/hook", body: %{event: "x"}}
 
-    start_supervised!({BroadwaySqsRetry.Pipeline, [queue_url: url]})
+      {:ok, _} =
+        SQS.send_message(url, Jason.encode!(payload)) |> ExAws.request(@config)
 
-    Process.sleep(2_000)
+      start_supervised!({BroadwaySqsRetry.Pipeline, [queue_url: url]})
 
-    {:ok, %{body: %{messages: msgs}}} =
-      SQS.receive_message(url, max_number_of_messages: 10, wait_time_seconds: 1)
-      |> ExAws.request(@config)
+      Process.sleep(2_000)
 
-    assert msgs == []
-  end
+      {:ok, %{body: %{messages: msgs}}} =
+        SQS.receive_message(url, max_number_of_messages: 10, wait_time_seconds: 1)
+        |> ExAws.request(@config)
 
-  @tag :localstack
-  test "failed webhook returns to queue after visibility timeout", %{url: url} do
-    bypass = Bypass.open()
-    Bypass.expect(bypass, fn conn -> Plug.Conn.resp(conn, 500, "bang") end)
+      assert msgs == []
+    end
 
-    payload = %{url: "http://localhost:#{bypass.port}/hook", body: %{}}
-    {:ok, _} = SQS.send_message(url, Jason.encode!(payload)) |> ExAws.request(@config)
+    @tag :localstack
+    test "failed webhook returns to queue after visibility timeout", %{url: url} do
+      bypass = Bypass.open()
+      Bypass.expect(bypass, fn conn -> Plug.Conn.resp(conn, 500, "bang") end)
 
-    start_supervised!({BroadwaySqsRetry.Pipeline, [queue_url: url]})
-    Process.sleep(1_000)
-    :ok = Supervisor.stop(BroadwaySqsRetry.Pipeline)
+      payload = %{url: "http://localhost:#{bypass.port}/hook", body: %{}}
+      {:ok, _} = SQS.send_message(url, Jason.encode!(payload)) |> ExAws.request(@config)
 
-    # Message should still be in queue (in-flight, invisible), not deleted
-    {:ok, %{body: %{messages: _}}} =
-      SQS.receive_message(url, max_number_of_messages: 10, wait_time_seconds: 1)
-      |> ExAws.request(@config)
+      start_supervised!({BroadwaySqsRetry.Pipeline, [queue_url: url]})
+      Process.sleep(1_000)
+      :ok = Supervisor.stop(BroadwaySqsRetry.Pipeline)
+
+      # Message should still be in queue (in-flight, invisible), not deleted
+      {:ok, %{body: %{messages: _}}} =
+        SQS.receive_message(url, max_number_of_messages: 10, wait_time_seconds: 1)
+        |> ExAws.request(@config)
+    end
   end
 end
 ```
@@ -324,6 +339,24 @@ IO.puts("avg: #{time_us / 10_000} µs/op")
 ```
 
 Target: operation should complete in the low-microsecond range on modern hardware; deviations by >2× indicate a regression worth investigating.
+
+## Deep Dive
+
+Data pipelines in Elixir leverage the Actor model to coordinate work across producer, consumer, and batcher stages. GenStage provides the foundation—a demand-driven backpressure mechanism that prevents memory bloat when producers exceed consumer capacity. Broadway abstracts this further, handling subscriptions, acknowledgments, and error propagation automatically. Understanding pipeline topology is critical at scale: a misconfigured batcher can serialize work and kill throughput; conversely, excessive partitioning fragments state and increases GC pressure. In production systems, always measure latency and memory per stage—Broadway's metrics integration with Telemetry makes this traceable. Consider exactly-once delivery semantics early; most pipelines require idempotency keys or deduplication at the consumer boundary. For high-volume Kafka scenarios, partition alignment (matching Broadway partitions to Kafka partitions) is essential to avoid rebalancing storms.
+## Advanced Considerations
+
+Data pipeline implementations at scale require careful consideration of backpressure, memory buffering, and failure recovery semantics. Broadway and Genstage provide demand-driven processing, but understanding the exact flow of backpressure through your pipeline is essential to avoid either starving producers or overwhelming buffers. The interaction between batcher timeouts and consumer demand can create unexpected latencies when tuples are held waiting for either a size threshold or time threshold to be reached. In systems processing millions of events, even a 100ms batch timeout can impact end-to-end latency dramatically.
+
+Idempotency and exactly-once semantics are not automatic — they require architectural decisions about checkpointing and deduplication strategies. Writing checkpoints too frequently becomes a bottleneck; writing them too infrequently means lost progress on failure and potential duplicates. The choice between in-process ETS-based deduplication versus external stores (Redis, database) changes your failure recovery story fundamentally. Broadway's acknowledgment system is flexible but requires explicit design; missing acknowledgments can cause data loss or duplicates in production environments where failures are common.
+
+When handling external systems (databases, message queues, APIs), transient failures and circuit-breaker patterns become essential. A single slow downstream service can cause backpressure to ripple through your entire pipeline catastrophically. Consider implementing bulkhead patterns where certain pipeline stages have isolated pools of workers to prevent cascading failures. For ETL pipelines combining Ecto with streaming, managing database connection pools and transaction contexts requires careful coordination to prevent connection exhaustion.
+
+
+## Deep Dive: Streaming Patterns and Production Implications
+
+Stream-based pipelines in Elixir achieve backpressure and composability by deferring computation until consumption. Unlike eager list operations that allocate all intermediate structures, Streams are lazy chains that produce one element at a time, reducing memory footprint and enabling infinite sequences. The BEAM scheduler yields between Stream operations, allowing multiple concurrent pipelines to interleave fairly. At scale (processing millions of rows or events), the difference between eager and lazy evaluation becomes the difference between consistent latency and garbage collection pauses. Production systems benefit most when Streams are composed at library boundaries, not scattered across the codebase.
+
+---
 
 ## Trade-offs and production gotchas
 
@@ -389,3 +422,13 @@ Fetch cost breakdown for 1M messages at ~3k/sec:
 - [Visibility timeout blog — AWS](https://aws.amazon.com/blogs/compute/amazon-sqs-visibility-timeout/)
 - [Concurrent Data Processing in Elixir — Svilen Gospodinov](https://pragprog.com/titles/sgdpelixir/)
 - [ExAws.SQS docs](https://hexdocs.pm/ex_aws_sqs/)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

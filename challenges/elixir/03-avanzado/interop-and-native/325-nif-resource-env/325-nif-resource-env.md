@@ -102,6 +102,16 @@ the refcount logic.
 
 ### Dependencies (`mix.exs`)
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
+
 ```elixir
 defmodule CacheLmdb.MixProject do
   use Mix.Project
@@ -128,6 +138,8 @@ end
 
 ### Step 1: Cargo manifest (`native/cache_lmdb_nif/Cargo.toml`)
 
+**Objective**: Use heed safe wrapper so NIF avoids raw FFI while exposing LMDB lifetimes to Rust's borrow checker.
+
 ```toml
 [package]
 name = "cache_lmdb_nif"
@@ -144,6 +156,8 @@ heed = "0.20"  # safe Rust bindings to LMDB
 ```
 
 ### Step 2: Rust NIF with resources (`native/cache_lmdb_nif/src/lib.rs`)
+
+**Objective**: Serialize writes via Mutex so concurrent schedulers never deadlock on LMDB's single-writer constraint.
 
 ```rust
 use rustler::{Env, Error, NifResult, OwnedBinary, ResourceArc, Term};
@@ -263,6 +277,8 @@ rustler::init!(
 
 ### Step 3: Elixir wrapper (`lib/cache_lmdb/db.ex`)
 
+**Objective**: Provide opaque handle so LMDB env closes automatically when BEAM GC drops all references.
+
 ```elixir
 defmodule CacheLmdb.DB do
   @moduledoc """
@@ -282,6 +298,8 @@ end
 ```
 
 ### Step 4: Application wrapper
+
+**Objective**: Minimal supervision since LMDB handles are owned by callers, not a central GenServer.
 
 ```elixir
 defmodule CacheLmdb.Application do
@@ -376,6 +394,37 @@ defmodule CacheLmdb.DBTest do
   end
 end
 ```
+
+## Benchmark
+
+```elixir
+handle = CacheLmdb.DB.open("/tmp/bench_lmdb", 64)
+:ok = CacheLmdb.DB.put(handle, "k", "v")
+
+{us, _} = :timer.tc(fn ->
+  for _ <- 1..10_000, do: CacheLmdb.DB.get(handle, "k")
+end)
+IO.puts("Avg: #{us / 10_000} µs per op")
+```
+
+Target: **<20 µs per op** on modern hardware.
+
+## Advanced Considerations: NIF Isolation and Scheduler Integration
+
+NIF calls run atomically on a scheduler thread, blocking all other processes on that scheduler until the function returns. For operations exceeding ~1 millisecond, this starvation becomes visible: heartbeat processes delay, ETS owner replies hang, supervision timeouts fire. The BEAM's dirty scheduler pool (8 CPU + 10 IO by default) isolates long NIFs from the main scheduler ring, but they're still a finite resource.
+
+Understanding scheduler capacity is critical. Each dirty CPU scheduler can run ~1,000 100-microsecond operations per second, or ~5 100-millisecond operations. Beyond that, callers queue. A GenServer pool capping concurrency and applying backpressure prevents cascade failures: if the dirty pool saturates, reject new work immediately instead of queuing unboundedly.
+
+Resource management inside NIFs differs from pure Elixir. A `Binary<'a>` is a borrow tied to the NIF call; it cannot escape to threads or be stored in resources. An `OwnedBinary` allocation isn't visible to BEAM's garbage collector, so memory limits must be enforced in the Elixir layer. Hybrid architectures (Port processes for I/O, NIFs for CPU work) offer better observability and failure isolation than trying to do everything in a single NIF crate.
+
+---
+
+
+## Deep Dive: Interop Patterns and Production Implications
+
+Interop with native code (NIFs, ports, C extensions) introduces failure modes that pure Elixir code doesn't have: segfaults, memory leaks, deadlocks with the Erlang emulator. Testing interop requires separate test suites for the native layer and integration tests that exercise the boundary.
+
+---
 
 ## Trade-offs and production gotchas
 

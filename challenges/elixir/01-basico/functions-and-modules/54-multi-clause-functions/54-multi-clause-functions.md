@@ -2,9 +2,6 @@
 
 **Project**: `order_state_machine` — transitions an order through `pending → paid → shipped → delivered`
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 1–2 hours
-
 ---
 
 ## Project structure
@@ -56,9 +53,53 @@ lookup tables — just pattern matching.
 
 ---
 
+## Why multi-clause and not a `case` block
+
+- A `case` inside `transition/2` works, but pushes all dispatch into one giant expression where every branch shares a scope — accidents happen when a variable from one branch is reused.
+- Multi-clause dispatch gives each transition its own function head with its own bindings. The compiler warns on unreachable clauses, which `case` does not do as aggressively.
+- A lookup `Map` works too, but loses guards and can't encode conditions like "cancel only from pending" without extra glue.
+
+---
+
+## Design decisions
+
+**Option A — single function with `case {from, event} do ... end`**
+- Pros: one function body to read; trivial to add logging around the dispatch.
+- Cons: long `case` arms drift; compiler warns less aggressively on dead branches; pattern guards become nested.
+
+**Option B — multi-clause `transition/2` with catch-all last** (chosen)
+- Pros: each valid transition is its own line; the catch-all makes invalid transitions a single explicit error path; compiler flags unreachable clauses.
+- Cons: adding dozens of states bloats the module; clause order becomes load-bearing.
+
+→ Chose **B** because the state space here is small (< 10 transitions) and each transition reads as a data point. For a 100-transition machine, a lookup map or `:gen_statem` wins.
+
+---
+
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  # No runtime deps — stdlib only.
+  []
+end
+```
+
 ### Step 1 — Create the project
+
+**Objective**: Build minimal library so multi-clause dispatch pattern matching IS the state machine without extra glue.
 
 ```bash
 mix new order_state_machine
@@ -66,6 +107,8 @@ cd order_state_machine
 ```
 
 ### Step 2 — `lib/order_state_machine/order.ex`
+
+**Objective**: Encode valid transitions as clauses, catch-all returns error so caller sees {:error, :invalid_transition} not FunctionClauseError.
 
 ```elixir
 defmodule OrderStateMachine.Order do
@@ -115,6 +158,8 @@ end
 ```
 
 ### Step 3 — `test/order_state_machine_test.exs`
+
+**Objective**: Test invalid transitions so catch-all clause is proved to fire and Enum.reduce_while short-circuits correctly.
 
 ```elixir
 defmodule OrderStateMachineTest do
@@ -176,11 +221,53 @@ end
 
 ### Step 4 — Run the tests
 
+**Objective**: Verify reduce_while + multi-clause dispatch halts on first invalid transition without draining remaining events.
+
 ```bash
 mix test
 ```
 
 All 10 tests pass.
+
+### Why this works
+
+Each clause is a compiled decision tree branch — the BEAM compiles multi-clause functions into a single jump table when clauses are simple literals like atoms, so dispatch is O(1), not O(n) over the clause list. The catch-all at the end converts every unmatched `(state, event)` pair into a uniform error tuple, so callers never see `FunctionClauseError`. `reduce_while/3` lets `run/2` short-circuit on the first error without an accumulator flag.
+
+---
+
+
+## Key Concepts
+
+### 1. Each Clause is a Separate Pattern Match
+Elixir tries each clause in order. The first one whose pattern and guards match executes. This is more powerful than `if/else`.
+
+### 2. Clause Order Matters
+If a later clause's pattern is more general, it will never match. Put more specific patterns first.
+
+### 3. Guard Clauses Refine Patterns
+Guards let one pattern match multiple branches without creating separate clauses. `when is_integer(x)` vs `when is_binary(x)`.
+
+---
+## Benchmark
+
+```elixir
+# bench/transitions.exs
+{t_valid, _} = :timer.tc(fn ->
+  Enum.each(1..1_000_000, fn _ ->
+    OrderStateMachine.Order.transition(:pending, :pay)
+  end)
+end)
+
+{t_invalid, _} = :timer.tc(fn ->
+  Enum.each(1..1_000_000, fn _ ->
+    OrderStateMachine.Order.transition(:delivered, :ship)
+  end)
+end)
+
+IO.puts("valid: #{t_valid} µs   invalid: #{t_invalid} µs")
+```
+
+Target: < 0.5 µs per call on modern hardware. Valid and invalid paths should be within noise of each other — the BEAM's decision-tree dispatch treats the catch-all as one more branch.
 
 ---
 
@@ -213,7 +300,9 @@ Without it, an unmatched call raises `FunctionClauseError`. That may be what you
 (fail fast) or not (graceful `{:error, :invalid}`). Be explicit.
 
 **3. Mixing multi-clause with default arguments incorrectly**
-See exercise 53 — defaults must go in a header clause when you also have multiple bodies.
+When a function has defaults **and** multiple bodies, the compiler requires a header clause
+(`def f(a, b \\ :x)` with no body) before the real clauses. Declaring a default inside one
+of the bodies is a compile error.
 
 **4. Overloading clauses with subtly different types**
 `def f(n) when is_integer(n)` and `def f(s) when is_binary(s)` side by side is fine,
@@ -223,6 +312,13 @@ but hides two different operations behind one name. Often two functions (`f_int/
 **5. Using clauses for validation only**
 `def save(%User{email: nil}), do: {:error, ...}` scattered across 10 clauses becomes a
 validation maze. Validate once upstream with `with`, then call a clean `save/1`.
+
+---
+
+## Reflection
+
+- Product asks you to add an **audit trail** (log every transition, valid or invalid). Where does the logging go — inside each clause, wrapped around `transition/2`, or in `run/2`? Which choice keeps the clauses readable?
+- Your state machine now has 40 transitions loaded from a config file. Multi-clause functions stop scaling (clauses must be literal at compile time). Would you switch to a lookup `Map`, a `:gen_statem`, or a hybrid? What does each cost you?
 
 ---
 

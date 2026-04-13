@@ -2,16 +2,13 @@
 
 **Project**: `sharded_workers` — `PartitionSupervisor` + `:erlang.phash2/2` sharding for per-shard isolation with deliberate cross-shard operations.
 
-**Difficulty**: ★★★★☆
-**Estimated time**: 4–6 hours
-
 ---
 
 ## Project context
 
 You maintain a real-time leaderboard service for a mobile game. Each match belongs to a `match_id`; players submit score updates every 2 s during the match; at match end, you compute final rankings and emit an event. Single-process approach fell over at 3 000 concurrent matches because the one `LeaderboardServer` GenServer mailbox routinely hit 10 000 messages.
 
-Your first refactor was to use `PartitionSupervisor` (exercise 07) with 16 partitions keyed by `match_id`. Latency dropped 40×. But two new requirements emerged:
+Your first refactor was to use `PartitionSupervisor` with 16 partitions keyed by `match_id`. Latency dropped 40×. But two new requirements emerged:
 
 1. **Global top-K across all matches** — the home screen shows the top 100 players across every active match. This REQUIRES cross-shard aggregation.
 2. **Match migration** — when a match ends, its state must be drained and persisted. A shard shouldn't accumulate dead matches forever.
@@ -41,6 +38,16 @@ sharded_workers/
 `PartitionSupervisor` with `{:via, PartitionSupervisor, {name, key}}` internally does `:erlang.phash2(key, n)`. For single-key ops (read/write one match), that's all you need.
 
 But for cross-shard aggregation, you want to iterate **every partition index deterministically**, NOT to hash keys. For that you call `PartitionSupervisor.which_children/1` OR directly address by partition index:
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
 
 ```elixir
 # Option A: iterate by index
@@ -113,9 +120,25 @@ end
 
 ---
 
+## Design decisions
+
+**Option A — single `GenServer` with a big map keyed by `match_id`**
+- Pros: simple; one mailbox to reason about; zero sharding logic.
+- Cons: the mailbox becomes the bottleneck at scale; one long write stalls every other match.
+
+**Option B — `PartitionSupervisor` with per-shard GenServer + cross-shard aggregator** (chosen)
+- Pros: per-match ops isolated; throughput scales with partition count; aggregator is an explicit O(N) step you can cache.
+- Cons: cross-shard queries cost more than single-key ops; rebalancing requires draining and restart.
+
+→ Chose **B** because the workload is 95% per-match ops and the aggregation is opt-in.
+
+---
+
 ## Implementation
 
 ### Step 1: Application
+
+**Objective**: Define the OTP application and wire the supervision tree.
 
 ```elixir
 # lib/sharded_workers/application.ex
@@ -141,6 +164,8 @@ end
 ```
 
 ### Step 2: Per-shard GenServer
+
+**Objective**: Implement Per-shard GenServer.
 
 ```elixir
 # lib/sharded_workers/shard.ex
@@ -218,6 +243,8 @@ end
 
 ### Step 3: Public API — sharded and cross-shard
 
+**Objective**: Build the public api layer: sharded and cross-shard.
+
 ```elixir
 # lib/sharded_workers/leaderboard.ex
 defmodule ShardedWorkers.Leaderboard do
@@ -289,6 +316,8 @@ end
 
 ### Step 4: Tests
 
+**Objective**: Add tests that cover the expected behavior and edge cases.
+
 ```elixir
 # test/sharded_workers/leaderboard_test.exs
 defmodule ShardedWorkers.LeaderboardTest do
@@ -302,43 +331,45 @@ defmodule ShardedWorkers.LeaderboardTest do
     :ok
   end
 
-  test "records and retrieves per-match top-k" do
-    Leaderboard.record("m-1", "alice", 100)
-    Leaderboard.record("m-1", "bob", 80)
-    Leaderboard.record("m-1", "charlie", 120)
+  describe "ShardedWorkers.Leaderboard" do
+    test "records and retrieves per-match top-k" do
+      Leaderboard.record("m-1", "alice", 100)
+      Leaderboard.record("m-1", "bob", 80)
+      Leaderboard.record("m-1", "charlie", 120)
 
-    assert [{"charlie", 120}, {"alice", 100}] = Leaderboard.top_k_match("m-1", 2)
-  end
-
-  test "global top-k aggregates across shards" do
-    # Spread across 50 matches → likely lands on all 16 shards.
-    for i <- 1..50 do
-      Leaderboard.record("m-#{i}", "player-#{i}", i * 10)
+      assert [{"charlie", 120}, {"alice", 100}] = Leaderboard.top_k_match("m-1", 2)
     end
 
-    top3 = Leaderboard.top_k_global(3)
-    assert length(top3) == 3
-    assert [{"player-50", 500}, {"player-49", 490}, {"player-48", 480}] = top3
-  end
+    test "global top-k aggregates across shards" do
+      # Spread across 50 matches → likely lands on all 16 shards.
+      for i <- 1..50 do
+        Leaderboard.record("m-#{i}", "player-#{i}", i * 10)
+      end
 
-  test "drop removes a match from its shard" do
-    Leaderboard.record("m-42", "alice", 999)
-    Leaderboard.drop_match("m-42")
-    assert [] = Leaderboard.top_k_match("m-42", 10)
-  end
-
-  test "shard_load distributes matches across shards" do
-    for i <- 1..64 do
-      Leaderboard.record("m-#{i}", "p", i)
+      top3 = Leaderboard.top_k_global(3)
+      assert length(top3) == 3
+      assert [{"player-50", 500}, {"player-49", 490}, {"player-48", 480}] = top3
     end
 
-    load = Leaderboard.shard_load()
-    total = Enum.sum(Enum.map(load, fn {_, n} -> n end))
-    assert total == 64
-    # Not ALL shards will have matches (64 across 16 is ~4/shard, variance is real),
-    # but most should.
-    populated = Enum.count(load, fn {_, n} -> n > 0 end)
-    assert populated >= 10
+    test "drop removes a match from its shard" do
+      Leaderboard.record("m-42", "alice", 999)
+      Leaderboard.drop_match("m-42")
+      assert [] = Leaderboard.top_k_match("m-42", 10)
+    end
+
+    test "shard_load distributes matches across shards" do
+      for i <- 1..64 do
+        Leaderboard.record("m-#{i}", "p", i)
+      end
+
+      load = Leaderboard.shard_load()
+      total = Enum.sum(Enum.map(load, fn {_, n} -> n end))
+      assert total == 64
+      # Not ALL shards will have matches (64 across 16 is ~4/shard, variance is real),
+      # but most should.
+      populated = Enum.count(load, fn {_, n} -> n > 0 end)
+      assert populated >= 10
+    end
   end
 end
 ```
@@ -348,25 +379,48 @@ end
 defmodule ShardedWorkers.ShardingTest do
   use ExUnit.Case, async: true
 
-  test "same key always lands on the same shard" do
-    p1 = GenServer.whereis({:via, PartitionSupervisor, {ShardedWorkers.Shards, "match-x"}})
-    p2 = GenServer.whereis({:via, PartitionSupervisor, {ShardedWorkers.Shards, "match-x"}})
-    assert p1 == p2
-  end
+  describe "ShardedWorkers.Sharding" do
+    test "same key always lands on the same shard" do
+      p1 = GenServer.whereis({:via, PartitionSupervisor, {ShardedWorkers.Shards, "match-x"}})
+      p2 = GenServer.whereis({:via, PartitionSupervisor, {ShardedWorkers.Shards, "match-x"}})
+      assert p1 == p2
+    end
 
-  test "phash2 distribution across 1000 synthetic keys is roughly uniform" do
-    counts =
-      for i <- 1..1_000 do
-        :erlang.phash2("match-#{i}", 16)
-      end
-      |> Enum.frequencies()
+    test "phash2 distribution across 1000 synthetic keys is roughly uniform" do
+      counts =
+        for i <- 1..1_000 do
+          :erlang.phash2("match-#{i}", 16)
+        end
+        |> Enum.frequencies()
 
-    # No shard should own more than 2× the mean (62.5)
-    max_count = counts |> Map.values() |> Enum.max()
-    assert max_count < 125
+      # No shard should own more than 2× the mean (62.5)
+      max_count = counts |> Map.values() |> Enum.max()
+      assert max_count < 125
+    end
   end
 end
 ```
+
+### Why this works
+
+Per-match ops hash to a single shard, so the concurrent workload fans out to N GenServers with independent mailboxes. Cross-shard aggregation is expressed as an explicit fan-out + merge step instead of being hidden inside a single process, so its cost is visible and cacheable. Pruning each shard to its top-K before merging keeps the merge cost linear in K × N, not in total state.
+
+---
+
+## Advanced Considerations: Partitioned Supervisors and Custom Restart Strategies
+
+A standard Supervisor is a single process managing a static tree. For thousands of children, a single supervisor becomes a bottleneck: all supervisor callbacks run on one process, and supervisor restart logic is sequential. PartitionSupervisor (OTP 25+) spawns N independent supervisors, each managing a subset of children. Hashing the child ID determines which partition supervises it, distributing load and enabling horizontal scaling.
+
+Custom restart strategies (via `Supervisor.init/2` callback) allow logic beyond the defaults. A strategy might prioritize restarting dependent services in a specific order, or apply backoff based on restart frequency. The downside is complexity: custom logic is harder to test and reason about, and mistakes cascade. Start with defaults and profile before adding custom behavior.
+
+Selective restart via `:rest_for_one` or `:one_for_all` affects failure isolation. `:one_for_all` restarts all children when one fails (simulating a total system failure), which can be necessary for consistency but is expensive. `:rest_for_one` restarts the failed child and any started after it, balancing isolation and dependencies. Understanding which strategy fits your architecture prevents cascading failures and unnecessary restarts.
+
+---
+
+
+## Deep Dive: Property Patterns and Production Implications
+
+Property-based testing inverts the testing mindset: instead of writing examples, you state invariants (properties) and let a generator find counterexamples. StreamData's shrinking capability is its superpower—when a property fails on a 10,000-element list, the framework reduces it to the minimal list that still fails, cutting debugging time from hours to minutes. The trade-off is that properties require rigorous thinking about domain constraints, and not every invariant is worth expressing as a property. Teams that adopt property testing often find bugs in specifications themselves, not just implementations.
 
 ---
 
@@ -390,7 +444,7 @@ end
 
 ---
 
-## Performance notes
+## Benchmark
 
 With 16 partitions on an 8-core machine:
 
@@ -404,6 +458,15 @@ Measure via `:timer.tc/1`:
 {t_us, _} = :timer.tc(fn -> ShardedWorkers.Leaderboard.top_k_global(100) end)
 IO.puts("top_k_global: #{t_us} µs")
 ```
+
+Target: per-match p99 ≤ 1 ms with 16 partitions; cross-shard top-K ≤ 5 ms for 16 shards.
+
+---
+
+## Reflection
+
+1. If your cross-shard aggregation grows to 30% of total operations, at what partition count does the aggregator itself become the bottleneck? What telemetry distinguishes "aggregator slow because of shard count" from "aggregator slow because shards are busy"?
+2. You must double the partition count from 16 to 32. Design a migration that preserves in-flight match state without requiring a maintenance window. Which assumptions does your plan make about the underlying durability layer?
 
 ---
 

@@ -32,6 +32,15 @@ zip_timelines/
 
 ---
 
+### Dependencies (`mix.exs`)
+
+```elixir
+def deps do
+  {empty},
+  {exunit},
+  {ok},
+end
+```
 ## Core concepts
 
 ### 1. `Stream.zip/2` halts at the shortest source
@@ -90,12 +99,18 @@ used by external sort.
 
 ### Step 1: Create the project
 
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
+
 ```bash
 mix new zip_timelines
 cd zip_timelines
 ```
 
 ### Step 2: `lib/zip_timelines.ex`
+
+**Objective**: Implement `zip_timelines.ex` — the lazy operator whose resource and memory profile only becomes visible when the stream is actually run.
+
 
 ```elixir
 defmodule ZipTimelines do
@@ -194,6 +209,9 @@ end
 
 ### Step 3: `test/zip_timelines_test.exs`
 
+**Objective**: Write `zip_timelines_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+
 ```elixir
 defmodule ZipTimelinesTest do
   use ExUnit.Case, async: true
@@ -258,6 +276,9 @@ end
 
 ### Step 4: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -269,6 +290,14 @@ mix test
 ---
 
 <!-- benchmark N/A: performance dominated by source IO patterns, not the merge itself -->
+
+
+## Key Concepts: Combining Multiple Streams
+
+`Stream.zip/1` combines multiple streams element-wise, stopping when the shortest is exhausted. Useful for processing related sequences in lockstep (e.g., timestamps and events, X and Y coordinates).
+
+Example: `Stream.zip([times, events]) |> Enum.map(fn {time, event} -> {time, event, process(event)} end)`. Gotcha: `zip` stops at the shortest stream—if you need to pad missing values, use `Stream.zip_with/2` or compose with `Stream.concat`.
+
 
 ## Trade-offs and production gotchas
 
@@ -328,3 +357,20 @@ accessor.
 - [Wikipedia — k-way merge](https://en.wikipedia.org/wiki/K-way_merge_algorithm) — the algorithm behind `merge_by_time/1`
 - [`:gb_trees` — Erlang docs](https://www.erlang.org/doc/man/gb_trees.html) — priority-queue-like structure for scaling the merge to many sources
 - Saša Jurić — *Elixir in Action*, section on composing lazy enumerables
+
+
+## Deep Dive
+
+Streams are lazy, composable data pipelines that process one element at a time without materializing intermediate collections. This is fundamentally different from Enum, which materializes the entire dataset before the next operation.
+
+**Lazy evaluation semantics:**
+Stream operations return a `%Stream{}` struct containing a function. The actual computation is deferred until consumed by a terminal operation (`.run()`, `Enum.to_list()`, etc.). This allows streams to:
+- Chain indefinite sequences (e.g., `Stream.iterate(0, &(&1 + 1))`)
+- Transform without memory bloat (e.g., processing multi-gigabyte files)
+- Compose reusable pipelines as first-class values
+
+**Resource lifecycle in streams:**
+Streams wrapping resources (`Stream.resource/3`) must define cleanup functions. A stream created from a file remains "open" (in terms of the lambda) until the consumer finishes or errors. If the consumer crashes or stops early, the cleanup function still runs — critical for proper file/socket/port management.
+
+**Backpressure and demand:**
+Unlike streams in other languages, Elixir's synchronous streams don't inherently implement backpressure. Backpressure is demand-based: the consumer pulls data at its own pace. `GenStage` and `Flow` add explicit backpressure — the producer waits for the consumer to request more elements. This is why benchmarking matters: a naive stream consumer can overwhelm memory if the pipeline produces faster than it consumes.

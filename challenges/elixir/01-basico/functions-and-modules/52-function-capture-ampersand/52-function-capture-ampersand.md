@@ -2,9 +2,6 @@
 
 **Project**: `pipeline_composer` — a tiny stage composer that treats functions as first-class references
 
-**Difficulty**: ★☆☆☆☆
-**Estimated time**: 1–2 hours
-
 ---
 
 ## Project structure
@@ -68,9 +65,54 @@ you can reorder, skip, or inject stages without editing the call site.
 
 ---
 
+## Why capture and not full `fn`
+
+- `fn x -> Mod.fun(x) end` works but adds visual noise — each named-function reference becomes three tokens instead of one.
+- Capture preserves arity in the syntax (`&Mod.fun/1`), so mismatches fail at compile time instead of silently closing over the wrong arity.
+- Anonymous `fn` is still the right tool for multi-line bodies or pattern matching on arguments — capture is the **named-function shortcut**, not a replacement.
+
+---
+
+## Design decisions
+
+**Option A — hardcoded pipe chain**
+- Pros: zero abstraction, trivially readable for a fixed pipeline.
+- Cons: reorder, skip, or inject a stage means editing the call site.
+
+**Option B — list of captured functions fed into `Enum.reduce`** (chosen)
+- Pros: pipeline shape is data; stages can be reordered or filtered at runtime; easy to test one stage in isolation.
+- Cons: one extra indirection; a typo in the stage list only fails when the pipeline runs.
+
+→ Chose **B** because the whole point of the exercise is treating functions as first-class values. A hardcoded `|>` chain would defeat the lesson.
+
+---
+
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  # No runtime deps — stdlib only.
+  []
+end
+```
+
+
 ### Step 1 — Create the project
+
+**Objective**: Split stages from the pipeline runner so captured function references, not lexical imports, define the order of execution.
 
 ```bash
 mix new pipeline_composer
@@ -78,6 +120,8 @@ cd pipeline_composer
 ```
 
 ### Step 2 — `lib/pipeline_composer/stages.ex`
+
+**Objective**: Keep stages as named unary functions so `&Module.fun/1` captures yield stable, serializable references — unlike anonymous closures.
 
 ```elixir
 defmodule PipelineComposer.Stages do
@@ -101,6 +145,8 @@ end
 
 ### Step 3 — `lib/pipeline_composer/pipeline.ex`
 
+**Objective**: Run `Enum.reduce/3` over a list of captures so the pipeline is data: stages can be reordered, mocked, or persisted without recompiling.
+
 ```elixir
 defmodule PipelineComposer.Pipeline do
   @moduledoc """
@@ -121,6 +167,8 @@ end
 ```
 
 ### Step 4 — `test/pipeline_composer_test.exs`
+
+**Objective**: Test the pipeline with captured anonymous and named functions mixed, proving both capture forms satisfy the same call contract.
 
 ```elixir
 defmodule PipelineComposerTest do
@@ -158,11 +206,66 @@ end
 
 ### Step 5 — Run the tests
 
+**Objective**: Run the suite to confirm captured stages keep their arity invariant; an arity mismatch is the one error capture cannot catch at compile.
+
 ```bash
 mix test
 ```
 
 All 4 tests should pass.
+
+### Why this works
+
+`Enum.reduce/3` is the minimal primitive that threads an accumulator through a list — which is exactly the shape of a pipeline. Because every stage is a `fun/1`, the reducer doesn't need to know anything about the domain; it just calls `stage.(acc)`. Capture syntax keeps the stage list dense and arity-checked, and `is_list(stages)` guarantees the caller passed a composable collection rather than a single function.
+
+---
+
+
+
+---
+## Key Concepts
+
+### 1. The Ampersand `&` Captures Functions as Values
+
+```elixir
+add = &+/2
+add.(1, 2)  # 3
+```
+
+The ampersand syntax `&function/arity` creates a closure capturing that function. This is powerful for passing functions to higher-order functions like `Enum.map(&String.upcase/1)`.
+
+### 2. Shorthand with `&` and Placeholders
+
+```elixir
+Enum.map([1, 2, 3], &(&1 * 2))
+```
+
+The `&(...)` syntax with `&1`, `&2` placeholders is shorthand for an anonymous function. `&(&1 * 2)` is equivalent to `fn x -> x * 2 end`.
+
+### 3. Module Functions vs Anonymous Functions
+
+Captured module functions are slightly more efficient than anonymous functions because they don't close over variables. For performance-sensitive code, prefer capturing: `Enum.map(list, &String.upcase/1)` over `Enum.map(list, fn x -> String.upcase(x) end)`.
+
+---
+## Benchmark
+
+```elixir
+# bench/capture_vs_fn.exs
+stages_capture = [&String.trim/1, &String.downcase/1, &(&1 <> "!")]
+stages_fn = [fn s -> String.trim(s) end, fn s -> String.downcase(s) end, fn s -> s <> "!" end]
+
+{t_cap, _} = :timer.tc(fn ->
+  Enum.each(1..100_000, fn _ -> PipelineComposer.Pipeline.run("  Hi  ", stages_capture) end)
+end)
+
+{t_fn, _} = :timer.tc(fn ->
+  Enum.each(1..100_000, fn _ -> PipelineComposer.Pipeline.run("  Hi  ", stages_fn) end)
+end)
+
+IO.puts("capture: #{t_cap} µs   fn: #{t_fn} µs")
+```
+
+Target: both forms within ~5% of each other (< 1 µs per run on modern hardware). Capture is pure syntax sugar — there should be no runtime difference.
 
 ---
 
@@ -204,6 +307,13 @@ helper or capture inside the module.
 **5. Capturing in a hot loop**
 Every `&Mod.fun/1` inside a hot `Enum.map` allocates a function value. If the loop runs
 millions of iterations, capture once outside the loop and reuse the reference.
+
+---
+
+## Reflection
+
+- If your pipeline needs to branch (stage C runs only when stage B returns `{:ok, _}`), is a flat list of captures still the right shape, or does it become a glorified `case`? How would you redesign it?
+- You want to trace every stage (log input/output) without modifying `Stages`. How do you wrap each captured function in the list? What does the capture syntax force you to give up?
 
 ---
 

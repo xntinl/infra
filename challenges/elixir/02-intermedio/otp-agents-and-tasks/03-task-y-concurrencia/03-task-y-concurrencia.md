@@ -68,15 +68,14 @@ result = Task.await(task, 5_000)
 
 Default timeout is 5 seconds. A timeout in `await` does **not** kill the
 task — the task keeps running, now orphaned. Use `Task.shutdown/2` if you
-need to actually cancel work past the deadline (exercise 54).
+need to actually cancel work past the deadline.
 
 ### 3. Parallelism is bounded by the scheduler, not by your input
 
 `Task.async` does not limit fan-out. If you map over 10_000 URLs, you
 will spawn 10_000 tasks. For CPU-bound work that's wasteful; for I/O
 with external rate limits it's often a self-DDoS. For bounded
-concurrency, use `Task.async_stream` (exercise 51) or a pool
-(exercise 55).
+concurrency, use `Task.async_stream` or a pool.
 
 ### 4. Pattern: map → async → await_many
 
@@ -107,18 +106,24 @@ shut down.
 
 ## Implementation
 
-### Dependencies (`mix.exs`)
+### Dependencies (mix.exs)
 
 ```elixir
 defp deps do
   [
-    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+    # Standard library: no external dependencies required
+    {:"ecto", "~> 1.0"},
   ]
 end
 ```
 
 
+
+
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
 
 ```bash
 mix new parallel_scraper
@@ -126,6 +131,9 @@ cd parallel_scraper
 ```
 
 ### Step 2: `lib/parallel_scraper.ex`
+
+**Objective**: Implement `parallel_scraper.ex` — the concurrency primitive whose back-pressure, linking, and timeout semantics we are isolating.
+
 
 ```elixir
 defmodule ParallelScraper do
@@ -181,6 +189,9 @@ end
 
 ### Step 3: `test/parallel_scraper_test.exs`
 
+**Objective**: Write `parallel_scraper_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+
 ```elixir
 defmodule ParallelScraperTest do
   use ExUnit.Case, async: true
@@ -227,6 +238,9 @@ end
 
 ### Step 4: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -238,6 +252,15 @@ mix test
 The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
 
 
+
+## Deep Dive: Task Spawn vs GenServer for Ephemeral Work
+
+A Task is lightweight `spawn/1` for bounded, self-contained work: compute, return, exit. Unlike GenServer (which receives messages indefinitely), Task is inherently ephemeral. This shapes everything: no callbacks, no state management, no back-pressure.
+
+Advantages: simplicity (few lines vs GenServer boilerplate). Disadvantages: no explicit state or message handling—Tasks assume pure computation or simple I/O. If you need a long-lived process responding to external events, you've outgrown Task.
+
+For CPU-bound work (calculations, parsing), Task.Supervisor with `:temporary` is ideal: spawn tasks, let them exit, don't restart. For coordinated async work (multiple tasks handing off results), GenServer + worker tasks often clarifies intent despite more boilerplate. Measure first: if code clarity improves with GenServer, the overhead is justified.
+
 ## Benchmark
 
 <!-- benchmark N/A: tema conceptual -->
@@ -247,20 +270,20 @@ The design leans on OTP primitives that already encode the invariants we care ab
 **1. `Task.async` is linked — a crash in one task crashes your caller**
 If you map 100 tasks and one of them raises, the caller dies too. For
 work where a single failure shouldn't abort the batch, use
-`Task.Supervisor.async_nolink` (exercise 52) or `Task.async_stream` with
+`Task.Supervisor.async_nolink` or `Task.async_stream` with
 `on_timeout: :kill_task`.
 
 **2. `Task.await` timeout does NOT cancel the task**
 A 5-second `await` that times out leaves the task running. In a request
 handler, that's a leak — you returned an error to the user but the work
-continues. Use `Task.shutdown(task, :brutal_kill)` (exercise 54) or
+continues. Use `Task.shutdown(task, :brutal_kill)` or
 switch to `yield_many`/`async_stream`.
 
 **3. Unbounded fan-out is a foot-gun**
 `urls |> Enum.map(&Task.async/1)` for 10_000 URLs spawns 10_000
 processes. Your target API will probably rate-limit or outright reject
-you. Use `Task.async_stream(max_concurrency: N)` (exercise 51) or a
-bounded pool (exercise 55) whenever the input size isn't small and fixed.
+you. Use `Task.async_stream(max_concurrency: N)` or a
+bounded pool whenever the input size isn't small and fixed.
 
 **4. Ownership is not transferable**
 Only the process that called `Task.async` can `Task.await`. Passing a
@@ -271,11 +294,11 @@ its owner, use `Task.Supervisor.async_nolink` or a full GenServer.
 **5. `await_many` has batch-level failure semantics**
 If one task raises, `Task.await_many` shuts down the rest and re-raises.
 That's the right default for "all or nothing" batches. For "give me
-what's ready by the deadline", use `Task.yield_many` (exercise 53).
+what's ready by the deadline", use `Task.yield_many`.
 
 **6. When NOT to use `Task.async`**
 - Fire-and-forget work where you don't want a link to the caller →
-  `Task.Supervisor.start_child` (exercise 52).
+  `Task.Supervisor.start_child`.
 - Long-running background jobs — these should be supervised named
   processes, not `Task`s.
 - CPU-bound work exceeding `System.schedulers_online/0` parallelism —

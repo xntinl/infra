@@ -113,9 +113,24 @@ version, and rely on.
 
 ---
 
+### Dependencies (`mix.exs`)
+
+```elixir
+def deps do
+  [
+    {benchee},
+    {exunit},
+    {iex},
+    {iexhelpersdemo},
+  ]
+end
+```
 ## Implementation
 
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
 
 ```bash
 mix new iex_helpers_demo
@@ -123,6 +138,9 @@ cd iex_helpers_demo
 ```
 
 ### Step 2: The helpers module — `lib/iex_helpers_demo/shell.ex`
+
+**Objective**: Provide The helpers module — `lib/iex_helpers_demo/shell.ex` — these are the supporting fixtures the main module depends on to make its concept demonstrable.
+
 
 ```elixir
 defmodule IExHelpersDemo.Shell do
@@ -184,6 +202,9 @@ end
 
 ### Step 3: `lib/iex_helpers_demo.ex` — trivial library code
 
+**Objective**: Edit `iex_helpers_demo.ex` — trivial library code, exposing code whose shape is chosen to exercise the tool's capabilities, not to solve a domain problem.
+
+
 ```elixir
 defmodule IExHelpersDemo do
   @moduledoc "Demo library — see `IExHelpersDemo.Shell` for the actual content."
@@ -195,6 +216,9 @@ end
 ```
 
 ### Step 4: `.iex.exs`
+
+**Objective**: Implement `.iex.exs` — code whose shape is chosen to exercise the tool's capabilities, not to solve a domain problem.
+
 
 ```elixir
 # Loaded automatically by `iex -S mix`. This is plain Elixir.
@@ -211,6 +235,9 @@ alias IExHelpersDemo, as: Demo
 ```
 
 ### Step 5: `test/shell_test.exs`
+
+**Objective**: Write `shell_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
 
 ```elixir
 defmodule IExHelpersDemo.ShellTest do
@@ -248,6 +275,9 @@ end
 ```
 
 ### Step 6: Explore
+
+**Objective**: Explore.
+
 
 ```bash
 iex -S mix
@@ -342,3 +372,20 @@ minimal (imports, aliases, banner) and put logic in testable modules.
 - [`IEx` overview](https://hexdocs.pm/iex/IEx.html) — configuration, `.iex.exs`, history
 - ["The `.iex.exs` file"](https://hexdocs.pm/iex/IEx.html#module-the-iex-exs-file) — loading order and examples
 - [`:recon`](https://hexdocs.pm/recon/) — production-grade analog of `top/1` for live-node diagnostics
+
+
+## Deep Dive
+
+Elixir's tooling ecosystem extends beyond the language into DevOps, profiling, and observability. Understanding each tool's role prevents misuse and false optimizations.
+
+**Mix tasks and releases:**
+Custom mix tasks (`mix myapp.setup`, `mix myapp.migrate`) encapsulate operational knowledge. Tasks run in the host environment (not the compiled app), so they're ideal for setup, teardown, or scripting. Releases, built with `mix release`, create self-contained OTP applications deployable without Elixir installed. They're immutable: no source code changes after release — all config comes from environment variables or runtime files.
+
+**Debugging and profiling tools:**
+- `:observer` (GUI): real-time process tree, metrics, and port inspection
+- `Recon`: production-safe introspection (stable even under high load)
+- `:eprof`: function-level timing; lower overhead than `:fprof`
+- `:fprof`: detailed trace analysis; use only in staging
+
+**Profiling approaches:**
+Ceiling profiling (e.g., "which modules consume CPU?") is cheap; go there first with `perf` or `eprof`. Floor profiling (e.g., "which lines in this function are slow?") is expensive; reserve for specific functions. In production, prefer metrics (Prometheus, New Relic) over profiling — continuous profiling has overhead. Store profiling data for post-mortem analysis, not real-time dashboards.

@@ -90,7 +90,21 @@ If the safe version always succeeds, the `{:ok, _}` wrapping is noise — return
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"jason", "~> 1.0"},
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: scaffold a new Mix project and set up the directory layout for the exercise.
 
 ```bash
 mix new config_loader
@@ -99,6 +113,8 @@ mkdir -p config
 ```
 
 ### Step 2: `config/example.exs` — a sample config for tests
+
+**Objective**: provide a sample config file used as a fixture for the loader tests.
 
 ```elixir
 # This file is used by tests. It is a plain Elixir file evaluated by Code.eval_file/1.
@@ -110,6 +126,8 @@ mkdir -p config
 ```
 
 ### Step 3: `lib/config_loader.ex`
+
+**Objective**: implement config_loader — loads a config file and validates its shape.
 
 ```elixir
 defmodule ConfigLoader do
@@ -190,6 +208,8 @@ end
 
 ### Step 4: `test/config_loader_test.exs`
 
+**Objective**: cover config_loader_test with ExUnit tests for the public API and representative edge cases.
+
 ```elixir
 defmodule ConfigLoaderTest do
   use ExUnit.Case, async: true
@@ -242,6 +262,8 @@ end
 
 ### Step 5: Run tests
 
+**Objective**: run the test suite and confirm all tests pass.
+
 ```bash
 mix test
 ```
@@ -252,6 +274,19 @@ mix test
 
 ---
 
+
+## Key Concepts
+
+### 1. Bang Functions (`!`) Raise on Failure; Safe Functions Return `{:ok, value}` / `{:error, reason}`
+`File.read` returns error tuple. `File.read!` raises. Use bang functions when certain of success. Use safe functions when failure is possible.
+
+### 2. When to Use Bang Functions
+Use bang functions for configuration parsing and known-safe data. Use safe functions for user input, external systems, and file I/O.
+
+### 3. Wrap Bang Functions for Predictability
+In production code, wrap bang functions to handle errors without raising. This gives you flexibility without creating wrapper modules everywhere.
+
+---
 ## Benchmark
 
 Compare the two paths on the happy case to confirm the mirror pattern has no measurable cost:

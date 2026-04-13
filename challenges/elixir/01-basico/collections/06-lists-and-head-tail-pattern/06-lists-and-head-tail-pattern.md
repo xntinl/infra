@@ -80,6 +80,17 @@ Chose **B** because even a moderate-size markdown file (a few thousand lines) ex
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### `lib/md_lite.ex`
 
 ```elixir
@@ -375,6 +386,24 @@ mix test --trace
 
 ---
 
+
+
+---
+## Key Concepts
+
+### 1. Lists Are Singly Linked, Head-Prepended
+
+A list is a chain of cells: `[H | T]` where `H` is the head and `T` is the tail. Prepending is O(1), but appending is O(n). Always prepend to lists in loops. If you find yourself appending, use `Enum.reduce` to build the list in reverse, then `Enum.reverse/1`.
+
+### 2. Pattern Matching on Head/Tail is Idiomatic
+
+This pattern is fundamental—many Enum functions are built on it. Every recursive list function terminates with a base case for `[]`. If you forget it, you get a `FunctionClauseError`.
+
+### 3. O(n) vs O(1) Operations Matter at Scale
+
+In a real-time system processing 10,000 events/second, choosing between O(1) prepend and O(n) append determines whether you keep up. Always be aware of the cost of list operations.
+
+---
 ## Benchmark
 
 ```elixir

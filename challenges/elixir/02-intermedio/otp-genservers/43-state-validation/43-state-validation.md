@@ -113,12 +113,18 @@ end
 
 ### Step 1: Create the project
 
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
+
 ```bash
 mix new validated_state_gs
 cd validated_state_gs
 ```
 
 ### Step 2: `lib/validated_state_gs.ex`
+
+**Objective**: Implement `validated_state_gs.ex` — the GenServer callback shape that determines blocking vs fire-and-forget semantics and state invariants.
+
 
 ```elixir
 defmodule ValidatedStateGs do
@@ -229,6 +235,9 @@ end
 
 ### Step 3: `test/validated_state_gs_test.exs`
 
+**Objective**: Write `validated_state_gs_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+
 ```elixir
 defmodule ValidatedStateGsTest do
   use ExUnit.Case, async: true
@@ -299,6 +308,9 @@ end
 
 ### Step 4: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -308,6 +320,15 @@ mix test
 ### Why this works
 
 The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Deep Dive: State Invariants and Defensive Validation Boundaries
+
+State validation is not just runtime safety—it's a design contract. A GenServer that validates preconditions before mutation catches bugs in the handler, not hours later when a corrupted state causes silent logic errors downstream. The pattern is twofold: validate the message (does it make sense?), then validate the state transition (does the new state preserve our invariants?).
+
+Guards (`when is_integer(x)`) catch type mismatches at the function head, failing fast and clearly. Inline validation (`if state.count < 0`) catches semantic invariants. Both are needed: guards prevent type errors, validation prevents logical errors (e.g., account balance going negative). When validation fails, emit structured context—what was the bad state, what message triggered it—so debugging doesn't become guesswork.
+
+A critical insight: validation failure should be *rare*. If you're validating the same invariant repeatedly across many handlers, it suggests the state machine design has an edge case. Instead of adding more validations, refactor to prevent the invalid state from being reachable in the first place. This means thinking about state transitions globally: what invariants must hold at every state? Encode those in the state struct's types (e.g., `@type account :: %{balance: non_neg_integer}`), and validation becomes defensive, not exploratory.
 
 
 ## Benchmark

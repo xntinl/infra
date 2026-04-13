@@ -74,6 +74,18 @@ Without the pin, `var = something` rebinds `var` — the original value is lost,
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"ecto", "~> 1.0"},
+  ]
+end
+```
+
+
 ### `lib/pinned_event_dispatcher.ex`
 
 ```elixir
@@ -261,6 +273,24 @@ mix test
 
 The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
 
+
+
+---
+## Key Concepts
+
+### 1. The Pin Operator `^` Prevents Rebinding
+
+In pattern matching, a bare variable always binds. The pin operator `^x` says "use the value of `x`, don't rebind": `{^x, y} = {1, 2}` matches and binds `y`; `{^x, y} = {2, 2}` raises `MatchError`.
+
+### 2. Pin in Guards Ensures Consistency
+
+Guards can use pinned variables to enforce constraints. A common bug in list comprehensions: forgetting the pin when matching against a captured variable.
+
+### 3. Understanding the Difference
+
+Without the pin, `{x, y} = {2, 2}` rebinds `x = 2`. With the pin, `{^x, y} = {2, 2}` checks that `x` already equals `2`. The pin prevents silent rebinding bugs.
+
+---
 ## Benchmark
 
 ```elixir

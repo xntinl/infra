@@ -2,9 +2,6 @@
 
 **Project**: `custom_pipe` — implement `~>` (ok-bind) and `|~>` (maybe-pipe) operators using `defmacro`, mirroring the Haskell-ish `Result` and `Maybe` plumbing Elixir programmers rebuild by hand.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -35,6 +32,19 @@ custom_pipe/
 │   └── custom_pipe_test.exs
 └── mix.exs
 ```
+
+---
+
+## Why a custom operator and not `with/1`
+
+`with/1` es la respuesta canónica de Elixir para chainear
+`{:ok, _}`/`{:error, _}` y suele ser la elección correcta en código de
+aplicación. Un operador custom solo gana cuando el mismo patrón aparece
+docenas de veces en una **librería** donde la inversión de lectura
+amortiza. La otra razón válida es vocabulario: `~>` se lee como "bind
+on ok" a alguien ya fluido, mientras que `with` requiere una línea
+extra por paso. Este ejercicio construye el operador para que entiendas
+qué renunciás al elegirlo.
 
 ---
 
@@ -77,9 +87,41 @@ means the usual pipe spacing conventions work unchanged.
 
 ---
 
+## Design decisions
+
+**Option A — Implementar a mano "insertar como primer argumento"**
+- Pros: Control total sobre la expansión.
+- Cons: Divergencias sutiles con `|>`; reimplementa lo que la stdlib ya
+  ofrece.
+
+**Option B — Reusar `Macro.pipe/3`** (elegida)
+- Pros: Semántica idéntica a `|>`; la intuición del usuario transfiere;
+  una fuente menos de bugs.
+- Cons: Acopla con stdlib (trivial).
+
+→ Elegida **B** porque cualquier desviación de `|>` es una trampa —
+usuarios esperan que `a ~> f(b, c)` se comporte como
+`a |> f(b, c)` menos el short-circuit. `Macro.pipe/3` lo garantiza.
+
+---
+
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
 
 ```bash
 mix new custom_pipe
@@ -87,6 +129,9 @@ cd custom_pipe
 ```
 
 ### Step 2: `lib/custom_pipe.ex`
+
+**Objective**: Implement `custom_pipe.ex` — AST manipulation that runs at compile time — making the macro's hygiene and unquoting choices observable.
+
 
 ```elixir
 defmodule CustomPipe do
@@ -158,6 +203,9 @@ end
 
 ### Step 3: `test/custom_pipe_test.exs`
 
+**Objective**: Write `custom_pipe_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+
 ```elixir
 defmodule CustomPipeTest do
   use ExUnit.Case, async: true
@@ -218,6 +266,9 @@ end
 
 ### Step 4: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -230,6 +281,60 @@ iex> import CustomPipe
 iex> ast = quote do: {:ok, 1} ~> double()
 iex> Macro.expand(ast, __ENV__) |> Macro.to_string() |> IO.puts
 ```
+
+### Why this works
+
+Elixir parsea cualquier `a OP b` como `{:OP, _, [a, b]}`, así que
+definir un macro llamado `~>` o `|~>` intercepta esa forma de call.
+Cada macro emite un `case` que inspecciona `left` en runtime,
+short-circuita en el sentinel de error, y si no, reusa `Macro.pipe/3`
+para insertar el valor unwrap en la call del RHS — heredando la
+semántica de inserción de argumento de `|>` exactamente. Precedencia
+y asociatividad las fija el parser según el símbolo, matcheando `|>`.
+
+---
+
+
+## Deep Dive: State Management and Message Handling Patterns
+
+Understanding state transitions is central to reliable OTP systems. Every `handle_call` or `handle_cast` receives current state and returns new state—immutability forces explicit reasoning. This prevents entire classes of bugs: missing state updates are immediately visible.
+
+Key insight: separate pure logic (state → new state) from side effects (logging, external calls). Move pure logic to private helpers; use handlers for orchestration. This makes servers testable—test pure functions independently.
+
+In production, monitor state size and mutation frequency. Unbounded growth is a memory leak; excessive mutations signal hot spots needing optimization. Always profile before reaching for performance solutions like ETS.
+
+## Benchmark
+
+```elixir
+import CustomPipe
+
+value = {:ok, 2}
+double = fn n -> n * 2 end
+
+{direct, _} =
+  :timer.tc(fn ->
+    Enum.each(1..1_000_000, fn _ ->
+      case value do
+        {:ok, v} -> {:ok, double.(v)}
+        {:error, _} = e -> e
+      end
+    end)
+  end)
+
+{piped, _} =
+  :timer.tc(fn ->
+    Enum.each(1..1_000_000, fn _ ->
+      value ~> double.()
+    end)
+  end)
+
+IO.puts("direct case: #{direct}µs, ~>: #{piped}µs")
+```
+
+Target esperado: ambos caminos dentro de ~10% uno del otro (<1µs por
+operación); el macro expande al mismo case, así que cualquier
+diferencia mayor indica un problema en la expansión (por ej. doble
+evaluación del `left`).
 
 ---
 
@@ -269,6 +374,19 @@ with no extra vocabulary for readers. Custom operators earn their keep
 in library code where they appear dozens of times and the reader
 investment pays off. If you find yourself writing `~>` three times in
 one module, use `with` instead.
+
+---
+
+## Reflection
+
+- Un junior entra al proyecto y encuentra un archivo con `~>` cada tres
+  líneas. Dedica dos días a entender el código. ¿A partir de qué umbral
+  (número de usos, módulos, tamaño del equipo) revertís a `with/1`?
+  Formulá una regla concreta para code review.
+- El macro actual asume `{:ok, _}`/`{:error, _}`. Tu API necesita
+  soportar `{:error, code, meta}` (tres elementos). ¿Extendés el `case`
+  del macro, introducís un behaviour runtime, o forzás al caller a
+  normalizar antes? Justificá pensando en qué se rompe silenciosamente.
 
 ---
 

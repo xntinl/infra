@@ -90,7 +90,20 @@ of raising.
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Separate Guards module from Engine so defguard macro expansion is isolated from dispatch logic.
 
 ```bash
 mix new auth_policy
@@ -98,6 +111,8 @@ cd auth_policy
 ```
 
 ### Step 2: `mix.exs`
+
+**Objective**: Use stdlib only so defguard inline behavior is visible without external guards clouding the mechanism.
 
 ```elixir
 defmodule AuthPolicy.MixProject do
@@ -120,6 +135,8 @@ end
 ```
 
 ### Step 3: `lib/auth_policy/guards.ex`
+
+**Objective**: Define domain predicates via defguard so they inline at call site and restricted guard grammar is enforced.
 
 ```elixir
 defmodule AuthPolicy.Guards do
@@ -164,6 +181,8 @@ end
 ```
 
 ### Step 4: `lib/auth_policy/engine.ex`
+
+**Objective**: Put admin override first and a catch-all last so clause ordering encodes precedence and no input escapes with `FunctionClauseError`.
 
 ```elixir
 defmodule AuthPolicy.Engine do
@@ -268,6 +287,8 @@ end
   exactly why access was granted or denied. Audit logs love this pattern.
 
 ### Step 5: Tests
+
+**Objective**: Test the boundary values (18:00, Saturday) because guard comparisons are strict and off-by-one errors hide in the `<` vs `<=` choice.
 
 ```elixir
 # test/auth_policy/guards_test.exs
@@ -383,6 +404,8 @@ end
 
 ### Step 6: Run the tests
 
+**Objective**: Run with `--trace` so clause ordering is visible — a rule firing in the wrong order is the failure mode guards cannot warn about.
+
 ```bash
 mix test --trace
 ```
@@ -397,6 +420,28 @@ every auditor request. That is the catch-all earning its keep.
 
 The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
 
+
+
+---
+## Key Concepts
+
+### 1. Guards Are Compile-Time Predicates
+
+Guards like `when is_integer(x)` narrow which clause matches. They are NOT runtime conditionals. If no clause matches, you get a `FunctionClauseError`. Guards must be pure and deterministic.
+
+### 2. Define Custom Guards with `defguard`
+
+```elixir
+defguard is_positive(x) when is_number(x) and x > 0
+```
+
+Custom guards become inlinable predicates usable in multiple functions. This avoids repetition and makes intent clear.
+
+### 3. Guard Limitations Are Intentional
+
+Guards cannot call custom functions (except guards themselves). This restriction keeps pattern matching fast and predictable. If your logic is complex, use a separate clause or a helper function.
+
+---
 ## Benchmark
 
 ```elixir

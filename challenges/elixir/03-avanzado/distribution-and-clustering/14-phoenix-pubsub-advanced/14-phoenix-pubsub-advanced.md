@@ -121,12 +121,16 @@ Phoenix.PubSub emits `[:phoenix, :pubsub, :broadcast]` events. Attach a handler 
 
 ### Step 1: Create the project
 
+**Objective**: Bootstrap app so PG2/Redis pubsubs and dedup cache start in coordinated supervision tree."""
+
 ```bash
 mix new pubsub_advanced --sup
 cd pubsub_advanced
 ```
 
 ### Step 2: `mix.exs`
+
+**Objective**: Pin deps so dual-publish (PG2 + Redis) can be instrumented via telemetry hooks."""
 
 ```elixir
 defmodule PubsubAdvanced.MixProject do
@@ -152,6 +156,8 @@ end
 
 ### Step 3: `config/config.exs`
 
+**Objective**: Parameterize Redis URL and dedup TTL so runtime config can override without code changes."""
+
 ```elixir
 import Config
 
@@ -163,6 +169,8 @@ config :pubsub_advanced,
 ```
 
 ### Step 4: `lib/pubsub_advanced/application.ex`
+
+**Objective**: Start PG2 before Redis so local subscribers bind before cross-cluster messages arrive."""
 
 ```elixir
 defmodule PubsubAdvanced.Application do
@@ -192,6 +200,8 @@ end
 ```
 
 ### Step 5: `lib/pubsub_advanced/event.ex`
+
+**Objective**: Wrap payloads with 128-bit ID + origin_node so dedup survives dual-publish via both adapters."""
 
 ```elixir
 defmodule PubsubAdvanced.Event do
@@ -224,6 +234,8 @@ end
 ```
 
 ### Step 6: `lib/pubsub_advanced/dedup_cache.ex`
+
+**Objective**: Use ETS :set with TTL-based cleanup so seen?/1 is O(1) and permits concurrent reads without serialization."""
 
 ```elixir
 defmodule PubsubAdvanced.DedupCache do
@@ -275,6 +287,8 @@ end
 ```
 
 ### Step 7: `lib/pubsub_advanced/broker.ex`
+
+**Objective**: Dual-publish (PG2 + Redis) and gate via dedup so exactly-once delivery survives both adapters."""
 
 ```elixir
 defmodule PubsubAdvanced.Broker do
@@ -342,6 +356,8 @@ end
 
 ### Step 8: `lib/pubsub_advanced/telemetry.ex`
 
+**Objective**: Attach telemetry handlers so publish/dedup counts are collected in ETS for monitoring."""
+
 ```elixir
 defmodule PubsubAdvanced.Telemetry do
   @moduledoc "Aggregates broker telemetry into a simple ETS-backed histogram."
@@ -383,6 +399,8 @@ end
 
 ### Step 9: Tests
 
+**Objective**: Assert dedup determinism and dual-publish idempotency so refactors preserve exactly-once guarantees."""
+
 ```elixir
 # test/pubsub_advanced/broker_test.exs
 defmodule PubsubAdvanced.BrokerTest do
@@ -398,24 +416,26 @@ defmodule PubsubAdvanced.BrokerTest do
     :ok
   end
 
-  test "publish/3 returns an event with a stable id" do
-    event = Broker.publish(@topic, :created, %{id: 1})
-    assert %Event{id: id, type: :created, payload: %{id: 1}} = event
-    assert byte_size(id) == 32
-  end
+  describe "PubsubAdvanced.Broker" do
+    test "publish/3 returns an event with a stable id" do
+      event = Broker.publish(@topic, :created, %{id: 1})
+      assert %Event{id: id, type: :created, payload: %{id: 1}} = event
+      assert byte_size(id) == 32
+    end
 
-  test "subscriber receives the event via the PG2 adapter" do
-    :ok = Broker.subscribe(@topic)
-    event = Broker.publish(@topic, :updated, %{x: 42})
+    test "subscriber receives the event via the PG2 adapter" do
+      :ok = Broker.subscribe(@topic)
+      event = Broker.publish(@topic, :updated, %{x: 42})
 
-    assert_receive %Event{id: id, type: :updated}, 500
-    assert id == event.id
-  end
+      assert_receive %Event{id: id, type: :updated}, 500
+      assert id == event.id
+    end
 
-  test "handle_incoming/1 dedups the same id on second delivery" do
-    event = Event.new(@topic, :dup, %{})
-    assert Broker.handle_incoming(event) == :deliver
-    assert Broker.handle_incoming(event) == :drop
+    test "handle_incoming/1 dedups the same id on second delivery" do
+      event = Event.new(@topic, :dup, %{})
+      assert Broker.handle_incoming(event) == :deliver
+      assert Broker.handle_incoming(event) == :drop
+    end
   end
 end
 ```
@@ -432,16 +452,18 @@ defmodule PubsubAdvanced.DedupCacheTest do
     :ok
   end
 
-  test "first call returns false, second returns true" do
-    refute DedupCache.seen?("id_1")
-    assert DedupCache.seen?("id_1")
-  end
+  describe "PubsubAdvanced.DedupCache" do
+    test "first call returns false, second returns true" do
+      refute DedupCache.seen?("id_1")
+      assert DedupCache.seen?("id_1")
+    end
 
-  test "different ids do not collide" do
-    refute DedupCache.seen?("id_a")
-    refute DedupCache.seen?("id_b")
-    assert DedupCache.seen?("id_a")
-    assert DedupCache.seen?("id_b")
+    test "different ids do not collide" do
+      refute DedupCache.seen?("id_a")
+      refute DedupCache.seen?("id_b")
+      assert DedupCache.seen?("id_a")
+      assert DedupCache.seen?("id_b")
+    end
   end
 end
 ```
@@ -458,6 +480,24 @@ mix test
 ### Why this works
 
 The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
+
+## Deep Dive
+
+Distributed Erlang relies on a heartbeat mechanism (net_kernel tick) to detect node failure, but the network is fundamentally asynchronous—split-brain scenarios are inevitable. A partitioned cluster may have two sets of nodes, each believing the other is dead. Libraries like Horde and Phoenix.PubSub solve this with quorum-aware consensus, but they add latency and complexity. At scale, choose your consistency model explicitly: eventual consistency (via Redis PubSub) is faster but allows temporary divergence; strong consistency (via Horde DLM or distributed transactions) is slower but guarantees atomicity. For global registries, the order of operations matters—registering a process before its monitor is live creates race conditions. In multi-region setups, latency between nodes compounds these issues; consider regional clusters with a lightweight coordinator rather than a fully meshed topology.
+## Advanced Considerations
+
+Distributed Elixir systems require careful consideration of network partitions, consistent hashing for distributed state, and the interaction between clustering libraries and node discovery mechanisms. Network partitions are not rare edge cases; they happen regularly in cloud deployments due to maintenance windows and infrastructure issues. A system that works perfectly during local testing but fails under network partitions indicates insufficient failure handling throughout the codebase. Split-brain scenarios where multiple network partitions lead to different cluster views require explicit recovery mechanisms that are often business-specific and context-dependent.
+
+Horde and distributed registries provide eventual consistency guarantees, but "eventual" can mean minutes during network partitions. Applications must handle the case where the same name is registered on multiple nodes simultaneously without coordination. Consistent hashing for distributed services requires understanding rebalancing costs — a single node failure can cause significant key redistribution and thundering herd problems if not carefully managed. The cost of distributed consensus using algorithms like Raft is high; choose it only when consistency is more important than availability and can afford the performance cost.
+
+Global state replication across nodes creates synchronization challenges at scale. Choosing between replicating everywhere versus replicating to specific nodes affects both consistency latency and network bandwidth utilization fundamentally. Node monitoring and heartbeat mechanisms require careful timeout tuning — too aggressive and you get false positives during network hiccups; too conservative and you don't detect actual failures quickly enough for recovery. The EPMD (Erlang Port Mapper Daemon) is a critical component that can become a bottleneck in large clusters and requires careful capacity planning.
+
+
+## Deep Dive: Phoenix Patterns and Production Implications
+
+Phoenix's conn struct represents an HTTP request/response in flight, accumulating transformations through middleware and handler code. Testing a Phoenix endpoint end-to-end (not just the controller) catches middleware order bugs, header mismatches, and plug composition issues. The trade-off is that full integration tests are slower and harder to parallelize than unit tests. Production bugs in auth, CORS, or session handling are often due to middleware assumptions that live tests reveal.
+
+---
 
 ## Trade-offs and production gotchas
 
@@ -543,3 +583,13 @@ The dual-publish winner is almost always PG2 on LAN. Redis kicks in when disterl
 - [Chris McCord — "Building a versioned LiveView"](https://dashbit.co/blog) — fan-out patterns in production
 - [Redis Pub/Sub docs](https://redis.io/docs/latest/develop/interact/pubsub/) — semantics, SUBSCRIBE limits
 - [Dashbit — Phoenix.PubSub v2 release notes](https://dashbit.co/blog/phoenix-pubsub-2-0) — adapter architecture
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

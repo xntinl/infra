@@ -2,15 +2,22 @@
 
 **Project**: `escape_quoted` — pass complex data structures (maps with regex, structs, nested tuples) from compile time into generated code using `Macro.escape/1`, and learn why naive interpolation breaks.
 
-**Difficulty**: ★★★★☆
-**Estimated time**: 3–4 hours
-
 ---
 
 ## Project context
 
 You wrote a macro that reads a YAML config file at compile time and bakes the parsed
 map into the generated code. When you tried:
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
 
 ```elixir
 defmacro load_config(path) do
@@ -40,6 +47,12 @@ escape_quoted/
 │   └── escape_quoted_test.exs
 └── mix.exs
 ```
+
+---
+
+## Why quoted literals and not runtime terms
+
+A runtime term is computed on every call and opaque to the compiler. A quoted literal is a constant in the BEAM chunk, meaning the VM can share it across callers and the compiler can fold dependent expressions.
 
 ---
 
@@ -95,9 +108,25 @@ compiled before the macro runs. Watch for circular deps.
 
 ---
 
+## Design decisions
+
+**Option A — store data as Elixir terms and encode on demand**
+- Pros: flexibility; editable at runtime.
+- Cons: repeated work on the hot path; lose compile-time validation.
+
+**Option B — quote the term once and splice as a literal** (chosen)
+- Pros: zero runtime cost; compiler can constant-fold.
+- Cons: recompile to change; must be `Macro.escape`-safe.
+
+→ Chose **B** because the term is fixed at build time and reads hot.
+
+---
+
 ## Implementation
 
 ### Step 1: `lib/escape_quoted/config_loader.ex`
+
+**Objective**: Read JSON file at compile time via @external_resource and bake parsed map via Macro.escape into config/0.
 
 ```elixir
 defmodule EscapeQuoted.ConfigLoader do
@@ -123,6 +152,8 @@ end
 ```
 
 ### Step 2: `lib/escape_quoted/compile_catalog.ex`
+
+**Objective**: Embed Product structs with regex patterns via Macro.escape so complex nested terms round-trip correctly.
 
 ```elixir
 defmodule EscapeQuoted.CompileCatalog do
@@ -173,6 +204,8 @@ end
 
 ### Step 3: `lib/escape_quoted/regex_map.ex` — showing what fails
 
+**Objective**: Comment out bad_macro/0 to document failure mode; show good_macro using escape so contrast is studied.
+
 ```elixir
 defmodule EscapeQuoted.RegexMap do
   @moduledoc """
@@ -202,6 +235,8 @@ end
 
 ### Step 4: Sample consumers
 
+**Objective**: Use macros in client modules to confirm Macro.escape round-trip preserves struct and regex identity at runtime.
+
 ```elixir
 defmodule EscapeQuoted.Sample.Catalog do
   use EscapeQuoted.CompileCatalog
@@ -214,6 +249,8 @@ end
 ```
 
 ### Step 5: Tests
+
+**Objective**: Verify regexes still match and nested tuples survive escape so the literal truly equals the pre-escape value.
 
 ```elixir
 defmodule EscapeQuotedTest do
@@ -254,6 +291,27 @@ defmodule EscapeQuotedTest do
   end
 end
 ```
+
+### Why this works
+
+Inside a macro, `Macro.escape/1` turns any Elixir term into AST that reconstructs the term when unquoted. Splicing that AST into the emitted code produces a literal the compiler stores once per module and references by pointer.
+
+---
+
+## Advanced Considerations: Macro Hygiene and Compile-Time Validation
+
+Macros execute at compile time, walking the AST and returning new AST. That power is easy to abuse: a macro that generates variables can shadow outer scope bindings, or a quote block that references variables directly can fail if the macro is used in a context where those variables don't exist. The `unquote` mechanism is the escape hatch, but misusing it leads to hard-to-debug compile errors.
+
+Macro hygiene is about capturing intent correctly. A `defmacro` that takes `:my_option` and uses it directly might match an unrelated `:my_option` from the caller's scope. The idiomatic pattern is to use `unquote` for values that should be "from the outside" and keep AST nodes quoted for safety. The `quote` block's binding of `var!` and `binding!` provides escape valves for the rare case when shadowing is intentional.
+
+Compile-time validation unlocks errors that would otherwise surface at runtime. A macro can call functions to validate input, generate code conditionally, or fail the build with `IO.warn`. Schema libraries like `Ecto` and `Ash` use macros to define fields at compile time, so runtime queries are guaranteed type-safe. The cost is cognitive load: developers must reason about both the code as written and the code generated.
+
+---
+
+
+## Deep Dive: Metaprogramming Patterns and Production Implications
+
+Metaprogramming (macros, AST manipulation) requires testing at compile time and runtime. The challenge is that macro tests often involve parsing and expanding code, which couples tests to compiler internals. Production bugs in macros can corrupt entire modules; testing macros rigorously is non-negotiable.
 
 ---
 
@@ -303,6 +361,13 @@ Benchee.run(%{
 ```
 
 Expect ~5–20 ms for a 1k-entry map. Compile-time only.
+
+---
+
+## Reflection
+
+- If the data changes twice a day via a CMS, does quoting still win? At what change frequency does the recompile cost outweigh the runtime savings?
+- `Macro.escape/1` fails on functions and PIDs. Which shapes of data force you away from this pattern, and what is the fallback?
 
 ---
 

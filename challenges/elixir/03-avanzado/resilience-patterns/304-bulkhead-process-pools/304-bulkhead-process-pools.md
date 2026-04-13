@@ -66,6 +66,16 @@ UPS, FedEx, and regional each have their own `Bulkhead.Pool`. An exhausted UPS p
 
 ### Dependencies (`mix.exs`)
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
+
 ```elixir
 defmodule ShippingBulkheads.MixProject do
   use Mix.Project
@@ -83,6 +93,8 @@ end
 ```
 
 ### Step 1: Application
+
+**Objective**: Provision per-carrier bulkheads so exhaustion of one pool's slots doesn't delay sibling dependencies or drain the shared process heap.
 
 ```elixir
 defmodule ShippingBulkheads.Application do
@@ -102,6 +114,8 @@ end
 ```
 
 ### Step 2: Pool (`lib/shipping_bulkheads/bulkhead/pool.ex`)
+
+**Objective**: Use atomic :counters increment/decrement for fail-fast admission control so thousands of concurrent checkouts scale linearly without GenServer bottleneck.
 
 ```elixir
 defmodule ShippingBulkheads.Bulkhead.Pool do
@@ -163,6 +177,8 @@ end
 
 ### Step 3: Worker (`lib/shipping_bulkheads/bulkhead/worker.ex`)
 
+**Objective**: Wrap user function in try/rescue/catch/after so :after block guarantees counter release even if fun crashes, exits, or throws.
+
 ```elixir
 defmodule ShippingBulkheads.Bulkhead.Worker do
   use Task, restart: :temporary
@@ -187,6 +203,8 @@ end
 ```
 
 ### Step 4: Public API (`lib/shipping_bulkheads/bulkhead.ex`)
+
+**Objective**: Reject over-limit calls immediately and timeout hanging workers without orphaning pool slots or blocking the caller on queue depth.
 
 ```elixir
 defmodule ShippingBulkheads.Bulkhead do
@@ -301,6 +319,23 @@ Benchee.run(
 ```
 
 Expected: p99 < 50µs for trivial work. Pool overhead should dominate over the `:ok` function itself.
+
+## Advanced Considerations: Circuit Breakers and Bulkheads in Production
+
+A circuit breaker monitors downstream service health and rejects new requests when failures exceed a threshold, failing fast instead of queuing indefinitely. States: `:closed` (normal), `:open` (fast-fail), `:half_open` (testing recovery). A timeout-based pattern monitors; once requests succeed again, the circuit closes. Half-open tests with a single request; if it succeeds, all requests resume.
+
+Bulkheads isolate resource pools so one slow endpoint doesn't starve others. A GenServer pool with a bounded queue (e.g., `:queue.len(state) >= 100`) can return `{:error, :overloaded}` immediately, preventing queue buildup. Combined with exponential backoff on the client (caller retries with increasing delays), this creates a natural circuit breaker behavior without explicit state.
+
+Graceful degradation means serving stale data or reduced functionality when a service is slow. A cached value with a 5-minute TTL is acceptable for many reads; serve it if the live source is timing out. Feature flags allow disabling expensive operations at runtime. Cascading timeout windows (outer service times out after 5s, inner calls must complete in 3s) prevent unbounded waiting. The cost is complexity: tracking degradation modes, testing failure scenarios, and ensuring data consistency under partial failures.
+
+---
+
+
+## Deep Dive: Resilience Patterns and Production Implications
+
+Resilience patterns (circuit breakers, timeouts, retries) are easy to implement but hard to test. The insight is that resilience patterns must be tested under failure: timeouts matter only when calls actually take time, retries matter only when transient failures occur. Production systems with untested resilience patterns often fail gracefully in test and catastrophically in production.
+
+---
 
 ## Trade-offs and production gotchas
 

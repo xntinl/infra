@@ -140,7 +140,20 @@ Chose **B** because the problem IS cartesian product with filtering, which is ex
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Build minimal scaffold so catalog/pricing modules expose for comprehension as only tool for cartesian products.
 
 ```bash
 mix new grid_combo
@@ -148,6 +161,8 @@ cd grid_combo
 ```
 
 ### Step 2: `mix.exs`
+
+**Objective**: Use stdlib only so for comprehension is visible as language feature without dependency abstractions.
 
 ```elixir
 defmodule GridCombo.MixProject do
@@ -168,6 +183,8 @@ end
 ```
 
 ### Step 3: `lib/grid_combo/catalog.ex`
+
+**Objective**: Build multi-generator for with inline filters so cartesian product reads as set-builder, not nested flat_map.
 
 ```elixir
 defmodule GridCombo.Catalog do
@@ -231,6 +248,8 @@ end
 
 ### Step 4: `lib/grid_combo/pricing.ex`
 
+**Objective**: Use into: %{} in for so direct write to map avoids intermediate list and trailing Enum.into overhead.
+
 ```elixir
 defmodule GridCombo.Pricing do
   @moduledoc """
@@ -276,6 +295,8 @@ end
 ```
 
 ### Step 5: Tests
+
+**Objective**: Hardcode expected cartesian count (38 = 4×4×3 minus excluded) so adding rules without test updates fails loudly.
 
 ```elixir
 # test/grid_combo/catalog_test.exs
@@ -409,6 +430,8 @@ end
 
 ### Step 6: Run and verify
 
+**Objective**: Compile with warnings-as-errors to catch unused comprehension variables that usually signal a bad filter or generator shape.
+
 ```bash
 mix compile --warnings-as-errors
 mix test --trace
@@ -420,6 +443,19 @@ A `for` comprehension desugars to nested enumerations with filters short-circuit
 
 ---
 
+
+## Key Concepts
+
+### 1. Comprehensions Are Syntactic Sugar for `map` + `filter`
+The `<-` is the generator (iterate), the condition is the filter, `do` is the transformation. Comprehensions are often more readable than nested `map`/`filter` calls.
+
+### 2. Comprehensions Support Multiple Generators
+Multiple generators create a Cartesian product. This is powerful for generating all combinations.
+
+### 3. Comprehensions Return Collections
+Comprehensions build lists by default. With the `into: %{}` option, you build maps. This is cleaner than building a list and converting.
+
+---
 ## Benchmark
 
 ```elixir

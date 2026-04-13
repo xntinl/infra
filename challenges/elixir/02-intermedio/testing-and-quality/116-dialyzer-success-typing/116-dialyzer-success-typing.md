@@ -4,9 +4,6 @@
 type errors, wired up to Dialyxir so you can read real warnings and fix
 them one at a time.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -34,6 +31,16 @@ dialyzer_demo/
 │   └── test_helper.exs
 └── mix.exs
 ```
+
+---
+
+## Why Dialyzer and not TypeScript-style gradual typing
+
+Elixir es dinámicamente tipado por diseño. Dialyzer aplica *success
+typing*: solo marca código que **no puede ser correcto** para ningún
+input. Eso minimiza falsos positivos al costo de perder algunos bugs
+reales. Es la única opción compatible con código sin `@spec` y con
+las features dinámicas del lenguaje.
 
 ---
 
@@ -73,9 +80,38 @@ warning-free from day one.
 
 ---
 
+## Design decisions
+
+**Option A — Dialyzer solo localmente**
+- Pros: Sin costo en CI.
+- Cons: Warnings se acumulan; nadie los ve hasta que explotan.
+
+**Option B — Dialyzer en CI con PLT cacheado** (elegida)
+- Pros: Gate de calidad continuo; caché amortiza el costo.
+- Cons: Un job CI más.
+
+→ Elegida **B** porque el valor de Dialyzer depende de que no se
+acumulen warnings.
+
+---
+
+### Dependencies (`mix.exs`)
+
+```elixir
+def deps do
+  [
+    {dialyxir},
+    {exunit},
+    {no_warn},
+  ]
+end
+```
 ## Implementation
 
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
 
 ```bash
 mix new dialyzer_demo
@@ -107,6 +143,9 @@ end
 
 ### Step 2: `lib/billing.ex` — the clean version
 
+**Objective**: Edit `billing.ex` — the clean version, exposing the subject under test — shaped specifically to make the testing technique of this lab observable.
+
+
 ```elixir
 defmodule Billing do
   @moduledoc """
@@ -126,6 +165,9 @@ end
 ```
 
 ### Step 3: `lib/reports.ex` — the buggy version (fix as an exercise)
+
+**Objective**: Edit `reports.ex` — the buggy version (fix as an exercise), exposing the subject under test — shaped specifically to make the testing technique of this lab observable.
+
 
 ```elixir
 defmodule Reports do
@@ -172,6 +214,9 @@ sum = Billing.total_of(invoices)
 
 ### Step 4: `test/billing_test.exs`
 
+**Objective**: Write `billing_test.exs` exercising the exact ExUnit feature under study — assertions should fail loudly if the technique is misused.
+
+
 ```elixir
 defmodule BillingTest do
   use ExUnit.Case, async: true
@@ -208,6 +253,9 @@ end
 
 ### Step 5: Run and read the warnings
 
+**Objective**: Run and read the warnings.
+
+
 ```bash
 mix deps.get
 mix dialyzer  # first run takes minutes, builds the PLT
@@ -215,6 +263,22 @@ mix dialyzer  # first run takes minutes, builds the PLT
 
 You should see warnings for each of the three planted issues in `Reports`.
 Read them, fix them, re-run until clean. Then commit the fixes.
+
+### Why this works
+
+Dialyzer construye un Persistent Lookup Table (PLT) con los tipos de
+OTP + dependencias. Luego analiza tu código aplicando success typing:
+cada call site contra el tipo inferido de la función destino. Si las
+intersecciones de tipos demuestran imposibilidad, emite warning. Todo
+es estático — el bytecode y runtime quedan intactos.
+
+---
+
+## Benchmark
+
+<!-- benchmark N/A: Dialyzer no tiene código runtime. La medida es
+tiempo de PLT build (minutos primera vez, segundos incremental) y
+análisis por módulo (sub-segundo). Se mide con `time mix dialyzer`. -->
 
 ---
 
@@ -251,6 +315,19 @@ the codebase reaches ~5k lines or you start a library.
 
 ---
 
+## Reflection
+
+- Heredás un codebase con 400 warnings de Dialyzer. ¿Arreglás
+  incrementalmente o escribís un `.dialyzer_ignore.exs` gigante y
+  decretás "warnings-clean desde hoy"? Justificá en términos de
+  riesgo de regresión.
+- Dialyzer marca una cláusula como "pattern_match_cov". El equipo
+  insiste en falso positivo porque "nunca llega ese input". ¿Cómo
+  resolvés: con test de integración, refactor, o aceptando el
+  warning?
+
+---
+
 ## Resources
 
 - [Dialyxir](https://hexdocs.pm/dialyxir/readme.html)
@@ -258,3 +335,17 @@ the codebase reaches ~5k lines or you start a library.
 - ["Success Typings for Erlang" — Lindahl & Sagonas, 2006](https://user.it.uu.se/~kostis/Papers/succ_types.pdf)
 - [Learn You Some Erlang: Dialyzer](https://learnyousomeerlang.com/dialyzer)
 - ["Making Dialyzer Play Nice with Your CI" — Dashbit blog](https://dashbit.co/blog)
+
+
+## Key Concepts
+
+ExUnit testing in Elixir balances speed, isolation, and readability. The framework provides fixtures, setup hooks, and async mode to achieve both performance and determinism.
+
+**ExUnit patterns and fixtures:**
+`setup_all` runs once per module (module-scoped state); `setup` runs before each test. Returning `{:ok, map}` injects variables into the test context. For side-effectful setup (e.g., starting supervised processes), use `start_supervised` — it automatically stops the process when the test ends, ensuring cleanup.
+
+**Async safety and isolation:**
+Tests with `async: true` run in parallel, but they must be isolated. Shared resources (database, ETS tables, Registry) require careful locking. A common pattern: `setup :set_myflag` — a private setup that configures a unique state for that test. Avoid global state unless protected by locks.
+
+**Mocking trade-offs:**
+Libraries like `Mox` provide compile-time mock modules that behave like real modules but with controlled behavior. The benefit: you catch missing function implementations at test time. The trade-off: mocks don't catch runtime errors (e.g., a real function that crashes). For critical paths, complement mocks with integration tests against real dependencies. Dependency injection (passing modules as arguments) is more testable than direct calls.

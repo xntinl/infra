@@ -59,7 +59,7 @@ BEAM scheduler thread
     returns ERL_NIF_TERM → BEAM resumes
 ```
 
-The NIF runs **on the scheduler thread**. If it takes longer than a few milliseconds, it blocks that scheduler, hurting latency for unrelated processes. Rule: keep NIFs under 1 ms. If longer, use **dirty schedulers** (next exercise) or **yielding NIFs**.
+The NIF runs **on the scheduler thread**. If it takes longer than a few milliseconds, it blocks that scheduler, hurting latency for unrelated processes. Rule: keep NIFs under 1 ms. If longer, use **dirty schedulers** for long-running operations or **yielding NIFs** to return control periodically.
 
 ### 2. Rustler's macros
 
@@ -135,6 +135,83 @@ Rule of thumb:
 
 ### Step 1: `mix.exs`
 
+**Objective**: Wire Rustler compiler plugin so `mix compile` auto-invokes cargo and lands optimized dylib in priv/native.
+
+```elixir
+defmodule RustlerIntro.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :rustler_intro,
+      version: "0.1.0",
+      elixir: "~> 1.15",
+      deps: deps(),
+      compilers: [:rustler] ++ Mix.compilers(),
+      rustler_crates: rustler_crates()
+    ]
+  end
+
+  def application, do: [extra_applications: [:logger]]
+
+  defp deps do
+    [{:rustler, "~> 0.32"}]
+  end
+
+  defp rustler_crates do
+    [rustler_intro_nif: [path: "native/rustler_intro_nif", mode: :release]]
+  end
+end
+```
+
+### Dependencies (mix.exs)
+
+```elixir
+```elixir
+defmodule RustlerIntro.Native do
+  use Rustler, otp_app: :rustler_intro, crate: "rustler_intro_nif"
+
+  def add(_a, _b), do: :erlang.nif_error(:nif_not_loaded)
+  def fib(_n),      do: :erlang.nif_error(:nif_not_loaded)
+  def sha256_hex(_bin), do: :erlang.nif_error(:nif_not_loaded)
+end
+```
+
+The body `:erlang.nif_error(:nif_not_loaded)` is what runs **if the dylib fails to load** (wrong arch, missing file). If loading succeeds, the Rust implementation replaces the stub at module-load time.
+
+### 5. Scheduler time rule
+
+The BEAM scheduler expects each reduction (cooperative yield point) to run ~1 µs. A NIF is a single reduction by default. If your NIF runs for 10 ms, you've starved that scheduler for 10,000× the expected time. Symptoms: tail-latency spikes, message queue pileups on unrelated processes, ETS contention.
+
+Rule of thumb:
+- **< 1 ms** — regular NIF is fine.
+- **1–100 ms** — use `DirtyCpu` or `DirtyIo` schedulers.
+- **> 100 ms** — chunk work with `enif_schedule_nif` (yielding NIF) or use a Port.
+
+### 6. Build and load
+
+`mix compile` runs `cargo build --release` inside `native/<crate>/`. The resulting `.so`/`.dylib`/`.dll` is placed in `priv/native/`. When `RustlerIntro.Native` first loads, BEAM looks at the `otp_app: :rustler_intro` attribute, finds `priv/native/librustler_intro_nif.{so,dylib,dll}`, and loads it.
+
+---
+
+## Design decisions
+
+**Option A — naive/simple approach**
+- Pros: minimal code, easy to reason about.
+- Cons: breaks under load, lacks observability, hard to evolve.
+
+**Option B — the approach used here** (chosen)
+- Pros: production-grade, handles edge cases, testable boundaries.
+- Cons: more moving parts, requires understanding of the BEAM primitives involved.
+
+→ Chose **B** because correctness under concurrency and failure modes outweighs the extra surface area.
+
+## Implementation
+
+### Step 1: `mix.exs`
+
+**Objective**: Wire Rustler compiler plugin so `mix compile` auto-invokes cargo and lands optimized dylib in priv/native.
+
 ```elixir
 defmodule RustlerIntro.MixProject do
   use Mix.Project
@@ -164,6 +241,8 @@ end
 
 ### Step 2: `native/rustler_intro_nif/Cargo.toml`
 
+**Objective**: Declare cdylib target and pull cryptographic deps so the shared object exposes typed NIF functions to Elixir.
+
 ```toml
 [package]
 name = "rustler_intro_nif"
@@ -181,6 +260,8 @@ hex  = "0.4"
 ```
 
 ### Step 3: `native/rustler_intro_nif/src/lib.rs`
+
+**Objective**: Reject overflow-prone Fibonacci and zero-copy SHA256 output into OwnedBinary to avoid unnecessary heap copies.
 
 ```rust
 use rustler::{Binary, Env, NifResult, Error};
@@ -219,6 +300,8 @@ rustler::init!("Elixir.RustlerIntro.Native", [add, fib, sha256_hex]);
 
 ### Step 4: `lib/rustler_intro/native.ex`
 
+**Objective**: Provide typed stubs with `:nif_not_loaded` fallback so Dialyzer type-checks FFI calls even if compilation fails.
+
 ```elixir
 defmodule RustlerIntro.Native do
   @moduledoc """
@@ -241,6 +324,8 @@ end
 ```
 
 ### Step 5: `test/rustler_intro_test.exs`
+
+**Objective**: Assert FFI correctness: Fibonacci bounds, overflow rejection, and deterministic SHA256 on edge cases and payloads.
 
 ```elixir
 defmodule RustlerIntroTest do
@@ -296,6 +381,14 @@ end
 
 The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
 
+
+## Key Concepts: Native Code Integration and Performance Boundaries
+
+Rustler is a framework for binding Rust functions as Elixir NIFs (Native Implemented Functions). When you call a NIF, the Erlang VM pauses that scheduler thread and executes Rust code directly—no message passing, no process switching. This is why NIFs are valuable for CPU-bound work: CPU-heavy algorithms in Rust can be 100x faster than equivalent Elixir.
+
+The catch: NIFs are **not concurrent** on the same scheduler thread. If a NIF blocks (e.g., on I/O), it blocks the entire scheduler. The solution is dirty NIFs (`:dirty_cpu` or `:dirty_io`), which run on separate thread pools and don't block normal scheduling. Another gotcha: Rust code can panic, which crashes the entire BEAM VM. Proper error handling and testing are mandatory. Use NIFs sparingly: for crypto, compression, numerical compute. Use Ports for long-running external processes instead.
+
+
 ## Benchmark
 
 ```elixir
@@ -307,6 +400,23 @@ IO.puts("avg: #{time_us / 10_000} µs/op")
 ```
 
 Target: operation should complete in the low-microsecond range on modern hardware; deviations by >2× indicate a regression worth investigating.
+
+## Advanced Considerations: NIF Isolation and Scheduler Integration
+
+NIF calls run atomically on a scheduler thread, blocking all other processes on that scheduler until the function returns. For operations exceeding ~1 millisecond, this starvation becomes visible: heartbeat processes delay, ETS owner replies hang, supervision timeouts fire. The BEAM's dirty scheduler pool (8 CPU + 10 IO by default) isolates long NIFs from the main scheduler ring, but they're still a finite resource.
+
+Understanding scheduler capacity is critical. Each dirty CPU scheduler can run ~1,000 100-microsecond operations per second, or ~5 100-millisecond operations. Beyond that, callers queue. A GenServer pool capping concurrency and applying backpressure prevents cascade failures: if the dirty pool saturates, reject new work immediately instead of queuing unboundedly.
+
+Resource management inside NIFs differs from pure Elixir. A `Binary<'a>` is a borrow tied to the NIF call; it cannot escape to threads or be stored in resources. An `OwnedBinary` allocation isn't visible to BEAM's garbage collector, so memory limits must be enforced in the Elixir layer. Hybrid architectures (Port processes for I/O, NIFs for CPU work) offer better observability and failure isolation than trying to do everything in a single NIF crate.
+
+---
+
+
+## Deep Dive: Interop Patterns and Production Implications
+
+Interop with native code (NIFs, ports, C extensions) introduces failure modes that pure Elixir code doesn't have: segfaults, memory leaks, deadlocks with the Erlang emulator. Testing interop requires separate test suites for the native layer and integration tests that exercise the boundary.
+
+---
 
 ## Trade-offs and production gotchas
 

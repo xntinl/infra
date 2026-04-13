@@ -76,6 +76,17 @@ money/
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### `lib/money.ex`
 
 ```elixir
@@ -446,6 +457,24 @@ mix test --trace
 
 The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
 
+
+
+---
+## Key Concepts
+
+### 1. Arbitrary-Precision Arithmetic Without Overflow
+
+Elixir integers are unlimited precision. There is no overflow, no wraparound, no silent truncation. The BEAM handles small integers efficiently and automatically promotes to big integers when needed. For financial systems processing trillions of cents, this is non-negotiable: you never need overflow guards or BigInteger imports.
+
+### 2. Integer Division is Not Symmetric
+
+Elixir provides three division operations: `/` (always returns float), `div/2` (truncates toward zero), and `Integer.floor_div/2` (floors toward negative infinity). For money, always use `div/2` and `rem/2`. The `/` operator introduces floats and rounding problems. Common gotcha: `10 / 3` returns `3.333...`, not `3`.
+
+### 3. Rounding Errors Compound at Scale
+
+A single lost cent × 1 million transactions = $10,000 audit discrepancy. In financial systems, you round once at the end (display time), never at intermediate steps. Calculate the entire pipeline in exact integers (cents), then round the final result.
+
+---
 ## Why Elixir integers never overflow
 
 Unlike Java's `int` (32-bit, max 2,147,483,647) or Go's `int64`, Elixir integers

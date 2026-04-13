@@ -114,6 +114,8 @@ end
 
 ### Step 1: the consumer's HTTP client
 
+**Objective**: Map HTTP status codes to semantic error tuples so the contract captures the shapes the consumer actually reacts to.
+
 ```elixir
 # payments_consumer/lib/payments_consumer/payment_client.ex
 defmodule PaymentsConsumer.PaymentClient do
@@ -144,6 +146,8 @@ end
 ```
 
 ### Step 2: consumer test — records the pact
+
+**Objective**: Serialize the consumer's observed request/response pairs to a pact file so the provider has a source of truth to replay.
 
 ```elixir
 # payments_consumer/test/payments_consumer/contract_test.exs
@@ -242,6 +246,8 @@ end
 
 ### Step 3: provider — controller and router
 
+**Objective**: Expose `POST /v1/charges` with the exact success/error branches the pact records, so verification has real code to hit.
+
 ```elixir
 # payments_provider/lib/payments_provider_web/controllers/payment_controller.ex
 defmodule PaymentsProviderWeb.PaymentController do
@@ -264,6 +270,8 @@ end
 ```
 
 ### Step 4: provider verification test — replays pacts
+
+**Objective**: Replay every pact interaction against the live router and assert structural superset matching so provider drift fails CI.
 
 ```elixir
 # payments_provider/test/payments_provider_web/contract_verification_test.exs
@@ -352,6 +360,21 @@ IO.puts("verification #{t / 1000}ms")
 
 Target: 100 interactions verified in < 1 s.
 
+## Deep Dive: Contract Patterns and Production Implications
+
+Contract testing ensures that mocked collaborators honor the same interface as the real ones. Pact allows you to define contracts once (in a shared file) and verify them against both consumer and provider, catching interface drift. This is critical in microservices where a consumer upgrade can break without ever touching the provider. The discipline is high, but the payoff is fewer integration surprises in production.
+
+---
+
+## Advanced Considerations
+
+Production testing strategies require careful attention to resource management and test isolation across multiple concurrent test processes. In large codebases, tests can consume significant memory and CPU resources, especially when using concurrent testing without proper synchronization and cleanup. The BEAM scheduler's preemptive nature means test processes may interfere with each other if shared resources aren't properly isolated at the process boundary. Pay careful attention to how Ecto's sandbox mode interacts with your supervision tree — if you have GenServers that hold state across tests, the sandbox rollback mechanism may leave phantom processes in your monitoring systems that continue consuming resources until forced cleanup occurs.
+
+When scaling tests to production-grade test suites, consider the cost of stub verification and the memory overhead of generated test cases. Each property-based test invocation can create thousands of synthetic test cases, potentially causing garbage collection pressure that's invisible during local testing but becomes critical in CI/CD pipelines running long test suites continuously. The interaction between concurrent tests and ETS tables (often used in caches and registry patterns) requires explicit `inherited: true` options to prevent unexpected sharing between test processes, which can cause mysterious failures when tests run in different orders or under load.
+
+For distributed testing scenarios using tools like `Peer`, network simulation can mask real latency issues and failure modes. Test timeouts that work locally may fail in CI due to scheduler contention and GC pauses. Always include substantial buffers for timeout values and monitor actual execution times under load. The coordination between multiple test nodes requires careful cleanup — a failure in test coordination can leave zombie processes consuming resources indefinitely. Implement proper telemetry hooks within your test helpers to diagnose production-like scenarios and capture performance characteristics.
+
+
 ## Trade-offs and production gotchas
 
 **1. Consumer asserting on dynamic values (generated ids, timestamps)**
@@ -396,3 +419,13 @@ provider verification of a consumer-signed timestamp) best defends against them?
 - [Pact Broker OSS](https://github.com/pact-foundation/pact_broker)
 - [Consumer-driven contracts — Martin Fowler](https://martinfowler.com/articles/consumerDrivenContracts.html)
 - [Req](https://hexdocs.pm/req/Req.html) · [Bypass](https://github.com/PSPDFKit-labs/bypass)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

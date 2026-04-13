@@ -119,6 +119,8 @@ end
 
 ### Step 1: Application and Repo
 
+**Objective**: Install `ash-functions`, `uuid-ossp`, `citext` in the Repo — Ash expressions compile to SQL and need these extensions to execute.
+
 ```elixir
 defmodule BillingCore.Application do
   use Application
@@ -139,6 +141,8 @@ end
 
 ### Step 2: Custom validation — positive amount
 
+**Objective**: Encapsulate the `amount > 0` rule as an `Ash.Resource.Validation` — reusable across actions, surfaced as a structured field error.
+
 ```elixir
 defmodule BillingCore.Billing.Validations.PositiveAmount do
   use Ash.Resource.Validation
@@ -156,6 +160,8 @@ end
 
 ### Step 3: Custom change — mark as paid
 
+**Objective**: Model the `status → :paid` transition as an `Ash.Resource.Change` — named changes make policies, notifiers, and audit hooks composable.
+
 ```elixir
 defmodule BillingCore.Billing.Changes.MarkPaid do
   use Ash.Resource.Change
@@ -170,6 +176,8 @@ end
 ```
 
 ### Step 4: The resource
+
+**Objective**: Declare `:pay` and `:void` as named state transitions with `attribute_equals` guards — each transition is addressable, policy-aware, and testable.
 
 ```elixir
 defmodule BillingCore.Billing.Invoice do
@@ -239,6 +247,8 @@ end
 
 ### Step 5: The domain
 
+**Objective**: Expose actions through a code interface (`pay_invoice`, `void_invoice`) — callers never touch changesets, so the data layer stays swappable.
+
 ```elixir
 defmodule BillingCore.Billing do
   use Ash.Domain
@@ -256,6 +266,8 @@ end
 ```
 
 ### Step 6: Migration
+
+**Objective**: Define the database migration: Migration.
 
 ```elixir
 defmodule BillingCore.Repo.Migrations.CreateInvoices do
@@ -280,6 +292,8 @@ end
 ```
 
 ### Step 7: Configuration
+
+**Objective**: Configure the runtime wiring for: Configuration.
 
 ```elixir
 # config/config.exs
@@ -407,6 +421,24 @@ Benchee.run(
 
 Target on a warm Postgres connection pool: `get_invoice` p50 < 700µs, `list_invoices` < 3ms for 50 rows. Anything above 5ms p50 usually means the domain is being recompiled on every call or the connection pool is saturated.
 
+## Deep Dive
+
+Specialized frameworks like Ash (business logic), Commanded (event sourcing), and Nx (numerical computing) abstract away common infrastructure but impose architectural constraints. Ash's declarative resource definitions simplify authorization and querying at the cost of reduced flexibility—deeply nested association policies can degrade query performance. Commanded's event store and aggregate roots enforce event sourcing discipline, making audit trails and temporal queries natural, but require careful snapshot strategy to avoid replaying years of events. Nx brings numerical computing to Elixir, but JIT compilation and lazy evaluation introduce latency; production models benefit from ahead-of-time compilation for inference. For IoT (Nerves), firmware updates must be atomic and resumable—OTA rollback on failure is non-negotiable. Choose frameworks that align with your scaling assumptions: Ash scales horizontally via read replicas; Commanded scales via sharding; Nx scales via distributed training.
+## Advanced Considerations
+
+Framework choices like Ash, Commanded, and Nerves create significant architectural constraints that are difficult to change later. Ash's powerful query builder and declarative approach simplify common patterns but can be opaque when debugging complex permission logic or custom filters at scale. Event sourcing with Commanded is powerful for audit trails but creates a different mental model for state management — replaying events to derive current state has CPU and latency costs that aren't apparent in traditional CRUD systems.
+
+Nerves requires understanding the full embedded system stack — from bootloader configuration to over-the-air update mechanisms. A Nerves system that works on your development board may fail in production due to hardware variations, network conditions, or power supply issues. NX's numerical computing is powerful but requires understanding GPU acceleration trade-offs and memory management for large datasets. Livebook provides interactive development but shouldn't be used for production deployments without careful containerization and resource isolation.
+
+The integration between these frameworks and traditional BEAM patterns (supervisors, processes, GenServers) requires careful design. A Commanded projection that rebuilds state from the event log can consume all available CPU, starving other services. NX autograd computations can create unexpected memory usage if not carefully managed. Nerves systems are memory-constrained; performance assumptions from desktop Elixir don't hold. Always prototype these frameworks in realistic environments before committing to them in production systems to validate assumptions.
+
+
+## Deep Dive: Domain Patterns and Production Implications
+
+Domain-specific frameworks enforce module dependencies and architectural boundaries. Testing domain isolation ensures that constraints are maintained as the codebase grows. Production systems without boundary enforcement often become monolithic and hard to test.
+
+---
+
 ## Trade-offs and production gotchas
 
 **1. `require_atomic?: false` hides a lock**
@@ -437,3 +469,13 @@ The `:pay` action guards `status == :pending` via a validation. Under high concu
 - [Ash 3 upgrade guide](https://hexdocs.pm/ash/upgrading-to-3-0.html)
 - [ash_postgres](https://hexdocs.pm/ash_postgres/)
 - [Dashbit: Idioms vs frameworks (José Valim)](https://dashbit.co/blog/)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

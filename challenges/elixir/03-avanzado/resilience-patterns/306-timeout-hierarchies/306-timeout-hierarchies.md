@@ -51,6 +51,16 @@ Deeper:   t=500  remaining = 2000 - 500 = 1500
 If `remaining <= 0` before doing any work, return `{:error, :deadline_exceeded}` immediately. No network call, no DB query.
 
 ### 3. Genserver.call timeout derivation
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
+
 ```elixir
 timeout = Deadline.remaining(deadline)
 GenServer.call(server, msg, timeout)
@@ -80,6 +90,8 @@ end
 ```
 
 ### Step 1: Deadline module (`lib/deadline_rpc/deadline.ex`)
+
+**Objective**: Encode deadlines as absolute monotonic times so child operations inherit min(parent, local), preventing timeouts from extending beyond caller's SLO budget.
 
 ```elixir
 defmodule DeadlineRpc.Deadline do
@@ -117,6 +129,8 @@ end
 
 ### Step 2: Client that propagates deadline (`lib/deadline_rpc/client.ex`)
 
+**Objective**: Short-circuit expired deadlines before RPC dispatch and pack deadline in message so server can abandon work early without caller timeout waiting.
+
 ```elixir
 defmodule DeadlineRpc.Client do
   alias DeadlineRpc.Deadline
@@ -138,6 +152,8 @@ end
 ```
 
 ### Step 3: Example service that respects inbound deadline (`lib/deadline_rpc/service.ex`)
+
+**Objective**: Check deadline before initiating work so GenServer won't burn cycles on operations doomed to timeout before callee finishes.
 
 ```elixir
 defmodule DeadlineRpc.Service do
@@ -273,6 +289,23 @@ IO.puts("avg: #{t / 1_000_000} µs")
 ```
 
 Expected: < 0.1µs. It's a single `System.monotonic_time` call and a subtraction.
+
+## Advanced Considerations: Circuit Breakers and Bulkheads in Production
+
+A circuit breaker monitors downstream service health and rejects new requests when failures exceed a threshold, failing fast instead of queuing indefinitely. States: `:closed` (normal), `:open` (fast-fail), `:half_open` (testing recovery). A timeout-based pattern monitors; once requests succeed again, the circuit closes. Half-open tests with a single request; if it succeeds, all requests resume.
+
+Bulkheads isolate resource pools so one slow endpoint doesn't starve others. A GenServer pool with a bounded queue (e.g., `:queue.len(state) >= 100`) can return `{:error, :overloaded}` immediately, preventing queue buildup. Combined with exponential backoff on the client (caller retries with increasing delays), this creates a natural circuit breaker behavior without explicit state.
+
+Graceful degradation means serving stale data or reduced functionality when a service is slow. A cached value with a 5-minute TTL is acceptable for many reads; serve it if the live source is timing out. Feature flags allow disabling expensive operations at runtime. Cascading timeout windows (outer service times out after 5s, inner calls must complete in 3s) prevent unbounded waiting. The cost is complexity: tracking degradation modes, testing failure scenarios, and ensuring data consistency under partial failures.
+
+---
+
+
+## Deep Dive: Resilience Patterns and Production Implications
+
+Resilience patterns (circuit breakers, timeouts, retries) are easy to implement but hard to test. The insight is that resilience patterns must be tested under failure: timeouts matter only when calls actually take time, retries matter only when transient failures occur. Production systems with untested resilience patterns often fail gracefully in test and catastrophically in production.
+
+---
 
 ## Trade-offs and production gotchas
 

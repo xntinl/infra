@@ -77,7 +77,21 @@ Chose **B** because the public API is small and the cost is paid once per CI run
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"ecto", "~> 1.0"},
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Build single module with complete @spec coverage so Dialyzer can enforce type contracts without gaps.
 
 ```bash
 mix new typed_calc
@@ -85,6 +99,8 @@ cd typed_calc
 ```
 
 ### Step 2: `mix.exs` — add Dialyxir
+
+**Objective**: Add Dialyxir dev-only so static type analysis runs in CI without runtime cost.
 
 ```elixir
 defmodule TypedCalc.MixProject do
@@ -111,6 +127,8 @@ end
 ```
 
 ### Step 3: `lib/typed_calc.ex`
+
+**Objective**: Use finite unions (:add | :sub | :mul | :div) instead of atom() so Dialyzer statically catches typos.
 
 ```elixir
 defmodule TypedCalc do
@@ -166,6 +184,8 @@ end
 
 ### Step 4: `test/typed_calc_test.exs`
 
+**Objective**: Cover both tagged-result branches so a future runtime-only change cannot sneak past without failing the suite.
+
 ```elixir
 defmodule TypedCalcTest do
   use ExUnit.Case, async: true
@@ -191,11 +211,15 @@ end
 
 ### Step 5: Run tests
 
+**Objective**: Run tests before Dialyzer so any runtime regression surfaces first, keeping the static layer focused on contract drift.
+
 ```bash
 mix test
 ```
 
 ### Step 6: Run Dialyzer
+
+**Objective**: Build the PLT once and run Dialyzer so success typings become a static gate rather than aspirational documentation.
 
 First run takes ~2 minutes (it builds the PLT — the persistent lookup table of OTP and
 your deps). Subsequent runs are seconds.
@@ -209,6 +233,8 @@ Expected output: `done (passed successfully)`. If you see warnings, read the
 filename:line and fix — Dialyzer is almost always right.
 
 ### Step 7: Deliberately break the spec and watch Dialyzer catch it
+
+**Objective**: Narrow the spec to an integer-only return so Dialyzer's success typing flags the float path `/` can produce.
 
 Change the `apply_op/3` spec to claim it returns `{:ok, integer()}`:
 
@@ -227,6 +253,22 @@ Revert the spec before finishing.
 
 ---
 
+
+## Key Concepts
+
+### 1. Typespecs Document Argument and Return Types
+
+Typespecs are comments—they don't enforce types at runtime. But tools like Dialyzer read them and warn about type mismatches. They communicate your intent to future readers.
+
+### 2. Dialyzer Catches Type Errors Before Runtime
+
+Dialyzer performs static analysis on typespecs. If you call a function and pattern-match the result incorrectly, Dialyzer warns. This prevents entire classes of bugs.
+
+### 3. Write Typespecs for Public APIs
+
+`iex> h MyModule.add` shows typespecs in the help. Write them for public APIs; internal functions can be less strict.
+
+---
 ## Benchmark
 
 <!-- benchmark N/A: typespecs are erased at compile time and Dialyzer is a static analyzer — there is nothing at runtime to measure. The relevant metric is CI time, not µs/call. -->

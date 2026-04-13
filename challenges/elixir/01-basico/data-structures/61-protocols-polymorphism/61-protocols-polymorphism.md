@@ -76,7 +76,22 @@ Chose **B** because the type set is open — user structs must participate witho
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"jason", "~> 1.0"},
+    {:"poison", "~> 1.0"},
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Lay out protocol, impls, and struct in separate files to mirror the open/closed boundary — new types extend the system without editing it.
 
 ```bash
 mix new jsonish
@@ -85,6 +100,8 @@ mkdir -p lib/jsonish
 ```
 
 ### Step 2: `lib/jsonish.ex` — the protocol
+
+**Objective**: Declare the dispatch table with `defprotocol` so the encoding function has one public signature and zero type-specific branches.
 
 ```elixir
 defprotocol Jsonish do
@@ -103,6 +120,8 @@ end
 ```
 
 ### Step 3: `lib/jsonish/builtins.ex` — impls for standard types
+
+**Objective**: Provide `defimpl` cases for stdlib types to prove dispatch works on tags the caller does not own and cannot modify.
 
 ```elixir
 defimpl Jsonish, for: Integer do
@@ -139,6 +158,8 @@ end
 
 ### Step 4: `lib/jsonish/user.ex` — custom struct with its own impl
 
+**Objective**: Ship a user-defined struct with its own impl colocated, showing how new types plug into the protocol without touching the core.
+
 ```elixir
 defmodule Jsonish.User do
   @enforce_keys [:id, :email]
@@ -157,6 +178,8 @@ end
 ```
 
 ### Step 5: `test/jsonish_test.exs`
+
+**Objective**: Verify dispatch across builtin and user types, plus the `Protocol.UndefinedError` path when no impl matches.
 
 ```elixir
 defmodule JsonishTest do
@@ -195,6 +218,8 @@ end
 
 ### Step 6: Run the tests
 
+**Objective**: Run the suite to confirm each impl is reachable and that missing impls raise loudly at the dispatch site.
+
 ```bash
 mix test
 ```
@@ -205,6 +230,22 @@ The protocol file declares the contract with zero logic — all the per-type cod
 
 ---
 
+
+## Key Concepts
+
+### 1. Protocols Define a Behavior Contract Across Types
+
+Protocols are like interfaces. Types implement them by providing specific behavior. This avoids long `if` chains checking types.
+
+### 2. Protocol Dispatch is Dynamic
+
+When you call a protocol function, Elixir checks the type at runtime and calls the correct implementation. This is polymorphism without classes.
+
+### 3. Built-in Protocols
+
+`Inspect`, `Enumerable`, `String.Chars`, `Collectable` are protocols built into Elixir. Implementing them for your types makes your code integrate seamlessly with the standard library.
+
+---
 ## Benchmark
 
 ```elixir

@@ -149,6 +149,8 @@ rolling deploy. This is what we implement below.
 
 ### Step 1: Mix project setup
 
+**Objective**: Declare OTP minimum version and optional dependencies to enable :pg module availability."""
+
 ```elixir
 # mix.exs
 defmodule PgMigration.MixProject do
@@ -180,6 +182,8 @@ end
 
 ### Step 2: Application supervisor
 
+**Objective**: Start dedicated :pg scope before workers join groups to isolate namespaces and enable gossip replication."""
+
 ```elixir
 defmodule PgMigration.Application do
   @moduledoc false
@@ -210,6 +214,8 @@ This isolates our groups from any library that also uses `:pg` (Phoenix.PubSub.P
 Phoenix versions uses `:pg` under the hood).
 
 ### Step 3: Unified group adapter
+
+**Objective**: Abstract :pg/:pg2 API behind polymorphic adapter to enable runtime detection and smooth OTP upgrade path."""
 
 ```elixir
 defmodule PgMigration.Group do
@@ -266,6 +272,8 @@ end
 
 ### Step 4: `:pg` adapter
 
+**Objective**: Implement eventual-consistency :pg behaviour with scoped groups and async gossip-based membership replication."""
+
 ```elixir
 defmodule PgMigration.Group.Pg do
   @moduledoc false
@@ -295,6 +303,8 @@ end
 ```
 
 ### Step 5: `:pg2` adapter (transitional)
+
+**Objective**: Implement legacy :pg2 adapter with quorum-based locks so rolling deploy survives mixed-version nodes."""
 
 ```elixir
 defmodule PgMigration.Group.Pg2 do
@@ -330,6 +340,8 @@ end
 
 ### Step 6: Domain worker
 
+**Objective**: Create supervised GenServer that joins/leaves group on init/terminate to minimize race windows."""
+
 ```elixir
 defmodule PgMigration.Worker do
   use GenServer
@@ -355,6 +367,8 @@ end
 
 ### Step 7: Tests
 
+**Objective**: Assert adapter.members/join/leave are deterministic across netsplits without requiring multi-node harness."""
+
 ```elixir
 defmodule PgMigration.GroupPgTest do
   use ExUnit.Case, async: false
@@ -367,74 +381,78 @@ defmodule PgMigration.GroupPgTest do
     :ok
   end
 
-  test "join appears in members and local_members" do
-    task = Task.async(fn ->
-      Group.join(:test_group)
-      receive do
-        :stop -> :ok
-      end
-    end)
-
-    # Give pg time to broadcast (local is immediate)
-    Process.sleep(20)
-
-    assert task.pid in Group.members(:test_group)
-    assert task.pid in Group.local_members(:test_group)
-
-    send(task.pid, :stop)
-    Task.await(task)
-  end
-
-  test "leave removes member" do
-    {:ok, pid} = Agent.start_link(fn -> nil end)
-    Agent.get(pid, fn _ ->
-      Group.join(:leave_group)
-    end)
-    Process.sleep(20)
-    assert pid in Group.members(:leave_group)
-
-    Agent.get(pid, fn _ -> Group.leave(:leave_group) end)
-    Process.sleep(20)
-    refute pid in Group.members(:leave_group)
-    Agent.stop(pid)
-  end
-
-  test "closest/1 prefers local" do
-    task = Task.async(fn ->
-      Group.join(:closest_group)
-      receive do
-        :stop -> :ok
-      end
-    end)
-
-    Process.sleep(20)
-
-    assert Group.closest(:closest_group) == task.pid
-    send(task.pid, :stop)
-    Task.await(task)
-  end
-
-  test "dead processes are auto-removed" do
-    {pid, ref} =
-      spawn_monitor(fn ->
-        Group.join(:auto_cleanup)
+  describe "PgMigration.GroupPg" do
+    test "join appears in members and local_members" do
+      task = Task.async(fn ->
+        Group.join(:test_group)
         receive do
           :stop -> :ok
         end
       end)
 
-    Process.sleep(20)
-    assert pid in Group.members(:auto_cleanup)
+      # Give pg time to broadcast (local is immediate)
+      Process.sleep(20)
 
-    Process.exit(pid, :kill)
-    assert_receive {:DOWN, ^ref, :process, ^pid, :killed}
-    Process.sleep(20)
-    refute pid in Group.members(:auto_cleanup)
+      assert task.pid in Group.members(:test_group)
+      assert task.pid in Group.local_members(:test_group)
+
+      send(task.pid, :stop)
+      Task.await(task)
+    end
+
+    test "leave removes member" do
+      {:ok, pid} = Agent.start_link(fn -> nil end)
+      Agent.get(pid, fn _ ->
+        Group.join(:leave_group)
+      end)
+      Process.sleep(20)
+      assert pid in Group.members(:leave_group)
+
+      Agent.get(pid, fn _ -> Group.leave(:leave_group) end)
+      Process.sleep(20)
+      refute pid in Group.members(:leave_group)
+      Agent.stop(pid)
+    end
+
+    test "closest/1 prefers local" do
+      task = Task.async(fn ->
+        Group.join(:closest_group)
+        receive do
+          :stop -> :ok
+        end
+      end)
+
+      Process.sleep(20)
+
+      assert Group.closest(:closest_group) == task.pid
+      send(task.pid, :stop)
+      Task.await(task)
+    end
+
+    test "dead processes are auto-removed" do
+      {pid, ref} =
+        spawn_monitor(fn ->
+          Group.join(:auto_cleanup)
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      Process.sleep(20)
+      assert pid in Group.members(:auto_cleanup)
+
+      Process.exit(pid, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^pid, :killed}
+      Process.sleep(20)
+      refute pid in Group.members(:auto_cleanup)
+    end
   end
 end
 ```
 
 ### Step 8: Multi-node test (uses `:peer` from OTP 25+)
+
+**Objective**: Implement: Multi-node test (uses `:peer` from OTP 25+).
 
 ```elixir
 defmodule PgMigration.ClusterTest do
@@ -453,21 +471,23 @@ defmodule PgMigration.ClusterTest do
     %{peer: peer, node: node}
   end
 
-  test "join on remote node visible locally after gossip", %{node: node} do
-    remote_pid =
-      :rpc.call(node, PgMigration.Group, :join, [:cluster_group])
-      |> case do
-        :ok -> :rpc.call(node, Process, :whereis, [:init])
-        other -> flunk("unexpected: #{inspect(other)}")
-      end
+  describe "PgMigration.Cluster" do
+    test "join on remote node visible locally after gossip", %{node: node} do
+      remote_pid =
+        :rpc.call(node, PgMigration.Group, :join, [:cluster_group])
+        |> case do
+          :ok -> :rpc.call(node, Process, :whereis, [:init])
+          other -> flunk("unexpected: #{inspect(other)}")
+        end
 
-    # :pg propagates eventually — allow up to 200ms
-    wait_until(fn ->
-      Enum.any?(PgMigration.Group.members(:cluster_group), &(node(&1) == node))
-    end)
+      # :pg propagates eventually — allow up to 200ms
+      wait_until(fn ->
+        Enum.any?(PgMigration.Group.members(:cluster_group), &(node(&1) == node))
+      end)
 
-    assert Enum.any?(PgMigration.Group.members(:cluster_group), &(node(&1) == node))
-    _ = remote_pid
+      assert Enum.any?(PgMigration.Group.members(:cluster_group), &(node(&1) == node))
+      _ = remote_pid
+    end
   end
 
   defp wait_until(fun, timeout \\ 2_000, step \\ 25) do
@@ -492,6 +512,24 @@ end
 ### Why this works
 
 The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
+
+## Deep Dive
+
+Distributed Erlang relies on a heartbeat mechanism (net_kernel tick) to detect node failure, but the network is fundamentally asynchronous—split-brain scenarios are inevitable. A partitioned cluster may have two sets of nodes, each believing the other is dead. Libraries like Horde and Phoenix.PubSub solve this with quorum-aware consensus, but they add latency and complexity. At scale, choose your consistency model explicitly: eventual consistency (via Redis PubSub) is faster but allows temporary divergence; strong consistency (via Horde DLM or distributed transactions) is slower but guarantees atomicity. For global registries, the order of operations matters—registering a process before its monitor is live creates race conditions. In multi-region setups, latency between nodes compounds these issues; consider regional clusters with a lightweight coordinator rather than a fully meshed topology.
+## Advanced Considerations
+
+Distributed Elixir systems require careful consideration of network partitions, consistent hashing for distributed state, and the interaction between clustering libraries and node discovery mechanisms. Network partitions are not rare edge cases; they happen regularly in cloud deployments due to maintenance windows and infrastructure issues. A system that works perfectly during local testing but fails under network partitions indicates insufficient failure handling throughout the codebase. Split-brain scenarios where multiple network partitions lead to different cluster views require explicit recovery mechanisms that are often business-specific and context-dependent.
+
+Horde and distributed registries provide eventual consistency guarantees, but "eventual" can mean minutes during network partitions. Applications must handle the case where the same name is registered on multiple nodes simultaneously without coordination. Consistent hashing for distributed services requires understanding rebalancing costs — a single node failure can cause significant key redistribution and thundering herd problems if not carefully managed. The cost of distributed consensus using algorithms like Raft is high; choose it only when consistency is more important than availability.
+
+Global state replication across nodes creates synchronization challenges at scale. Choosing between replicating everywhere versus replicating to specific nodes affects both consistency latency and network bandwidth utilization. Node monitoring and heartbeat mechanisms require careful timeout tuning — too aggressive and you get false positives during network hiccups; too conservative and you don't detect actual failures quickly enough for recovery.
+
+
+## Deep Dive: Cluster Patterns and Production Implications
+
+Clustering distributes computation across nodes using Erlang's distribution protocol. Testing clusters requires simulating node failures, network partitions, and message delays—challenges that single-node tests don't expose. Production clusters fail in ways that cluster tests reveal: nodes can become isolated (stuck), messages can be reordered, and consensus is expensive.
+
+---
 
 ## Trade-offs and production gotchas
 
@@ -599,3 +637,13 @@ Compare with `:pg2` if you still have OTP 23 around: joins are ~5-10x slower und
 - [OTP 23 release notes — pg section](https://www.erlang.org/blog/otp-23-highlights/)
 - [Phoenix.PubSub.PG2 source](https://github.com/phoenixframework/phoenix_pubsub/blob/main/lib/phoenix/pubsub/pg2.ex) — production usage of :pg as a transport
 - [Erlang in Anger — chapter on distribution](https://www.erlang-in-anger.com/) — Fred Hébert on netsplit survival
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

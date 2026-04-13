@@ -68,6 +68,16 @@ Per-release upgrade instructions. Combines all `.appup`s into an ordered sequenc
 
 ### Dependencies (`mix.exs`)
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
+
 ```elixir
 defmodule CoinCounter.MixProject do
   use Mix.Project
@@ -105,6 +115,8 @@ end
 
 ### Step 1: Application
 
+**Objective**: Minimize supervision tree so upgrade surface concentrates on code_change/3, not restart semantics.
+
 ```elixir
 defmodule CoinCounter.Application do
   use Application
@@ -118,6 +130,8 @@ end
 ```
 
 ### Step 2: Counter v1
+
+**Objective**: Stamp @vsn "1" so release_handler matches code version and dispatches correct code_change/3 clause on upgrade.
 
 ```elixir
 defmodule CoinCounter.Counter do
@@ -147,6 +161,8 @@ end
 ```
 
 ### Step 3: Counter v2 — add `:timestamps` field
+
+**Objective**: Add :timestamps field and code_change/3 to migrate v1 state live without losing accumulated count.
 
 ```elixir
 defmodule CoinCounter.Counter do
@@ -197,6 +213,8 @@ end
 
 ### Step 4: `.rel` files — release specs
 
+**Objective**: Lock exact ERTS + OTP versions so systools diffs releases and emits valid relup instructions.
+
 ```erlang
 %% rel/coin_counter-1.0.0.rel
 {release,
@@ -225,6 +243,8 @@ end
 
 ### Step 5: `.appup` file — required for `mix release` to produce a `relup`
 
+**Objective**: Declare {update, Counter, {advanced, []}} so release_handler suspends GenServer, loads new code, routes to code_change/3.
+
 Place at `priv/appup/coin_counter.appup` (or rely on `Mix.Tasks.Release` when using `distillery`/`mix release` + appup generator):
 
 ```erlang
@@ -240,6 +260,8 @@ Place at `priv/appup/coin_counter.appup` (or rely on `Mix.Tasks.Release` when us
 `{advanced, []}` means "use `code_change/3`". The empty argument goes into `extra`.
 
 ### Step 6: Assemble and upgrade — `UPGRADE_STEPS.md`
+
+**Objective**: Test full v1→v2 cycle so state survives code swap on running node end-to-end via release_handler.
 
 ```bash
 # -- 1. Build v1 --
@@ -339,6 +361,23 @@ end)
 ```
 
 Target: under 500ms for a small app with a single GenServer, independent of in-memory state size (state migration itself is O(n) over fields, not O(items) unless you touch collections). If upgrade time > 5 seconds, the likely cause is `code_change/3` doing real work.
+
+## Advanced Considerations: Supervision and Hot Code Upgrade Patterns
+
+The OTP supervision tree is the backbone of Elixir's fault tolerance. A DynamicSupervisor can spawn workers on demand and track them, but if a worker crashes before it's supervised, messages to it drop silently. Equally, a `:temporary` worker that crashes is restarted zero times — useful for one-off tasks, but requires the caller to handle crashes. `:transient` restarts on non-normal exits; `:permanent` always restarts.
+
+`handle_continue` callbacks and `:hibernate` reduce memory overhead in long-lived processes. After initializing, a GenServer can return `{:noreply, state, {:continue, :do_work}}` to defer expensive work past the `init/1` call, keeping the supervisor's synchronous startup fast. Hibernation moves a process's heap to disk, freeing RAM at the cost of latency when the process receives its next message.
+
+Hot code upgrades via `sys:replace_state/2` or `:sys.replace_state/3` allow changing code without restarting the VM, but only if state structure is forward- and backward-compatible. In practice, code changes that alter state shape (adding or removing fields) require a migration function. The `:code.purge/1` and `:code.load_file/1` cycle reloads the module, but old pids still run old code until they return to the scheduler. Design for graceful degradation: code that cannot upgrade hot should acknowledge that in docs and operational runbooks.
+
+---
+
+
+## Deep Dive: Otp Patterns and Production Implications
+
+OTP primitives (GenServer, Supervisor, Application) are tested through their public interfaces, not by inspecting internal state. This discipline forces correct design: if you can't test a behavior without peeking into the server's state, the behavior is not public. Production systems with tight integration tests on GenServer internals are fragile and hard to refactor.
+
+---
 
 ## Trade-offs and production gotchas
 

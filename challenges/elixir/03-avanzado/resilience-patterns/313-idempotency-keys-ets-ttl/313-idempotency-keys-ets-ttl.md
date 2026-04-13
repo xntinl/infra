@@ -61,6 +61,16 @@ If a duplicate arrives while the original is still processing, we don't reject �
 
 ### Dependencies (`mix.exs`)
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
+
 ```elixir
 defmodule ChargeIdempotency.MixProject do
   use Mix.Project
@@ -71,6 +81,8 @@ end
 ```
 
 ### Step 1: Application
+
+**Objective**: Configure ttl_ms and sweep_ms at boot so 24h dedup window and GC frequency are operator-tunable without code changes.
 
 ```elixir
 defmodule ChargeIdempotency.Application do
@@ -88,6 +100,8 @@ end
 ```
 
 ### Step 2: Store (`lib/charge_idempotency/store.ex`)
+
+**Objective**: Use :ets.insert_new/2 to atomically mark first-arrival vs. duplicate, then serialize on :in_flight so retried requests block until original completes without double-execution.
 
 ```elixir
 defmodule ChargeIdempotency.Store do
@@ -176,6 +190,8 @@ end
 ```
 
 ### Step 3: Example service (`lib/charge_idempotency/service.ex`)
+
+**Objective**: Wrap charge operation in ensure_once/3 so concurrent webhook retries coalesce to a single charge without billing customer twice.
 
 ```elixir
 defmodule ChargeIdempotency.Service do
@@ -296,6 +312,23 @@ Benchee.run(
 ```
 
 Expected: first call ~5µs, cached call ~1µs. If cached call > 10µs you are hitting the sweeper or spending time in GenServer.
+
+## Advanced Considerations: Circuit Breakers and Bulkheads in Production
+
+A circuit breaker monitors downstream service health and rejects new requests when failures exceed a threshold, failing fast instead of queuing indefinitely. States: `:closed` (normal), `:open` (fast-fail), `:half_open` (testing recovery). A timeout-based pattern monitors; once requests succeed again, the circuit closes. Half-open tests with a single request; if it succeeds, all requests resume.
+
+Bulkheads isolate resource pools so one slow endpoint doesn't starve others. A GenServer pool with a bounded queue (e.g., `:queue.len(state) >= 100`) can return `{:error, :overloaded}` immediately, preventing queue buildup. Combined with exponential backoff on the client (caller retries with increasing delays), this creates a natural circuit breaker behavior without explicit state.
+
+Graceful degradation means serving stale data or reduced functionality when a service is slow. A cached value with a 5-minute TTL is acceptable for many reads; serve it if the live source is timing out. Feature flags allow disabling expensive operations at runtime. Cascading timeout windows (outer service times out after 5s, inner calls must complete in 3s) prevent unbounded waiting. The cost is complexity: tracking degradation modes, testing failure scenarios, and ensuring data consistency under partial failures.
+
+---
+
+
+## Deep Dive: Etsdets Patterns and Production Implications
+
+ETS tables are in-memory, non-distributed key-value stores with tunable semantics (ordered_set, duplicate_bag). Under concurrent read/write load, ETS table semantics matter: bag semantics allow fast appends but slow deletes; ordered_set allows range queries but slower inserts. Testing ETS behavior under concurrent load is non-trivial; single-threaded tests miss lock contention. Production ETS tables often fail under load due to concurrency assumptions that quiet tests don't exercise.
+
+---
 
 ## Trade-offs and production gotchas
 

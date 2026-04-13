@@ -1,8 +1,6 @@
 # DETS vs ETS — Persistence, Cost, and Crash Recovery
 
 **Project**: `dets_vs_ets` — same KV store in DETS and ETS with crash-recovery tests.
-**Difficulty**: ★★★★☆
-**Estimated time**: 3–6 hours
 
 ---
 
@@ -39,6 +37,12 @@ dets_vs_ets/
         ├── dets_store_test.exs
         └── hybrid_store_test.exs
 ```
+
+---
+
+## Why DETS vs ETS decision
+
+DETS solves the one thing ETS does not — outliving the node. It is not a general-purpose database; it is an ETS-shaped file. Use it for caches you want to warm on restart or for configuration you can afford to lose on corruption.
 
 ---
 
@@ -111,9 +115,35 @@ equal to your flush interval. This is essentially what Erlang's
 
 ---
 
+## Design decisions
+
+**Option A — ETS only (RAM)**
+- Pros: fastest; simplest mental model.
+- Cons: dies with the node; cold start loses everything.
+
+**Option B — DETS (disk) or ETS + external persistence** (chosen)
+- Pros: survives restart; no external dependency.
+- Cons: DETS is slower and has a 2 GB file size cap; locking model is less forgiving.
+
+→ Chose **B** because context-dependent; use DETS for small, persistent-but-local state; use ETS for performance.
+
+---
+
 ## Implementation
 
 ### Step 1: `mix.exs`
+
+**Objective**: Declare the project, dependencies, and OTP application in `mix.exs`.
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
 
 ```elixir
 defmodule DetsVsEts.MixProject do
@@ -132,6 +162,8 @@ end
 ```
 
 ### Step 2: `lib/dets_vs_ets/application.ex`
+
+**Objective**: Define the OTP application and supervision tree in `lib/dets_vs_ets/application.ex`.
 
 ```elixir
 defmodule DetsVsEts.Application do
@@ -154,6 +186,8 @@ end
 ```
 
 ### Step 3: `lib/dets_vs_ets/ets_store.ex`
+
+**Objective**: Implement the module in `lib/dets_vs_ets/ets_store.ex`.
 
 ```elixir
 defmodule DetsVsEts.EtsStore do
@@ -193,6 +227,8 @@ end
 ```
 
 ### Step 4: `lib/dets_vs_ets/dets_store.ex`
+
+**Objective**: Implement the module in `lib/dets_vs_ets/dets_store.ex`.
 
 ```elixir
 defmodule DetsVsEts.DetsStore do
@@ -259,6 +295,8 @@ end
 ```
 
 ### Step 5: `lib/dets_vs_ets/hybrid_store.ex`
+
+**Objective**: Implement the module in `lib/dets_vs_ets/hybrid_store.ex`.
 
 ```elixir
 defmodule DetsVsEts.HybridStore do
@@ -349,6 +387,8 @@ end
 
 ### Step 6: `test/dets_vs_ets/dets_store_test.exs`
 
+**Objective**: Write tests in `test/dets_vs_ets/dets_store_test.exs` covering behavior and edge cases.
+
 ```elixir
 defmodule DetsVsEts.DetsStoreTest do
   use ExUnit.Case, async: false
@@ -361,25 +401,29 @@ defmodule DetsVsEts.DetsStoreTest do
     :ok
   end
 
-  test "put/get round-trip" do
-    assert :ok = DetsStore.put("k", :v)
-    assert {:ok, :v} = DetsStore.get("k")
-  end
+  describe "DetsVsEts.DetsStore" do
+    test "put/get round-trip" do
+      assert :ok = DetsStore.put("k", :v)
+      assert {:ok, :v} = DetsStore.get("k")
+    end
 
-  test "sync/0 fsyncs to disk" do
-    DetsStore.put("durable", 1)
-    assert :ok = DetsStore.sync()
-  end
+    test "sync/0 fsyncs to disk" do
+      DetsStore.put("durable", 1)
+      assert :ok = DetsStore.sync()
+    end
 
-  test "delete/1 removes the key" do
-    DetsStore.put("gone", :v)
-    DetsStore.delete("gone")
-    assert :miss = DetsStore.get("gone")
+    test "delete/1 removes the key" do
+      DetsStore.put("gone", :v)
+      DetsStore.delete("gone")
+      assert :miss = DetsStore.get("gone")
+    end
   end
 end
 ```
 
 ### Step 7: `test/dets_vs_ets/hybrid_store_test.exs`
+
+**Objective**: Write tests in `test/dets_vs_ets/hybrid_store_test.exs` covering behavior and edge cases.
 
 ```elixir
 defmodule DetsVsEts.HybridStoreTest do
@@ -393,23 +437,27 @@ defmodule DetsVsEts.HybridStoreTest do
     :ok
   end
 
-  test "put/get round-trip hits the ETS table" do
-    HybridStore.put("k", :v)
-    assert {:ok, :v} = HybridStore.get("k")
-  end
+  describe "DetsVsEts.HybridStore" do
+    test "put/get round-trip hits the ETS table" do
+      HybridStore.put("k", :v)
+      assert {:ok, :v} = HybridStore.get("k")
+    end
 
-  test "force_snapshot/0 persists the current state" do
-    HybridStore.put("persistent", "yes")
-    HybridStore.force_snapshot()
+    test "force_snapshot/0 persists the current state" do
+      HybridStore.put("persistent", "yes")
+      HybridStore.force_snapshot()
 
-    # The value should now be in DETS — we verify indirectly by looking
-    # in the DETS table directly.
-    assert [{"persistent", "yes"}] = :dets.lookup(:hybrid_dets, "persistent")
+      # The value should now be in DETS — we verify indirectly by looking
+      # in the DETS table directly.
+      assert [{"persistent", "yes"}] = :dets.lookup(:hybrid_dets, "persistent")
+    end
   end
 end
 ```
 
 ### Step 8: Simulating crash recovery
+
+**Objective**: Implement Simulating crash recovery.
 
 Run in IEx:
 
@@ -436,6 +484,28 @@ Restart IEx. You will see Erlang log lines like:
 
 Repair can take tens of seconds on this size file; minutes on a much
 larger one. This is the exact scenario production on-call shifts dread.
+
+### Why this works
+
+DETS uses a linear hashing scheme on disk. Lookups do a small number of disk reads (or zero if the page is in OS cache). Writes mutate the page and mark it dirty; `:dets.sync/1` forces the OS to flush.
+
+---
+
+## Deep Dive
+
+ETS (Erlang Term Storage) is RAM-only and process-linked; table destruction triggers if the owner crashes, causing silent data loss in careless designs. Match specifications (match_specs) are micro-programs that filter/transform data at the C layer, orders of magnitude faster than fetching all records and filtering in Elixir. Mnesia adds disk persistence and replication but introduces transaction overhead and deadlock potential; dirty operations bypass locks for speed but sacrifice consistency guarantees. For caching, named tables (public by design) are globally visible but require careful name management; consider ETS sharding (multiple small tables) to reduce lock contention on hot keys. DETS (Disk ETS) persists to disk but is single-process bottleneck and slower than a real database. At scale, prefer ETS for in-process state and Mnesia/PostgreSQL for shared, persistent data.
+## Advanced Considerations
+
+ETS and DETS performance characteristics change dramatically based on access patterns and table types. Ordered sets provide range queries but slower access than hash tables; set types don't support duplicate keys while bags do. The `heir` option for ETS tables is essential for fault tolerance — when a table owner crashes, the heir process can take ownership and prevent data loss. Without it, the table is lost immediately. Mnesia replicates entire tables across nodes; choosing which nodes should have replicas and whether they're RAM or disk replicas affects both consistency guarantees and network traffic during cluster operations.
+
+DETS persistence comes with significant performance implications — writes are synchronous to disk by default, creating latency spikes. Using `sync: false` improves throughput but risks data loss on crashes. The maximum DETS table size is limited by available memory and the file system; planning capacity requires understanding your growth patterns. Mnesia's transaction system provides ACID guarantees, but dirty operations bypass these guarantees for performance. Understanding when to use dirty reads versus transactional reads significantly impacts both correctness and latency.
+
+Debugging ETS and DETS issues is challenging because problems often emerge under load when many processes contend for the same table. Table memory fragmentation is invisible to code but can exhaust memory. Using match specs instead of iteration over large tables can dramatically improve performance but requires careful construction. The interaction between ETS, replication, and distributed systems creates subtle consistency issues — a node with a stale ETS replica can serve incorrect data during network partitions. Always monitor table sizes and replication status with structured logging.
+
+
+## Deep Dive: Etsdets Patterns and Production Implications
+
+ETS tables are in-memory, non-distributed key-value stores with tunable semantics (ordered_set, duplicate_bag). Under concurrent read/write load, ETS table semantics matter: bag semantics allow fast appends but slow deletes; ordered_set allows range queries but slower inserts. Testing ETS behavior under concurrent load is non-trivial; single-threaded tests miss lock contention. Production ETS tables often fail under load due to concurrency assumptions that quiet tests don't exercise.
 
 ---
 
@@ -522,6 +592,13 @@ Representative results (M1, NVMe, OTP 26):
 | DETS put    | 28µs   | ~36_000   |
 
 The 25-30x gap is the DETS serialization cost.
+
+---
+
+## Reflection
+
+- Your DETS file hit the 2 GB cap. What are your options, in order of effort? Which is the cheapest that still gives you durability?
+- If DETS is slower than ETS and smaller than Mnesia, when is it the right answer? Can you name a real use case that is neither one of the extremes?
 
 ---
 

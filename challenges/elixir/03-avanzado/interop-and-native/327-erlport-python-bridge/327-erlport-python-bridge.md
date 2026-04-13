@@ -99,6 +99,16 @@ non-trivial startup cost). Keep workers stable; make their code idempotent.
 
 ### Dependencies (`mix.exs`)
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
+
 ```elixir
 defmodule MlInference.MixProject do
   use Mix.Project
@@ -124,6 +134,8 @@ Python dependencies are managed with `pip` inside a virtualenv that ErlPort uses
 we stub the model so the example runs without installing scikit-learn.
 
 ### Step 1: Python side (`priv/python/predictor.py`)
+
+**Objective**: Load model at module import time so ErlPort calls hit warm interpreter, avoiding per-call joblib overhead.
 
 ```python
 """
@@ -170,6 +182,8 @@ def model_version():
 Empty `priv/python/__init__.py` makes it an importable package.
 
 ### Step 2: Worker GenServer (`lib/ml_inference/worker.ex`)
+
+**Objective**: Own long-lived interpreter per worker and warm it so first prediction call skips import cost.
 
 ```elixir
 defmodule MlInference.Worker do
@@ -221,6 +235,8 @@ end
 
 ### Step 3: Pool (`lib/ml_inference/pool.ex`)
 
+**Objective**: Round-robin workers so Python calls parallelize across schedulers without per-request interpreter spin-up.
+
 ```elixir
 defmodule MlInference.Pool do
   @moduledoc """
@@ -259,6 +275,8 @@ end
 ```
 
 ### Step 4: Application supervision
+
+**Objective**: Boot pool so interpreter crashes are isolated to their workers and peers survive.
 
 ```elixir
 defmodule MlInference.Application do
@@ -335,6 +353,34 @@ defmodule MlInference.PoolTest do
   end
 end
 ```
+
+## Benchmark
+
+```elixir
+{us, _} = :timer.tc(fn ->
+  for _ <- 1..10_000, do: MlInference.Pool.predict([0.1, 0.2, 0.3])
+end)
+IO.puts("Avg: #{us / 10_000} µs per op")
+```
+
+Target: **<500 µs per op** on modern hardware (port round-trip + Python dispatch).
+
+## Advanced Considerations: NIF Isolation and Scheduler Integration
+
+NIF calls run atomically on a scheduler thread, blocking all other processes on that scheduler until the function returns. For operations exceeding ~1 millisecond, this starvation becomes visible: heartbeat processes delay, ETS owner replies hang, supervision timeouts fire. The BEAM's dirty scheduler pool (8 CPU + 10 IO by default) isolates long NIFs from the main scheduler ring, but they're still a finite resource.
+
+Understanding scheduler capacity is critical. Each dirty CPU scheduler can run ~1,000 100-microsecond operations per second, or ~5 100-millisecond operations. Beyond that, callers queue. A GenServer pool capping concurrency and applying backpressure prevents cascade failures: if the dirty pool saturates, reject new work immediately instead of queuing unboundedly.
+
+Resource management inside NIFs differs from pure Elixir. A `Binary<'a>` is a borrow tied to the NIF call; it cannot escape to threads or be stored in resources. An `OwnedBinary` allocation isn't visible to BEAM's garbage collector, so memory limits must be enforced in the Elixir layer. Hybrid architectures (Port processes for I/O, NIFs for CPU work) offer better observability and failure isolation than trying to do everything in a single NIF crate.
+
+---
+
+
+## Deep Dive: Interop Patterns and Production Implications
+
+Interop with native code (NIFs, ports, C extensions) introduces failure modes that pure Elixir code doesn't have: segfaults, memory leaks, deadlocks with the Erlang emulator. Testing interop requires separate test suites for the native layer and integration tests that exercise the boundary.
+
+---
 
 ## Trade-offs and production gotchas
 

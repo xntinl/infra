@@ -134,9 +134,24 @@ an example becomes aspirational.
 
 ---
 
+### Dependencies (`mix.exs`)
+
+```elixir
+def deps do
+  [
+    {docs_demo},
+    {ex_doc},
+    {exunit},
+    {mix},
+  ]
+end
+```
 ## Implementation
 
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
 
 ```bash
 mix new docs_demo
@@ -144,6 +159,9 @@ cd docs_demo
 ```
 
 ### Step 2: Add ExDoc to `mix.exs`
+
+**Objective**: Add ExDoc to `mix.exs`.
+
 
 ```elixir
 defmodule DocsDemo.MixProject do
@@ -202,6 +220,9 @@ end
 
 ### Step 3: `lib/docs_demo.ex` — the entry-point module
 
+**Objective**: Edit `docs_demo.ex` — the entry-point module, exposing code whose shape is chosen to exercise the tool's capabilities, not to solve a domain problem.
+
+
 ```elixir
 defmodule DocsDemo do
   @moduledoc """
@@ -229,6 +250,9 @@ end
 ```
 
 ### Step 4: `lib/docs_demo/string_utils.ex`
+
+**Objective**: Implement `string_utils.ex` — code whose shape is chosen to exercise the tool's capabilities, not to solve a domain problem.
+
 
 ```elixir
 defmodule DocsDemo.StringUtils do
@@ -274,6 +298,9 @@ end
 ```
 
 ### Step 5: `lib/docs_demo/math_utils.ex`
+
+**Objective**: Implement `math_utils.ex` — code whose shape is chosen to exercise the tool's capabilities, not to solve a domain problem.
+
 
 ```elixir
 defmodule DocsDemo.MathUtils do
@@ -328,6 +355,9 @@ end
 
 ### Step 6: `guides/getting_started.md`
 
+**Objective**: Implement `getting_started.md` — code whose shape is chosen to exercise the tool's capabilities, not to solve a domain problem.
+
+
 ```markdown
 # Getting Started
 
@@ -337,6 +367,9 @@ or `DocsDemo.StringUtils.shout/1` from anywhere in your code.
 ```
 
 ### Step 7: Tests (with doctests enabled)
+
+**Objective**: Tests (with doctests enabled).
+
 
 `test/math_utils_test.exs`:
 
@@ -363,6 +396,9 @@ end
 ```
 
 ### Step 8: Build the docs
+
+**Objective**: Build the docs.
+
 
 ```bash
 mix deps.get
@@ -452,3 +488,20 @@ For those, describe the behavior in prose and test it in the test file.
 - [Writing documentation — the Elixir guide](https://hexdocs.pm/elixir/writing-documentation.html) — idioms for `@moduledoc`, `@doc`, `@typedoc`
 - [ExUnit.DocTest](https://hexdocs.pm/ex_unit/ExUnit.DocTest.html) — doctest mechanics and escape hatches
 - [Hex.pm — "Publishing docs"](https://hex.pm/docs/publish#publishing-docs) — how `mix hex.publish` uploads to hexdocs.pm
+
+
+## Deep Dive
+
+Elixir's tooling ecosystem extends beyond the language into DevOps, profiling, and observability. Understanding each tool's role prevents misuse and false optimizations.
+
+**Mix tasks and releases:**
+Custom mix tasks (`mix myapp.setup`, `mix myapp.migrate`) encapsulate operational knowledge. Tasks run in the host environment (not the compiled app), so they're ideal for setup, teardown, or scripting. Releases, built with `mix release`, create self-contained OTP applications deployable without Elixir installed. They're immutable: no source code changes after release — all config comes from environment variables or runtime files.
+
+**Debugging and profiling tools:**
+- `:observer` (GUI): real-time process tree, metrics, and port inspection
+- `Recon`: production-safe introspection (stable even under high load)
+- `:eprof`: function-level timing; lower overhead than `:fprof`
+- `:fprof`: detailed trace analysis; use only in staging
+
+**Profiling approaches:**
+Ceiling profiling (e.g., "which modules consume CPU?") is cheap; go there first with `perf` or `eprof`. Floor profiling (e.g., "which lines in this function are slow?") is expensive; reserve for specific functions. In production, prefer metrics (Prometheus, New Relic) over profiling — continuous profiling has overhead. Store profiling data for post-mortem analysis, not real-time dashboards.

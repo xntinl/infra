@@ -48,6 +48,16 @@ use this wrapper.
 
 ## Why argv-only and never shell
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
+
 ```elixir
 System.cmd("sh", ["-c", "ffmpeg -i #{user_path} out.jpg"])   # NO
 System.cmd("ffmpeg", ["-i", user_path, "out.jpg"])           # YES
@@ -130,6 +140,8 @@ end
 ```
 
 ### Step 1: The runner (`lib/media_toolbox/command_runner.ex`)
+
+**Objective**: Spawn via `:spawn_executable` with argv-only args and SIGKILL on wall-clock timeout so a runaway CLI cannot leak zombies or exhaust memory.
 
 ```elixir
 defmodule MediaToolbox.CommandRunner do
@@ -292,6 +304,8 @@ end
 
 ### Step 2: Tool wrappers (`lib/media_toolbox/ffmpeg.ex`)
 
+**Objective**: Pass `-nostdin` and explicit `-loglevel error` to ffmpeg so a hanging filesystem never stalls the port waiting on interactive prompts.
+
 ```elixir
 defmodule MediaToolbox.Ffmpeg do
   alias MediaToolbox.CommandRunner
@@ -323,6 +337,8 @@ end
 ```
 
 ### Step 3: exiftool wrapper (`lib/media_toolbox/exiftool.ex`)
+
+**Objective**: Parse `-json -n` output with OTP 27's `:json.decode/1` so metadata extraction returns a typed map without a Jason runtime dependency.
 
 ```elixir
 defmodule MediaToolbox.Exiftool do
@@ -356,6 +372,8 @@ end
 ```
 
 ### Step 4: clamscan wrapper (`lib/media_toolbox/clamscan.ex`)
+
+**Objective**: Map clamscan's non-zero exit (1 = infected) into a `{:ok, {:infected, sig}}` verdict so callers never confuse infection with tool failure.
 
 ```elixir
 defmodule MediaToolbox.Clamscan do
@@ -393,6 +411,8 @@ end
 ```
 
 ### Step 5: Application stub
+
+**Objective**: Boot with an empty supervisor since command wrappers are stateless functions called synchronously from caller processes.
 
 ```elixir
 defmodule MediaToolbox.Application do
@@ -493,6 +513,27 @@ defmodule MediaToolbox.CommandRunnerTest do
   end
 end
 ```
+
+## Benchmark
+
+<!-- benchmark N/A: topic is conceptual/architectural, not performance-sensitive -->
+
+## Advanced Considerations: NIF Isolation and Scheduler Integration
+
+NIF calls run atomically on a scheduler thread, blocking all other processes on that scheduler until the function returns. For operations exceeding ~1 millisecond, this starvation becomes visible: heartbeat processes delay, ETS owner replies hang, supervision timeouts fire. The BEAM's dirty scheduler pool (8 CPU + 10 IO by default) isolates long NIFs from the main scheduler ring, but they're still a finite resource.
+
+Understanding scheduler capacity is critical. Each dirty CPU scheduler can run ~1,000 100-microsecond operations per second, or ~5 100-millisecond operations. Beyond that, callers queue. A GenServer pool capping concurrency and applying backpressure prevents cascade failures: if the dirty pool saturates, reject new work immediately instead of queuing unboundedly.
+
+Resource management inside NIFs differs from pure Elixir. A `Binary<'a>` is a borrow tied to the NIF call; it cannot escape to threads or be stored in resources. An `OwnedBinary` allocation isn't visible to BEAM's garbage collector, so memory limits must be enforced in the Elixir layer. Hybrid architectures (Port processes for I/O, NIFs for CPU work) offer better observability and failure isolation than trying to do everything in a single NIF crate.
+
+---
+
+
+## Deep Dive: Interop Patterns and Production Implications
+
+Interop with native code (NIFs, ports, C extensions) introduces failure modes that pure Elixir code doesn't have: segfaults, memory leaks, deadlocks with the Erlang emulator. Testing interop requires separate test suites for the native layer and integration tests that exercise the boundary.
+
+---
 
 ## Trade-offs and production gotchas
 

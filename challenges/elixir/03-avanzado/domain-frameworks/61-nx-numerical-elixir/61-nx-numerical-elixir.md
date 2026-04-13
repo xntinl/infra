@@ -65,6 +65,8 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ### Step 1: `mix.exs` — add Nx
 
+**Objective**: Declare project dependencies and configure the Mix build.
+
 ```elixir
 defp deps do
   [
@@ -76,6 +78,8 @@ end
 ```
 
 ### Step 2: `lib/api_gateway/metrics/analyzer.ex`
+
+**Objective**: Build Nx-powered statistical analysis for latency anomalies: mean, std_dev, z-score masking.
 
 ```elixir
 defmodule ApiGateway.Metrics.Analyzer do
@@ -197,6 +201,8 @@ The `stats/1` function converts a plain Elixir list to an `:f32` tensor, compute
 
 ### Step 3: Given tests — must pass without modification
 
+**Objective**: Verify stats/1, anomaly_indices/2, linear_trend/1 and rolling_zscore/1 against regression test suite.
+
 ```elixir
 # test/api_gateway/metrics_analyzer_test.exs
 defmodule ApiGateway.Metrics.AnalyzerTest do
@@ -273,6 +279,8 @@ end
 
 ### Step 4: Run the tests
 
+**Objective**: Verify the implementation by running the test suite.
+
 ```bash
 mix test test/api_gateway/metrics_analyzer_test.exs --trace
 ```
@@ -284,6 +292,26 @@ mix test test/api_gateway/metrics_analyzer_test.exs --trace
 
 The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
 
+## Deep Dive
+
+Specialized frameworks like Ash (business logic), Commanded (event sourcing), and Nx (numerical computing) abstract away common infrastructure but impose architectural constraints. Ash's declarative resource definitions simplify authorization and querying at the cost of reduced flexibility—deeply nested association policies can degrade query performance. Commanded's event store and aggregate roots enforce event sourcing discipline, making audit trails and temporal queries natural, but require careful snapshot strategy to avoid replaying years of events. Nx brings numerical computing to Elixir, but JIT compilation and lazy evaluation introduce latency; production models benefit from ahead-of-time compilation for inference. For IoT (Nerves), firmware updates must be atomic and resumable—OTA rollback on failure is non-negotiable. Choose frameworks that align with your scaling assumptions: Ash scales horizontally via read replicas; Commanded scales via sharding; Nx scales via distributed training.
+
+---
+
+## Advanced Considerations
+
+Framework choices like Ash, Commanded, and Nerves create significant architectural constraints that are difficult to change later. Ash's powerful query builder and declarative approach simplify common patterns but can be opaque when debugging complex permission logic or custom filters at scale. Event sourcing with Commanded is powerful for audit trails but creates a different mental model for state management — replaying events to derive current state has CPU and latency costs that aren't apparent in traditional CRUD systems.
+
+Nerves requires understanding the full embedded system stack — from bootloader configuration to over-the-air update mechanisms. A Nerves system that works on your development board may fail in production due to hardware variations, network conditions, or power supply issues. NX's numerical computing is powerful but requires understanding GPU acceleration trade-offs and memory management for large datasets. Livebook provides interactive development but shouldn't be used for production deployments without careful containerization and resource isolation.
+
+The integration between these frameworks and traditional BEAM patterns (supervisors, processes, GenServers) requires careful design. A Commanded projection that rebuilds state from the event log can consume all available CPU, starving other services. NX autograd computations can create unexpected memory usage if not carefully managed. Nerves systems are memory-constrained; performance assumptions from desktop Elixir don't hold. Always prototype these frameworks in realistic environments before committing to them in production systems to validate assumptions.
+
+
+## Deep Dive: Domain Patterns and Production Implications
+
+Domain-specific frameworks enforce module dependencies and architectural boundaries. Testing domain isolation ensures that constraints are maintained as the codebase grows. Production systems without boundary enforcement often become monolithic and hard to test.
+
+---
 ## Trade-off analysis
 
 | Aspect | Nx + `defn` | Plain `Enum` + `:math` | `Statistics` library |
@@ -337,3 +365,13 @@ Target: operation should complete in the low-microsecond range on modern hardwar
 - [Nx.Defn](https://hexdocs.pm/nx/Nx.Defn.html) — `defn` semantics and limitations
 - [EXLA Backend](https://hexdocs.pm/exla/EXLA.html) — XLA compilation and GPU support
 - [Machine Learning in Elixir — Sean Moriarity](https://pragprog.com/titles/smelixir/machine-learning-in-elixir/)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

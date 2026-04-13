@@ -61,7 +61,7 @@ The first argument is the table name (an atom); the second is a list of
 options. The most important options on day one:
 
 - **Type**: `:set` (default, one tuple per key), `:ordered_set`, `:bag`,
-  `:duplicate_bag`. You'll explore the differences in exercise 95.
+  `:duplicate_bag`. You'll explore the differences later.
 - **Access**: `:public` (any process can read/write), `:protected` (owner
   writes, everyone reads — default), `:private` (only owner).
 - **`:named_table`**: if present, you refer to the table by its atom name;
@@ -137,7 +137,22 @@ would just pay you to forget it. Real apps add the GenServer back on top.
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"phoenix", "~> 1.0"},
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
 
 ```bash
 mix new ets_intro
@@ -145,6 +160,9 @@ cd ets_intro
 ```
 
 ### Step 2: `lib/ets_intro.ex`
+
+**Objective**: Implement `ets_intro.ex` — the access pattern that exposes the trade-off between ETS concurrency flags, match specs, and lookup cost.
+
 
 ```elixir
 defmodule EtsIntro do
@@ -204,6 +222,9 @@ end
 ```
 
 ### Step 3: `test/ets_intro_test.exs`
+
+**Objective**: Write `ets_intro_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
 
 ```elixir
 defmodule EtsIntroTest do
@@ -278,6 +299,9 @@ end
 
 ### Step 4: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -290,6 +314,18 @@ this by `spawn`ing an owner, waiting for `:DOWN`, then asserting
 `:ets.info/1 == :undefined`. CRUD operations (`insert`, `lookup`, `delete`)
 are all single-step and atomic per operation — no cross-key transactions,
 but no torn writes either.
+
+## Key Concepts: ETS Ownership and Memory Model
+
+Erlang Term Storage (ETS) is fundamentally different from a GenServer-wrapped Map because it allows multiple reader processes to bypass the owner's mailbox entirely. When you call `:ets.lookup/2` from any process with read access, the kernel transfers that tuple directly to your heap—no message passing, no queueing. This is why ETS scales where GenServer-based state stores hit a ceiling: at 100 concurrent readers, a GenServer can handle ~10k get operations per second; ETS handles millions.
+
+Ownership, however, is the gotcha that humbles every newcomer. The table exists **only while its owner process is alive**. A common mistake is opening an ETS table in an IEx experiment, crashing the evaluator, and being confused why the table vanished. In production, tables live inside long-lived GenServers under a supervision tree. When the owner receives a `:DOWN` signal from the supervisor, clean up explicitly or accept that the table's data is lost. The `:heir` option (`{:heir, heir_pid, heir_data}`) lets you transfer ownership on exit, but that's rarely used—most apps treat ETS as a volatile cache that rebuilds on startup.
+
+---
+
+## Key Concepts
+
+ETS (Erlang Term Storage) is Elixir's primary in-process key-value store—mutable, fast, and shared across processes. `ets:new/2` creates a table (named or unnamed); `ets:insert/2` and `ets:lookup/2` perform atomic operations. ETS is valuable when you need shared read-heavy state (caches, registries, counters) but making a GenServer would serialize all access. The table lives as long as the creating process; if that process dies, the table disappears. This couples table lifetime to process lifecycle—wrap ETS creation in a supervised process to keep tables alive. Concurrency semantics vary: `set` tables provide atomic inserts (last write wins), `ordered_set` maintains sort order, `bag` allows duplicates. Production systems use ETS for caches (fast reads, occasional rebuilds), rate-limit counters, and session lookups—never for transactional data requiring rollback. Understanding ETS limits is crucial: there's no transactions, no query language beyond pattern matching, and no persistence to disk. For larger datasets or complex queries, a real database is more appropriate. The performance difference between ETS and GenServer access is orders of magnitude—ETS is the right choice for high-frequency state access.
 
 ---
 

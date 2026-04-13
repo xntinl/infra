@@ -4,9 +4,6 @@
 ExCoveralls, producing HTML and JSON reports suitable for Codecov or
 Coveralls.io CI integration.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -35,6 +32,16 @@ coverage_ci/
 │       └── ci.yml
 └── mix.exs
 ```
+
+---
+
+## Why ExCoveralls and not just `mix test --cover`
+
+`mix test --cover` funciona sin deps pero el output es plano y sin
+integración con CI services. ExCoveralls envuelve `:cover` y agrega
+reports HTML, JSON, y `mix coveralls.github` para upload directo
+desde GitHub Actions. Para cualquier proyecto más grande que un toy,
+ExCoveralls es el default.
 
 ---
 
@@ -86,9 +93,41 @@ gymnastics.
 
 ---
 
+## Design decisions
+
+**Option A — `minimum_coverage` alto como aspiración (90%+)**
+- Pros: Forza al equipo a escribir tests.
+- Cons: Incentiva tests triviales; impide mergear bugfixes por 1%
+  de drop.
+
+**Option B — `minimum_coverage` como gate anti-regresión** (elegida)
+- Pros: Bloquea caídas accidentales; no presiona a tests malos.
+- Cons: No empuja el número hacia arriba por sí solo.
+
+→ Elegida **B** (nivel actual menos 1–2 puntos). El número sube con
+reviews honestos, no con gates agresivos.
+
+---
+
+### Dependencies (`mix.exs`)
+
+```elixir
+def deps do
+  [
+    {error},
+    {excoveralls},
+    {exunit},
+    {mix},
+    {ok},
+  ]
+end
+```
 ## Implementation
 
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
 
 ```bash
 mix new coverage_ci
@@ -96,6 +135,9 @@ cd coverage_ci
 ```
 
 ### Step 2: `mix.exs`
+
+**Objective**: Declare dependencies and project config in `mix.exs`.
+
 
 ```elixir
 defmodule CoverageCi.MixProject do
@@ -126,6 +168,9 @@ end
 
 ### Step 3: `coveralls.json` (project root)
 
+**Objective**: Provide `coveralls.json` (project root) — these are the supporting fixtures the main module depends on to make its concept demonstrable.
+
+
 ```json
 {
   "coverage_options": {
@@ -140,6 +185,9 @@ end
 ```
 
 ### Step 4: `lib/calc.ex`
+
+**Objective**: Implement `calc.ex` — the subject under test — shaped specifically to make the testing technique of this lab observable.
+
 
 ```elixir
 defmodule Calc do
@@ -172,6 +220,9 @@ end
 ```
 
 ### Step 5: `test/calc_test.exs`
+
+**Objective**: Write `calc_test.exs` exercising the exact ExUnit feature under study — assertions should fail loudly if the technique is misused.
+
 
 ```elixir
 defmodule CalcTest do
@@ -211,6 +262,9 @@ end
 
 ### Step 6: `.github/workflows/ci.yml`
 
+**Objective**: Implement `ci.yml` — the subject under test — shaped specifically to make the testing technique of this lab observable.
+
+
 ```yaml
 name: CI
 
@@ -243,6 +297,9 @@ jobs:
 
 ### Step 7: Run locally
 
+**Objective**: Run locally.
+
+
 ```bash
 mix deps.get
 
@@ -263,6 +320,22 @@ open cover/excoveralls.html
 The HTML report lights up the uncovered `describe_status/1` branches in
 red. Push to GitHub and `coveralls.github` uploads the report on every
 PR.
+
+### Why this works
+
+ExCoveralls hookea `:cover` de OTP vía `test_coverage` en `mix.exs`,
+recibe cobertura por línea, y formatea para distintos consumidores.
+`mix coveralls.github` lee `GITHUB_TOKEN` y postea al API de
+Coveralls/Codecov — sin plugins, sin YAML manual.
+
+---
+
+## Benchmark
+
+<!-- benchmark N/A: coverage es instrumentación de test time. El
+costo relevante es el overhead de `:cover` durante el suite (10–30%
+más lento). Se mide comparando `mix test` vs `mix coveralls` con
+`time`, no con microbenchmarks. -->
 
 ---
 
@@ -299,6 +372,19 @@ Enforce on libraries, domain modules, and anything with business rules.
 
 ---
 
+## Reflection
+
+- Tu coverage está estancado en 78% por seis meses. El equipo propone
+  subir el `minimum_coverage` a 85% para "forzar mejora". ¿Aceptás?
+  ¿Qué propondrías en su lugar que mejore el testing sin incentivar
+  tests triviales?
+- Un bug crítico vino de un archivo con 100% coverage. Los tests
+  llamaban la función pero no verificaban el resultado. ¿Qué agregás
+  al proceso (review, mutation testing, otra cosa) para que coverage
+  deje de mentir?
+
+---
+
 ## Resources
 
 - [`mix test --cover` — Mix task docs](https://hexdocs.pm/mix/Mix.Tasks.Test.html)
@@ -306,3 +392,17 @@ Enforce on libraries, domain modules, and anything with business rules.
 - [OTP `:cover` module](https://www.erlang.org/doc/man/cover.html)
 - [Coveralls.io Elixir setup](https://docs.coveralls.io/elixir)
 - [setup-beam GitHub Action](https://github.com/erlef/setup-beam)
+
+
+## Key Concepts
+
+ExUnit testing in Elixir balances speed, isolation, and readability. The framework provides fixtures, setup hooks, and async mode to achieve both performance and determinism.
+
+**ExUnit patterns and fixtures:**
+`setup_all` runs once per module (module-scoped state); `setup` runs before each test. Returning `{:ok, map}` injects variables into the test context. For side-effectful setup (e.g., starting supervised processes), use `start_supervised` — it automatically stops the process when the test ends, ensuring cleanup.
+
+**Async safety and isolation:**
+Tests with `async: true` run in parallel, but they must be isolated. Shared resources (database, ETS tables, Registry) require careful locking. A common pattern: `setup :set_myflag` — a private setup that configures a unique state for that test. Avoid global state unless protected by locks.
+
+**Mocking trade-offs:**
+Libraries like `Mox` provide compile-time mock modules that behave like real modules but with controlled behavior. The benefit: you catch missing function implementations at test time. The trade-off: mocks don't catch runtime errors (e.g., a real function that crashes). For critical paths, complement mocks with integration tests against real dependencies. Dependency injection (passing modules as arguments) is more testable than direct calls.

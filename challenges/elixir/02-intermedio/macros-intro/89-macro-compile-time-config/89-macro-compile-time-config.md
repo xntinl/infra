@@ -2,9 +2,6 @@
 
 **Project**: `compile_time_routes` — a simplified `Phoenix.Router`-style DSL that reads a route table at compile time and generates a dispatching function per route.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -38,6 +35,19 @@ compile_time_routes/
 │   └── compile_time_routes_test.exs
 └── mix.exs
 ```
+
+---
+
+## Why compile-time generation and not a runtime map
+
+Un map en runtime escala linealmente a miles de rutas: cada dispatch
+es un lookup. La generación en compile-time cambia tiempo de
+compilación por costo runtime — cada ruta se vuelve una cláusula
+pattern-match del BEAM, así que el dispatch es O(1) a nivel de
+instrucción sin allocación. Para rutas estáticas conocidas al build
+gana; para rutas dinámicas por tenant o desde base de datos pierde (un
+recompile por cambio es inaceptable). Phoenix elige compile-time
+porque web apps tienen rutas estáticas por diseño.
 
 ---
 
@@ -80,9 +90,46 @@ dispatch cost.
 
 ---
 
+## Design decisions
+
+**Option A — Emitir una `match_route/2` por ruta al llamar al macro**
+- Pros: Modelo mental simple; sin hook `__before_compile__`.
+- Cons: El orden de clauses sigue estrictamente el orden fuente; no se
+  pueden reordenar ni validar globalmente.
+
+**Option B — Acumular en `@routes`, emitir vía `__before_compile__`** (elegida)
+- Pros: Todas las rutas visibles en un solo lugar antes de emitir
+  código — se pueden ordenar, deduplicar, validar existencia del
+  handler.
+- Cons: Dos macros en vez de una; el hook `@before_compile` agrega un
+  nivel de indirección.
+
+→ Elegida **B** porque refleja la forma real de Phoenix/Plug y
+habilita las features de vista global que cualquier router no trivial
+necesita.
+
+---
+
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"ecto", "~> 1.0"},
+    {:"phoenix", "~> 1.0"},
+    {:"plug", "~> 1.0"},
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
 
 ```bash
 mix new compile_time_routes
@@ -90,6 +137,9 @@ cd compile_time_routes
 ```
 
 ### Step 2: `lib/compile_time_routes/router.ex`
+
+**Objective**: Implement `router.ex` — AST manipulation that runs at compile time — making the macro's hygiene and unquoting choices observable.
+
 
 ```elixir
 defmodule CompileTimeRoutes.Router do
@@ -166,6 +216,9 @@ end
 
 ### Step 3: `lib/compile_time_routes.ex` — a concrete router
 
+**Objective**: Edit `compile_time_routes.ex` — a concrete router, exposing AST manipulation that runs at compile time — making the macro's hygiene and unquoting choices observable.
+
+
 ```elixir
 defmodule CompileTimeRoutes do
   @moduledoc """
@@ -183,6 +236,9 @@ end
 ```
 
 ### Step 4: `test/compile_time_routes_test.exs`
+
+**Objective**: Write `compile_time_routes_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
 
 ```elixir
 defmodule CompileTimeRoutesTest do
@@ -224,9 +280,63 @@ end
 
 ### Step 5: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
+
+### Why this works
+
+`Module.register_attribute(..., accumulate: true)` convierte `@routes`
+en una lista creciente visible solo durante la compilación del módulo.
+Cada macro `get/2`/`post/2` appendea una tupla. El hook
+`@before_compile` corre una vez por módulo justo antes de cerrar la
+compilación, lee la lista final, y emite una clause
+`def match_route/2` por entrada más una catch-all. El resultado es
+dispatch pattern-matched puro — la primitiva de lookup más rápida del
+BEAM.
+
+---
+
+
+## Deep Dive: State Management and Message Handling Patterns
+
+Understanding state transitions is central to reliable OTP systems. Every `handle_call` or `handle_cast` receives current state and returns new state—immutability forces explicit reasoning. This prevents entire classes of bugs: missing state updates are immediately visible.
+
+Key insight: separate pure logic (state → new state) from side effects (logging, external calls). Move pure logic to private helpers; use handlers for orchestration. This makes servers testable—test pure functions independently.
+
+In production, monitor state size and mutation frequency. Unbounded growth is a memory leak; excessive mutations signal hot spots needing optimization. Always profile before reaching for performance solutions like ETS.
+
+## Benchmark
+
+```elixir
+routes_map = %{
+  {:get, "/users"} => :list_users,
+  {:post, "/users"} => :create_user,
+  {:get, "/health"} => :health
+}
+
+{compiled, _} =
+  :timer.tc(fn ->
+    Enum.each(1..1_000_000, fn _ ->
+      CompileTimeRoutes.match_route(:get, "/users")
+    end)
+  end)
+
+{runtime, _} =
+  :timer.tc(fn ->
+    Enum.each(1..1_000_000, fn _ ->
+      Map.get(routes_map, {:get, "/users"})
+    end)
+  end)
+
+IO.puts("compiled: #{compiled}µs, runtime map: #{runtime}µs")
+```
+
+Target esperado: dispatch compilado <0.5µs por call; Map.get runtime
+~1µs. La diferencia crece con el número de rutas.
 
 ---
 
@@ -266,6 +376,18 @@ routing tables, a runtime trie is the better data structure.
 Use runtime dispatch (a map or list lookup) when routes come from
 external config, the database, or a tenant-specific setup. Code
 generation shines only when the data is static at compile time.
+
+---
+
+## Reflection
+
+- El equipo de producto agrega "rutas personalizables por tenant" y
+  propone leer rutas desde DB al iniciar el router. ¿Seguís con
+  compile-time o cambiás a dispatch runtime? Justificá con dos
+  criterios (frecuencia de cambio, volumen, latencia).
+- El router crece a 3.000 rutas y la compilación pasa de 2s a 45s.
+  ¿Qué medís para decidir si el problema es el número de clauses o el
+  tamaño del AST por clause, y qué refactorizás primero?
 
 ---
 

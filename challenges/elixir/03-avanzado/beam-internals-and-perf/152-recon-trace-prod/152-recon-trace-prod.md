@@ -166,6 +166,8 @@ survives SSH disconnects and can be stopped from any other shell.
 
 ### Step 1: `mix.exs`
 
+**Objective**: Pin :recon so rate-limited trace limits and match-spec pre-filtering prevent mailbox saturation in production.
+
 ```elixir
 defmodule ReconTraceProd.MixProject do
   use Mix.Project
@@ -194,6 +196,8 @@ end
 
 ### Step 2: `lib/recon_trace_prod/application.ex`
 
+**Objective**: Register Safe GenServer so traces survive remote_shell disconnects and prevent concurrent overlapping tracing.
+
 ```elixir
 defmodule ReconTraceProd.Application do
   @moduledoc false
@@ -211,6 +215,8 @@ end
 ```
 
 ### Step 3: `lib/recon_trace_prod/guardrails.ex`
+
+**Objective**: Enforce max_msgs ≤ 5000 and window_ms ≤ 60s plus validate arity:_ absence so unbounded traces cannot escape.
 
 ```elixir
 defmodule ReconTraceProd.Guardrails do
@@ -262,6 +268,8 @@ end
 
 ### Step 4: `lib/recon_trace_prod/sink.ex`
 
+**Objective**: Buffer trace output to disk via :delayed_write so remote_shell TCP backpressure never blocks scheduler threads.
+
 ```elixir
 defmodule ReconTraceProd.Sink do
   @moduledoc """
@@ -287,6 +295,8 @@ end
 ```
 
 ### Step 5: `lib/recon_trace_prod/safe.ex`
+
+**Objective**: Own :recon_trace lifecycle (validate → format → sink) and prevent concurrent traces via one-at-a-time GenServer dispatch.
 
 ```elixir
 defmodule ReconTraceProd.Safe do
@@ -406,6 +416,8 @@ end
 
 ### Step 6: `test/recon_trace_prod/guardrails_test.exs`
 
+**Objective**: Validate rate limits, arity exclusion, and unbounded match-spec rejection so guard violations cannot bypass safety checks.
+
 ```elixir
 defmodule ReconTraceProd.GuardrailsTest do
   use ExUnit.Case, async: true
@@ -447,6 +459,8 @@ end
 ```
 
 ### Step 7: `test/recon_trace_prod/safe_test.exs`
+
+**Objective**: Verify trace isolation, concurrent-trace rejection, and file persistence so one active trace dominates at boot.
 
 ```elixir
 defmodule ReconTraceProd.SafeTest do
@@ -500,6 +514,8 @@ end
 
 ### Step 8: Benchmark the overhead of an active trace
 
+**Objective**: Quantify VM-level match-spec filter cost so trace overhead remains negligible (<5%) when guards exclude all calls.
+
 ```elixir
 # bench/overhead_bench.exs
 alias ReconTraceProd.Safe
@@ -537,6 +553,46 @@ the baseline, confirming that the VM-level match spec filter is effectively free
 ### Why this works
 
 The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
+
+## Deep Dive: BEAM Scheduler Tuning and Memory Profiling in Production
+
+The BEAM scheduler is not "magic" — it's a preemptive work-stealing scheduler that divides CPU time 
+into reductions (bytecode instructions). Understanding scheduler tuning is critical when you suspect 
+latency spikes in production.
+
+**Key concepts**:
+- **Reductions budget**: By default, a process gets ~2000 reductions before yielding to another process.
+  Heavy CPU work (binary matching, list recursion) can exhaust the budget and cause tail latency.
+- **Dirty schedulers**: If a process does CPU-intensive work (crypto, compression, numerical), it blocks 
+  the main scheduler. Use dirty NIFs or `spawn_opt(..., [{:fullsweep_after, 0}])` for GC tuning.
+- **Heap tuning per process**: `Process.flag(:min_heap_size, ...)` reserves heap upfront, reducing GC 
+  pauses. Measure; don't guess.
+
+**Memory profiling workflow**:
+1. Run `recon:memory/0` in iex; identify top 10 memory consumers by type (atoms, binaries, ets).
+2. If binaries dominate, check for refc binary leaks (binary held by process that should have been freed).
+3. Use `eprof` or `fprof` for function-level CPU attribution; `recon:proc_window/3` for process memory trends.
+
+**Production pattern**: Deploy with `+K true` (async IO), `-env ERL_MAX_PORTS 65536` (port limit), 
+`+T 9` (async threads). Measure GC time with `erlang:statistics(garbage_collection)` — if >5% of uptime, 
+tune heap or reduce allocation pressure. Never assume defaults are optimal for YOUR workload.
+
+---
+
+## Advanced Considerations
+
+Understanding BEAM internals at production scale requires deep knowledge of scheduler behavior, memory models, and garbage collection dynamics. The soft real-time guarantees of BEAM only hold under specific conditions — high system load, uneven process distribution across schedulers, or GC pressure can break predictable latency completely. Monitor `erlang:statistics(run_queue)` in production to catch scheduler saturation before it degrades latency significantly. The difference between immediate, offheap, and continuous GC garbage collection strategies can significantly impact tail latencies in systems with millions of messages per second and sustained memory pressure.
+
+Process reductions and the reduction counter affect scheduler fairness fundamentally. A process that runs for extended periods without yielding can starve other processes, even though the scheduler treats it fairly by reduction count per scheduling interval. This is especially critical in pipelines processing large data structures or performing recursive computations where yielding points are infrequent and difficult to predict. The BEAM's preemption model is deterministic per reduction, making performance testing reproducible but sometimes hiding race conditions that only manifest under specific load patterns and GC interactions.
+
+The interaction between ETS, Mnesia, and process message queues creates subtle bottlenecks in distributed systems. ETS reads don't block other processes, but writes require acquiring locks; understanding when your workload transitions from read-heavy to write-heavy is crucial for capacity planning. Port drivers and NIFs bypass the BEAM scheduler entirely, which can lead to unexpected priority inversions if not carefully managed. Always profile with `eprof` and `fprof` in realistic production-like environments before deployment to catch performance surprises.
+
+
+## Deep Dive: Otp Patterns and Production Implications
+
+OTP primitives (GenServer, Supervisor, Application) are tested through their public interfaces, not by inspecting internal state. This discipline forces correct design: if you can't test a behavior without peeking into the server's state, the behavior is not public. Production systems with tight integration tests on GenServer internals are fragile and hard to refactor.
+
+---
 
 ## Trade-offs and production gotchas
 
@@ -607,3 +663,13 @@ irrelevant. Above 10k/s, every filter-clause you add in the match spec matters.
 - [Match specifications](https://www.erlang.org/doc/apps/erts/match_spec.html) — the compiled guard language
 - [Discord's engineering blog — scaling Elixir](https://discord.com/blog/how-discord-scaled-elixir-to-5-000-000-concurrent-users) — real-world tracing stories at scale
 - [Dashbit — observability in Elixir](https://dashbit.co/blog/observability-and-elixir) — José Valim on runtime introspection strategy
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

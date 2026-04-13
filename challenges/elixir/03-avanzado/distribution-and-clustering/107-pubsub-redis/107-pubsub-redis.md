@@ -153,6 +153,8 @@ Inside each cluster: PG2 for fast local fanout. Between clusters: Redis.
 
 ### Step 1: Dependencies
 
+**Objective**: Pin phoenix_pubsub_redis to enable Redis transport layer so WAN-separated clusters avoid :net_kernel latency."""
+
 ```elixir
 # mix.exs
 defp deps do
@@ -166,6 +168,8 @@ end
 ```
 
 ### Step 2: Event envelope
+
+**Objective**: Wrap payloads with UUIDv4 msg_id and origin_node so dedup+loop-prevention survive Redis failover/reconnect."""
 
 ```elixir
 defmodule PubsubRedisAdapter.Event do
@@ -210,6 +214,8 @@ end
 
 ### Step 3: Application supervisor
 
+**Objective**: Start PubSub before Subscriber so subscriptions establish before handler pool is ready."""
+
 ```elixir
 defmodule PubsubRedisAdapter.Application do
   @moduledoc false
@@ -239,6 +245,8 @@ end
 ```
 
 ### Step 4: Dedup GenServer with ETS
+
+**Objective**: Use :ets.insert_new/2 with periodic sweep for O(1) idempotent delivery across Redis failovers."""
 
 ```elixir
 defmodule PubsubRedisAdapter.Dedup do
@@ -303,6 +311,8 @@ end
 
 ### Step 5: Publisher
 
+**Objective**: Pre-mark outgoing msg_id as seen so local echo from Redis does not re-trigger downstream handlers."""
+
 ```elixir
 defmodule PubsubRedisAdapter.Publisher do
   @moduledoc "Tags every broadcast with a unique msg_id."
@@ -323,6 +333,8 @@ end
 ```
 
 ### Step 6: Subscriber
+
+**Objective**: Dispatch inbound events through Task.Supervisor so slow handlers never block Phoenix.PubSub delivery thread."""
 
 ```elixir
 defmodule PubsubRedisAdapter.Subscriber do
@@ -382,6 +394,8 @@ end
 
 ### Step 7: Tests
 
+**Objective**: Assert dedup idempotency and cluster origin filtering so exactly-once delivery is preserved under refactors."""
+
 ```elixir
 defmodule PubsubRedisAdapter.DedupTest do
   use ExUnit.Case, async: false
@@ -393,26 +407,28 @@ defmodule PubsubRedisAdapter.DedupTest do
     :ok
   end
 
-  test "first sighting is :new, second is :duplicate" do
-    assert Dedup.check_and_mark("msg-1") == :new
-    assert Dedup.check_and_mark("msg-1") == :duplicate
-  end
+  describe "PubsubRedisAdapter.Dedup" do
+    test "first sighting is :new, second is :duplicate" do
+      assert Dedup.check_and_mark("msg-1") == :new
+      assert Dedup.check_and_mark("msg-1") == :duplicate
+    end
 
-  test "different ids don't collide" do
-    assert Dedup.check_and_mark("msg-a") == :new
-    assert Dedup.check_and_mark("msg-b") == :new
-  end
+    test "different ids don't collide" do
+      assert Dedup.check_and_mark("msg-a") == :new
+      assert Dedup.check_and_mark("msg-b") == :new
+    end
 
-  test "high-concurrency inserts do not double-mark" do
-    results =
-      1..200
-      |> Enum.map(fn _ ->
-        Task.async(fn -> Dedup.check_and_mark("hot") end)
-      end)
-      |> Task.await_many(5_000)
+    test "high-concurrency inserts do not double-mark" do
+      results =
+        1..200
+        |> Enum.map(fn _ ->
+          Task.async(fn -> Dedup.check_and_mark("hot") end)
+        end)
+        |> Task.await_many(5_000)
 
-    new_count = Enum.count(results, &(&1 == :new))
-    assert new_count == 1
+      new_count = Enum.count(results, &(&1 == :new))
+      assert new_count == 1
+    end
   end
 end
 ```
@@ -429,26 +445,28 @@ defmodule PubsubRedisAdapter.PublisherTest do
     :ok
   end
 
-  test "broadcast emits envelope with required fields" do
-    Phoenix.PubSub.subscribe(PubsubRedisAdapter.PubSub, "orders.events")
+  describe "PubsubRedisAdapter.Publisher" do
+    test "broadcast emits envelope with required fields" do
+      Phoenix.PubSub.subscribe(PubsubRedisAdapter.PubSub, "orders.events")
 
-    :ok = Publisher.broadcast("orders.events", %{id: 42, state: :placed})
+      :ok = Publisher.broadcast("orders.events", %{id: 42, state: :placed})
 
-    assert_receive {:cross_cluster, %Event{} = ev}, 1_000
-    assert ev.topic == "orders.events"
-    assert ev.cluster == "test-cluster"
-    assert ev.origin_node == node()
-    assert is_binary(ev.msg_id)
-    assert ev.payload == %{id: 42, state: :placed}
-  end
+      assert_receive {:cross_cluster, %Event{} = ev}, 1_000
+      assert ev.topic == "orders.events"
+      assert ev.cluster == "test-cluster"
+      assert ev.origin_node == node()
+      assert is_binary(ev.msg_id)
+      assert ev.payload == %{id: 42, state: :placed}
+    end
 
-  test "own-cluster broadcast is marked seen so echo is ignored" do
-    :ok = Publisher.broadcast("fulfillment.events", :test)
-    # The publisher pre-marks its msg_id — verify indirectly: if subscriber
-    # also marks, it should see :duplicate. We replay by hand.
-    event = Event.new("test-cluster", "fulfillment.events", :test)
-    # A distinct id = treated as new
-    assert PubsubRedisAdapter.Dedup.check_and_mark(event.msg_id) == :new
+    test "own-cluster broadcast is marked seen so echo is ignored" do
+      :ok = Publisher.broadcast("fulfillment.events", :test)
+      # The publisher pre-marks its msg_id — verify indirectly: if subscriber
+      # also marks, it should see :duplicate. We replay by hand.
+      event = Event.new("test-cluster", "fulfillment.events", :test)
+      # A distinct id = treated as new
+      assert PubsubRedisAdapter.Dedup.check_and_mark(event.msg_id) == :new
+    end
   end
 end
 ```
@@ -471,6 +489,24 @@ IO.puts("avg: #{time_us / 10_000} µs/op")
 ```
 
 Target: operation should complete in the low-microsecond range on modern hardware; deviations by >2× indicate a regression worth investigating.
+
+## Deep Dive
+
+Distributed Erlang relies on a heartbeat mechanism (net_kernel tick) to detect node failure, but the network is fundamentally asynchronous—split-brain scenarios are inevitable. A partitioned cluster may have two sets of nodes, each believing the other is dead. Libraries like Horde and Phoenix.PubSub solve this with quorum-aware consensus, but they add latency and complexity. At scale, choose your consistency model explicitly: eventual consistency (via Redis PubSub) is faster but allows temporary divergence; strong consistency (via Horde DLM or distributed transactions) is slower but guarantees atomicity. For global registries, the order of operations matters—registering a process before its monitor is live creates race conditions. In multi-region setups, latency between nodes compounds these issues; consider regional clusters with a lightweight coordinator rather than a fully meshed topology.
+## Advanced Considerations
+
+Distributed Elixir systems require careful consideration of network partitions, consistent hashing for distributed state, and the interaction between clustering libraries and node discovery mechanisms. Network partitions are not rare edge cases; they happen regularly in cloud deployments due to maintenance windows and infrastructure issues. A system that works perfectly during local testing but fails under network partitions indicates insufficient failure handling throughout the codebase. Split-brain scenarios where multiple network partitions lead to different cluster views require explicit recovery mechanisms that are often business-specific and context-dependent.
+
+Horde and distributed registries provide eventual consistency guarantees, but "eventual" can mean minutes during network partitions. Applications must handle the case where the same name is registered on multiple nodes simultaneously without coordination. Consistent hashing for distributed services requires understanding rebalancing costs — a single node failure can cause significant key redistribution and thundering herd problems if not carefully managed. The cost of distributed consensus using algorithms like Raft is high; choose it only when consistency is more important than availability and can afford the performance cost.
+
+Global state replication across nodes creates synchronization challenges at scale. Choosing between replicating everywhere versus replicating to specific nodes affects both consistency latency and network bandwidth utilization fundamentally. Node monitoring and heartbeat mechanisms require careful timeout tuning — too aggressive and you get false positives during network hiccups; too conservative and you don't detect actual failures quickly enough for recovery. The EPMD (Erlang Port Mapper Daemon) is a critical component that can become a bottleneck in large clusters and requires careful capacity planning.
+
+
+## Deep Dive: Cluster Patterns and Production Implications
+
+Clustering distributes computation across nodes using Erlang's distribution protocol. Testing clusters requires simulating node failures, network partitions, and message delays—challenges that single-node tests don't expose. Production clusters fail in ways that cluster tests reveal: nodes can become isolated (stuck), messages can be reordered, and consensus is expensive.
+
+---
 
 ## Trade-offs and production gotchas
 
@@ -556,3 +592,13 @@ until Redis CPU hits 60%, then shard topics across multiple Redis instances.
 - [`Redix` hex docs](https://hexdocs.pm/redix/) — low-level client used under the hood
 - [Dashbit — "Real-time in Elixir"](https://dashbit.co/blog) — patterns for cross-cluster broadcasting
 - [Phoenix.PubSub.Redis source](https://github.com/phoenixframework/phoenix_pubsub_redis) — study the fastlane and pool structure
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

@@ -97,9 +97,22 @@ dispatch walks partitions serially in the caller.
 
 ---
 
+### Dependencies (`mix.exs`)
+
+```elixir
+def deps do
+  [
+    {exunit},
+    {ok},
+  ]
+end
+```
 ## Implementation
 
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
 
 ```bash
 mix new partitioned_reg --sup
@@ -107,6 +120,9 @@ cd partitioned_reg
 ```
 
 ### Step 2: `lib/partitioned_reg.ex`
+
+**Objective**: Implement `partitioned_reg.ex` — the naming/lookup strategy that decides how processes are addressed under concurrency and failure.
+
 
 ```elixir
 defmodule PartitionedReg do
@@ -134,6 +150,9 @@ end
 ```
 
 ### Step 3: `lib/partitioned_reg/bench.ex`
+
+**Objective**: Implement `bench.ex` — the naming/lookup strategy that decides how processes are addressed under concurrency and failure.
+
 
 ```elixir
 defmodule PartitionedReg.Bench do
@@ -183,6 +202,9 @@ end
 ```
 
 ### Step 4: `test/partitioned_reg_test.exs`
+
+**Objective**: Write `partitioned_reg_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
 
 ```elixir
 defmodule PartitionedRegTest do
@@ -250,6 +272,9 @@ end
 
 ### Step 5: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -263,6 +288,14 @@ VM the numbers converge.
 Partitioning shards registrations across N independent ETS tables keyed by `:erlang.phash2(key, N)`. Each table has its own mutex, so on an N-core box, N concurrent writers progress in parallel instead of serializing on a single write-lock. The public API is unchanged — `register/3`, `lookup/2`, and `dispatch/3` route transparently through the partition — which is why the upgrade is a one-line configuration change, not a rewrite.
 
 ---
+
+
+## Key Concepts: Partitioned Registries and Scalability
+
+By default, `Registry` is a single GenServer, which can become a bottleneck under high registration throughput. Partitioned registries shard the registry across N partitions, reducing contention. Each partition is its own GenServer.
+
+Example: `Registry.start_link(name: MyReg, keys: :unique, partitions: System.schedulers_online())` creates one partition per scheduler, so registrations don't serialize. The trade-off: slightly slower lookups (hash the key to find the partition), but much better throughput.
+
 
 ## Benchmark
 
@@ -330,3 +363,15 @@ ETS contention actually shows up (~thousands of ops/sec).
 - [Fix Process Bottlenecks with Elixir 1.14's Partition Supervisor — AppSignal](https://blog.appsignal.com/2022/09/20/fix-process-bottlenecks-with-elixir-1-14s-partition-supervisor.html)
 - [A journey to Syn v2 — Roberto Ostinelli](https://www.ostinelli.net/a-journey-to-syn-v2/) — deep dive into partitioned registry design
 - [`PartitionSupervisor`](https://hexdocs.pm/elixir/PartitionSupervisor.html) — the same idea applied to any GenServer
+
+
+## Key Concepts
+
+Registry patterns in Elixir provide distributed name resolution through a central registry process. Unlike traditional naming services, Elixir registries are per-node by default but can be partitioned globally. Process name resolution follows a lookup chain: local registry → distributed registry (if configured) → `:global` → fallback mechanisms.
+
+**Critical concepts:**
+- **Via tuple pattern** `{:via, module, name}`: Enables pluggable naming backends. The registry module intercepts `:whereis`, `:register`, `:unregister` calls, allowing both local and distributed strategies.
+- **Partitioned registries** (`Registry.start_link(partitions: 8)`): Reduce contention by sharding the registry across multiple ETS tables. Each partition handles independent name lookups, improving throughput under high concurrency.
+- **Clustering implications**: Global registries across nodes require consensus. Elixir's registry design favors availability (CAP theorem) — a node can register locally and replicate asynchronously. This is why `:global` exists separately from local registries.
+
+**Senior-level gotcha**: Mixing local and global registration without explicit sync logic can cause "phantom" processes — a process registered locally appears available to local callers but fails remote calls. Always make registry scope explicit in your architecture.

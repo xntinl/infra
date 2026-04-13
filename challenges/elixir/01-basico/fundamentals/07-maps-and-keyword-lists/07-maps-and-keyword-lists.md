@@ -70,6 +70,17 @@ app_config/
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### `lib/app_config.ex`
 
 ```elixir
@@ -421,6 +432,19 @@ mix test --trace
 
 The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
 
+
+## Key Concepts
+
+### 1. Maps Are Key-Value Stores, Keyword Lists Are Ordered Tuples
+Maps use any term as a key and unordered lookup. Keyword lists are ordered lists of tuples—each key can appear multiple times. Choose maps for data, keyword lists for options.
+
+### 2. Keyword Lists Allow Duplicate Keys
+A keyword list can have multiple entries for the same key. Accessing with `[]` returns the first value. Use `Keyword.get_values/2` to get all values.
+
+### 3. Pattern Matching on Maps Matches Partial Keys
+Only keys you pattern-match on need to be present. Extra keys are ignored. This makes maps flexible for APIs where you don't control all fields.
+
+---
 ## Map access: dot notation vs bracket notation
 
 ```elixir

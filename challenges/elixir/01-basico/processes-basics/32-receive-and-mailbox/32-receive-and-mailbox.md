@@ -3,9 +3,6 @@
 **Project**: `req_resp` — a minimal request/response abstraction using unique refs,
 the same pattern that sits underneath `GenServer.call/3`.
 
-**Difficulty**: ★★☆☆☆
-**Time**: 2-3 hours
-
 ---
 
 ## Project structure
@@ -62,9 +59,47 @@ This is the atomic pattern that every sync BEAM RPC builds on.
 
 ---
 
+## Design decisions
+
+**Option A — tag replies with a monotonic integer counter in the process dict**
+- Pros: avoids allocating a ref per call; "feels" cheaper.
+- Cons: counter is process-local — across nodes you need global uniqueness; mutable state in process dict is ugly; collisions after overflow are catastrophic.
+
+**Option B — `make_ref/0` per call + `^ref` match** (chosen)
+- Pros: unique within the cluster; zero bookkeeping; matches exactly how `GenServer.call/3` works internally; easy to reason about.
+- Cons: one ref allocation per call (cheap — nanoseconds on the BEAM).
+
+→ Chose **B** because refs are the canonical BEAM correlation primitive. Any deviation requires justification; there is none at this scale.
+
+---
+
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"phoenix", "~> 1.0"},
+  ]
+end
+```
+
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  # stdlib + :logger only.
+  []
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Split mailbox helpers, server, and client into separate modules so each concept of the request/response pattern is independently testable.
 
 ```bash
 mix new req_resp
@@ -72,6 +107,8 @@ cd req_resp
 ```
 
 ### Step 2: `mix.exs`
+
+**Objective**: Configure the OTP application with no external deps, proving `spawn`, `send`, and `receive` alone are enough to build the request/response primitive.
 
 ```elixir
 defmodule ReqResp.MixProject do
@@ -95,6 +132,8 @@ end
 
 ### Step 3: `.formatter.exs`
 
+**Objective**: Pin formatter rules so concurrency-heavy code reads uniformly across reviewers, where subtle indentation usually hides real bugs.
+
 ```elixir
 [
   inputs: ["{mix,.formatter}.exs", "{config,lib,test}/**/*.{ex,exs}"],
@@ -103,6 +142,8 @@ end
 ```
 
 ### Step 4: `lib/req_resp/mailbox.ex`
+
+**Objective**: Expose the raw mailbox so callers see the FIFO ordering and selective-receive mechanics that `GenServer` normally hides behind its API.
 
 ```elixir
 defmodule ReqResp.Mailbox do
@@ -152,6 +193,8 @@ end
 ```
 
 ### Step 5: `lib/req_resp/echo_server.ex`
+
+**Objective**: Build a loop over `receive` that echoes payloads back to the caller's pid, demonstrating the bidirectional message shape GenServer encodes.
 
 ```elixir
 defmodule ReqResp.EchoServer do
@@ -209,6 +252,8 @@ end
 ```
 
 ### Step 6: `lib/req_resp/client.ex`
+
+**Objective**: Tag each request with a unique `make_ref/0` so replies cannot be confused with unrelated messages already sitting in the mailbox.
 
 ```elixir
 defmodule ReqResp.Client do
@@ -276,6 +321,8 @@ end
 ```
 
 ### Step 7: Tests
+
+**Objective**: Cover timeouts, stale messages, and interleaved requests to prove the ref-tag protocol is immune to out-of-order delivery.
 
 ```elixir
 # test/req_resp/echo_server_test.exs
@@ -383,12 +430,54 @@ end
 
 ### Step 8: Run
 
+**Objective**: Compile with strict warnings to catch dead `receive` clauses, which are a classic mailbox-blocking bug in hand-rolled processes.
+
 ```bash
 mix deps.get
 mix compile --warnings-as-errors
 mix test
 mix format
 ```
+
+### Why this works
+
+`receive` with `^ref` does selective receive on a unique correlation tag, so even with 50 concurrent calls into the same `EchoServer` the replies can't be confused — the BEAM scans the caller's mailbox and extracts only the matching message. `flush_stale/1` with `after 0` does a non-blocking drain of any reply that arrived after the timeout window closed, which prevents the caller's mailbox from accumulating stale messages that would slow every future `receive` to O(n). The server's `other ->` catch-all keeps unknown messages from wedging the mailbox.
+
+---
+
+
+
+---
+## Key Concepts
+
+### 1. `receive` Blocks Until a Matching Message Arrives
+
+Every process has a mailbox. Messages pile up in order. `receive` pattern-matches on the mailbox, waiting for the first message that matches a clause. The `after` clause handles timeouts. If no clause matches and no timeout is set, the process waits forever.
+
+### 2. Message Ordering is Per-Process, Not Global
+
+If Process A sends messages to Process B, they arrive in order. But if multiple senders send to B, the order depends on timing—not guaranteed. Never rely on ordering across multiple senders without explicit coordination.
+
+### 3. Selective Receive: Patterns Determine Which Messages Are Handled
+
+Only messages matching your patterns are removed from the mailbox. Other messages stay queued. If you have unmatched messages and no catch-all clause, `receive` waits forever. Make sure your patterns cover all message types you expect.
+
+---
+## Benchmark
+
+```elixir
+# bench/call.exs
+pid = ReqResp.EchoServer.start()
+
+{t_sync, _} = :timer.tc(fn ->
+  Enum.each(1..100_000, fn i -> {:ok, ^i} = ReqResp.Client.call(pid, i, 1_000) end)
+end)
+
+IO.puts("100k sync calls: #{t_sync} µs — #{t_sync / 100_000} µs/call")
+ReqResp.EchoServer.stop(pid)
+```
+
+Target: < 10 µs per synchronous call on modern hardware (alive? + send + receive-with-ref). This is the same order of magnitude as `GenServer.call/3` — any abstraction on top adds microseconds, not milliseconds.
 
 ---
 
@@ -444,6 +533,13 @@ VM OOMs. In production, observe `:message_queue_len` via telemetry.
 
 This pattern is the minimum viable sync RPC on the BEAM. Learn it, then let
 `GenServer` hide it for you.
+
+---
+
+## Reflection
+
+- Your `:message_queue_len` telemetry shows one specific process regularly sits at 50k messages. `receive` has now degraded to O(n). What structural change fixes this — bounded mailbox, sharding the process, or moving the unmatched-message handling inside the receive? Justify.
+- You replace `Process.alive?/1 + send` with `Process.monitor/1`. What exactly changes in the receive clauses of `Client.call/3`, and which failure mode becomes detectable that wasn't before?
 
 ---
 

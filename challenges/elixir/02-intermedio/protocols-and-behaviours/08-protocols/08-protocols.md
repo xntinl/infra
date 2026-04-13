@@ -95,9 +95,22 @@ use one where the other fits.
 
 ---
 
+### Dependencies (`mix.exs`)
+
+```elixir
+def deps do
+  [
+    {a},
+    {exunit},
+  ]
+end
+```
 ## Implementation
 
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
 
 ```bash
 mix new jsonable_proto
@@ -105,6 +118,9 @@ cd jsonable_proto
 ```
 
 ### Step 2: `lib/jsonable.ex`
+
+**Objective**: Implement `jsonable.ex` — polymorphism via dispatch on the data's type (protocol) or via an explicit contract (behaviour).
+
 
 ```elixir
 defprotocol Jsonable do
@@ -120,6 +136,9 @@ end
 ```
 
 ### Step 3: `lib/jsonable/impls.ex`
+
+**Objective**: Implement `impls.ex` — polymorphism via dispatch on the data's type (protocol) or via an explicit contract (behaviour).
+
 
 ```elixir
 defmodule Jsonable.Impls do
@@ -175,6 +194,9 @@ end
 ```
 
 ### Step 4: `test/jsonable_test.exs`
+
+**Objective**: Write `jsonable_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
 
 ```elixir
 defmodule JsonableTest do
@@ -232,6 +254,9 @@ end
 
 ### Step 5: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -241,6 +266,14 @@ mix test
 `defprotocol` declares the single dispatch function, and each `defimpl … for: Type` registers one branch. At compile time, `mix` consolidates the protocol into an optimized dispatch function, so `Jsonable.to_json(42)` in production is effectively a direct call into the `Integer` impl. The `Protocol.UndefinedError` on unsupported types (e.g., tuples) is not a bug — it's the protocol telling you exactly which extension point is missing.
 
 ---
+
+
+## Key Concepts: Protocol Polymorphism and Extensibility
+
+Protocols define a set of functions that can be implemented for different data types. For example, `Enumerable` protocol requires `reduce/3`, `count/0`, etc. When you call `Enum.to_list(my_custom_struct)`, Elixir looks up the `Enumerable` implementation for your struct's type and calls the appropriate function.
+
+Protocols are more flexible than behaviours for library design: a library author defines a protocol, and downstream users implement it for their types without modifying the library. Real-world example: `JSON.encode(value)` checks if `value` has a `JSON` protocol implementation; if so, uses it; otherwise raises a clear error. Protocols also support fallback: `@derive Enumerable` automatically generates the protocol impl for simple cases.
+
 
 ## Benchmark
 
@@ -304,3 +337,17 @@ different design.
 - [`Protocol` module](https://hexdocs.pm/elixir/Protocol.html)
 - [`Jason.Encoder` source](https://github.com/michalmuskala/jason/blob/master/lib/encoder.ex) — a production-grade protocol
 - ["Polymorphism in Elixir" — Dashbit blog](https://dashbit.co/blog/writing-extensible-elixir-with-protocols)
+
+
+## Key Concepts
+
+Protocols and behaviors are Elixir's mechanism for ad-hoc and static polymorphism. They solve different problems and are often confused.
+
+**Protocols:**
+Dispatch based on the type/struct of the first argument at runtime. A protocol defines a contract (e.g., `Enumerable`); any type can implement it by adding a corresponding implementation block. Protocols excel when you control neither the type nor the caller — e.g., a library that needs to iterate any collection. The fallback is `:any` — if no specific implementation exists, the `:any` handler is tried. This enables "optional" protocol implementations.
+
+**Behaviours:**
+Static polymorphism enforced at compile time. A module implements a behavior by defining callbacks (functions). Behaviors are about contracts between modules, not types. Use when you need multiple implementations of the same interface and the caller chooses which to use (e.g., different database adapters, different strategies). Callbacks are checked at compile time — missing a required callback is a compiler error.
+
+**Architectural patterns:**
+Behaviors excel in plugin systems (user defines modules conforming to the behavior). Protocols excel in type-driven dispatch (any type can conform). Mix both: a behavior can require that its callbacks operate on types that implement a protocol. Example: `MyAdapter` behavior requiring callbacks that work with `Enumerable` types.

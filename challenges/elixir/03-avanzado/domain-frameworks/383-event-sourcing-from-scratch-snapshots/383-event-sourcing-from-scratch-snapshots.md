@@ -87,6 +87,8 @@ end
 
 ### Step 1: Migrations
 
+**Objective**: Shape the append-only `events` log plus `snapshots` cache — the unique `(stream_id, version)` index is the optimistic-concurrency guard.
+
 ```elixir
 defmodule InventoryEs.Repo.Migrations.CreateEvents do
   use Ecto.Migration
@@ -122,6 +124,8 @@ end
 
 ### Step 2: Repo
 
+**Objective**: Wire the Ecto Repo against Postgres — the durable substrate for the event log; durability semantics are deferred to the database.
+
 ```elixir
 defmodule InventoryEs.Repo do
   use Ecto.Repo, otp_app: :inventory_es, adapter: Ecto.Adapters.Postgres
@@ -129,6 +133,8 @@ end
 ```
 
 ### Step 3: Errors
+
+**Objective**: Model `ConcurrencyError` as a typed exception so callers can distinguish version conflicts from transient database failures.
 
 ```elixir
 defmodule InventoryEs.Errors do
@@ -148,6 +154,8 @@ end
 ```
 
 ### Step 4: Events and commands
+
+**Objective**: Separate intent (commands, imperative) from facts (events, past-tense) — commands can fail, events are immutable history.
 
 ```elixir
 defmodule InventoryEs.Stock.Events do
@@ -186,6 +194,8 @@ end
 ```
 
 ### Step 5: Aggregate
+
+**Objective**: Split `decide/2` (pure command→events) from `apply/2` (pure event→state) — the core functional core of event sourcing.
 
 ```elixir
 defmodule InventoryEs.Stock.Aggregate do
@@ -250,6 +260,8 @@ end
 ```
 
 ### Step 6: Event store
+
+**Objective**: Append events transactionally — translate the unique-index violation into `ConcurrencyError`, and snapshot every N versions to bound replay cost.
 
 ```elixir
 defmodule InventoryEs.EventStore do
@@ -326,6 +338,8 @@ end
 ```
 
 ### Step 7: Repository (load / save)
+
+**Objective**: Rehydrate from snapshot + tail events, then fold; the repository is the only place where impure IO meets the pure aggregate.
 
 ```elixir
 defmodule InventoryEs.Stock.Repository do
@@ -506,6 +520,24 @@ Benchee.run(
 
 Target: short-stream load < 1ms. Long-stream with snapshot < 2ms (snapshot read + 1 event fold). If the snapshot is *not* kicking in you will see >30ms on the long stream — that is your signal that `@snapshot_every` is misconfigured or the snapshots table is empty.
 
+## Deep Dive
+
+Specialized frameworks like Ash (business logic), Commanded (event sourcing), and Nx (numerical computing) abstract away common infrastructure but impose architectural constraints. Ash's declarative resource definitions simplify authorization and querying at the cost of reduced flexibility—deeply nested association policies can degrade query performance. Commanded's event store and aggregate roots enforce event sourcing discipline, making audit trails and temporal queries natural, but require careful snapshot strategy to avoid replaying years of events. Nx brings numerical computing to Elixir, but JIT compilation and lazy evaluation introduce latency; production models benefit from ahead-of-time compilation for inference. For IoT (Nerves), firmware updates must be atomic and resumable—OTA rollback on failure is non-negotiable. Choose frameworks that align with your scaling assumptions: Ash scales horizontally via read replicas; Commanded scales via sharding; Nx scales via distributed training.
+## Advanced Considerations
+
+Framework choices like Ash, Commanded, and Nerves create significant architectural constraints that are difficult to change later. Ash's powerful query builder and declarative approach simplify common patterns but can be opaque when debugging complex permission logic or custom filters at scale. Event sourcing with Commanded is powerful for audit trails but creates a different mental model for state management — replaying events to derive current state has CPU and latency costs that aren't apparent in traditional CRUD systems.
+
+Nerves requires understanding the full embedded system stack — from bootloader configuration to over-the-air update mechanisms. A Nerves system that works on your development board may fail in production due to hardware variations, network conditions, or power supply issues. NX's numerical computing is powerful but requires understanding GPU acceleration trade-offs and memory management for large datasets. Livebook provides interactive development but shouldn't be used for production deployments without careful containerization and resource isolation.
+
+The integration between these frameworks and traditional BEAM patterns (supervisors, processes, GenServers) requires careful design. A Commanded projection that rebuilds state from the event log can consume all available CPU, starving other services. NX autograd computations can create unexpected memory usage if not carefully managed. Nerves systems are memory-constrained; performance assumptions from desktop Elixir don't hold. Always prototype these frameworks in realistic environments before committing to them in production systems to validate assumptions.
+
+
+## Deep Dive: Domain Patterns and Production Implications
+
+Domain-specific frameworks enforce module dependencies and architectural boundaries. Testing domain isolation ensures that constraints are maintained as the codebase grows. Production systems without boundary enforcement often become monolithic and hard to test.
+
+---
+
 ## Trade-offs and production gotchas
 
 **1. Fold time is linear in events**
@@ -536,3 +568,13 @@ You wrote state into the snapshot as a JSON map derived from the aggregate struc
 - [Martin Kleppmann — Designing Data-Intensive Applications, ch. 11](https://dataintensive.net/)
 - [Elixir Ecto docs — `insert_all`](https://hexdocs.pm/ecto/Ecto.Repo.html#c:insert_all/3)
 - [Commanded source](https://github.com/commanded/commanded) — read how they implement stream version check
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

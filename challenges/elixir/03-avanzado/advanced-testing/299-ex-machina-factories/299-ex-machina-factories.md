@@ -107,6 +107,8 @@ defp elixirc_paths(_),     do: ["lib"]
 
 ### Step 1: schemas
 
+**Objective**: Model `User` with unique email and role inclusion so factories must respect real constraints, not bypass them.
+
 ```elixir
 # lib/user_directory/users/user.ex
 defmodule UserDirectory.Users.User do
@@ -156,6 +158,8 @@ end
 
 ### Step 2: the factory
 
+**Objective**: Use `sequence/2` for per-factory uniqueness and compose `admin_user` over `user` so overrides stay minimal and intent-revealing.
+
 ```elixir
 # test/support/factory.ex
 defmodule UserDirectory.Factory do
@@ -197,6 +201,8 @@ end
 
 ### Step 3: DataCase imports Factory
 
+**Objective**: Auto-import factory helpers into every `DataCase` test so `build`, `insert`, `params_for` are first-class without per-file boilerplate.
+
 ```elixir
 # test/support/data_case.ex
 defmodule UserDirectory.DataCase do
@@ -221,6 +227,8 @@ end
 ```
 
 ### Step 4: tests using factories
+
+**Objective**: Contrast `build/insert/params_for` so tests only pay the DB cost when persistence is actually under assertion.
 
 ```elixir
 # test/user_directory/users_test.exs
@@ -347,6 +355,21 @@ Benchee.run(%{
 
 Target: `build/1` < 10µs; `insert/1` < 1ms.
 
+## Deep Dive: Property Patterns and Production Implications
+
+Property-based testing inverts the testing mindset: instead of writing examples, you state invariants (properties) and let a generator find counterexamples. StreamData's shrinking capability is its superpower—when a property fails on a 10,000-element list, the framework reduces it to the minimal list that still fails, cutting debugging time from hours to minutes. The trade-off is that properties require rigorous thinking about domain constraints, and not every invariant is worth expressing as a property. Teams that adopt property testing often find bugs in specifications themselves, not just implementations.
+
+---
+
+## Advanced Considerations
+
+Production testing strategies require careful attention to resource management and test isolation across multiple concurrent test processes. In large codebases, tests can consume significant memory and CPU resources, especially when using concurrent testing without proper synchronization and cleanup. The BEAM scheduler's preemptive nature means test processes may interfere with each other if shared resources aren't properly isolated at the process boundary. Pay careful attention to how Ecto's sandbox mode interacts with your supervision tree — if you have GenServers that hold state across tests, the sandbox rollback mechanism may leave phantom processes in your monitoring systems that continue consuming resources until forced cleanup occurs.
+
+When scaling tests to production-grade test suites, consider the cost of stub verification and the memory overhead of generated test cases. Each property-based test invocation can create thousands of synthetic test cases, potentially causing garbage collection pressure that's invisible during local testing but becomes critical in CI/CD pipelines running long test suites continuously. The interaction between concurrent tests and ETS tables (often used in caches and registry patterns) requires explicit `inherited: true` options to prevent unexpected sharing between test processes, which can cause mysterious failures when tests run in different orders or under load.
+
+For distributed testing scenarios using tools like `Peer`, network simulation can mask real latency issues and failure modes. Test timeouts that work locally may fail in CI due to scheduler contention and GC pauses. Always include substantial buffers for timeout values and monitor actual execution times under load. The coordination between multiple test nodes requires careful cleanup — a failure in test coordination can leave zombie processes consuming resources indefinitely. Implement proper telemetry hooks within your test helpers to diagnose production-like scenarios and capture performance characteristics.
+
+
 ## Trade-offs and production gotchas
 
 **1. Tests asserting on factory defaults**
@@ -389,3 +412,13 @@ automatically?
 - [`ExMachina.Ecto`](https://hexdocs.pm/ex_machina/ExMachina.Ecto.html)
 - [ThoughtBot — factories vs fixtures](https://thoughtbot.com/blog/factories-should-be-the-bare-minimum)
 - [`Ecto.Changeset.traverse_errors/2`](https://hexdocs.pm/ecto/Ecto.Changeset.html#traverse_errors/2)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

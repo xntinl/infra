@@ -141,6 +141,78 @@ checkout queue time (the #1 symptom of an undersized pool) for free.
 
 ### Step 1: mix.exs
 
+**Objective**: Add finch, req, telemetry so HTTP client is built on production foundations with pool management and instrumentation.
+
+```elixir
+defp deps do
+  [
+    {:finch, "~> 0.18"},
+    {:req, "~> 0.5"},
+    {:jason, "~> 1.4"},
+    {:telemetry, "~> 1.2"},
+    {:bypass, "~> 2.1", only: :test}
+  ]
+end
+```
+
+### Dependencies (mix.exs)
+
+```elixir
+```elixir
+{Finch,
+ name: MyFinch,
+ pools: %{
+   "https://api.stripe.com"  => [size: 25, protocols: [:http2], count: 1],
+   "https://api.adyen.com"   => [size: 25, protocols: [:http2], count: 1],
+   "https://legacy.bank.net" => [size: 10, protocols: [:http1], count: 10]
+ }}
+```
+
+Finch matches the destination URL against these keys and picks the pool.
+
+### 4. Streaming vs buffered
+
+`Req.get!(url)` loads the full response into memory. For a 2GB CSV this is
+fatal. `Finch.stream/4` hands you chunks as they arrive so you can pipe them
+to disk or a parser:
+
+```
+Mint TCP ─▶ Finch.stream callback ─▶ chunk 1 ─▶ handler
+                                  └─▶ chunk 2 ─▶ handler
+                                  └─▶ chunk N ─▶ :done
+```
+
+The handler accumulates, writes to file, or pipes to `File.stream!/1` without
+ever materializing the whole body.
+
+### 5. Telemetry — what Finch already emits
+
+Finch emits `[:finch, :request, :start]`, `[:finch, :request, :stop]`,
+`[:finch, :request, :exception]`, plus `[:finch, :queue, :start]/:stop`
+(how long checkout waits), `[:finch, :connect, :start]/:stop`, and
+`[:finch, :recv, :start]/:stop`. Attaching handlers to these gives you
+checkout queue time (the #1 symptom of an undersized pool) for free.
+
+---
+
+## Design decisions
+
+**Option A — naive/simple approach**
+- Pros: minimal code, easy to reason about.
+- Cons: breaks under load, lacks observability, hard to evolve.
+
+**Option B — the approach used here** (chosen)
+- Pros: production-grade, handles edge cases, testable boundaries.
+- Cons: more moving parts, requires understanding of the BEAM primitives involved.
+
+→ Chose **B** because correctness under concurrency and failure modes outweighs the extra surface area.
+
+## Implementation
+
+### Step 1: mix.exs
+
+**Objective**: Add finch, req, telemetry so HTTP client is built on production foundations with pool management and instrumentation.
+
 ```elixir
 defp deps do
   [
@@ -154,6 +226,8 @@ end
 ```
 
 ### Step 2: `lib/http_clients_deep/pools.ex`
+
+**Objective**: Configure per-upstream pool sizes for protocol (HTTP/2 count:1, HTTP/1.1 count:N) so multiplexing is sized correctly without over-allocating connections.
 
 ```elixir
 defmodule HttpClientsDeep.Pools do
@@ -189,6 +263,8 @@ end
 
 ### Step 3: `lib/http_clients_deep/client.ex`
 
+**Objective**: Wire Req timeout and retry defaults so all callsites inherit consistent failure handling without per-request reconfig.
+
 ```elixir
 defmodule HttpClientsDeep.Client do
   @moduledoc """
@@ -222,6 +298,8 @@ end
 ```
 
 ### Step 4: Streaming download — `lib/http_clients_deep/stream.ex`
+
+**Objective**: Use Finch.stream/4 to pipe chunks to disk so multi-GB downloads never buffer in memory or exceed heap limits.
 
 ```elixir
 defmodule HttpClientsDeep.Stream do
@@ -259,6 +337,8 @@ end
 ```
 
 ### Step 5: Telemetry reporter
+
+**Objective**: Attach to `:finch` spans so pool-checkout latency surfaces undersized pools long before users see cascading timeouts.
 
 ```elixir
 defmodule HttpClientsDeep.TelemetryReporter do
@@ -307,6 +387,8 @@ end
 
 ### Step 6: `lib/http_clients_deep/application.ex`
 
+**Objective**: Define the OTP application and supervision tree in `lib/http_clients_deep/application.ex`.
+
 ```elixir
 defmodule HttpClientsDeep.Application do
   use Application
@@ -326,6 +408,8 @@ end
 
 ### Step 7: Tests with Bypass
 
+**Objective**: Write tests for with Bypass.
+
 ```elixir
 defmodule HttpClientsDeep.ClientTest do
   use ExUnit.Case, async: false
@@ -336,34 +420,36 @@ defmodule HttpClientsDeep.ClientTest do
     %{bypass: bypass, url: "http://localhost:#{bypass.port}/api"}
   end
 
-  test "GET 200 returns body", %{bypass: bypass, url: url} do
-    Bypass.expect(bypass, "GET", "/api", fn conn ->
-      Plug.Conn.resp(conn, 200, ~s({"ok": true}))
-    end)
+  describe "HttpClientsDeep.Client" do
+    test "GET 200 returns body", %{bypass: bypass, url: url} do
+      Bypass.expect(bypass, "GET", "/api", fn conn ->
+        Plug.Conn.resp(conn, 200, ~s({"ok": true}))
+      end)
 
-    assert {:ok, %Req.Response{status: 200, body: %{"ok" => true}}} = Client.get(url)
-  end
+      assert {:ok, %Req.Response{status: 200, body: %{"ok" => true}}} = Client.get(url)
+    end
 
-  test "503 triggers safe_transient retry", %{bypass: bypass, url: url} do
-    counter = :counters.new(1, [])
+    test "503 triggers safe_transient retry", %{bypass: bypass, url: url} do
+      counter = :counters.new(1, [])
 
-    Bypass.expect(bypass, "GET", "/api", fn conn ->
-      :counters.add(counter, 1, 1)
+      Bypass.expect(bypass, "GET", "/api", fn conn ->
+        :counters.add(counter, 1, 1)
 
-      if :counters.get(counter, 1) < 3 do
-        Plug.Conn.resp(conn, 503, "")
-      else
-        Plug.Conn.resp(conn, 200, "ok")
-      end
-    end)
+        if :counters.get(counter, 1) < 3 do
+          Plug.Conn.resp(conn, 503, "")
+        else
+          Plug.Conn.resp(conn, 200, "ok")
+        end
+      end)
 
-    assert {:ok, %Req.Response{status: 200}} = Client.get(url)
-    assert :counters.get(counter, 1) == 3
-  end
+      assert {:ok, %Req.Response{status: 200}} = Client.get(url)
+      assert :counters.get(counter, 1) == 3
+    end
 
-  test "connect_timeout trips on unreachable host" do
-    assert {:error, %Mint.TransportError{reason: _}} =
-             Client.get("http://10.255.255.1:81/never", connect_timeout: 50)
+    test "connect_timeout trips on unreachable host" do
+      assert {:error, %Mint.TransportError{reason: _}} =
+               Client.get("http://10.255.255.1:81/never", connect_timeout: 50)
+    end
   end
 end
 
@@ -378,29 +464,33 @@ defmodule HttpClientsDeep.StreamTest do
     %{bypass: bypass, path: path, url: "http://localhost:#{bypass.port}/file"}
   end
 
-  test "writes chunked body to file", %{bypass: bypass, url: url, path: path} do
-    payload = :crypto.strong_rand_bytes(1_000_000)
+  describe "HttpClientsDeep.Stream" do
+    test "writes chunked body to file", %{bypass: bypass, url: url, path: path} do
+      payload = :crypto.strong_rand_bytes(1_000_000)
 
-    Bypass.expect(bypass, "GET", "/file", fn conn ->
-      conn = Plug.Conn.send_chunked(conn, 200)
+      Bypass.expect(bypass, "GET", "/file", fn conn ->
+        conn = Plug.Conn.send_chunked(conn, 200)
 
-      Enum.reduce_while(:binary.bin_to_list(payload) |> Enum.chunk_every(8192), conn, fn
-        chunk, conn ->
-          case Plug.Conn.chunk(conn, :binary.list_to_bin(chunk)) do
-            {:ok, conn} -> {:cont, conn}
-            _ -> {:halt, conn}
-          end
+        Enum.reduce_while(:binary.bin_to_list(payload) |> Enum.chunk_every(8192), conn, fn
+          chunk, conn ->
+            case Plug.Conn.chunk(conn, :binary.list_to_bin(chunk)) do
+              {:ok, conn} -> {:cont, conn}
+              _ -> {:halt, conn}
+            end
+        end)
       end)
-    end)
 
-    assert {:ok, bytes} = DStream.download(url, path)
-    assert bytes == byte_size(payload)
-    assert File.read!(path) == payload
+      assert {:ok, bytes} = DStream.download(url, path)
+      assert bytes == byte_size(payload)
+      assert File.read!(path) == payload
+    end
   end
 end
 ```
 
 ### Step 8: Pool benchmark
+
+**Objective**: Implement Pool benchmark.
 
 ```elixir
 # bench/pool_bench.exs
@@ -452,6 +542,23 @@ IO.puts("avg: #{time_us / 10_000} µs/op")
 ```
 
 Target: operation should complete in the low-microsecond range on modern hardware; deviations by >2× indicate a regression worth investigating.
+
+## Advanced Considerations: Circuit Breakers and Bulkheads in Production
+
+A circuit breaker monitors downstream service health and rejects new requests when failures exceed a threshold, failing fast instead of queuing indefinitely. States: `:closed` (normal), `:open` (fast-fail), `:half_open` (testing recovery). A timeout-based pattern monitors; once requests succeed again, the circuit closes. Half-open tests with a single request; if it succeeds, all requests resume.
+
+Bulkheads isolate resource pools so one slow endpoint doesn't starve others. A GenServer pool with a bounded queue (e.g., `:queue.len(state) >= 100`) can return `{:error, :overloaded}` immediately, preventing queue buildup. Combined with exponential backoff on the client (caller retries with increasing delays), this creates a natural circuit breaker behavior without explicit state.
+
+Graceful degradation means serving stale data or reduced functionality when a service is slow. A cached value with a 5-minute TTL is acceptable for many reads; serve it if the live source is timing out. Feature flags allow disabling expensive operations at runtime. Cascading timeout windows (outer service times out after 5s, inner calls must complete in 3s) prevent unbounded waiting. The cost is complexity: tracking degradation modes, testing failure scenarios, and ensuring data consistency under partial failures.
+
+---
+
+
+## Deep Dive: Resilience Patterns and Production Implications
+
+Resilience patterns (circuit breakers, timeouts, retries) are easy to implement but hard to test. The insight is that resilience patterns must be tested under failure: timeouts matter only when calls actually take time, retries matter only when transient failures occur. Production systems with untested resilience patterns often fail gracefully in test and catastrophically in production.
+
+---
 
 ## Trade-offs and production gotchas
 

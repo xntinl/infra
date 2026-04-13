@@ -74,6 +74,17 @@ tree/
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### `lib/tree.ex`
 
 ```elixir
@@ -422,6 +433,24 @@ mix test --trace
 
 The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
 
+
+
+---
+## Key Concepts
+
+### 1. Tail Call Optimization (TCO) Prevents Stack Overflow
+
+A tail-recursive call is one where the recursive call is the last operation. The BEAM optimizes this to a loop (no new stack frame). Non-tail calls build a stack and will blow it on large inputs. Always structure recursive functions to be tail-recursive using an accumulator.
+
+### 2. Accumulator Pattern is Standard
+
+The public function calls the private tail-recursive function with an accumulator (often `[]` or `0`). The accumulator builds the result, then you reverse if needed (because prepend is O(1)).
+
+### 3. Use `Enum` Unless You Have a Specific Reason
+
+Elixir's `Enum` module is built on recursion and TCO internally. Unless you need custom behavior, use `Enum.map`, `Enum.reduce`, etc. rather than writing your own recursion.
+
+---
 ## Tail recursion vs body recursion
 
 ```elixir

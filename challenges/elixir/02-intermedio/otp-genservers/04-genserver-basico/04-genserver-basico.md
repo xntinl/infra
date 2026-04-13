@@ -104,12 +104,18 @@ end
 
 ### Step 1: Create the project
 
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
+
 ```bash
 mix new kv_store_gs
 cd kv_store_gs
 ```
 
 ### Step 2: `lib/kv_store_gs.ex`
+
+**Objective**: Implement `kv_store_gs.ex` — the GenServer callback shape that determines blocking vs fire-and-forget semantics and state invariants.
+
 
 ```elixir
 defmodule KvStoreGs do
@@ -178,6 +184,9 @@ end
 
 ### Step 3: `test/kv_store_gs_test.exs`
 
+**Objective**: Write `kv_store_gs_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+
 ```elixir
 defmodule KvStoreGsTest do
   use ExUnit.Case, async: true
@@ -245,6 +254,9 @@ end
 
 ### Step 4: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -255,6 +267,11 @@ mix test
 
 The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
 
+## Key Concepts: GenServer Message Handling and Concurrency
+
+A GenServer processes messages sequentially through its mailbox. When you call `GenServer.call(pid, request)`, your process blocks until the server replies. When you call `GenServer.cast(pid, request)`, your process continues immediately. This is the fundamental trade-off: `call` gives you request-response semantics and backpressure (the caller waits), while `cast` is fire-and-forget (but you lose feedback).
+
+The `{:reply, response, new_state}` return tuple from `handle_call` combines acknowledgment with state transition. If you return `{:noreply, new_state}`, the client is left waiting forever unless you send a reply later via a separate `send` or never reply (timeout triggers an error on the client side). For performance-sensitive paths, batch several casts before a call, or replace GenServer with plain ETS if you only need reads. The gotcha: a slow `handle_call` callback blocks all other calls from all clients—the server processes one message at a time. This is why monitoring and timeouts matter.
 
 ## Benchmark
 

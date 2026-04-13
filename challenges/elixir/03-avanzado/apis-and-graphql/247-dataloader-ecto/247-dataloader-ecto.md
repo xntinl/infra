@@ -121,6 +121,8 @@ relationships or apply custom logic.
 
 ### Step 1: Ecto schemas
 
+**Objective**: Model Product/Variant/Seller/Review with explicit `belongs_to`/`has_many` so Dataloader can batch associations by foreign key.
+
 ```elixir
 # lib/dataloader_ecto/catalog/product.ex
 defmodule DataloaderEcto.Catalog.Product do
@@ -168,6 +170,8 @@ end
 ```
 
 ### Step 2: Loader with a centralized `query/2` and custom `run_batch`
+
+**Objective**: Centralize soft-delete filters and default ordering in `query/2` and override `run_batch` with a LATERAL join for top-N-per-parent.
 
 ```elixir
 # lib/dataloader_ecto/graphql/loader.ex
@@ -273,6 +277,8 @@ end
 
 ### Step 3: Schema types using the loader
 
+**Objective**: Declare associations via `resolve: dataloader(:catalog)` so Absinthe collapses per-row lookups into a single batched load per association.
+
 ```elixir
 # lib/dataloader_ecto/graphql/types/product_types.ex
 defmodule DataloaderEcto.Graphql.Types.ProductTypes do
@@ -322,6 +328,8 @@ end
 
 ### Step 4: Schema
 
+**Objective**: Wire `context/1` to seed a fresh loader per request and register `Absinthe.Middleware.Dataloader` so batches flush between resolution phases.
+
 ```elixir
 # lib/dataloader_ecto/graphql/schema.ex
 defmodule DataloaderEcto.Graphql.Schema do
@@ -352,6 +360,8 @@ end
 
 ### Step 5: Preload count test
 
+**Objective**: Assert a 25-product query issues at most 4 SELECTs via telemetry counters, proving N+1 is eliminated end-to-end.
+
 ```elixir
 # test/dataloader_ecto/preload_test.exs
 defmodule DataloaderEcto.PreloadTest do
@@ -364,27 +374,29 @@ defmodule DataloaderEcto.PreloadTest do
     :ok
   end
 
-  test "25-product query runs at most 4 SELECTs: products, sellers, variants, reviews" do
-    count = :counters.new(1, [])
-    :telemetry.attach("sql", [:dataloader_ecto, :repo, :query],
-      fn _, _, meta, _ ->
-        if meta.source != "schema_migrations", do: :counters.add(count, 1, 1)
-      end, nil)
+  describe "DataloaderEcto.Preload" do
+    test "25-product query runs at most 4 SELECTs: products, sellers, variants, reviews" do
+      count = :counters.new(1, [])
+      :telemetry.attach("sql", [:dataloader_ecto, :repo, :query],
+        fn _, _, meta, _ ->
+          if meta.source != "schema_migrations", do: :counters.add(count, 1, 1)
+        end, nil)
 
-    query = """
-    { products(limit: 25) {
-        name seller { name }
-        variants { sku priceCents }
-        topReviews(limit: 3) { rating body }
-    } }
-    """
-    assert {:ok, %{data: %{"products" => list}}} =
-             Absinthe.run(query, DataloaderEcto.Graphql.Schema)
-    assert length(list) == 25
+      query = """
+      { products(limit: 25) {
+          name seller { name }
+          variants { sku priceCents }
+          topReviews(limit: 3) { rating body }
+      } }
+      """
+      assert {:ok, %{data: %{"products" => list}}} =
+               Absinthe.run(query, DataloaderEcto.Graphql.Schema)
+      assert length(list) == 25
 
-    :telemetry.detach("sql")
-    total = :counters.get(count, 1)
-    assert total <= 4, "expected ≤ 4 SELECTs, got #{total}"
+      :telemetry.detach("sql")
+      total = :counters.get(count, 1)
+      assert total <= 4, "expected ≤ 4 SELECTs, got #{total}"
+    end
   end
 
   defp seed_catalog(products, variants_each, reviews_each) do
@@ -409,6 +421,50 @@ end
 ### Why this works
 
 The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
+
+## Deep Dive: Query Complexity and N+1 Prevention Patterns
+
+GraphQL's flexibility is a double-edged sword. A query like `{ users { posts { comments { author { email } } } } }`
+becomes a DDoS vector if unchecked: a resolver that loads each post's comments naively yields 1000 database 
+queries for a 100-user query.
+
+**Three strategies to prevent N+1**:
+1. **Dataloader batching** (Absinthe-native): Queue fields in phase 1 (`load/3`), flush in phase 2 (`run/1`).
+   Single database call per level. Works across HTTP boundaries via custom sources.
+2. **Ecto select/5 eager loading** (preload): Best when schema relationships are known at resolver definition time.
+   Fine-grained control; requires discipline in your types.
+3. **Complexity analysis** (persisted queries): Assign a "weight" to each field (users=2, posts=5, comments=10).
+   Reject queries exceeding a threshold BEFORE execution. Prevents runaway queries entirely.
+
+**Production gotcha**: Complexity analysis doesn't prevent slow queries — it prevents expensive queries.
+A query that hits 50,000 database rows but under the complexity limit still runs. Combine with database 
+query timeouts and active monitoring.
+
+**Subscription patterns** (real-time): Subscriptions over PubSub break traditional Dataloader batching 
+because events arrive asynchronously. Use a separate resolver that doesn't call the loader; instead, 
+publish (source) and subscribe (sink) directly. This keeps subscriptions cheap and doesn't starve 
+the dataloader queue.
+
+**Field-level authorization**: Dataloader sources can enforce per-user visibility rules at load time, 
+not in the resolver. This is cleaner than filtering after the fact and reduces unnecessary database 
+queries for unauthorized fields.
+
+---
+
+## Advanced Considerations
+
+API implementations at scale require careful consideration of request handling, error responses, and the interaction between multiple clients with different performance expectations. The distinction between public APIs and internal APIs affects error reporting granularity, versioning strategies, and backwards compatibility guarantees fundamentally. Versioning APIs through headers, paths, or query parameters each have trade-offs in terms of maintenance burden, client complexity, and developer experience across multiple client versions. When deprecating API endpoints, the migration window and support period must balance client migration costs with infrastructure maintenance costs and team capacity constraints.
+
+GraphQL adds complexity around query costs, depth limits, and the interaction between nested resolvers and N+1 query problems. A deeply nested GraphQL query can trigger hundreds of database queries if not carefully managed with proper preloading and query analysis. Implementing query cost analysis prevents malicious or poorly-written queries from starving resources and degrading service for other clients. The caching layer becomes more complex with GraphQL because the same data may be accessed through multiple query paths, each with different caching semantics and TTL requirements that must be carefully coordinated at the application level.
+
+Error handling and status codes require careful design to balance information disclosure with security concerns. Too much detail in error messages helps attackers; too little detail frustrates legitimate users. Implement structured error responses with specific error codes that clients can use to handle different failure scenarios intelligently and retry appropriately. Rate limiting, circuit breakers, and backpressure mechanisms prevent API overload but require careful configuration based on expected traffic patterns and SLA requirements.
+
+
+## Deep Dive: Ecto Patterns and Production Implications
+
+Ecto queries are composable, built up incrementally with pipes. Testing queries requires understanding that a query is lazy—until you call Repo.all, Repo.one, or Repo.update_all, no SQL is executed. This allows for property-based testing of query builders without hitting the database. Production bugs in complex queries often stem from incorrect scoping or ambiguous joins.
+
+---
 
 ## Trade-offs and production gotchas
 
@@ -479,3 +535,13 @@ per product for display-3 is 33× wasted bytes.
 - [Dashbit — "Top N per group in Ecto"](https://dashbit.co/blog/)
 - [Fly.io — GraphQL with Absinthe + Dataloader in practice](https://fly.io/phoenix-files/)
 - [Chris Keathley — "Recognizing design elements in Elixir apps"](https://keathley.io/blog/elixir-patterns)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

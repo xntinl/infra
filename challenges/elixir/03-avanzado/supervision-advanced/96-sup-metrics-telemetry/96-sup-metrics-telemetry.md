@@ -1,8 +1,6 @@
 # Supervisor Metrics via `:telemetry`
 
 **Project**: `sup_metrics` — instrument supervisors with telemetry events to emit restart counts, child lifecycle, and tree health metrics.
-**Difficulty**: ★★★★☆
-**Estimated time**: 3–6 hours
 
 ---
 
@@ -105,6 +103,16 @@ Use both: poller for inventory gauges, wrapper for restart-event counters.
 SASL reports restarts as `:supervisor_report` in the logger metadata. You can attach a
 custom `:logger` handler:
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
+
 ```elixir
 :logger.add_handler(:sup_metrics_sasl, :logger_std_h,
   %{filter_default: :stop,
@@ -123,9 +131,25 @@ not by pid.
 
 ---
 
+## Design decisions
+
+**Option A — parse SASL logs for restart events**
+- Pros: zero code changes; already emitted by OTP.
+- Cons: log parsing is brittle; SASL formatting changes break metrics; high-cardinality tags are impractical.
+
+**Option B — emit `:telemetry` events from an instrumented supervisor wrapper + poller** (chosen)
+- Pros: structured events with bounded-cardinality tags; metrics handlers are code, not regexes; poller covers snapshot state.
+- Cons: extra wrapper layer; must avoid double-counting when SASL is also enabled.
+
+→ Chose **B** because metrics pipelines want structured data, and "grep the logs" is a fragile observability posture in multi-node systems.
+
+---
+
 ## Implementation
 
 ### Step 1: `mix.exs`
+
+**Objective**: Declare the project, dependencies, and OTP application in `mix.exs`.
 
 ```elixir
 defmodule SupMetrics.MixProject do
@@ -152,6 +176,8 @@ end
 
 ### Step 2: `lib/sup_metrics/application.ex`
 
+**Objective**: Define the OTP application and supervision tree in `lib/sup_metrics/application.ex`.
+
 ```elixir
 defmodule SupMetrics.Application do
   @moduledoc false
@@ -170,6 +196,8 @@ end
 ```
 
 ### Step 3: `lib/sup_metrics/supervisor.ex`
+
+**Objective**: Implement the module in `lib/sup_metrics/supervisor.ex`.
 
 ```elixir
 defmodule SupMetrics.Supervisor do
@@ -250,6 +278,8 @@ end
 
 ### Step 4: `lib/sup_metrics/reporter.ex`
 
+**Objective**: Implement the module in `lib/sup_metrics/reporter.ex`.
+
 ```elixir
 defmodule SupMetrics.Reporter do
   @moduledoc """
@@ -302,6 +332,8 @@ end
 ```
 
 ### Step 5: `lib/sup_metrics/instrumentation.ex`
+
+**Objective**: Implement the module in `lib/sup_metrics/instrumentation.ex`.
 
 ```elixir
 defmodule SupMetrics.Instrumentation do
@@ -366,6 +398,8 @@ end
 
 ### Step 6: Registry wire-up (add to application.ex)
 
+**Objective**: Implement Registry wire-up (add to application.ex).
+
 ```elixir
 # Adjust Application.start/2 to include:
 children = [
@@ -377,82 +411,92 @@ children = [
 
 ### Step 7: `test/supervisor_test.exs`
 
+**Objective**: Write tests in `test/supervisor_test.exs` covering behavior and edge cases.
+
 ```elixir
 defmodule SupMetrics.SupervisorTest do
   use ExUnit.Case, async: false
 
-  test "init event is emitted when supervisor boots" do
-    test_pid = self()
-    ref = make_ref()
+  describe "SupMetrics.Supervisor" do
+    test "init event is emitted when supervisor boots" do
+      test_pid = self()
+      ref = make_ref()
 
-    :telemetry.attach(
-      "init-probe-#{inspect(ref)}",
-      [:sup_metrics, :supervisor, :init],
-      fn _e, m, meta, _ -> send(test_pid, {ref, :init, m, meta}) end,
-      nil
-    )
+      :telemetry.attach(
+        "init-probe-#{inspect(ref)}",
+        [:sup_metrics, :supervisor, :init],
+        fn _e, m, meta, _ -> send(test_pid, {ref, :init, m, meta}) end,
+        nil
+      )
 
-    # Stop + restart under the application supervisor
-    :ok = Supervisor.terminate_child(SupMetrics.RootSup, SupMetrics.Instrumentation)
-    {:ok, _} = Supervisor.restart_child(SupMetrics.RootSup, SupMetrics.Instrumentation)
+      # Stop + restart under the application supervisor
+      :ok = Supervisor.terminate_child(SupMetrics.RootSup, SupMetrics.Instrumentation)
+      {:ok, _} = Supervisor.restart_child(SupMetrics.RootSup, SupMetrics.Instrumentation)
 
-    assert_receive {^ref, :init, %{children: 2}, %{name: SupMetrics.Instrumentation}}, 500
-    :telemetry.detach("init-probe-#{inspect(ref)}")
-  end
+      assert_receive {^ref, :init, %{children: 2}, %{name: SupMetrics.Instrumentation}}, 500
+      :telemetry.detach("init-probe-#{inspect(ref)}")
+    end
 
-  test "child_started and terminated events fire on restart" do
-    test_pid = self()
-    ref = make_ref()
+    test "child_started and terminated events fire on restart" do
+      test_pid = self()
+      ref = make_ref()
 
-    :telemetry.attach_many(
-      "child-probe-#{inspect(ref)}",
-      [
-        [:sup_metrics, :child, :started],
-        [:sup_metrics, :child, :terminated]
-      ],
-      fn event, m, meta, _ -> send(test_pid, {ref, event, m, meta}) end,
-      nil
-    )
+      :telemetry.attach_many(
+        "child-probe-#{inspect(ref)}",
+        [
+          [:sup_metrics, :child, :started],
+          [:sup_metrics, :child, :terminated]
+        ],
+        fn event, m, meta, _ -> send(test_pid, {ref, event, m, meta}) end,
+        nil
+      )
 
-    pid = GenServer.whereis({:via, Registry, {SupMetrics.SampleRegistry, :sample1}})
-    Process.exit(pid, :kill)
+      pid = GenServer.whereis({:via, Registry, {SupMetrics.SampleRegistry, :sample1}})
+      Process.exit(pid, :kill)
 
-    assert_receive {^ref, [:sup_metrics, :child, :terminated], %{count: 1}, _}, 500
-    assert_receive {^ref, [:sup_metrics, :child, :started], %{count: 1}, _}, 500
+      assert_receive {^ref, [:sup_metrics, :child, :terminated], %{count: 1}, _}, 500
+      assert_receive {^ref, [:sup_metrics, :child, :started], %{count: 1}, _}, 500
 
-    :telemetry.detach("child-probe-#{inspect(ref)}")
+      :telemetry.detach("child-probe-#{inspect(ref)}")
+    end
   end
 end
 ```
 
 ### Step 8: `test/reporter_test.exs`
 
+**Objective**: Write tests in `test/reporter_test.exs` covering behavior and edge cases.
+
 ```elixir
 defmodule SupMetrics.ReporterTest do
   use ExUnit.Case, async: false
 
-  test "snapshot event fires periodically" do
-    test_pid = self()
-    ref = make_ref()
+  describe "SupMetrics.Reporter" do
+    test "snapshot event fires periodically" do
+      test_pid = self()
+      ref = make_ref()
 
-    :telemetry.attach(
-      "snap-#{inspect(ref)}",
-      [:sup_metrics, :supervisor, :snapshot],
-      fn _e, m, meta, _ -> send(test_pid, {ref, m, meta}) end,
-      nil
-    )
+      :telemetry.attach(
+        "snap-#{inspect(ref)}",
+        [:sup_metrics, :supervisor, :snapshot],
+        fn _e, m, meta, _ -> send(test_pid, {ref, m, meta}) end,
+        nil
+      )
 
-    # Reporter is configured with period: 5_000 but we override in the app.
-    # For the test, we accept waiting up to the period.
-    assert_receive {^ref, %{active: active}, %{name: SupMetrics.Instrumentation}}, 6_000
-    assert active >= 2
+      # Reporter is configured with period: 5_000 but we override in the app.
+      # For the test, we accept waiting up to the period.
+      assert_receive {^ref, %{active: active}, %{name: SupMetrics.Instrumentation}}, 6_000
+      assert active >= 2
 
-    :telemetry.detach("snap-#{inspect(ref)}")
+      :telemetry.detach("snap-#{inspect(ref)}")
+    end
   end
 end
 ```
 
 ### Step 9: `bench/overhead_bench.exs`
+
+**Objective**: Implement the script in `bench/overhead_bench.exs`.
 
 ```elixir
 # Compare wrapped vs unwrapped supervisor startup costs for 100 children.
@@ -496,6 +540,23 @@ Benchee.run(
 
 ---
 
+## Advanced Considerations: Partitioned Supervisors and Custom Restart Strategies
+
+A standard Supervisor is a single process managing a static tree. For thousands of children, a single supervisor becomes a bottleneck: all supervisor callbacks run on one process, and supervisor restart logic is sequential. PartitionSupervisor (OTP 25+) spawns N independent supervisors, each managing a subset of children. Hashing the child ID determines which partition supervises it, distributing load and enabling horizontal scaling.
+
+Custom restart strategies (via `Supervisor.init/2` callback) allow logic beyond the defaults. A strategy might prioritize restarting dependent services in a specific order, or apply backoff based on restart frequency. The downside is complexity: custom logic is harder to test and reason about, and mistakes cascade. Start with defaults and profile before adding custom behavior.
+
+Selective restart via `:rest_for_one` or `:one_for_all` affects failure isolation. `:one_for_all` restarts all children when one fails (simulating a total system failure), which can be necessary for consistency but is expensive. `:rest_for_one` restarts the failed child and any started after it, balancing isolation and dependencies. Understanding which strategy fits your architecture prevents cascading failures and unnecessary restarts.
+
+---
+
+
+## Deep Dive: Telemetry Patterns and Production Implications
+
+Telemetry decouples event emission from consumption, allowing system components to broadcast facts without coupling to logging, metrics, or observability code. GenServer processes are natural telemetry publishers—each lifecycle event (init, cast, call) is an opportunity to emit metrics. The architectural benefit is that test suites can attach telemetry handlers to verify internal state transitions without coupling tests to implementation details. Production systems build observability atop telemetry; testing it early catches assumptions about causality that are false at scale.
+
+---
+
 ## Trade-offs and production gotchas
 
 **1. Telemetry handlers run in the publisher's process.** A slow handler (doing HTTP
@@ -534,9 +595,13 @@ fit `Observer.GUI` into your debugging workflow, the marginal value of telemetry
 infrastructure is low. Adopt this when you have 10+ supervised subsystems, multi-node
 deployments, or regulatory audit requirements on restart events.
 
+### Why this works
+
+`:telemetry.execute/3` is a zero-handler no-op until something attaches, so instrumentation has no steady-state cost when no one is listening. The instrumented wrapper emits events at child lifecycle transitions — where they matter most — and the poller owns periodic snapshots. That cleanly separates event-driven metrics (restarts) from gauge-style metrics (child counts).
+
 ---
 
-## Performance notes
+## Benchmark
 
 On a modern machine, `:telemetry.execute/3` with zero handlers is ~ 300 ns. With one
 synchronous handler that does an `:ets.update_counter/3`, ~ 1 µs.
@@ -547,6 +612,15 @@ supervisor; it scales O(N) in children.
 
 Compare wrapper startup time: wrapped supervisor with 100 children adds ~ 0.5 ms vs
 bare. Acceptable for boot-time tree construction.
+
+Target: telemetry event overhead ≤ 1 µs per emission; reporter snapshot cost ≤ 50 µs for a 200-child supervisor.
+
+---
+
+## Reflection
+
+1. Your dashboard shows `:child_started` events but not `:child_terminated` events at the matching rate. What is the most likely cause — handler crash, restart loop, or measurement gap — and which additional event would disambiguate?
+2. You must alert on restart storms but avoid false positives during deploys (restart is expected). How do you express "storm" as a metric query that distinguishes the two cases without hand-tuning per service?
 
 ---
 

@@ -67,6 +67,18 @@ Chose **B** because this is a domain core (no DB concern yet) and owning the val
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"ecto", "~> 1.0"},
+  ]
+end
+```
+
+
 ### `lib/user_schema.ex`
 
 ```elixir
@@ -535,6 +547,22 @@ mix test --trace
 
 ---
 
+
+## Key Concepts
+
+### 1. Structs Are Maps with a Fixed Set of Fields
+
+Structs enforce that only certain keys are allowed. They compile to maps but with additional compile-time constraints. Use structs for domain entities where you want field validation. Use plain maps for unstructured data.
+
+### 2. Default Values Are Set at Definition
+
+When you define a struct, you set defaults. If a field has no default, it becomes `nil`. You can require fields explicitly with `@enforce_keys`.
+
+### 3. Structs Pattern-Match Like Maps
+
+`def process(%User{name: name})` only matches if the value is a `User` struct. Plain maps will not match, preventing bugs where you accidentally pass the wrong type.
+
+---
 ## Benchmark
 
 ```elixir

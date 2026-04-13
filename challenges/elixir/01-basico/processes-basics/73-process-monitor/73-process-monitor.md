@@ -2,16 +2,13 @@
 
 **Project**: `worker_watcher` — a standalone watcher that observes a pool of workers, counts their deaths, and stays alive regardless.
 
-**Difficulty**: ★☆☆☆☆
-**Estimated time**: 1 hour
-
 ---
 
 ## Project context
 
-You saw in the previous exercise that links are bidirectional and kill both sides.
-Sometimes that's the opposite of what you want: "tell me when that process dies,
-but leave me alone". That's a **monitor**.
+Links are bidirectional and kill both sides (unless you trap exits). Sometimes
+that's the opposite of what you want: "tell me when that process dies, but leave
+me alone". That's a **monitor**.
 
 In this exercise you build a watcher — no GenServer, no Supervisor — that:
 
@@ -74,9 +71,54 @@ a stale message triggering dead-pid logic later.
 
 ---
 
+## Why monitor and not link + trap_exit
+
+- A linked process + `trap_exit` achieves the "don't die with it" goal, but every linked death in the system now arrives in your mailbox — you can't selectively observe one target.
+- Monitors are **per-target, per-call, ref-keyed** — you decide which observations you want, and you can stop observing without touching the target process.
+- Monitors fire on `:normal` exits; links don't. For a watcher that counts ALL deaths (including clean stops), that's the right semantics.
+
+---
+
+## Design decisions
+
+**Option A — link + trap_exit in the watcher**
+- Pros: one mechanism for both "supervise" and "observe".
+- Cons: trap_exit is a global flag on the process — you can't be trapping for some targets and not others; noisy if you only want to watch one worker in a busy process.
+
+**Option B — `Process.monitor/1` per worker** (chosen)
+- Pros: per-target refs give precise control; demonitor stops watching a single target without affecting others; no global process flag.
+- Cons: monitors have a small bookkeeping cost per target; can leak if you forget to `demonitor/2`.
+
+→ Chose **B** because the watcher's job is strictly observation with a fine-grained count. Trap_exit is overkill and leaks observability into every other linked relationship the watcher may later acquire.
+
+---
+
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  # BEAM primitives only.
+  []
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Scaffold a project focused on one module so monitor semantics are isolated from supervision trees and GenServer callbacks.
 
 ```bash
 mix new worker_watcher
@@ -84,6 +126,8 @@ cd worker_watcher
 ```
 
 ### Step 2: `lib/worker_watcher.ex`
+
+**Objective**: Use `Process.monitor/1` to receive `:DOWN` messages so the watcher observes worker deaths without the bidirectional coupling of a link.
 
 ```elixir
 defmodule WorkerWatcher do
@@ -167,6 +211,8 @@ end
 
 ### Step 3: `test/worker_watcher_test.exs`
 
+**Objective**: Assert the watcher stays alive after every worker crash and that each `:DOWN` is keyed by the correct monitor reference, never a stray pid.
+
 ```elixir
 defmodule WorkerWatcherTest do
   use ExUnit.Case, async: true
@@ -246,9 +292,34 @@ end
 
 ### Step 4: Run
 
+**Objective**: Run the suite to confirm monitored crashes never propagate back and the watcher's death counter converges to the expected value.
+
 ```bash
 mix test
 ```
+
+### Why this works
+
+`Process.monitor/1` registers a unidirectional watch in the BEAM's monitor table keyed by a unique reference. When the target dies, the scheduler delivers exactly one `{:DOWN, ref, :process, pid, reason}` message and discards the monitor entry. The watcher has no `trap_exit` flag and no link to the workers, so worker crashes cannot reach it by any path other than the `:DOWN` message — which is just a regular message in the mailbox, handled in order. `Process.demonitor(ref, [:flush])` is the only way to reliably stop watching AND remove any already-queued `:DOWN`, which is what prevents the "stale death" bug.
+
+---
+
+
+## Key Concepts
+
+### 1. Monitors Are One-Way Exit Notifications
+Unlike links (bidirectional), monitors are one-way. If the monitored process dies, the monitor receives a `DOWN` message. The monitoring process is not affected.
+
+### 2. Monitors Don't Create Bidirectional Coupling
+With links, if either process exits, both die (unless one traps exits). With monitors, the monitoring process remains unaffected.
+
+### 3. Multiple Monitors on One Process
+You can monitor the same process multiple times. Each monitor sends its own `DOWN` message.
+
+---
+## Benchmark
+
+<!-- benchmark N/A: tema conceptual — monitor setup and :DOWN delivery are sub-microsecond BEAM internals; a meaningful benchmark would measure the BEAM itself, not user code. -->
 
 ---
 
@@ -277,6 +348,13 @@ can't treat "did I already monitor this pid?" as a boolean — track your own re
 If you need the watcher to die with the target (co-lifetime), use a link.
 If you need automatic restart, use a Supervisor. Monitors are the building block
 for "tell me, I'll decide" logic — they are not a restart mechanism on their own.
+
+---
+
+## Reflection
+
+- Your watcher monitors 50k workers. Each `:DOWN` adds a tiny amount of work. Under a surge, the watcher's mailbox backs up and `stats/1` latency balloons. Is the bottleneck the monitor count, the `:DOWN` processing, or the mailbox contention with `:stats`? How would you profile it, and what architectural change (partition the watcher? offload counting to ETS?) fixes the right one?
+- You treat `:DOWN` with reason `:noproc` as "the target was already dead" and increment the death counter the same as a crash. Is conflating these two reasons a bug in your metric, or a reasonable simplification? When does it stop being reasonable?
 
 ---
 

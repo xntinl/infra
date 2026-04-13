@@ -111,6 +111,8 @@ end
 
 ### Step 1: Schema and migration
 
+**Objective**: Model jobs with a partial index on `state = 'pending'` so dequeue scans only the live backlog, not the completed tail.
+
 ```elixir
 # lib/job_queue/schemas/job.ex
 defmodule JobQueue.Schemas.Job do
@@ -176,6 +178,8 @@ end
 ```
 
 ### Step 2: Queue — enqueue and dequeue
+
+**Objective**: Claim one pending row with FOR UPDATE SKIP LOCKED so concurrent workers never block, with exponential-backoff retries on failure.
 
 ```elixir
 # lib/job_queue/queue.ex
@@ -272,6 +276,8 @@ end
 ```
 
 ### Step 3: Worker — the poll loop
+
+**Objective**: Drive a GenServer that polls, dispatches, and reports complete/fail outside the claim transaction so locks stay under milliseconds.
 
 ```elixir
 # lib/job_queue/worker.ex
@@ -483,6 +489,24 @@ Benchee.run(
 
 ---
 
+## Deep Dive
+
+Ecto queries compile to SQL, but the translation is not always obvious. Complex preload patterns spawn subqueries for each association level—a naive nested preload can explode into hundreds of queries. Window functions and CTEs (Common Table Expressions) exist in Ecto but require raw fragments, making the boundary between Elixir and SQL explicit. For high-throughput systems, consider schemaless queries and streaming to defer memory allocation; loading 1M records as `Ecto.Repo.all/2` marshals everything into memory. Multi-tenancy via row-level database policies is cleaner than application-level filtering and leverages PostgreSQL's built-in enforcement. Zero-downtime migrations require careful orchestration: add columns before code that uses them, remove columns after code stops referencing them. Lock contention on hot rows kills throughput—use FOR UPDATE in transactions and understand when Ecto's optimistic locking is sufficient.
+## Advanced Considerations
+
+Advanced Ecto usage at scale requires understanding transaction semantics, locking strategies, and query performance under concurrent load. Ecto transactions are database transactions, not application-level transactions; they don't isolate against application-level concurrency issues. Using `:serializable` isolation level prevents anomalies but significantly impacts throughput. The choice between row-level locking with `for_update()` and optimistic locking with version columns affects both concurrency and latency. Deadlocks are not failures in Ecto; they're expected outcomes that require retry logic and careful key ordering to minimize.
+
+Preload optimization is subtle — using `preload` for related data prevents N+1 queries but can create large intermediate result sets that exceed memory limits. Pagination with preloads requires careful consideration of whether to paginate before or after preloading related data. Custom types and schemaless queries provide flexibility but bypass Ecto's validation layer, creating opportunities for subtle bugs where invalid data sneaks into your database. The interaction between Ecto's change tracking and ETS caching can create stale data issues if not carefully managed across process boundaries.
+
+Zero-downtime migrations require a different mental model than traditional migration scripts. Adding a column is fast; backfilling millions of rows is slow and can lock tables. Deploying code that expects the new column before the migration completes causes failures. Implement feature flags and dual-write patterns for truly zero-downtime deployments. Full-text search with PostgreSQL's tsearch requires careful index maintenance and stop-word configuration; performance characteristics change dramatically with language-specific settings and custom dictionaries.
+
+
+## Deep Dive: Ecto Patterns and Production Implications
+
+Ecto queries are composable, built up incrementally with pipes. Testing queries requires understanding that a query is lazy—until you call Repo.all, Repo.one, or Repo.update_all, no SQL is executed. This allows for property-based testing of query builders without hitting the database. Production bugs in complex queries often stem from incorrect scoping or ambiguous joins.
+
+---
+
 ## Trade-offs and production gotchas
 
 **1. Stuck-in-`running` jobs.** A worker crash after `UPDATE state='running'` but before
@@ -526,3 +550,13 @@ decision between "add workers" vs. "partition the queue"?
 - [Oban source](https://github.com/oban-bg/oban) — read `Oban.Plugins.Pruner` and `Oban.Queue.Producer` for reaping patterns
 - [What the heck is SKIP LOCKED](https://2ndquadrant.com/en/blog/what-is-select-skip-locked-for-in-postgresql-9-5/)
 - [`Ecto.Query` `lock:` option](https://hexdocs.pm/ecto/Ecto.Query.html#lock/3)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

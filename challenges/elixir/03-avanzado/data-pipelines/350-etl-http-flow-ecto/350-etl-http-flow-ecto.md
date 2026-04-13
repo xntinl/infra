@@ -150,6 +150,8 @@ end
 
 ### Step 1: Extract — HTTP fetch with bounded concurrency
 
+**Objective**: Cap concurrent Finch requests via `Task.async_stream` so upstream APIs see bounded RPS and 429s trigger backoff, not thrash.
+
 ```elixir
 defmodule WeatherEtl.Extract do
   @moduledoc """
@@ -209,6 +211,8 @@ end
 
 ### Step 2: Transform — parallel enrichment with Flow
 
+**Objective**: Spread enrichment (unit conversion, heat-index) across `schedulers_online` Flow stages so CPU-bound work saturates every core.
+
 ```elixir
 defmodule WeatherEtl.Transform do
   @moduledoc """
@@ -265,6 +269,8 @@ end
 
 ### Step 3: Load — chunked bulk insert
 
+**Objective**: Batch rows into 1k-row `insert_all` chunks with `on_conflict: :nothing` to amortise round-trips and stay idempotent on retries.
+
 ```elixir
 defmodule WeatherEtl.Load do
   alias WeatherEtl.Repo
@@ -291,6 +297,8 @@ end
 ```
 
 ### Step 4: Pipeline orchestrator
+
+**Objective**: Compose Extract → Transform → Load as a single lazy stream so backpressure and memory stay bounded end-to-end.
 
 ```elixir
 defmodule WeatherEtl.Pipeline do
@@ -419,6 +427,24 @@ Benchee.run(%{
 Postgres. With real HTTP extract, throughput will be rate-limit bound
 (10 concurrent × 1 page/200ms × 200 rows = 10k rows/sec).
 
+## Deep Dive
+
+Data pipelines in Elixir leverage the Actor model to coordinate work across producer, consumer, and batcher stages. GenStage provides the foundation—a demand-driven backpressure mechanism that prevents memory bloat when producers exceed consumer capacity. Broadway abstracts this further, handling subscriptions, acknowledgments, and error propagation automatically. Understanding pipeline topology is critical at scale: a misconfigured batcher can serialize work and kill throughput; conversely, excessive partitioning fragments state and increases GC pressure. In production systems, always measure latency and memory per stage—Broadway's metrics integration with Telemetry makes this traceable. Consider exactly-once delivery semantics early; most pipelines require idempotency keys or deduplication at the consumer boundary. For high-volume Kafka scenarios, partition alignment (matching Broadway partitions to Kafka partitions) is essential to avoid rebalancing storms.
+## Advanced Considerations
+
+Data pipeline implementations at scale require careful consideration of backpressure, memory buffering, and failure recovery semantics. Broadway and Genstage provide demand-driven processing, but understanding the exact flow of backpressure through your pipeline is essential to avoid either starving producers or overwhelming buffers. The interaction between batcher timeouts and consumer demand can create unexpected latencies when tuples are held waiting for either a size threshold or time threshold to be reached. In systems processing millions of events, even a 100ms batch timeout can impact end-to-end latency dramatically.
+
+Idempotency and exactly-once semantics are not automatic — they require architectural decisions about checkpointing and deduplication strategies. Writing checkpoints too frequently becomes a bottleneck; writing them too infrequently means lost progress on failure and potential duplicates. The choice between in-process ETS-based deduplication versus external stores (Redis, database) changes your failure recovery story fundamentally. Broadway's acknowledgment system is flexible but requires explicit design; missing acknowledgments can cause data loss or duplicates in production environments where failures are common.
+
+When handling external systems (databases, message queues, APIs), transient failures and circuit-breaker patterns become essential. A single slow downstream service can cause backpressure to ripple through your entire pipeline catastrophically. Consider implementing bulkhead patterns where certain pipeline stages have isolated pools of workers to prevent cascading failures. For ETL pipelines combining Ecto with streaming, managing database connection pools and transaction contexts requires careful coordination to prevent connection exhaustion.
+
+
+## Deep Dive: Streaming Patterns and Production Implications
+
+Stream-based pipelines in Elixir achieve backpressure and composability by deferring computation until consumption. Unlike eager list operations that allocate all intermediate structures, Streams are lazy chains that produce one element at a time, reducing memory footprint and enabling infinite sequences. The BEAM scheduler yields between Stream operations, allowing multiple concurrent pipelines to interleave fairly. At scale (processing millions of rows or events), the difference between eager and lazy evaluation becomes the difference between consistent latency and garbage collection pauses. Production systems benefit most when Streams are composed at library boundaries, not scattered across the codebase.
+
+---
+
 ## Trade-offs and production gotchas
 
 **1. `Task.async_stream` with `on_timeout: :kill_task` drops data silently.**
@@ -469,3 +495,13 @@ Load stage being 16× slower than Transform, and what database-side changes
 - [`Ecto.Repo.insert_all/3` — hexdocs](https://hexdocs.pm/ecto/Ecto.Repo.html#c:insert_all/3)
 - [Finch — hexdocs](https://hexdocs.pm/finch/Finch.html)
 - [PostgreSQL bulk insert performance tips](https://www.postgresql.org/docs/current/populate.html)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

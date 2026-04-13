@@ -4,9 +4,6 @@
 StreamData properties (idempotence, preservation of elements, and the
 classic `Enum.sort` equivalence).
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -34,6 +31,17 @@ stream_data_intro/
 │   └── test_helper.exs
 └── mix.exs
 ```
+
+---
+
+## Why property testing and not exhaustive example tests
+
+Examples solo cubren lo que te acordaste. Properties preguntan "¿qué
+tiene que ser verdad para *cualquier* input?" y StreamData genera
+cientos tratando de romper tu asunción. Shrinking convierte un
+contraejemplo grande en el mínimo que aún falla — inmediatamente
+debuggeable. Examples cubren corner cases conocidos; properties
+cubren invariantes.
 
 ---
 
@@ -81,9 +89,40 @@ invariants that should hold for all inputs.
 
 ---
 
+## Design decisions
+
+**Option A — Reemplazar todos los example tests por properties**
+- Pros: Mayor cobertura de inputs.
+- Cons: Properties tardan más; corner cases conocidos pueden quedar
+  fuera del rango del generador.
+
+**Option B — Properties + examples selectivos** (elegida)
+- Pros: Examples dan feedback rápido; properties cubren el espacio
+  entre ellos.
+- Cons: Suite ligeramente más grande.
+
+→ Elegida **B** porque ambos se complementan: examples son
+regresiones documentadas, properties son invariantes.
+
+---
+
+### Dependencies (`mix.exs`)
+
+```elixir
+def deps do
+  [
+    {exunit},
+    {exunitproperties},
+    {stream_data},
+  ]
+end
+```
 ## Implementation
 
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
 
 ```bash
 mix new stream_data_intro
@@ -101,6 +140,9 @@ end
 Then `mix deps.get`.
 
 ### Step 2: `lib/sort.ex`
+
+**Objective**: Implement `sort.ex` — the subject under test — shaped specifically to make the testing technique of this lab observable.
+
 
 ```elixir
 defmodule Sort do
@@ -131,6 +173,9 @@ end
 ```
 
 ### Step 3: `test/sort_test.exs`
+
+**Objective**: Write `sort_test.exs` exercising the exact ExUnit feature under study — assertions should fail loudly if the technique is misused.
+
 
 ```elixir
 defmodule SortTest do
@@ -209,6 +254,9 @@ end
 
 ### Step 4: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 mix test --seed 0   # pin StreamData's seed for reproducibility
@@ -217,6 +265,26 @@ mix test --seed 0   # pin StreamData's seed for reproducibility
 If a property fails, StreamData prints the **shrunk counterexample** —
 the minimal input that breaks the assertion — along with the original
 failing input.
+
+### Why this works
+
+`check all list <- list_of(integer()), do: ...` genera N valores (100
+por defecto), ejecuta la property con cada uno, y si falla comienza
+el shrinking: progresivamente reduce el input mientras la property
+siga fallando. El resultado final es el contraejemplo mínimo.
+
+---
+
+## Benchmark
+
+```elixir
+# mix test test/sort_test.exs
+# Target: 100 iteraciones × propiedad × tamaño 10 elementos
+# ~200ms por property en hardware moderno para algoritmos triviales.
+```
+
+Target esperado: propiedades simples 50–500ms cada una; >5s indica
+generador mal escalado o costo cuadrático en el código bajo test.
 
 ---
 
@@ -250,9 +318,35 @@ and **numerical code**.
 
 ---
 
+## Reflection
+
+- Escribís una property para un parser de CSV:
+  `parse(serialize(x)) == x`. StreamData encuentra un contraejemplo
+  con comillas anidadas. ¿El bug está en `parse`, `serialize`, o en
+  tu definición de "x válido"?
+- El equipo propone medir "coverage" de las properties igual que los
+  tests. ¿Tiene sentido el mismo número? ¿Qué métrica alternativa
+  mediría la calidad de una property-based suite?
+
+---
+
 ## Resources
 
 - [StreamData — HexDocs](https://hexdocs.pm/stream_data/StreamData.html)
 - [`ExUnitProperties`](https://hexdocs.pm/stream_data/ExUnitProperties.html)
 - ["Property-based testing is a mindset" — Fred Hebert](https://ferd.ca/you-reap-what-you-code.html)
 - [QuickCheck paper (Claessen & Hughes, 2000)](https://www.cs.tufts.edu/~nr/cs257/archive/john-hughes/quick.pdf) — the origin of property-based testing
+
+
+## Key Concepts
+
+ExUnit testing in Elixir balances speed, isolation, and readability. The framework provides fixtures, setup hooks, and async mode to achieve both performance and determinism.
+
+**ExUnit patterns and fixtures:**
+`setup_all` runs once per module (module-scoped state); `setup` runs before each test. Returning `{:ok, map}` injects variables into the test context. For side-effectful setup (e.g., starting supervised processes), use `start_supervised` — it automatically stops the process when the test ends, ensuring cleanup.
+
+**Async safety and isolation:**
+Tests with `async: true` run in parallel, but they must be isolated. Shared resources (database, ETS tables, Registry) require careful locking. A common pattern: `setup :set_myflag` — a private setup that configures a unique state for that test. Avoid global state unless protected by locks.
+
+**Mocking trade-offs:**
+Libraries like `Mox` provide compile-time mock modules that behave like real modules but with controlled behavior. The benefit: you catch missing function implementations at test time. The trade-off: mocks don't catch runtime errors (e.g., a real function that crashes). For critical paths, complement mocks with integration tests against real dependencies. Dependency injection (passing modules as arguments) is more testable than direct calls.

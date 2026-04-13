@@ -67,7 +67,7 @@ declares `@behaviour`.
 ### `@behaviour ModuleName`
 
 Marks a module as implementing a behaviour. The compiler emits a warning for missing
-callbacks. It does NOT check return types — that is Dialyzer's job (exercise 63).
+callbacks. It does NOT check return types — that is Dialyzer's job.
 
 ### `@optional_callbacks`
 
@@ -79,7 +79,21 @@ via `defoverridable`.
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"ecto", "~> 1.0"},
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Separate Backend module contract from InMemory/File impls so @callback enforcement is clear and testable.
 
 ```bash
 mix new kv_store
@@ -88,6 +102,8 @@ mkdir -p lib/kv_store
 ```
 
 ### Step 2: `lib/kv_store/backend.ex` — the behaviour
+
+**Objective**: Declare @callback + @optional_callbacks so compiler enforces contract and separates required from optional capabilities.
 
 ```elixir
 defmodule KvStore.Backend do
@@ -120,6 +136,8 @@ end
 ```
 
 ### Step 3: `lib/kv_store/in_memory.ex`
+
+**Objective**: Use @impl true on all callbacks so compiler flags missing/renamed functions instead of silent runtime UndefinedFunctionError.
 
 ```elixir
 defmodule KvStore.InMemory do
@@ -162,6 +180,8 @@ end
 ```
 
 ### Step 4: `lib/kv_store/file.ex`
+
+**Objective**: Skip `list_keys/1` deliberately so `function_exported?/3` is exercised as the proper gate for optional callbacks.
 
 ```elixir
 defmodule KvStore.File do
@@ -211,6 +231,8 @@ end
 ```
 
 ### Step 5: `test/kv_store_test.exs`
+
+**Objective**: Run the same test shape against both backends so any contract drift between impls shows up as a red test, not a runtime crash.
 
 ```elixir
 defmodule KvStoreTest do
@@ -268,6 +290,8 @@ end
 
 ### Step 6: Run the tests
 
+**Objective**: Confirm both backends produce identical results, which is the only proof the behaviour is doing its job.
+
 ```bash
 mix test
 ```
@@ -278,6 +302,22 @@ The `KvStore.Backend` module contains only `@callback` declarations — zero exe
 
 ---
 
+
+## Key Concepts
+
+### 1. Behaviours Define Required Callbacks
+
+A behaviour lists required functions (`@callback`). Modules implementing it must define those functions. This is compile-time contract enforcement.
+
+### 2. Behaviours vs Protocols
+
+Behaviours work with modules; protocols work with types. Use behaviours for plugin systems. Use protocols for polymorphism across types.
+
+### 3. Common Behaviours in Elixir
+
+`GenServer`, `Supervisor`, `Agent` are all behaviours. When you `use GenServer`, you agree to implement `handle_call`, `handle_cast`, etc. This contract ensures your code integrates correctly.
+
+---
 ## Benchmark
 
 <!-- benchmark N/A: behaviours compile to plain function calls — there is no dispatch overhead to measure. Performance depends entirely on the chosen backend, not on the behaviour mechanism itself. -->

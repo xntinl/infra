@@ -138,7 +138,23 @@ exact workflow.
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"ecto", "~> 1.0"},
+    {:"phoenix", "~> 1.0"},
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
 
 ```bash
 mix new changeset_lab
@@ -146,6 +162,9 @@ cd changeset_lab
 ```
 
 ### Step 2: `mix.exs`
+
+**Objective**: Declare dependencies and project config in `mix.exs`.
+
 
 ```elixir
 defmodule ChangesetLab.MixProject do
@@ -175,6 +194,9 @@ Run `mix deps.get`.
 
 ### Step 3: `lib/changeset_lab.ex`
 
+**Objective**: Implement `changeset_lab.ex` — the integration seam where external protocol semantics meet Elixir domain code.
+
+
 ```elixir
 defmodule ChangesetLab do
   @moduledoc """
@@ -184,8 +206,8 @@ defmodule ChangesetLab do
   * `contact_form_changeset/1` — a schemaless changeset over a plain map.
 
   Both illustrate the four-step pipeline: `cast` → `validate_required` →
-  `validate_format` → return. Neither touches a database — `Repo.insert` is
-  left to later exercises.
+  `validate_format` → return. Neither touches a database — database persistence via
+  `Repo.insert` is beyond this exercise's scope.
   """
 
   import Ecto.Changeset
@@ -247,6 +269,9 @@ end
 ```
 
 ### Step 4: `test/changeset_lab_test.exs`
+
+**Objective**: Write `changeset_lab_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
 
 ```elixir
 defmodule ChangesetLabTest do
@@ -376,6 +401,9 @@ end
 
 ### Step 5: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -393,12 +421,27 @@ a table" reuses the same machinery.
 
 ---
 
+
+## Deep Dive: ETS Concurrency Trade-Offs and Operation Atomicity
+
+ETS (Erlang Term Storage) is mutable, shared, in-process state—antithetical to Elixir's immutability. But it's required for specific cases: large shared datasets, fast lookups under contention, atomic counters across processes. Trade-off: operations aren't composable (no atomic multi-table updates without extra bookkeeping), and debugging is harder because mutations are invisible in code.
+
+Use ETS when: (1) true sharing between processes, (2) data is large (megabytes), (3) sub-millisecond latency required. Use GenServer when: (1) single process owns state, (2) dataset is small, (3) complex transition logic.
+
+Most common mistake: using ETS to work around GenServer bottlenecks without profiling. Profile usually shows either handler logic is expensive (move it out) or contention from N processes calling it. ETS solves contention via sharding: split state across tables/processes indexed by key. Always profile before choosing ETS.
+
 ## Benchmark
 
 <!-- benchmark N/A: changeset evaluation is microseconds-per-field on
      modern hardware; wall time is dominated by DB round-trips, not
      validation. Target: a 10-field signup changeset runs in well under
      100µs end-to-end. -->
+
+---
+
+## Key Concepts
+
+Changesets represent intended changes to data with validations and error tracking. A changeset carries the original data, the proposed changes, and validation results—all without touching the database. Changesets separate concerns: form validation is local (in the changeset), database constraints are handled separately (foreign keys, unique indexes). This enables layered error handling: first validate in Elixir, then catch DB-level violations and translate to user-friendly messages. The pattern: validate with `validate_*` functions, then `Repo.insert/2` or `Repo.update/2` to execute. Changesets are central to Ecto; mastering them is essential for clean data mutation. They also provide a testing boundary: test changesets independently without database setup.
 
 ---
 

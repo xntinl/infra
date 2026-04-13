@@ -1,8 +1,6 @@
 # `:proc_lib.start_link` vs `spawn_link`: the OTP handshake
 
 **Project**: `proc_lib_worker` — understanding the `init_ack` protocol that separates OTP-compliant processes from raw spawns.
-**Difficulty**: ★★★★☆
-**Estimated time**: 3–5 hours
 
 ---
 
@@ -131,9 +129,35 @@ and will report `{:error, :timeout}` after 5 s (or the configured
 
 ---
 
+## Design decisions
+
+**Option A — `spawn_link` with a manual `send/receive` init signal**
+- Pros: minimal code; no OTP dependency.
+- Cons: every caller has to re-implement the handshake; supervisor trees have no idea when init finished; `code_change` and `sys` are unavailable.
+
+**Option B — `:proc_lib.start_link/3` with `:proc_lib.init_ack/1`** (chosen)
+- Pros: the supervisor only considers the child started after init succeeds; sys/telemetry/observer see the process as first-class; proper crash reports from SASL.
+- Cons: ~3 µs extra per spawn; an extra function to call; easy to forget `init_ack` and deadlock start_link.
+
+→ Chose **B** because every OTP tool downstream assumes init-ack semantics, and the handshake is exactly the thing `spawn_link` gets wrong.
+
+---
+
 ## Implementation
 
 ### Step 1: `mix.exs`
+
+**Objective**: Build stdlib-only so init-ack handshake judged strictly against :proc_lib semantics, no library shim.
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
 
 ```elixir
 defmodule ProcLibWorker.MixProject do
@@ -153,6 +177,8 @@ end
 ```
 
 ### Step 2: `lib/proc_lib_worker/naive_worker.ex` — the broken version
+
+**Objective**: Expose spawn_link race: caller gets {:ok, pid} before init runs, crash arrives async as :EXIT.
 
 ```elixir
 defmodule ProcLibWorker.NaiveWorker do
@@ -192,6 +218,8 @@ end
 ```
 
 ### Step 3: `lib/proc_lib_worker/ok_worker.ex` — the OTP-compliant version
+
+**Objective**: Use :proc_lib.start_link with init_ack so caller learns init success synchronously, :sys grants OTP citizenship.
 
 ```elixir
 defmodule ProcLibWorker.OkWorker do
@@ -284,6 +312,8 @@ end
 
 ### Step 4: `lib/proc_lib_worker/application.ex`
 
+**Objective**: Wire empty root supervisor so tests drive start_link/1 directly, init-ack contract observed in isolation.
+
 ```elixir
 defmodule ProcLibWorker.Application do
   @moduledoc false
@@ -298,30 +328,36 @@ end
 
 ### Step 5: `test/proc_lib_worker/naive_worker_test.exs`
 
+**Objective**: Pin broken contract: {:ok, pid} before init crash so async :EXIT after is regression target.
+
 ```elixir
 defmodule ProcLibWorker.NaiveWorkerTest do
   use ExUnit.Case, async: true
 
   alias ProcLibWorker.NaiveWorker
 
-  test "spawn_link returns {:ok, pid} even if init will crash" do
-    Process.flag(:trap_exit, true)
-    assert {:ok, pid} = NaiveWorker.start_link(fail_init?: true)
-    # We got {:ok, pid} synchronously. The crash arrives asynchronously.
-    assert_receive {:EXIT, ^pid, :econnrefused}, 500
-  end
+  describe "ProcLibWorker.NaiveWorker" do
+    test "spawn_link returns {:ok, pid} even if init will crash" do
+      Process.flag(:trap_exit, true)
+      assert {:ok, pid} = NaiveWorker.start_link(fail_init?: true)
+      # We got {:ok, pid} synchronously. The crash arrives asynchronously.
+      assert_receive {:EXIT, ^pid, :econnrefused}, 500
+    end
 
-  test "echo works when init does not fail" do
-    Process.flag(:trap_exit, true)
-    {:ok, pid} = NaiveWorker.start_link(label: "foo")
-    send(pid, {:echo, self()})
-    assert_receive {:echoed, "foo"}, 200
-    send(pid, :stop)
+    test "echo works when init does not fail" do
+      Process.flag(:trap_exit, true)
+      {:ok, pid} = NaiveWorker.start_link(label: "foo")
+      send(pid, {:echo, self()})
+      assert_receive {:echoed, "foo"}, 200
+      send(pid, :stop)
+    end
   end
 end
 ```
 
 ### Step 6: `test/proc_lib_worker/ok_worker_test.exs`
+
+**Objective**: Assert init failure returns {:error, reason} synchronously, :sys.get_state works, full OTP handshake proven.
 
 ```elixir
 defmodule ProcLibWorker.OkWorkerTest do
@@ -329,50 +365,69 @@ defmodule ProcLibWorker.OkWorkerTest do
 
   alias ProcLibWorker.OkWorker
 
-  test "init failure surfaces synchronously as {:error, reason}" do
-    Process.flag(:trap_exit, true)
-    assert {:error, :econnrefused} = OkWorker.start_link(fail_init?: true)
-    # No pid was ever exposed; no orphan exit to handle.
-    refute_receive {:EXIT, _, _}, 100
-  end
+  describe "ProcLibWorker.OkWorker" do
+    test "init failure surfaces synchronously as {:error, reason}" do
+      Process.flag(:trap_exit, true)
+      assert {:error, :econnrefused} = OkWorker.start_link(fail_init?: true)
+      # No pid was ever exposed; no orphan exit to handle.
+      refute_receive {:EXIT, _, _}, 100
+    end
 
-  test "happy path returns a live, echo-capable pid" do
-    {:ok, pid} = OkWorker.start_link(label: "hello")
-    assert OkWorker.echo(pid) == "hello"
-    send(pid, :stop)
-  end
+    test "happy path returns a live, echo-capable pid" do
+      {:ok, pid} = OkWorker.start_link(label: "hello")
+      assert OkWorker.echo(pid) == "hello"
+      send(pid, :stop)
+    end
 
-  test "sys protocol works (get_state / replace_state)" do
-    {:ok, pid} = OkWorker.start_link(label: "inspected")
+    test "sys protocol works (get_state / replace_state)" do
+      {:ok, pid} = OkWorker.start_link(label: "inspected")
 
-    state = :sys.get_state(pid)
-    assert state.label == "inspected"
-    assert state.count == 0
+      state = :sys.get_state(pid)
+      assert state.label == "inspected"
+      assert state.count == 0
 
-    _ = OkWorker.echo(pid)
-    assert :sys.get_state(pid).count == 1
+      _ = OkWorker.echo(pid)
+      assert :sys.get_state(pid).count == 1
 
-    :sys.replace_state(pid, fn s -> %{s | label: "patched"} end)
-    assert OkWorker.echo(pid) == "patched"
-    send(pid, :stop)
-  end
+      :sys.replace_state(pid, fn s -> %{s | label: "patched"} end)
+      assert OkWorker.echo(pid) == "patched"
+      send(pid, :stop)
+    end
 
-  test "supervisor-friendly: can be supervised" do
-    children = [
-      %{
-        id: :ok_worker,
-        start: {OkWorker, :start_link, [[label: "sup"]]},
-        restart: :temporary
-      }
-    ]
+    test "supervisor-friendly: can be supervised" do
+      children = [
+        %{
+          id: :ok_worker,
+          start: {OkWorker, :start_link, [[label: "sup"]]},
+          restart: :temporary
+        }
+      ]
 
-    {:ok, sup} = Supervisor.start_link(children, strategy: :one_for_one)
-    [{:ok_worker, worker, :worker, [OkWorker]}] = Supervisor.which_children(sup)
-    assert OkWorker.echo(worker) == "sup"
-    Supervisor.stop(sup)
+      {:ok, sup} = Supervisor.start_link(children, strategy: :one_for_one)
+      [{:ok_worker, worker, :worker, [OkWorker]}] = Supervisor.which_children(sup)
+      assert OkWorker.echo(worker) == "sup"
+      Supervisor.stop(sup)
+    end
   end
 end
 ```
+
+---
+
+## Advanced Considerations: Supervision and Hot Code Upgrade Patterns
+
+The OTP supervision tree is the backbone of Elixir's fault tolerance. A DynamicSupervisor can spawn workers on demand and track them, but if a worker crashes before it's supervised, messages to it drop silently. Equally, a `:temporary` worker that crashes is restarted zero times — useful for one-off tasks, but requires the caller to handle crashes. `:transient` restarts on non-normal exits; `:permanent` always restarts.
+
+`handle_continue` callbacks and `:hibernate` reduce memory overhead in long-lived processes. After initializing, a GenServer can return `{:noreply, state, {:continue, :do_work}}` to defer expensive work past the `init/1` call, keeping the supervisor's synchronous startup fast. Hibernation moves a process's heap to disk, freeing RAM at the cost of latency when the process receives its next message.
+
+Hot code upgrades via `sys:replace_state/2` or `:sys.replace_state/3` allow changing code without restarting the VM, but only if state structure is forward- and backward-compatible. In practice, code changes that alter state shape (adding or removing fields) require a migration function. The `:code.purge/1` and `:code.load_file/1` cycle reloads the module, but old pids still run old code until they return to the scheduler. Design for graceful degradation: code that cannot upgrade hot should acknowledge that in docs and operational runbooks.
+
+---
+
+
+## Deep Dive: Otp Patterns and Production Implications
+
+OTP primitives (GenServer, Supervisor, Application) are tested through their public interfaces, not by inspecting internal state. This discipline forces correct design: if you can't test a behavior without peeking into the server's state, the behavior is not public. Production systems with tight integration tests on GenServer internals are fragile and hard to refactor.
 
 ---
 
@@ -413,7 +468,7 @@ to run cleanup before exiting.
 
 **7. When NOT to use this.** For 95% of workers, **use `gen_server`**.
 `proc_lib` is the right tool when (a) you need a custom receive shape
-(TCP accept loops, selective-receive prioritisation, see exercise 73),
+(TCP accept loops, selective-receive prioritisation),
 (b) you are writing a new OTP behaviour (like Broadway's producer), or
 (c) you have *measured* `gen_server` overhead and it matters. Do not
 reach for `proc_lib` to feel fancy.
@@ -423,9 +478,13 @@ reach for `proc_lib` to feel fancy.
 `spawn_link` process is invisible to them. `proc_lib` workers are
 first-class citizens.
 
+### Why this works
+
+The `init_ack` handshake turns "the child was spawned" and "the child is ready" into two distinguishable events. Supervisors wait for the ack before declaring the child started, which means init failures surface synchronously instead of later as a missed message. Sys-protocol compliance is free once you are on `proc_lib`, so the worker becomes visible to observer, telemetry, and upgrade tooling without further work.
+
 ---
 
-## Performance notes
+## Benchmark
 
 Start-up cost comparison:
 
@@ -453,6 +512,15 @@ for `proc_lib.start_link`. The ~3 µs extra is the init-ack round-trip.
 For a pool of 1,000 workers created once at boot, the difference is
 invisible (3 ms total). For a fan-out pattern spawning 100,000
 short-lived workers per second, it matters.
+
+Target: `proc_lib.start_link/3` overhead ≤ 5 µs per process on modern hardware; ≤ 3 µs delta vs `spawn_link`.
+
+---
+
+## Reflection
+
+1. You inherit a legacy module that uses `spawn_link` + ad-hoc send-based readiness. What is the minimum diff to make it OTP-compliant without touching the internal protocol, and which failure modes does that diff fix first?
+2. At what spawn rate does the 3 µs init-ack overhead actually affect end-to-end latency? Design an experiment that distinguishes "slow because of init-ack" from "slow because of the downstream caller pattern".
 
 ---
 

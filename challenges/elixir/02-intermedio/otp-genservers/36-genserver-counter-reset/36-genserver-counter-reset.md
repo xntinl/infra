@@ -116,12 +116,18 @@ end
 
 ### Step 1: Create the project
 
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
+
 ```bash
 mix new counter_reset_gs
 cd counter_reset_gs
 ```
 
 ### Step 2: `lib/counter_reset_gs.ex`
+
+**Objective**: Implement `counter_reset_gs.ex` — the GenServer callback shape that determines blocking vs fire-and-forget semantics and state invariants.
+
 
 ```elixir
 defmodule CounterResetGs do
@@ -191,6 +197,9 @@ end
 
 ### Step 3: `test/counter_reset_gs_test.exs`
 
+**Objective**: Write `counter_reset_gs_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+
 ```elixir
 defmodule CounterResetGsTest do
   use ExUnit.Case, async: true
@@ -241,6 +250,9 @@ end
 
 ### Step 4: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -250,6 +262,14 @@ mix test
 ### Why this works
 
 The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+
+## Key Concepts: State Mutations and Side Effects in GenServer
+
+Each `handle_call` and `handle_cast` invocation receives the current state and returns a new state. Elixir's immutability means the old state is discarded; only the new state persists. This forces explicit reasoning about state transitions. If you forget to return the new state (e.g., `:ok` instead of `{:reply, :ok, new_state}`), the server's state stays unchanged—a silent bug.
+
+A common pattern is embedding the state mutation logic in a private helper function that returns the new state, then using that in the handler. This separates pure logic (state → new state) from impure side effects (logging, external calls). For example, increment logic lives in a pure function; logging lives in the handler. This makes the server easier to test: you can test the pure function independently.
 
 
 ## Benchmark

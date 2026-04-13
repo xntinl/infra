@@ -3,9 +3,6 @@
 **Project**: `url_fetch` — a concurrent URL fetcher that downloads N URLs in
 parallel with per-request timeouts and bounded concurrency.
 
-**Difficulty**: ★★☆☆☆
-**Time**: 2-3 hours
-
 ---
 
 ## Project structure
@@ -35,7 +32,7 @@ short-lived concurrent work without writing receive loops by hand.
 **1. `Task.async/1` + `Task.await/2`.** `Task.async/1` spawns a linked process
 that runs a function; `Task.await/2` blocks the caller until that process
 produces a result or the timeout fires. Under the hood it's exactly the same
-ref/mailbox dance you saw in exercise 32 — `Task` just packages it.
+ref/mailbox dance that `GenServer.call/3` uses — `Task` just packages it.
 
 **2. `Task.async_stream/3`.** When you have a *collection* to process, never
 spawn N tasks in a `for` loop. `Task.async_stream/3` gives you bounded
@@ -62,9 +59,59 @@ Serial fetching is O(N × network_latency) — minutes for 50 URLs. You need:
 
 ---
 
+## Why `Task` and not raw `spawn`/`receive`
+
+- A raw `spawn` + `receive` loop works for the sync-reply pattern, but you rewrite the ref/mailbox/timeout dance every time.
+- `Task.async/1` links the task to the caller, so a caller crash cleans up its workers automatically — no supervision boilerplate.
+- `Task.yield/2 + shutdown/2` converts timeouts into `nil` instead of raising `exit` in the caller, which is what a batch pipeline actually wants.
+- For N items with a concurrency cap, `Task.async_stream/3` gives you bounded parallelism without writing a pool.
+
+---
+
+## Design decisions
+
+**Option A — `Task.await/2` for each task**
+- Pros: shortest code; one line per await.
+- Cons: on timeout, `await` **raises an exit in the caller**. The batch dies on the first slow URL unless you wrap every call in `try/catch`.
+
+**Option B — `Task.yield/2 || Task.shutdown/2`** (chosen for `Fetcher`)
+- Pros: timeouts become `nil` instead of exits; slow tasks are actively killed, not leaked; caller returns a partial result set with `{:error, :timeout}` for the slow items.
+- Cons: slightly more code; two concepts to teach instead of one.
+
+**Option C — `Task.async_stream/3` with `:max_concurrency`** (chosen for `StreamFetcher`)
+- Pros: bounded concurrency for free; lazy stream composes with `Stream.take/2`; `on_timeout: :kill_task` gives the same partial-result semantics per item.
+- Cons: the result shape is `{:ok, value}` / `{:exit, reason}` — callers have to normalize.
+
+→ Chose **B** for the fixed-N fetcher (teaches timeouts explicitly) and **C** for the batch fetcher (teaches concurrency caps). Covering both is the lesson.
+
+---
+
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  # No HTTP client — tests use an in-memory fake. stdlib only.
+  []
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Scaffold the project so HTTP transport, per-task fetcher, and bounded-concurrency fetcher are separate modules with independent tests.
 
 ```bash
 mix new url_fetch
@@ -72,6 +119,8 @@ cd url_fetch
 ```
 
 ### Step 2: `mix.exs`
+
+**Objective**: Declare a behaviour-based HTTP dep surface so tests can swap the transport and stay fully offline while still exercising `Task` semantics.
 
 ```elixir
 defmodule UrlFetch.MixProject do
@@ -98,6 +147,8 @@ deterministic and the exercise stays focused on `Task`, not on networking.
 
 ### Step 3: `.formatter.exs`
 
+**Objective**: Pin formatter rules so pipelines of `Task.async_stream/3` options stay readable across reviewers, where indentation carries meaning.
+
 ```elixir
 [
   inputs: ["{mix,.formatter}.exs", "{config,lib,test}/**/*.{ex,exs}"],
@@ -106,6 +157,8 @@ deterministic and the exercise stays focused on `Task`, not on networking.
 ```
 
 ### Step 4: `lib/url_fetch/http.ex`
+
+**Objective**: Define a behaviour the transport must honour, so tests inject a deterministic impl and real deployments plug in a live HTTP client.
 
 ```elixir
 defmodule UrlFetch.Http do
@@ -162,6 +215,8 @@ end
 
 ### Step 5: `lib/url_fetch/fetcher.ex`
 
+**Objective**: Use `Task.async`/`await` so each fetch runs in a linked process — the caller crashes if any task crashes, making failures loud, not silent.
+
 ```elixir
 defmodule UrlFetch.Fetcher do
   @moduledoc """
@@ -208,6 +263,8 @@ end
 ```
 
 ### Step 6: `lib/url_fetch/stream_fetcher.ex`
+
+**Objective**: Bound concurrency with `Task.async_stream/3` so fetching 10k URLs never spawns 10k sockets, trading peak parallelism for stable resource use.
 
 ```elixir
 defmodule UrlFetch.StreamFetcher do
@@ -269,6 +326,8 @@ end
 ```
 
 ### Step 7: Tests
+
+**Objective**: Cover timeouts, task crashes, and on-timeout options to prove the fetcher fails loudly or degrades predictably, never mid-way silently.
 
 ```elixir
 # test/url_fetch/fetcher_test.exs
@@ -402,12 +461,64 @@ end
 
 ### Step 8: Run
 
+**Objective**: Run the full suite to validate that both fetchers meet their contract under load and degrade predictably on per-task failures.
+
 ```bash
 mix deps.get
 mix compile --warnings-as-errors
 mix test
 mix format
 ```
+
+### Why this works
+
+`Task.async/1` is just `spawn_link/1` plus a monitor and a reply channel. The linked lifecycle means a caller crash takes its tasks with it — no orphaned processes. `Task.yield/2` is non-raising: it either returns `{:ok, value}` once the task replied, or `nil` once the deadline passed. Pairing it with `Task.shutdown/2, :brutal_kill` guarantees the task is dead before the caller moves on. `Task.async_stream/3` with `:max_concurrency` uses a sliding window internally — at most N tasks run concurrently, the rest queue lazily — so the pipeline stays bounded in memory regardless of input size.
+
+---
+
+
+
+---
+## Key Concepts
+
+### 1. Tasks Are Lightweight Wrappers Around Spawned Functions
+
+```elixir
+task = Task.async(fn -> expensive_computation() end)
+result = Task.await(task)  # Blocks until the task finishes
+```
+
+`Task.async` spawns a process and returns a task reference. `Task.await` blocks until the task finishes, returning its result or raising if it failed.
+
+### 2. Tasks Integrate with Supervision
+
+Tasks started with `Task.start_link` are linked to the parent process. If the task crashes, the parent gets an exit signal. If the parent crashes, the task terminates. This integration makes fault tolerance automatic.
+
+### 3. Timeouts Prevent Hanging
+
+`Task.await(task, 5000)` waits up to 5 seconds. If the task doesn't finish in time, it raises `Task.timeout`. Always set timeouts for tasks that communicate with external systems.
+
+---
+## Benchmark
+
+```elixir
+# bench/fetch.exs
+UrlFetch.Http.Fake.start(
+  Map.new(1..100, fn i -> {"u#{i}", {:sleep, 50, {:ok, 200, "#{i}"}}} end)
+)
+
+urls = Enum.map(1..100, &"u#{&1}")
+
+{t_serial, _} = :timer.tc(fn -> Enum.map(urls, &UrlFetch.Http.Fake.get(&1, 1_000)) end)
+{t_unbounded, _} = :timer.tc(fn -> UrlFetch.Fetcher.fetch_all(urls, UrlFetch.Http.Fake, 2_000) end)
+{t_bounded, _} = :timer.tc(fn ->
+  UrlFetch.StreamFetcher.fetch_all(urls, max_concurrency: 10, timeout: 2_000)
+end)
+
+IO.puts("serial: #{t_serial} µs   unbounded: #{t_unbounded} µs   bounded(10): #{t_bounded} µs")
+```
+
+Target: serial ≈ 5s (100 × 50ms), unbounded ≈ 50–80ms (all in parallel), bounded(10) ≈ 500ms (10 batches of 10). The bounded number should be ~N/concurrency × per-request latency — if it's far from that, either the fake is serializing or you hit the scheduler cap.
 
 ---
 
@@ -458,12 +569,19 @@ discards successful results as "not matching".
 
 ## When NOT to use `Task`
 
-- You need long-lived state — use `Agent` (exercise 34) or `GenServer`.
-- You need request/response with correlation — use the pattern from exercise 32.
+- You need long-lived state — use `Agent` or `GenServer`.
+- You need custom request/response with correlation — build the ref/`receive` loop directly.
 - The work is CPU-bound and you want parallelism across cores — `Task` works,
   but check `:erlang.system_info(:schedulers_online)` and size
   `max_concurrency` accordingly.
-- You need a named, discoverable process — use `Registry` (exercise 35).
+- You need a named, discoverable process — use `Registry`.
+
+---
+
+## Reflection
+
+- Your pipeline occasionally leaks processes on timeout. The audit shows `Task.await/2` is used in one path and `Task.yield + shutdown` in another. Walk through what the BEAM does in each case when the task runs 1ms past the deadline. Which code path does the leaking?
+- With 10k URLs and `max_concurrency: 100`, you hit the HTTP client's connection pool cap (say 50). Where does backpressure happen — in `async_stream`, in the HTTP client, or in the OS? What signal tells you which is the bottleneck?
 
 ---
 

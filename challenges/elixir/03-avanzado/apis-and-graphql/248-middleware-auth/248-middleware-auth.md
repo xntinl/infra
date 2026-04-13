@@ -140,6 +140,8 @@ independently.
 
 ### Step 1: Core middlewares
 
+**Objective**: Split auth into one-concern middlewares (authN, tenant, role, scope, resource) so each rule composes, tests in isolation, and short-circuits explicitly.
+
 ```elixir
 # lib/graphql_middleware_auth/graphql/middleware/authenticate.ex
 defmodule GraphqlMiddlewareAuth.Graphql.Middleware.Authenticate do
@@ -252,6 +254,8 @@ end
 
 ### Step 2: Policy module
 
+**Objective**: Keep authorization as pattern-matched pure `can?/3` clauses so each rule is unit-testable without a schema, context, or database.
+
 ```elixir
 # lib/graphql_middleware_auth/graphql/policy.ex
 defmodule GraphqlMiddlewareAuth.Graphql.Policy do
@@ -284,6 +288,8 @@ end
 ```
 
 ### Step 3: Schema-level auth chain expander
+
+**Objective**: Expand `meta :auth, [...]` shorthand into real middleware modules so field definitions declare intent, not wiring, and resource checks run post-resolve.
 
 ```elixir
 # lib/graphql_middleware_auth/graphql/auth_chain.ex
@@ -318,6 +324,8 @@ end
 
 ### Step 4: Schema using the chain
 
+**Objective**: Hook the chain through `middleware/3` so every field inherits the expansion by default — no field can forget to declare its guard.
+
 ```elixir
 # lib/graphql_middleware_auth/graphql/schema.ex
 defmodule GraphqlMiddlewareAuth.Graphql.Schema do
@@ -347,6 +355,8 @@ end
 ```
 
 ### Step 5: Document type using the meta
+
+**Objective**: Attach declarative `meta :auth` on each field so the access rule lives next to the field, visible to reviewers without trawling schema callbacks.
 
 ```elixir
 # lib/graphql_middleware_auth/graphql/types/document_types.ex
@@ -393,6 +403,8 @@ end
 
 ### Step 6: Resolvers
 
+**Objective**: Keep resolvers auth-free — they just load and return — because the middleware chain has already gated access end-to-end.
+
 ```elixir
 defmodule GraphqlMiddlewareAuth.Graphql.Resolvers.DocumentResolver do
   alias GraphqlMiddlewareAuth.{Repo, Docs.Document}
@@ -417,6 +429,8 @@ end
 ```
 
 ### Step 7: Tests
+
+**Objective**: Drive admin, member, anon, and cross-tenant viewers through real queries so the chain's deny/allow matrix is pinned against regressions.
 
 ```elixir
 # test/graphql_middleware_auth/middleware_test.exs
@@ -480,6 +494,50 @@ IO.puts("avg: #{time_us / 10_000} µs/op")
 ```
 
 Target: operation should complete in the low-microsecond range on modern hardware; deviations by >2× indicate a regression worth investigating.
+
+## Deep Dive: Query Complexity and N+1 Prevention Patterns
+
+GraphQL's flexibility is a double-edged sword. A query like `{ users { posts { comments { author { email } } } } }`
+becomes a DDoS vector if unchecked: a resolver that loads each post's comments naively yields 1000 database 
+queries for a 100-user query.
+
+**Three strategies to prevent N+1**:
+1. **Dataloader batching** (Absinthe-native): Queue fields in phase 1 (`load/3`), flush in phase 2 (`run/1`).
+   Single database call per level. Works across HTTP boundaries via custom sources.
+2. **Ecto select/5 eager loading** (preload): Best when schema relationships are known at resolver definition time.
+   Fine-grained control; requires discipline in your types.
+3. **Complexity analysis** (persisted queries): Assign a "weight" to each field (users=2, posts=5, comments=10).
+   Reject queries exceeding a threshold BEFORE execution. Prevents runaway queries entirely.
+
+**Production gotcha**: Complexity analysis doesn't prevent slow queries — it prevents expensive queries.
+A query that hits 50,000 database rows but under the complexity limit still runs. Combine with database 
+query timeouts and active monitoring.
+
+**Subscription patterns** (real-time): Subscriptions over PubSub break traditional Dataloader batching 
+because events arrive asynchronously. Use a separate resolver that doesn't call the loader; instead, 
+publish (source) and subscribe (sink) directly. This keeps subscriptions cheap and doesn't starve 
+the dataloader queue.
+
+**Field-level authorization**: Dataloader sources can enforce per-user visibility rules at load time, 
+not in the resolver. This is cleaner than filtering after the fact and reduces unnecessary database 
+queries for unauthorized fields.
+
+---
+
+## Advanced Considerations
+
+API implementations at scale require careful consideration of request handling, error responses, and the interaction between multiple clients with different performance expectations. The distinction between public APIs and internal APIs affects error reporting granularity, versioning strategies, and backwards compatibility guarantees fundamentally. Versioning APIs through headers, paths, or query parameters each have trade-offs in terms of maintenance burden, client complexity, and developer experience across multiple client versions. When deprecating API endpoints, the migration window and support period must balance client migration costs with infrastructure maintenance costs and team capacity constraints.
+
+GraphQL adds complexity around query costs, depth limits, and the interaction between nested resolvers and N+1 query problems. A deeply nested GraphQL query can trigger hundreds of database queries if not carefully managed with proper preloading and query analysis. Implementing query cost analysis prevents malicious or poorly-written queries from starving resources and degrading service for other clients. The caching layer becomes more complex with GraphQL because the same data may be accessed through multiple query paths, each with different caching semantics and TTL requirements that must be carefully coordinated at the application level.
+
+Error handling and status codes require careful design to balance information disclosure with security concerns. Too much detail in error messages helps attackers; too little detail frustrates legitimate users. Implement structured error responses with specific error codes that clients can use to handle different failure scenarios intelligently and retry appropriately. Rate limiting, circuit breakers, and backpressure mechanisms prevent API overload but require careful configuration based on expected traffic patterns and SLA requirements.
+
+
+## Deep Dive: Apis Patterns and Production Implications
+
+API testing requires testing schema validation, error messages, pagination, and rate limiting—not just happy paths. The mistake is testing only the happy path and assuming error handling works. Production APIs with weak error handling become support nightmares.
+
+---
 
 ## Trade-offs and production gotchas
 
@@ -552,3 +610,13 @@ deeply-nested cached queries. If needed, `Policy.can?/3` can be cached per
 - [Chris Keathley — "An approach to authorization in Elixir"](https://keathley.io/blog/authorization-in-elixir.html)
 - [Dashbit — "Composing Plug-like stacks in Elixir"](https://dashbit.co/blog/)
 - [RFC 8693 — OAuth token exchange (scope semantics)](https://datatracker.ietf.org/doc/html/rfc8693)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

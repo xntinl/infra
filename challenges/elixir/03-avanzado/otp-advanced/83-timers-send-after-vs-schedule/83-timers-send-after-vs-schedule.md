@@ -1,8 +1,6 @@
 # Timers on the BEAM: `send_after` vs `:timer` vs `start_timer`
 
 **Project**: `timer_comparison` — measuring the real trade-offs between the three timer primitives.
-**Difficulty**: ★★★★☆
-**Estimated time**: 3–5 hours
 
 ---
 
@@ -66,6 +64,16 @@ through this one process. It becomes a global bottleneck above a few
 thousand scheduled events per second.
 
 ### 2. `Process.send_after/3` — the default
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
 
 ```elixir
 ref = Process.send_after(pid, :tick, 1_000)
@@ -144,9 +152,29 @@ still triggers a handler later.
 
 ---
 
+## Design decisions
+
+**Option A — `:timer.send_after/3`**
+- Pros: familiar stdlib wrapper; returns a simple ref.
+- Cons: every call serialises through the `:timer_server` process, ~25× slower than the alternatives under load.
+
+**Option B — `Process.send_after/3` (chosen for most workloads)**
+- Pros: directly uses the BEAM timer wheel; cheapest option; cancel returns remaining time; works with the registered-name form.
+- Cons: messages are not tagged as timers, so a stale delivery after `cancel_timer` can be mistaken for a real event.
+
+**Option C — `:erlang.start_timer/3`**
+- Pros: envelope-tagged messages distinguish timer deliveries from regular ones; same timer-wheel cost as B.
+- Cons: caller must handle the `{:timeout, ref, msg}` shape; slightly awkward for existing code patterns.
+
+→ Chose **B** as the default; use **C** when stale-delivery discrimination matters. Avoid **A** on the hot path.
+
+---
+
 ## Implementation
 
 ### Step 1: `mix.exs`
+
+**Objective**: Bootstrap project with OTP app config so timer workers start under supervision.
 
 ```elixir
 defmodule TimerComparison.MixProject do
@@ -168,6 +196,8 @@ end
 
 ### Step 2: `lib/timer_comparison/application.ex`
 
+**Objective**: Wire supervision tree so three timer variants start as sibling workers.
+
 ```elixir
 defmodule TimerComparison.Application do
   @moduledoc false
@@ -181,6 +211,8 @@ end
 ```
 
 ### Step 3: `lib/timer_comparison/send_after_worker.ex`
+
+**Objective**: Implement Process.send_after/3 variant using :timer refs, measureable for baseline.
 
 ```elixir
 defmodule TimerComparison.SendAfterWorker do
@@ -210,6 +242,8 @@ end
 
 ### Step 4: `lib/timer_comparison/stdlib_timer_worker.ex`
 
+**Objective**: Implement :timer.send_after/3 variant using global :timer server process.
+
 ```elixir
 defmodule TimerComparison.StdlibTimerWorker do
   @moduledoc "GenServer that schedules ticks via :timer.send_after/3 (singleton)."
@@ -237,6 +271,8 @@ end
 ```
 
 ### Step 5: `lib/timer_comparison/start_timer_worker.ex`
+
+**Objective**: Implement :timer.start_timer/3 variant returning standalone timers per worker.
 
 ```elixir
 defmodule TimerComparison.StartTimerWorker do
@@ -275,6 +311,8 @@ end
 
 ### Step 6: `bench/timers_bench.exs`
 
+**Objective**: Benchmark the three timer approaches at scale to quantify contention differences.
+
 ```elixir
 # Run with: mix run bench/timers_bench.exs
 Benchee.run(
@@ -307,6 +345,8 @@ Benchee.run(
 ```
 
 ### Step 7: `test/timer_comparison/timer_comparison_test.exs`
+
+**Objective**: Test all three timer variants fire correctly and compare behavior under supervised lifecycle.
 
 ```elixir
 defmodule TimerComparisonTest do
@@ -359,6 +399,23 @@ end
 
 ---
 
+## Advanced Considerations: Supervision and Hot Code Upgrade Patterns
+
+The OTP supervision tree is the backbone of Elixir's fault tolerance. A DynamicSupervisor can spawn workers on demand and track them, but if a worker crashes before it's supervised, messages to it drop silently. Equally, a `:temporary` worker that crashes is restarted zero times — useful for one-off tasks, but requires the caller to handle crashes. `:transient` restarts on non-normal exits; `:permanent` always restarts.
+
+`handle_continue` callbacks and `:hibernate` reduce memory overhead in long-lived processes. After initializing, a GenServer can return `{:noreply, state, {:continue, :do_work}}` to defer expensive work past the `init/1` call, keeping the supervisor's synchronous startup fast. Hibernation moves a process's heap to disk, freeing RAM at the cost of latency when the process receives its next message.
+
+Hot code upgrades via `sys:replace_state/2` or `:sys.replace_state/3` allow changing code without restarting the VM, but only if state structure is forward- and backward-compatible. In practice, code changes that alter state shape (adding or removing fields) require a migration function. The `:code.purge/1` and `:code.load_file/1` cycle reloads the module, but old pids still run old code until they return to the scheduler. Design for graceful degradation: code that cannot upgrade hot should acknowledge that in docs and operational runbooks.
+
+---
+
+
+## Deep Dive: Otp Patterns and Production Implications
+
+OTP primitives (GenServer, Supervisor, Application) are tested through their public interfaces, not by inspecting internal state. This discipline forces correct design: if you can't test a behavior without peeking into the server's state, the behavior is not public. Production systems with tight integration tests on GenServer internals are fragile and hard to refactor.
+
+---
+
 ## Trade-offs and production gotchas
 
 **1. `:timer` is a process — it can be overwhelmed.** Under load,
@@ -405,9 +462,13 @@ that survives restarts, persists across nodes, or coordinates across
 the cluster — use Oban, Quantum, or a cron-backed system. Timers are
 in-memory, per-process, and die when the owner dies.
 
+### Why this works
+
+The BEAM timer wheel is an O(1) amortised structure, and `Process.send_after` and `:erlang.start_timer` both hit it directly. `:timer.send_after` adds an extra process round-trip, which is why its per-call cost is 25× higher and why it drifts under sustained high-frequency rescheduling. Cancellation semantics differ per primitive, and choosing the right one is really about how you want to handle races between "timer fired" and "timer cancelled".
+
 ---
 
-## Performance notes
+## Benchmark
 
 Representative Benchee output on an M2 laptop, Elixir 1.16 / OTP 26,
 scheduling 1 M timers with `0` delay (measuring pure overhead):
@@ -434,6 +495,15 @@ For the rescheduling worker test under sustained 1 ms intervals:
 
 The last one shows visible drift because `:timer_server` cannot keep
 up under high-frequency rescheduling.
+
+Target: per-timer scheduling overhead ≤ 250 ns with `Process.send_after` or `:erlang.start_timer` on modern hardware.
+
+---
+
+## Reflection
+
+1. Your service schedules 100k short-duration timers per second and observes unexplained p99 drift. Which diagnostic do you reach for first — `:erlang.system_info(:scheduler_wall_time)`, `:observer`, or a synthetic benchmark against a bare loop — and why?
+2. You must distinguish "timer fired naturally" from "timer fired after a cancel race". Which primitive makes this cheapest, and what does the code look like when you cannot change the primitive (e.g. legacy `:timer.send_after`)?
 
 ---
 

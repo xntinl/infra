@@ -63,6 +63,17 @@ validator/
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### `lib/validator.ex`
 
 ```elixir
@@ -494,6 +505,28 @@ mix test --trace
 
 The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
 
+
+
+---
+## Key Concepts
+
+### 1. Pattern Matching Beats Boolean Checks
+
+Pattern matching is checked at compile time (with exhaustiveness tools). Boolean conditions are checked at runtime. Use `case` when possible—it forces exhaustiveness and avoids boolean traps.
+
+### 2. `case` vs `cond` vs `if`
+
+- `case` — matches patterns (tuple structure, atoms, guards)
+- `cond` — multiple boolean conditions (when patterns don't fit)
+- `if` — single boolean, occasionally useful
+
+For most logic, `case` wins.
+
+### 3. Exhaustiveness Checking
+
+`case` without a catch-all can miss cases. Dialyzer will warn if your patterns don't cover all possibilities. Always end with a catch-all or let Dialyzer tell you what's missing.
+
+---
 ## `with` vs nested `case`
 
 Without `with`, the same validation looks like this:

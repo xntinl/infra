@@ -1,8 +1,6 @@
 # Intercepting Broadcasts with `intercept` and `handle_out`
 
 **Project**: `channels_intercept` — per-subscriber filtering and enrichment of PubSub broadcasts.
-**Difficulty**: ★★★★☆
-**Estimated time**: 3–5 hours
 
 ---
 
@@ -40,6 +38,12 @@ channels_intercept/
 │           └── room_channel_test.exs
 └── mix.exs
 ```
+
+---
+
+## Why intercept and not pre-filter in the publisher
+
+Pre-filtering in the publisher means the publisher knows every subscriber's shape. Interception lets each subscriber decide what to receive based on its own assigns, which is where the per-user context already lives.
 
 ---
 
@@ -131,9 +135,103 @@ event.
 
 ---
 
+## Design decisions
+
+**Option A — broadcast full payloads to all subscribers**
+- Pros: simple; no per-subscriber logic on the sender.
+- Cons: every subscriber pays for fields they do not need or are not allowed to see.
+
+**Option B — `intercept` + `handle_out` to customize per-subscriber** (chosen)
+- Pros: per-subscriber filtering; sensitive fields stripped; payload shaped per client.
+- Cons: every intercepted message runs through the subscriber's process.
+
+→ Chose **B** because mixed-audience topics need per-subscriber shaping; interception is the idiomatic place.
+
+---
+
 ## Implementation
 
 ### Step 1: `mix.exs`
+
+**Objective**: Pin Phoenix 1.7 with Bandit so the WebSocket transport runs on a modern HTTP/1.1 server without Cowboy adapter baggage.
+
+```elixir
+defmodule ChannelsIntercept.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :channels_intercept, version: "0.1.0", elixir: "~> 1.16", deps: deps()]
+  end
+
+  def application do
+    [mod: {ChannelsIntercept.Application, []}, extra_applications: [:logger]]
+  end
+
+  defp deps do
+    [
+      {:phoenix, "~> 1.7"},
+      {:phoenix_pubsub, "~> 2.1"},
+      {:jason, "~> 1.4"},
+      {:bandit, "~> 1.5"}
+    ]
+  end
+end
+```
+
+### Dependencies (mix.exs)
+
+```elixir
+```elixir
+def handle_out("new_post", payload, socket) do
+  cond do
+    blocked?(socket, payload["author_id"]) -> {:noreply, socket}
+    muted?(socket)                          -> {:noreply, socket}
+    true ->
+      push(socket, "new_post", redact_for(socket, payload))
+      {:noreply, socket}
+  end
+end
+```
+
+Return tuples:
+
+| Return | Effect |
+|--------|--------|
+| `{:noreply, socket}` | Broadcast dropped for this subscriber (silent) |
+| `{:reply, {:ok, _}, socket}` | Not valid here — `handle_out` cannot reply |
+| `push(socket, ev, p) ; {:noreply, socket}` | Send `ev` with `p` to this subscriber |
+
+You can also call `push/3` multiple times to fan one broadcast into several events.
+
+### 5. Where the filter state lives
+
+`socket.assigns` should carry everything `handle_out/3` needs. Do NOT go out to ETS,
+the database, or another GenServer from inside `handle_out/3` — this runs on the
+channel process and adds latency to every message for every subscriber. Snapshot the
+block-list into assigns at `join/3` time and refresh it on an explicit `"refresh_blocks"`
+event.
+
+---
+
+## Design decisions
+
+**Option A — broadcast full payloads to all subscribers**
+- Pros: simple; no per-subscriber logic on the sender.
+- Cons: every subscriber pays for fields they do not need or are not allowed to see.
+
+**Option B — `intercept` + `handle_out` to customize per-subscriber** (chosen)
+- Pros: per-subscriber filtering; sensitive fields stripped; payload shaped per client.
+- Cons: every intercepted message runs through the subscriber's process.
+
+→ Chose **B** because mixed-audience topics need per-subscriber shaping; interception is the idiomatic place.
+
+---
+
+## Implementation
+
+### Step 1: `mix.exs`
+
+**Objective**: Pin Phoenix 1.7 with Bandit so the WebSocket transport runs on a modern HTTP/1.1 server without Cowboy adapter baggage.
 
 ```elixir
 defmodule ChannelsIntercept.MixProject do
@@ -159,6 +257,8 @@ end
 ```
 
 ### Step 2: `lib/channels_intercept/block_list.ex`
+
+**Objective**: Back the block-list with a named `:bag` ETS table so per-user lookups are O(1) and safe under `read_concurrency`.
 
 ```elixir
 defmodule ChannelsIntercept.BlockList do
@@ -190,6 +290,8 @@ end
 ```
 
 ### Step 3: `lib/channels_intercept/channels/room_channel.ex`
+
+**Objective**: Declare `intercept ["new_post"]` and redact in `handle_out/3` so block-list and role filters run per-subscriber, keeping fastlane for typing events.
 
 ```elixir
 defmodule ChannelsIntercept.Channels.RoomChannel do
@@ -276,6 +378,8 @@ end
 
 ### Step 4: `lib/channels_intercept/user_socket.ex`
 
+**Objective**: Map the `room:*` topic pattern to the channel module so every room shares one socket definition without per-room boilerplate.
+
 ```elixir
 defmodule ChannelsIntercept.UserSocket do
   use Phoenix.Socket
@@ -292,6 +396,8 @@ end
 
 ### Step 5: `lib/channels_intercept/endpoint.ex`
 
+**Objective**: Expose the socket over WebSocket only, disabling longpoll so the transport surface stays minimal.
+
 ```elixir
 defmodule ChannelsIntercept.Endpoint do
   use Phoenix.Endpoint, otp_app: :channels_intercept
@@ -301,6 +407,8 @@ end
 ```
 
 ### Step 6: `lib/channels_intercept/application.ex`
+
+**Objective**: Create the ETS table before supervisor children start so channel joins never race against an uninitialized block-list.
 
 ```elixir
 defmodule ChannelsIntercept.Application do
@@ -321,6 +429,8 @@ end
 ```
 
 ### Step 7: Tests
+
+**Objective**: Drive `Phoenix.ChannelTest.subscribe_and_join/3` with multiple subscribers so per-socket filtering, muting, and redaction are asserted on each path.
 
 ```elixir
 # test/channels_intercept/channels/room_channel_test.exs
@@ -463,6 +573,27 @@ defmodule ChannelsIntercept.Channels.RoomChannelTest do
 end
 ```
 
+### Why this works
+
+`intercept ["msg"]` tells Phoenix to route the named events through `handle_out/3` in each subscriber process. The subscriber can rewrite, drop, or forward the payload. The sender is unchanged.
+
+---
+
+## Advanced Considerations: LiveView Real-Time Patterns and Pubsub Scale
+
+LiveView bridges the browser and BEAM via WebSocket, allowing server-side renders to push incremental DOM diffs to the client. A LiveView process is long-lived, receiving events (clicks, form submissions) and broadcasting updates. For real-time features (collaborative editing, live notifications), LiveView processes subscribe to PubSub topics and receive broadcast messages.
+
+Phoenix.PubSub partitions topics across a pool of processes, allowing horizontal scaling. By default, `:local` mode uses in-memory ETS; `:redis` mode distributes across nodes via Redis. At scale (thousands of concurrent LiveViews), topic fanout can bottleneck: broadcasting to a million subscribers means delivering one million messages. The BEAM handles this, but the network cost matters on multi-node deployments.
+
+`Presence` module tracks which users are viewing which pages, syncing state via PubSub. A presence join/leave is broadcast to all nodes, allowing real-time "who's online" updates. Under partition, presence state can diverge; the library uses unique presence keys to detect and reconcile. Operationally, watching presence on every page load can amplify server load if users are flaky (mobile networks, browser reloads). Consider presence only for features where it's user-facing (collaborative editors, live sports scoreboards).
+
+---
+
+
+## Deep Dive: Phoenix Patterns and Production Implications
+
+Phoenix's conn struct represents an HTTP request/response in flight, accumulating transformations through middleware and handler code. Testing a Phoenix endpoint end-to-end (not just the controller) catches middleware order bugs, header mismatches, and plug composition issues. The trade-off is that full integration tests are slower and harder to parallelize than unit tests. Production bugs in auth, CORS, or session handling are often due to middleware assumptions that live tests reveal.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -496,6 +627,25 @@ filtering, split into multiple channels mounted on different topic patterns.
 see `admin_log` events"), don't intercept — create a separate topic (`admin_log:<id>`)
 and only let admins join it. Topics are your first-class authorization boundary;
 `handle_out/3` is the escape hatch when you can't partition the traffic cleanly.
+
+---
+
+## Benchmark
+
+```elixir
+# :timer.tc / Benchee measurement sketch
+{time_us, _} = :timer.tc(fn -> :ok end)
+IO.puts("elapsed: #{time_us} us")
+```
+
+Target: `handle_out/3` adds 5-20 us per subscriber per message; acceptable up to thousands of subscribers per topic.
+
+---
+
+## Reflection
+
+- At 10k subscribers on a topic, does `handle_out` still scale, or do you need a different fan-out model?
+- If your intercept logic is 'strip field X from admins', is that the channel's job or the publisher's? Which side owns the policy?
 
 ---
 

@@ -151,6 +151,8 @@ Otherwise: use `:erpc`. It is the current recommended API in the Erlang/OTP docs
 
 ### Step 1: Mix project
 
+**Objective**: Create benchable project so :rpc/:erpc latencies are measurable without OTP machinery overhead."""
+
 ```elixir
 defmodule ErpcBenchmark.MixProject do
   use Mix.Project
@@ -177,6 +179,8 @@ end
 ```
 
 ### Step 2: Worker function exposed for remote calls
+
+**Objective**: Expose pure functions so benchmark measures RPC overhead, not computation or I/O latency."""
 
 ```elixir
 defmodule ErpcBenchmark.Worker do
@@ -205,6 +209,8 @@ end
 ```
 
 ### Step 3: `:rpc` runner
+
+**Objective**: Wrap :rpc calls to expose :rex bottleneck behavior when many concurrent remote calls serialize."""
 
 ```elixir
 defmodule ErpcBenchmark.RpcRunner do
@@ -236,6 +242,8 @@ end
 ```
 
 ### Step 4: `:erpc` runner
+
+**Objective**: Wrap :erpc.send_request/receive_response to measure process-alias driven concurrency without :rex blocking."""
 
 ```elixir
 defmodule ErpcBenchmark.ErpcRunner do
@@ -297,6 +305,8 @@ end
 
 ### Step 5: Peer-node harness
 
+**Objective**: Boot sibling BEAM nodes via `:peer` and inject code paths so benchmarks run against a real distribution transport locally.
+
 ```elixir
 defmodule ErpcBenchmark.Harness do
   @moduledoc """
@@ -325,6 +335,8 @@ end
 
 ### Step 6: Tests
 
+**Objective**: Assert timeout, exception-to-tuple, and async-await semantics so regressions in either runner surface without launching a full cluster.
+
 ```elixir
 defmodule ErpcBenchmark.ErpcRunnerTest do
   use ExUnit.Case, async: false
@@ -337,41 +349,45 @@ defmodule ErpcBenchmark.ErpcRunnerTest do
     %{node: node}
   end
 
-  test "call returns {:ok, value} on success", %{node: node} do
-    assert {:ok, :hello} = ErpcRunner.call(node, Worker, :echo, [:hello])
-  end
+  describe "ErpcBenchmark.ErpcRunner" do
+    test "call returns {:ok, value} on success", %{node: node} do
+      assert {:ok, :hello} = ErpcRunner.call(node, Worker, :echo, [:hello])
+    end
 
-  test "call returns {:error, reason} on raise", %{node: node} do
-    assert {:error, %RuntimeError{message: "boom"}} =
-             ErpcRunner.call(node, Worker, :raise_boom, [])
-  end
+    test "call returns {:error, reason} on raise", %{node: node} do
+      assert {:error, %RuntimeError{message: "boom"}} =
+               ErpcRunner.call(node, Worker, :raise_boom, [])
+    end
 
-  test "call enforces timeout and does not hang", %{node: node} do
-    started = System.monotonic_time(:millisecond)
+    test "call enforces timeout and does not hang", %{node: node} do
+      started = System.monotonic_time(:millisecond)
 
-    assert {:error, _reason} =
-             ErpcRunner.call(node, Worker, :sleep_then_return, [500, :late], 50)
+      assert {:error, _reason} =
+               ErpcRunner.call(node, Worker, :sleep_then_return, [500, :late], 50)
 
-    elapsed = System.monotonic_time(:millisecond) - started
-    # 50ms timeout + some slack for scheduling
-    assert elapsed < 200
-  end
+      elapsed = System.monotonic_time(:millisecond) - started
+      # 50ms timeout + some slack for scheduling
+      assert elapsed < 200
+    end
 
-  test "multicall returns per-node ok/error map", %{node: node} do
-    result = ErpcRunner.multicall([node, node], Worker, :compute, [100])
-    assert %{ok: oks, errors: []} = result
-    assert length(oks) == 2
-    assert Enum.all?(oks, fn {_, v} -> v == 5050 end)
-  end
+    test "multicall returns per-node ok/error map", %{node: node} do
+      result = ErpcRunner.multicall([node, node], Worker, :compute, [100])
+      assert %{ok: oks, errors: []} = result
+      assert length(oks) == 2
+      assert Enum.all?(oks, fn {_, v} -> v == 5050 end)
+    end
 
-  test "send_request / await — async without :rex bottleneck", %{node: node} do
-    id = ErpcRunner.send_request(node, Worker, :compute, [1000])
-    assert {:ok, 500_500} = ErpcRunner.await(id, 1_000)
+    test "send_request / await — async without :rex bottleneck", %{node: node} do
+      id = ErpcRunner.send_request(node, Worker, :compute, [1000])
+      assert {:ok, 500_500} = ErpcRunner.await(id, 1_000)
+    end
   end
 end
 ```
 
 ### Step 7: Benchmark script
+
+**Objective**: Benchmark `:rpc` vs `:erpc` under serial and parallel load to quantify the `:rex` bottleneck and pipelining gains.
 
 ```elixir
 # bench/rpc_vs_erpc.exs
@@ -461,6 +477,24 @@ IO.puts("avg: #{time_us / 10_000} µs/op")
 
 Target: operation should complete in the low-microsecond range on modern hardware; deviations by >2× indicate a regression worth investigating.
 
+## Deep Dive
+
+Distributed Erlang relies on a heartbeat mechanism (net_kernel tick) to detect node failure, but the network is fundamentally asynchronous—split-brain scenarios are inevitable. A partitioned cluster may have two sets of nodes, each believing the other is dead. Libraries like Horde and Phoenix.PubSub solve this with quorum-aware consensus, but they add latency and complexity. At scale, choose your consistency model explicitly: eventual consistency (via Redis PubSub) is faster but allows temporary divergence; strong consistency (via Horde DLM or distributed transactions) is slower but guarantees atomicity. For global registries, the order of operations matters—registering a process before its monitor is live creates race conditions. In multi-region setups, latency between nodes compounds these issues; consider regional clusters with a lightweight coordinator rather than a fully meshed topology.
+## Advanced Considerations
+
+Distributed Elixir systems require careful consideration of network partitions, consistent hashing for distributed state, and the interaction between clustering libraries and node discovery mechanisms. Network partitions are not rare edge cases; they happen regularly in cloud deployments due to maintenance windows and infrastructure issues. A system that works perfectly during local testing but fails under network partitions indicates insufficient failure handling throughout the codebase. Split-brain scenarios where multiple network partitions lead to different cluster views require explicit recovery mechanisms that are often business-specific and context-dependent.
+
+Horde and distributed registries provide eventual consistency guarantees, but "eventual" can mean minutes during network partitions. Applications must handle the case where the same name is registered on multiple nodes simultaneously without coordination. Consistent hashing for distributed services requires understanding rebalancing costs — a single node failure can cause significant key redistribution and thundering herd problems if not carefully managed. The cost of distributed consensus using algorithms like Raft is high; choose it only when consistency is more important than availability and can afford the performance cost.
+
+Global state replication across nodes creates synchronization challenges at scale. Choosing between replicating everywhere versus replicating to specific nodes affects both consistency latency and network bandwidth utilization fundamentally. Node monitoring and heartbeat mechanisms require careful timeout tuning — too aggressive and you get false positives during network hiccups; too conservative and you don't detect actual failures quickly enough for recovery. The EPMD (Erlang Port Mapper Daemon) is a critical component that can become a bottleneck in large clusters and requires careful capacity planning.
+
+
+## Deep Dive: Cluster Patterns and Production Implications
+
+Clustering distributes computation across nodes using Erlang's distribution protocol. Testing clusters requires simulating node failures, network partitions, and message delays—challenges that single-node tests don't expose. Production clusters fail in ways that cluster tests reveal: nodes can become isolated (stuck), messages can be reordered, and consensus is expensive.
+
+---
+
 ## Trade-offs and production gotchas
 
 **1. `:erpc.call` raises — update error handling**
@@ -519,3 +553,13 @@ your OTP version: `:erlang.system_info(:otp_release)`.
 - [Dashbit — "Releasing Erlang/OTP 24"](https://dashbit.co/blog) — commentary on erpc perf
 - [Fred Hébert — Learn You Some Erlang: Distribunomicon](https://learnyousomeerlang.com/distribunomicon) — foundations
 - [`:peer` module docs](https://www.erlang.org/doc/man/peer.html) — used by the test harness
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

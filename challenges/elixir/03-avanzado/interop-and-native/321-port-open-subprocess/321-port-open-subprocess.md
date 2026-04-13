@@ -94,6 +94,16 @@ dominated by spawn.
 
 No external deps beyond Elixir/Erlang.
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
+
 ```elixir
 defmodule PdfRenderer.MixProject do
   use Mix.Project
@@ -113,6 +123,8 @@ end
 ```
 
 ### Step 1: The guard (`lib/pdf_renderer/port_guard.ex`)
+
+**Objective**: Enforce hard timeout with SIGKILL fallback so subprocess hangs never block the caller indefinitely.
 
 ```elixir
 defmodule PdfRenderer.PortGuard do
@@ -205,6 +217,8 @@ end
 
 ### Step 2: The renderer (`lib/pdf_renderer/renderer.ex`)
 
+**Objective**: Wrap headless chromium invocation so HTML-to-PDF conversion stays timeout-protected and memory-safe.
+
 ```elixir
 defmodule PdfRenderer.Renderer do
   @moduledoc """
@@ -236,6 +250,8 @@ end
 ```
 
 ### Step 3: Supervision
+
+**Objective**: Boot TaskSupervisor so port guard tasks run isolated from the caller and crash-safe.
 
 ```elixir
 defmodule PdfRenderer.Application do
@@ -348,6 +364,23 @@ Benchee.run(
 **Expected**: spawn+wait latency is ~5ms for trivial commands (dominated by `fork+exec`),
 and ~200ms for chromium. If `dd` 1MB takes > 50ms, stdout read path is the bottleneck —
 measure `Port.command`/receive overhead before optimizing the subprocess itself.
+
+## Advanced Considerations: NIF Isolation and Scheduler Integration
+
+NIF calls run atomically on a scheduler thread, blocking all other processes on that scheduler until the function returns. For operations exceeding ~1 millisecond, this starvation becomes visible: heartbeat processes delay, ETS owner replies hang, supervision timeouts fire. The BEAM's dirty scheduler pool (8 CPU + 10 IO by default) isolates long NIFs from the main scheduler ring, but they're still a finite resource.
+
+Understanding scheduler capacity is critical. Each dirty CPU scheduler can run ~1,000 100-microsecond operations per second, or ~5 100-millisecond operations. Beyond that, callers queue. A GenServer pool capping concurrency and applying backpressure prevents cascade failures: if the dirty pool saturates, reject new work immediately instead of queuing unboundedly.
+
+Resource management inside NIFs differs from pure Elixir. A `Binary<'a>` is a borrow tied to the NIF call; it cannot escape to threads or be stored in resources. An `OwnedBinary` allocation isn't visible to BEAM's garbage collector, so memory limits must be enforced in the Elixir layer. Hybrid architectures (Port processes for I/O, NIFs for CPU work) offer better observability and failure isolation than trying to do everything in a single NIF crate.
+
+---
+
+
+## Deep Dive: Interop Patterns and Production Implications
+
+Interop with native code (NIFs, ports, C extensions) introduces failure modes that pure Elixir code doesn't have: segfaults, memory leaks, deadlocks with the Erlang emulator. Testing interop requires separate test suites for the native layer and integration tests that exercise the boundary.
+
+---
 
 ## Trade-offs and production gotchas
 

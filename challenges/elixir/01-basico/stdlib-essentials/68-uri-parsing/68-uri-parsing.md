@@ -2,9 +2,6 @@
 
 **Project**: `url_validator` — a tiny library that validates and normalizes URLs before they're stored.
 
-**Difficulty**: ★☆☆☆☆
-**Estimated time**: 1 hour
-
 ---
 
 ## Project context
@@ -69,9 +66,42 @@ Using the wrong one corrupts query strings in subtle ways (double-encoded slashe
 
 ---
 
+## Why `URI.new/1` + whitelist and not a regex
+
+A "validate URL with a regex" approach looks minimal but is wrong almost every time: the right regex is several hundred characters (see RFC 3986 appendix B), rejects legitimate inputs (IPv6 hosts, Unicode paths), and still does no normalisation, so `HTTPS://Example.com` and `https://example.com` become two cache keys. `URI.new/1` reuses the stdlib parser (RFC 3986 compliant), returns `{:error, part}` on malformed input, and gives you a struct you can canonicalise field-by-field (lowercase scheme/host, drop default ports, default missing path to `/`). Whitelisting schemes (`http`, `https`) closes the `javascript:`/`file:` hole that every URL-shortener service gets bitten by eventually.
+
+---
+
+## Design decisions
+
+**Option A — regex-based validation, string concatenation for resolution**
+- Pros: no parser dependency; one-liner for the "looks like URL" check; fast.
+- Cons: wrong on IPv6, punycode, fragments, and `..` resolution; validation and normalisation stay coupled as two regexes that drift over time; rejects legitimate inputs.
+
+**Option B — `URI.new/1` + struct whitelist + `URI.merge/2` for resolution** (chosen)
+- Pros: RFC 3986 compliance comes for free; normalisation is explicit per field; resolution handles `..`, `./`, and absolute-wins semantics; validation errors report which part failed.
+- Cons: slightly more code per case; callers must remember that `URI.parse/1` is the forgiving variant (not for validation); IDN/punycode still needs a separate library.
+
+Chose **B** because URL handling is the canonical "looks simple, breaks in production" problem; leaning on a stdlib parser trades one dependency for correctness on every edge case you haven't imagined yet.
+
+---
+
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: URI.parse is forgiving; URI.new validates; never regex URLs — RFC 3986 has edge cases (IPv6, `..`).
 
 ```bash
 mix new url_validator
@@ -79,6 +109,8 @@ cd url_validator
 ```
 
 ### Step 2: `lib/url_validator.ex`
+
+**Objective**: Whitelist schemes (http, https); URI.merge/2 resolves relative per RFC; normalise scheme/host to lowercase.
 
 ```elixir
 defmodule UrlValidator do
@@ -161,6 +193,8 @@ end
 
 ### Step 3: `test/url_validator_test.exs`
 
+**Objective**: Test relative resolution, IPv6 in brackets, query string preservation, scheme blacklist (javascript:).
+
 ```elixir
 defmodule UrlValidatorTest do
   use ExUnit.Case, async: true
@@ -222,11 +256,60 @@ end
 
 ### Step 4: Run
 
+**Objective**: --warnings-as-errors catches unused URI fields; test coverage validates normalization is deterministic.
+
 ```bash
 mix test
 ```
 
 All tests should pass on a clean implementation.
+
+### Why this works
+
+`URI.new/1` distinguishes "parseable" from "meaningful": it returns `{:error, part}` for inputs like `https://` where a required component is missing, while `URI.parse/1` would silently return a partially-filled struct. The `with` pipeline (`URI.new` → `check_scheme` → `check_host` → `canonicalize`) fails on the first violation and returns an atom reason so callers can branch on it. Canonicalisation only lowercases scheme and host (both case-insensitive per RFC 3986) and leaves the path untouched — paths are case-sensitive on most servers, and mass-lowercasing breaks APIs whose URL design relies on that.
+
+---
+
+
+## Key Concepts
+
+### 1. `URI.parse/1` Parses URLs
+`URI.parse` breaks down a URL into components: scheme, host, port, path, query, fragment, userinfo.
+
+### 2. Encoding and Decoding
+`URI.encode` and `URI.decode` handle URL encoding. Always encode before appending to a URL.
+
+### 3. Building URLs
+You can build URIs from scratch and convert them back to strings with `URI.to_string/1`.
+
+---
+## Benchmark
+
+```elixir
+# bench.exs
+defmodule Bench do
+  def run do
+    urls = ~w(
+      https://Example.com/Path https://acme.com:443/x http://acme.com:80/
+      https://a.com/../b ftp://x.com https:// not-a-url https://acme.com/MixedCase
+    )
+
+    {us, _} =
+      :timer.tc(fn ->
+        Enum.each(1..10_000, fn _ ->
+          Enum.each(urls, &UrlValidator.normalize/1)
+        end)
+      end)
+
+    per_call = us / (10_000 * length(urls))
+    IO.puts("normalize/1: #{Float.round(per_call, 2)} µs/call")
+  end
+end
+
+Bench.run()
+```
+
+Target: under 5 µs per call. `URI.new/1` dominates; the rest of the pipeline is pure struct manipulation.
 
 ---
 
@@ -253,6 +336,13 @@ Mixing them up double-encodes slashes or corrupts query strings. Rule of thumb:
 For a full HTTP client, let `Req`/`Finch`/`:httpc` do their own URL handling. This
 module is for validation + normalization at the edges of your system, not for
 constructing request targets on the fly.
+
+---
+
+## Reflection
+
+1. The validator rejects non-http(s) schemes. A new product line needs to accept `mailto:` and `tel:` from a contacts import. Would you parameterise `@allowed_schemes`, add a second function `normalize_contact/1`, or keep the strict default and layer a laxer validator alongside? What does each choice say about where "URL policy" lives in your system?
+2. Canonicalisation treats `https://a.com` and `https://a.com/` as the same URL by defaulting the path. A customer files a bug because `https://api.a.com/v1` and `https://api.a.com/v1/` hit different backend routes in their system. Is the path default wrong, is the API wrong, or is this a contract gap in the shortener? How do you decide without breaking millions of existing short links?
 
 ---
 

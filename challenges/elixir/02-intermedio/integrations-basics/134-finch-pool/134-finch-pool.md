@@ -6,14 +6,11 @@ for a modern one), attach telemetry handlers to observe connect, queue,
 send, and recv phases, and drive it from a small client module with tests
 that stub the adapter via `Req.Test`.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 3–4 hours
-
 ---
 
 ## Project context
 
-`Req` (exercise 133) is the easy-mode HTTP client. One layer below sits
+`Req` is the easy-mode HTTP client. One layer below sits
 [Finch](https://hexdocs.pm/finch/): a pool-per-host HTTP client built on
 `Mint` with first-class HTTP/2 support. When you need to tune connection
 counts, opt into HTTP/2 multiplexing, control idle timeouts, or wire
@@ -85,9 +82,37 @@ You handle JSON, retries, and redirects yourself.
 
 ---
 
+## Design decisions
+
+**Option A — single `:default` Finch pool with generous size for every host**
+- Pros: minimal configuration; one knob to tune; fits tutorials.
+- Cons: HTTP/2 hosts can't multiplex properly, legacy HTTP/1 hosts contend on one pool; a slow host starves every other host; you can't tune idle timeouts per upstream.
+
+**Option B — per-host pools keyed by `scheme://host:port` with protocol-specific sizing (chosen)**
+- Pros: HTTP/1 hosts get `size × count` concurrent slots; HTTP/2 hosts get `count` multiplexed connections; each upstream has its own idle timeout; one misbehaving host can't drain the rest.
+- Cons: more config surface; you must keep the map in sync with the hosts your app actually talks to.
+
+→ Chose **B** because anything beyond a toy deployment mixes HTTP/1 and HTTP/2 upstreams, and tuning them with one pool is knowingly wrong.
+
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"jason", "~> 1.0"},
+    {:"plug", "~> 1.0"},
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
 
 ```bash
 mix new finch_pool --sup
@@ -107,6 +132,9 @@ end
 ```
 
 ### Step 2: `lib/finch_pool/application.ex`
+
+**Objective**: Wire `application.ex` to start the supervision tree that boots Repo and external adapters in the correct order before serving traffic.
+
 
 ```elixir
 defmodule FinchPool.Application do
@@ -155,6 +183,9 @@ end
 ```
 
 ### Step 3: `lib/finch_pool/telemetry.ex` — attach handlers
+
+**Objective**: Edit `telemetry.ex` — attach handlers, exposing the integration seam where external protocol semantics meet Elixir domain code.
+
 
 ```elixir
 defmodule FinchPool.Telemetry do
@@ -213,6 +244,9 @@ end
 
 ### Step 4: `lib/finch_pool/client.ex`
 
+**Objective**: Implement `client.ex` — the integration seam where external protocol semantics meet Elixir domain code.
+
+
 ```elixir
 defmodule FinchPool.Client do
   @moduledoc "Low-level client wrapping `Finch.build/request`."
@@ -234,6 +268,9 @@ end
 ```
 
 ### Step 5: `test/finch_pool_test.exs`
+
+**Objective**: Write `finch_pool_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
 
 ```elixir
 defmodule FinchPoolTest do
@@ -282,6 +319,21 @@ mix test
 
 ---
 
+
+## Key Concepts
+
+External integrations in Elixir split across multiple patterns: Ecto for relational databases with changesets and migrations; Telemetry for metrics and observability; HTTP libraries like Req or Finch for REST APIs; and specialized parsers like Jason, NimbleCSV, and NimbleParsec for data formats. Choosing the right tool avoids the trap of one library solving everything poorly.
+
+Ecto is the de facto standard for databases because changesets encode validation before queries, migrations manage schema evolution, and the Repo pattern separates query logic from business logic. Migrations are version-controlled SQL, ensuring reproducible deployments. For integrating external services, Req is the modern HTTP client with built-in retry, redirect, and error handling policies.
+
+Telemetry decouples metrics collection from application code: you emit events and let listeners subscribe. This separation keeps business logic clean and metrics infrastructure pluggable. Use metrics, not print statements, in production.
+
+## Key Concepts
+
+Finch is a connection-pooling HTTP client—multiple connections are maintained and reused. `Finch.build/3` creates a request, `Finch.request!/3` executes it. Finch is useful when you make hundreds of HTTP calls per second; Req is simpler for modest traffic. The trade-off: Finch adds complexity but avoids connection exhaustion under load. Use Finch when profiling shows HTTP connection overhead; use Req by default.
+
+---
+
 ## Trade-offs and production gotchas
 
 **1. HTTP/2 connection reuse is a double-edged sword**
@@ -309,12 +361,20 @@ The match is on scheme+host+port exactly. `"https://api.example.com"` does
 *not* match `https://api.example.com:8443`. Include the port if non-default.
 
 **6. When NOT to use Finch directly**
-If you're making typical JSON REST calls, use Req (exercise 133) — it
+If you're making typical JSON REST calls, use Req — it
 *already* uses Finch under the hood. Reach for Finch when you need custom
 request pipelines, streaming bodies via `Finch.stream/5`, or per-pool
 telemetry that Req can't expose cleanly.
 
 ---
+
+## Benchmark
+
+<!-- benchmark N/A: integration/configuration exercise -->
+
+## Reflection
+
+- An HTTP/2 pool with `count: 4` gives you 4 independent connections each multiplexing many streams. If your p99 latency spikes during deployments of the upstream service, would increasing `count` actually help, or are you fighting a head-of-line-blocking problem that a bigger pool can't fix?
 
 ## Resources
 

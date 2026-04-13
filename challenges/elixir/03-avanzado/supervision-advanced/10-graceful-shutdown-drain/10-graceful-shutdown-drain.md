@@ -143,7 +143,106 @@ defp deps do
 end
 ```
 
+### Dependencies (mix.exs)
+
+```elixir
+```elixir
+%{id: MyServer,
+  start: {MyServer, :start_link, []},
+  shutdown: 10_000,      # ms
+  restart: :permanent}
+```
+
+| Value | Behavior |
+|---|---|
+| `:brutal_kill` | `Process.exit(pid, :kill)` immediately. No `terminate/2`. |
+| `:infinity` | Wait forever. Dangerous — hangs shutdown if drain hangs. |
+| integer N (ms) | Wait N ms; then `Process.exit(pid, :kill)`. |
+
+Pick N = (typical drain) + (safety margin). Never `:infinity` for workers; reserve it for nested supervisors only.
+
+### 3. Application-wide shutdown timeout
+
+`Application.stop/1` has its own timer (default `:infinity`). The OS supervisor (systemd, K8s) gives you a fixed window (K8s `terminationGracePeriodSeconds`, default 30 s). If your app's drain takes 60 s, K8s sends `SIGKILL` at 30 s regardless.
+
+Align these three:
+
+```
+K8s terminationGracePeriodSeconds (30s)
+    ≥  Application drain budget (25s)
+        ≥  Root supervisor shutdown (20s)
+            ≥  Leaf server shutdown (15s)
+```
+
+### 4. The four-stage drain pattern
+
+```elixir
+def terminate(reason, state) do
+  # Stage 1: flip gate to reject new work.
+  :ets.insert(:gate, {:accepting, false})
+
+  # Stage 2: wait for in-flight work to drain.
+  wait_for_drain(state, _deadline_ms = 10_000)
+
+  # Stage 3: flush side effects.
+  flush_buffer(state)
+
+  # Stage 4: return — Supervisor will log reason.
+  :ok
+end
+```
+
+### 5. The gate pattern
+
+A public "accepting" flag (ETS or `:persistent_term`) that the entry points check BEFORE doing work:
+
+```elixir
+def handle(req) do
+  if accepting?() do
+    GenServer.call(Server, {:handle, req})
+  else
+    {:error, :draining}
+  end
+end
+```
+
+The flag is set by the GenServer's `terminate/2` in stage 1. Readers do NOT go through the GenServer, so the flip is effective even if the GenServer is already handling 50 queued messages.
+
+---
+
+## Why a four-stage drain and not `Process.flag(:trap_exit, true)` alone
+
+Trapping exits converts the supervisor's `:shutdown` signal into a `terminate/2` call — that is necessary but not sufficient. Without a gate that rejects new work, producers keep `call`-ing the GenServer during drain and push its mailbox beyond the shutdown budget. Without a deadline inside the drain loop, `terminate/2` blocks forever on a stuck downstream and the supervisor `:brutal_kill`s at `shutdown:` expiry — losing exactly the state you were trying to flush. The four stages (gate → drain → flush → exit) are the minimum needed to make the guarantee load-bearing.
+
+---
+
+## Design decisions
+
+**Option A — accept everything and drain on terminate, no gate**
+- Pros: simplest code; single state transition.
+- Cons: producers keep writing into the mailbox during drain; the drain window never closes; `:brutal_kill` dominates under load.
+
+**Option B — gate flag + bounded drain + flush** (chosen)
+- Pros: producers see `:unavailable` immediately and back off; the drain budget is deterministic; flush happens once the mailbox is empty of in-flight work.
+- Cons: more state (`draining?` flag), and every public callback must inspect it — a touch point that is easy to forget on new endpoints.
+
+→ Chose **B** because the SLO is about not dropping in-flight requests, which requires a bounded closing window that only gating makes possible.
+
+---
+
+## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  []
+end
+```
+
 ### Step 1: Application
+
+**Objective**: Define the OTP application and wire the supervision tree.
 
 ```elixir
 # lib/drain_shutdown/application.ex
@@ -173,6 +272,8 @@ end
 ```
 
 ### Step 2: The drainable server
+
+**Objective**: Implement The drainable server.
 
 ```elixir
 # lib/drain_shutdown/server.ex
@@ -293,6 +394,8 @@ end
 
 ### Step 3: Tests
 
+**Objective**: Add tests that cover the expected behavior and edge cases.
+
 ```elixir
 # test/drain_shutdown/drain_test.exs
 defmodule DrainShutdown.DrainTest do
@@ -305,32 +408,34 @@ defmodule DrainShutdown.DrainTest do
     :ok
   end
 
-  test "accepts requests under normal conditions" do
-    assert {:ok, {:handled, :ping}} = Server.handle(:ping)
-  end
+  describe "DrainShutdown.Drain" do
+    test "accepts requests under normal conditions" do
+      assert {:ok, {:handled, :ping}} = Server.handle(:ping)
+    end
 
-  test "terminate drains in-flight work before returning" do
-    # Kick off 5 in-flight requests.
-    tasks = for i <- 1..5, do: Task.async(fn -> Server.handle({:req, i}) end)
-    Process.sleep(20)
+    test "terminate drains in-flight work before returning" do
+      # Kick off 5 in-flight requests.
+      tasks = for i <- 1..5, do: Task.async(fn -> Server.handle({:req, i}) end)
+      Process.sleep(20)
 
-    # Manually invoke terminate under controlled conditions.
-    pid = Process.whereis(Server)
-    ref = Process.monitor(pid)
+      # Manually invoke terminate under controlled conditions.
+      pid = Process.whereis(Server)
+      ref = Process.monitor(pid)
 
-    # Send a :shutdown exit like the supervisor would.
-    Process.exit(pid, :shutdown)
+      # Send a :shutdown exit like the supervisor would.
+      Process.exit(pid, :shutdown)
 
-    assert_receive {:DOWN, ^ref, :process, ^pid, :shutdown}, 15_000
+      assert_receive {:DOWN, ^ref, :process, ^pid, :shutdown}, 15_000
 
-    # All in-flight tasks should have received a reply (not a timeout/exit).
-    results = Task.await_many(tasks, 15_000)
-    assert Enum.all?(results, &match?({:ok, {:handled, _}}, &1))
-  end
+      # All in-flight tasks should have received a reply (not a timeout/exit).
+      results = Task.await_many(tasks, 15_000)
+      assert Enum.all?(results, &match?({:ok, {:handled, _}}, &1))
+    end
 
-  test "rejects new work after gate flips" do
-    :ets.insert(:drain_gate, {:accepting, false})
-    assert {:error, :draining} = Server.handle(:new_req)
+    test "rejects new work after gate flips" do
+      :ets.insert(:drain_gate, {:accepting, false})
+      assert {:error, :draining} = Server.handle(:new_req)
+    end
   end
 end
 ```
@@ -338,6 +443,23 @@ end
 ### Why this works
 
 `trap_exit` turns the supervisor's `:shutdown` into a `terminate/2` call instead of an instant death. The ETS-backed gate flag flips in `terminate/2` and is read by public callbacks *without* going through the GenServer itself — so callers get `:unavailable` instantly instead of queuing behind the draining process. The bounded `receive` loop in `terminate/2` processes remaining `:work_done` signals until either the in-flight counter hits zero or the drain deadline expires; either way `terminate/2` returns within the `shutdown:` budget, so the supervisor never has to fall back to `:brutal_kill`.
+
+---
+
+## Advanced Considerations: Partitioned Supervisors and Custom Restart Strategies
+
+A standard Supervisor is a single process managing a static tree. For thousands of children, a single supervisor becomes a bottleneck: all supervisor callbacks run on one process, and supervisor restart logic is sequential. PartitionSupervisor (OTP 25+) spawns N independent supervisors, each managing a subset of children. Hashing the child ID determines which partition supervises it, distributing load and enabling horizontal scaling.
+
+Custom restart strategies (via `Supervisor.init/2` callback) allow logic beyond the defaults. A strategy might prioritize restarting dependent services in a specific order, or apply backoff based on restart frequency. The downside is complexity: custom logic is harder to test and reason about, and mistakes cascade. Start with defaults and profile before adding custom behavior.
+
+Selective restart via `:rest_for_one` or `:one_for_all` affects failure isolation. `:one_for_all` restarts all children when one fails (simulating a total system failure), which can be necessary for consistency but is expensive. `:rest_for_one` restarts the failed child and any started after it, balancing isolation and dependencies. Understanding which strategy fits your architecture prevents cascading failures and unnecessary restarts.
+
+---
+
+
+## Deep Dive: Property Patterns and Production Implications
+
+Property-based testing inverts the testing mindset: instead of writing examples, you state invariants (properties) and let a generator find counterexamples. StreamData's shrinking capability is its superpower—when a property fails on a 10,000-element list, the framework reduces it to the minimal list that still fails, cutting debugging time from hours to minutes. The trade-off is that properties require rigorous thinking about domain constraints, and not every invariant is worth expressing as a property. Teams that adopt property testing often find bugs in specifications themselves, not just implementations.
 
 ---
 

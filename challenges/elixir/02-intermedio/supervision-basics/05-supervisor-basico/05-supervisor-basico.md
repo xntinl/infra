@@ -44,7 +44,7 @@ basic_supervisor/
 Under the hood, `Supervisor` is a specialized process that calls
 `Process.flag(:trap_exit, true)`, links each child via `start_link`, and
 turns every `{:EXIT, child, reason}` message into a restart decision.
-Nothing magical — just the primitives from exercise 72 wrapped in a
+Nothing magical — just low-level link/trap_exit primitives wrapped in a
 reusable behavior.
 
 ### 2. Child specs describe HOW to start and restart a child
@@ -108,12 +108,18 @@ end
 
 ### Step 1: Create the project
 
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
+
 ```bash
 mix new basic_supervisor
 cd basic_supervisor
 ```
 
 ### Step 2: `lib/basic_supervisor/worker.ex`
+
+**Objective**: Encode the restart policy in `worker.ex` — the supervisor strategy is the lesson; the children exist to make it observable.
+
 
 ```elixir
 defmodule BasicSupervisor.Worker do
@@ -154,6 +160,9 @@ end
 
 ### Step 3: `lib/basic_supervisor/supervisor.ex`
 
+**Objective**: Encode the restart policy in `supervisor.ex` — the supervisor strategy is the lesson; the children exist to make it observable.
+
+
 ```elixir
 defmodule BasicSupervisor.Supervisor do
   @moduledoc """
@@ -184,6 +193,9 @@ end
 ```
 
 ### Step 4: `test/basic_supervisor_test.exs`
+
+**Objective**: Write `basic_supervisor_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
 
 ```elixir
 defmodule BasicSupervisorTest do
@@ -254,6 +266,9 @@ end
 
 ### Step 5: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -263,6 +278,14 @@ mix test
 ### Why this works
 
 The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+
+## Key Concepts: Process Trees and Fault Tolerance
+
+A Supervisor is a special process that starts and monitors child processes. If a child crashes, the supervisor restarts it according to a restart strategy (`:one_for_one`, `:one_for_all`, `:rest_for_one`). Supervisors form a tree: you have a root supervisor that starts application-level services, and deeper supervisors manage pools of workers.
+
+The key insight: **let it crash** is safe because supervisors restart failed processes automatically. You design for recovery, not prevention. Supervisors also enforce clean shutdown: when the supervisor shuts down, it waits for all children to terminate (respecting shutdown timeouts) before exiting. This is how Elixir achieves graceful shutdowns and zero-downtime deployments. The gotcha: a restart loop (process crashes, supervisor restarts, crashes again immediately) will eventually hit a max restart limit and the supervisor itself terminates. Use exponential backoff or circuit breakers to break the loop.
 
 
 ## Benchmark
@@ -290,7 +313,7 @@ against crash loops —
 **4. Static children only — for dynamic children use `DynamicSupervisor`**
 `Supervisor` expects its `init/1` to return the full child list up front.
 If you need to start workers after boot (one per user, per job, etc.),
-reach for `DynamicSupervisor` — exercise 26.
+reach for `DynamicSupervisor`.
 
 **5. When NOT to use a plain Supervisor**
 If children depend on each other in startup order AND any crash should
@@ -311,3 +334,17 @@ where later stages depend on earlier ones, you want `:rest_for_one`. Plain
 - ["Supervisor and Application" — Elixir getting started](https://hexdocs.pm/elixir/supervisor-and-application.html)
 - [Erlang `supervisor` behavior](https://www.erlang.org/doc/man/supervisor.html) — the canonical reference
 - [Designing for Scalability with Erlang/OTP — Ch. 8 "Supervisors"](https://www.oreilly.com/library/view/designing-for-scalability/9781449361556/) — the clearest explanation of restart strategies in print
+
+
+## Advanced Considerations
+
+Supervision trees encode your application's fault tolerance strategy. The tree structure, restart policy, and shutdown semantics directly determine behavior during crashes, dependencies, and graceful shutdown.
+
+**Supervision tree design:**
+A well-designed tree mirrors data/message flow: dependencies point upward. If process A depends on process B, B should be higher in the tree (started first, shut down last). Supervisor strategies (`:one_for_one`, `:one_for_all`, `:rest_for_one`) define the scope of cascading restarts. `:one_for_one` isolates failures (each crash restarts only that child); `:one_for_all` is for tightly-coupled groups (e.g., a reader-writer pair).
+
+**Restart strategies and intensity:**
+`max_restarts: 3, max_seconds: 5` means "if 3+ restarts occur in 5 seconds, kill the supervisor." This circuit-breaker pattern prevents restart loops that consume resources. The key decision: should a crashing child take down the whole app (escalate to parent) or just itself? Transient/temporary children exit "cleanly" and don't trigger restarts — useful for request handlers.
+
+**Error propagation and shutdown ordering:**
+When a supervisor exits, it sends `:shutdown` to children in reverse start order (LIFO). Children have `shutdown: 5000` milliseconds to terminate gracefully before hard killing. Nested supervisors propagate this signal recursively. Understanding this order prevents resource leaks: a child waiting on another child's graceful shutdown will deadlock if not designed carefully.

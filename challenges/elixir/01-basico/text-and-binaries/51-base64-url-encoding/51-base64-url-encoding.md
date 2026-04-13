@@ -68,7 +68,22 @@ Never invent your own MAC.
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"phoenix", "~> 1.0"},
+    {:"plug", "~> 1.0"},
+  ]
+end
+```
+
+
 ### Step 1 — Create the project
+
+**Objective**: Signed URLs use HMAC to prove intent; URL-safe Base64 is RFC 4648 section 5 — standard Base64 breaks in URLs.
 
 ```bash
 mix new signed_url
@@ -76,6 +91,8 @@ cd signed_url
 ```
 
 ### Step 2 — `lib/signed_url.ex`
+
+**Objective**: HMAC-SHA256 + Base64url proves URL authenticity without database lookups; constant-time equality prevents timing attacks.
 
 ```elixir
 defmodule SignedUrl do
@@ -164,6 +181,8 @@ end
 
 ### Step 3 — `test/signed_url_test.exs`
 
+**Objective**: Test signature tampering (one byte change fails), expiry boundaries (now vs 1s ago), and URL encoding roundtrip.
+
 ```elixir
 defmodule SignedUrlTest do
   use ExUnit.Case, async: true
@@ -220,6 +239,8 @@ end
 
 ### Step 4 — Run the tests
 
+**Objective**: --warnings-as-errors catches incorrect padding removal; test coverage validates HMAC doesn't silently accept bad sigs.
+
 ```bash
 mix test
 ```
@@ -228,6 +249,19 @@ All 6 tests should pass.
 
 ---
 
+
+## Key Concepts
+
+### 1. `Base.encode64/1` and `Base.decode64/1` Handle Encoding
+Base64 is text-safe encoding for binary data. It's 33% larger but uses only ASCII characters.
+
+### 2. URL-Safe Encoding
+URL-safe Base64 uses `-` and `_` instead of `+` and `/`, and omits padding. Use this for URLs and JSON.
+
+### 3. Padding Matters
+Base64 with padding is standard. Without padding, some decoders fail. Use the appropriate variant for your context.
+
+---
 ## Trade-offs
 
 | Encoder | Alphabet | Padding | Use case |

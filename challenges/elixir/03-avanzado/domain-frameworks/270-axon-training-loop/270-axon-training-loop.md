@@ -142,6 +142,8 @@ Track `best_metric_so_far`. After each epoch, if `metric` did not improve by `mi
 
 ### Step 1: `mix.exs`
 
+**Objective**: Declare project dependencies and configure the Mix build.
+
 ```elixir
 defmodule AxonTrainingLoop.MixProject do
   use Mix.Project
@@ -165,6 +167,8 @@ end
 ```
 
 ### Step 2: `lib/axon_training_loop/callbacks/checkpoint.ex`
+
+**Objective**: Implement the `checkpoint.ex` module.
 
 ```elixir
 defmodule AxonTrainingLoop.Callbacks.Checkpoint do
@@ -258,6 +262,8 @@ end
 
 ### Step 3: `lib/axon_training_loop/callbacks/early_stopping.ex`
 
+**Objective**: Implement the `early_stopping.ex` module.
+
 ```elixir
 defmodule AxonTrainingLoop.Callbacks.EarlyStopping do
   @moduledoc """
@@ -311,6 +317,8 @@ end
 
 ### Step 4: `lib/axon_training_loop/callbacks/ema.ex`
 
+**Objective**: Implement the `ema.ex` module.
+
 ```elixir
 defmodule AxonTrainingLoop.Callbacks.EMA do
   @moduledoc """
@@ -350,6 +358,8 @@ end
 ```
 
 ### Step 5: `lib/axon_training_loop/callbacks/lr_schedule.ex`
+
+**Objective**: Implement the `lr_schedule.ex` module.
 
 ```elixir
 defmodule AxonTrainingLoop.Callbacks.LRSchedule do
@@ -394,6 +404,8 @@ end
 Note: `Polaris.Updates.set_learning_rate/2` is a helper present in Polaris ≥ 0.1.1; on older versions, replace the optimizer with one built from the new LR.
 
 ### Step 6: `lib/axon_training_loop/trainer.ex`
+
+**Objective**: Implement the `trainer.ex` module.
 
 ```elixir
 defmodule AxonTrainingLoop.Trainer do
@@ -459,6 +471,8 @@ end
 
 ### Step 7: Tests
 
+**Objective**: Verify the implementation by running the test suite.
+
 ```elixir
 # test/axon_training_loop/early_stopping_test.exs
 defmodule AxonTrainingLoop.EarlyStoppingTest do
@@ -474,13 +488,15 @@ defmodule AxonTrainingLoop.EarlyStoppingTest do
     }
   end
 
-  test "halts after `patience` epochs of no improvement (min mode)" do
-    loop = Axon.Loop.loop(fn _, s -> s end) |> EarlyStopping.attach(metric: "loss", mode: :min, patience: 2)
-    [{:epoch_completed, [handler]}] = Enum.filter(loop.handlers, fn {e, _} -> e == :epoch_completed end)
+  describe "AxonTrainingLoop.EarlyStopping" do
+    test "halts after `patience` epochs of no improvement (min mode)" do
+      loop = Axon.Loop.loop(fn _, s -> s end) |> EarlyStopping.attach(metric: "loss", mode: :min, patience: 2)
+      [{:epoch_completed, [handler]}] = Enum.filter(loop.handlers, fn {e, _} -> e == :epoch_completed end)
 
-    {:continue, s1} = handler.(fake_state(%{"loss" => 1.0}))
-    {:continue, s2} = handler.(%{s1 | metrics: %{"loss" => 1.1}, epoch: 1})
-    {:halt_loop, _} = handler.(%{s2 | metrics: %{"loss" => 1.2}, epoch: 2})
+      {:continue, s1} = handler.(fake_state(%{"loss" => 1.0}))
+      {:continue, s2} = handler.(%{s1 | metrics: %{"loss" => 1.1}, epoch: 1})
+      {:halt_loop, _} = handler.(%{s2 | metrics: %{"loss" => 1.2}, epoch: 2})
+    end
   end
 end
 ```
@@ -500,20 +516,24 @@ defmodule AxonTrainingLoop.CheckpointTest do
     %{dir: dir}
   end
 
-  test "load_latest returns :empty for empty dir", %{dir: dir} do
-    assert Checkpoint.load_latest(dir) == :empty
-  end
+  describe "AxonTrainingLoop.Checkpoint" do
+    test "load_latest returns :empty for empty dir", %{dir: dir} do
+      assert Checkpoint.load_latest(dir) == :empty
+    end
 
-  test "picks highest step file", %{dir: dir} do
-    payload = %{epoch: 2, iteration: 50, step_state: %{}, handler_metadata: %{}, metrics: %{}}
-    File.write!(Path.join(dir, "step-000001-000010.ckpt"), :erlang.term_to_binary(payload))
-    File.write!(Path.join(dir, "step-000002-000050.ckpt"), :erlang.term_to_binary(payload))
-    assert {:ok, %{epoch: 2, iteration: 50}} = Checkpoint.load_latest(dir)
+    test "picks highest step file", %{dir: dir} do
+      payload = %{epoch: 2, iteration: 50, step_state: %{}, handler_metadata: %{}, metrics: %{}}
+      File.write!(Path.join(dir, "step-000001-000010.ckpt"), :erlang.term_to_binary(payload))
+      File.write!(Path.join(dir, "step-000002-000050.ckpt"), :erlang.term_to_binary(payload))
+      assert {:ok, %{epoch: 2, iteration: 50}} = Checkpoint.load_latest(dir)
+    end
   end
 end
 ```
 
 ### Step 8: End-to-end smoke test
+
+**Objective**: Implement: End-to-end smoke test.
 
 ```elixir
 # test/axon_training_loop/trainer_test.exs
@@ -521,27 +541,30 @@ defmodule AxonTrainingLoop.TrainerTest do
   use ExUnit.Case, async: false
 
   @tag :integration
-  test "trains a tiny model and produces better-than-random accuracy" do
-    model = Axon.input("input", shape: {nil, 4}) |> Axon.dense(8) |> Axon.relu() |> Axon.dense(3)
 
-    data =
-      Stream.repeatedly(fn ->
-        x = Nx.iota({32, 4}) |> Nx.as_type(:f32) |> Nx.divide(32.0)
-        y = Nx.argmax(x, axis: 1) |> Nx.new_axis(-1) |> Nx.equal(Nx.iota({1, 3})) |> Nx.as_type(:f32)
-        {x, y}
-      end)
-      |> Stream.take(50)
+  describe "AxonTrainingLoop.Trainer" do
+    test "trains a tiny model and produces better-than-random accuracy" do
+      model = Axon.input("input", shape: {nil, 4}) |> Axon.dense(8) |> Axon.relu() |> Axon.dense(3)
 
-    loop =
-      AxonTrainingLoop.Trainer.build(
-        model: model,
-        loss: :categorical_cross_entropy,
-        optimizer: Polaris.Optimizers.adam(learning_rate: 0.01),
-        epochs: 2
-      )
+      data =
+        Stream.repeatedly(fn ->
+          x = Nx.iota({32, 4}) |> Nx.as_type(:f32) |> Nx.divide(32.0)
+          y = Nx.argmax(x, axis: 1) |> Nx.new_axis(-1) |> Nx.equal(Nx.iota({1, 3})) |> Nx.as_type(:f32)
+          {x, y}
+        end)
+        |> Stream.take(50)
 
-    result = Axon.Loop.run(loop, data, %{}, epochs: 2, compiler: EXLA)
-    assert is_map(result)
+      loop =
+        AxonTrainingLoop.Trainer.build(
+          model: model,
+          loss: :categorical_cross_entropy,
+          optimizer: Polaris.Optimizers.adam(learning_rate: 0.01),
+          epochs: 2
+        )
+
+      result = Axon.Loop.run(loop, data, %{}, epochs: 2, compiler: EXLA)
+      assert is_map(result)
+    end
   end
 end
 ```
@@ -564,6 +587,24 @@ IO.puts("avg: #{time_us / 10_000} µs/op")
 ```
 
 Target: operation should complete in the low-microsecond range on modern hardware; deviations by >2× indicate a regression worth investigating.
+
+## Deep Dive
+
+Specialized frameworks like Ash (business logic), Commanded (event sourcing), and Nx (numerical computing) abstract away common infrastructure but impose architectural constraints. Ash's declarative resource definitions simplify authorization and querying at the cost of reduced flexibility—deeply nested association policies can degrade query performance. Commanded's event store and aggregate roots enforce event sourcing discipline, making audit trails and temporal queries natural, but require careful snapshot strategy to avoid replaying years of events. Nx brings numerical computing to Elixir, but JIT compilation and lazy evaluation introduce latency; production models benefit from ahead-of-time compilation for inference. For IoT (Nerves), firmware updates must be atomic and resumable—OTA rollback on failure is non-negotiable. Choose frameworks that align with your scaling assumptions: Ash scales horizontally via read replicas; Commanded scales via sharding; Nx scales via distributed training.
+## Advanced Considerations
+
+Framework choices like Ash, Commanded, and Nerves create significant architectural constraints that are difficult to change later. Ash's powerful query builder and declarative approach simplify common patterns but can be opaque when debugging complex permission logic or custom filters at scale. Event sourcing with Commanded is powerful for audit trails but creates a different mental model for state management — replaying events to derive current state has CPU and latency costs that aren't apparent in traditional CRUD systems.
+
+Nerves requires understanding the full embedded system stack — from bootloader configuration to over-the-air update mechanisms. A Nerves system that works on your development board may fail in production due to hardware variations, network conditions, or power supply issues. NX's numerical computing is powerful but requires understanding GPU acceleration trade-offs and memory management for large datasets. Livebook provides interactive development but shouldn't be used for production deployments without careful containerization and resource isolation.
+
+The integration between these frameworks and traditional BEAM patterns (supervisors, processes, GenServers) requires careful design. A Commanded projection that rebuilds state from the event log can consume all available CPU, starving other services. NX autograd computations can create unexpected memory usage if not carefully managed. Nerves systems are memory-constrained; performance assumptions from desktop Elixir don't hold. Always prototype these frameworks in realistic environments before committing to them in production systems to validate assumptions.
+
+
+## Deep Dive: Domain Patterns and Production Implications
+
+Domain-specific frameworks enforce module dependencies and architectural boundaries. Testing domain isolation ensures that constraints are maintained as the codebase grows. Production systems without boundary enforcement often become monolithic and hard to test.
+
+---
 
 ## Trade-offs and production gotchas
 
@@ -614,3 +655,13 @@ Checkpoint save itself takes 50–500 ms for a 100 MB model with `:compressed`. 
 - [Axon training guides](https://hexdocs.pm/axon/custom_models.html) — patterns for custom steps and metrics.
 - [PyTorch's `torch.optim.swa_utils.AveragedModel`](https://docs.pytorch.org/docs/stable/optim.html#stochastic-weight-averaging) — reference for EMA semantics.
 - [Ian Goodfellow et al. — "Deep Learning" chapter 8](https://www.deeplearningbook.org/) — numerics behind LR schedules, momentum, and weight averaging.
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

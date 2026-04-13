@@ -24,9 +24,8 @@ You already run Postgres for your primary database. The pragmatic choice is
 `SKIP LOCKED` row-level locking, with zero extra infrastructure. Sidekiq-style
 durability without a Redis operational story.
 
-The previous exercises (42, 44) built **in-VM** schedulers. This exercise is
-about crossing the durability boundary: when losing a job equals losing money,
-you need Postgres underneath.
+This exercise is about durability: when losing a job equals losing money,
+you need Postgres underneath instead of in-memory scheduling alone.
 
 Project structure:
 
@@ -147,7 +146,7 @@ Attempt 1 failure → retry at +1s, attempt 2 → +16s, attempt 3 → +81s, atte
 ### 5. Unique jobs (preview)
 
 `unique: [period: 60, keys: [:invoice_id]]` prevents duplicates within a window.
-We skim this here and cover it in depth in exercise 258.
+We skim this here and cover it in depth later.
 
 ---
 
@@ -166,6 +165,8 @@ We skim this here and cover it in depth in exercise 258.
 ## Implementation
 
 ### Step 1: Create the project
+
+**Objective**: Initialize Mix project with Oban, PostgreSQL, and Ecto for persistent job storage and background processing.
 
 ```bash
 mix new oban_intro --sup
@@ -187,6 +188,8 @@ end
 ```
 
 ### Step 2: `config/config.exs`
+
+**Objective**: Configure Oban queues with per-queue concurrency limits and plugins for pruning to manage job lifecycle.
 
 ```elixir
 import Config
@@ -221,6 +224,8 @@ end
 
 ### Step 3: Repo and migrations
 
+**Objective**: Create Ecto Repo and run Oban migrations to establish job queue table schema.
+
 ```elixir
 # lib/oban_intro/repo.ex
 defmodule ObanIntro.Repo do
@@ -249,6 +254,8 @@ mix ecto.migrate
 
 ### Step 4: `lib/oban_intro/application.ex`
 
+**Objective**: Start Repo and Oban supervisor with telemetry to boot job processing at application startup.
+
 ```elixir
 defmodule ObanIntro.Application do
   @moduledoc false
@@ -268,6 +275,8 @@ end
 ```
 
 ### Step 5: Workers
+
+**Objective**: Build Oban.Worker modules with custom backoff strategies and queue-specific concurrency settings for different job types.
 
 ```elixir
 # lib/oban_intro/workers/pdf_worker.ex
@@ -352,6 +361,8 @@ end
 
 ### Step 6: Telemetry
 
+**Objective**: Implement: Telemetry.
+
 ```elixir
 # lib/oban_intro/observability/telemetry.ex
 defmodule ObanIntro.Observability.Telemetry do
@@ -395,6 +406,8 @@ end
 
 ### Step 7: Tests
 
+**Objective**: Verify the implementation by running the test suite.
+
 ```elixir
 # test/test_helper.exs
 ExUnit.start()
@@ -413,17 +426,19 @@ defmodule ObanIntro.Workers.PdfWorkerTest do
     :ok = Ecto.Adapters.SQL.Sandbox.checkout(ObanIntro.Repo)
   end
 
-  test "perform/1 returns ok with pdf bytes" do
-    assert {:ok, %{invoice_id: 7}} = perform_job(PdfWorker, %{invoice_id: 7})
-  end
+  describe "ObanIntro.Workers.PdfWorker" do
+    test "perform/1 returns ok with pdf bytes" do
+      assert {:ok, %{invoice_id: 7}} = perform_job(PdfWorker, %{invoice_id: 7})
+    end
 
-  test "unique constraint prevents duplicates" do
-    {:ok, _} = PdfWorker.new(%{invoice_id: 7}) |> Oban.insert()
-    assert {:ok, %Oban.Job{conflict?: true}} = PdfWorker.new(%{invoice_id: 7}) |> Oban.insert()
-  end
+    test "unique constraint prevents duplicates" do
+      {:ok, _} = PdfWorker.new(%{invoice_id: 7}) |> Oban.insert()
+      assert {:ok, %Oban.Job{conflict?: true}} = PdfWorker.new(%{invoice_id: 7}) |> Oban.insert()
+    end
 
-  test "backoff grows exponentially" do
-    assert PdfWorker.backoff(%Oban.Job{attempt: 1}) < PdfWorker.backoff(%Oban.Job{attempt: 3})
+    test "backoff grows exponentially" do
+      assert PdfWorker.backoff(%Oban.Job{attempt: 1}) < PdfWorker.backoff(%Oban.Job{attempt: 3})
+    end
   end
 end
 ```
@@ -440,12 +455,14 @@ defmodule ObanIntro.Workers.WebhookWorkerTest do
     :ok = Ecto.Adapters.SQL.Sandbox.checkout(ObanIntro.Repo)
   end
 
-  test "delivers successfully with 2xx" do
-    assert :ok =
-             perform_job(WebhookWorker, %{
-               "url" => "https://example.com/hook",
-               "payload" => %{"event" => "order.placed"}
-             })
+  describe "ObanIntro.Workers.WebhookWorker" do
+    test "delivers successfully with 2xx" do
+      assert :ok =
+               perform_job(WebhookWorker, %{
+                 "url" => "https://example.com/hook",
+                 "payload" => %{"event" => "order.placed"}
+               })
+    end
   end
 end
 ```
@@ -457,6 +474,8 @@ mix test
 ```
 
 ### Step 8: Enqueue in IEx
+
+**Objective**: Implement: Enqueue in IEx.
 
 ```elixir
 iex -S mix
@@ -481,6 +500,14 @@ ObanIntro.Workers.EmailWorker.new(%{template: "nudge", to: "bob@example.com"},
 
 The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
 
+
+## Key Concepts: Job Queues and Failure Handling
+
+Oban is a job queue built on top of PostgreSQL. Jobs are stored as rows in a table, processed by workers, and retried on failure using exponential backoff. The key insight: using PostgreSQL as the queue avoids adding yet another dependency (Redis, RabbitMQ). A single `Oban.Job` record contains the job type, args, retries, scheduled time, and tags.
+
+Oban workers define how a job is processed: `perform/1` receives the job and returns `:ok` or `{:error, reason}`. On error, Oban reschedules the job with a delay (5s, 25s, 2m, ...). Critical behavior: only the first 10 retries are automatic; after that, the job is dead-lettered. You must monitor dead-letter jobs and decide whether to requeue or investigate. Real-world patterns: rate-limiting workers (max N concurrent jobs), unique jobs (only one per arg tuple), priority queues (process high-priority jobs first).
+
+
 ## Benchmark
 
 ```elixir
@@ -492,6 +519,21 @@ IO.puts("avg: #{time_us / 10_000} µs/op")
 ```
 
 Target: operation should complete in the low-microsecond range on modern hardware; deviations by >2× indicate a regression worth investigating.
+
+## Deep Dive: Domain Patterns and Production Implications
+
+Domain-specific frameworks enforce module dependencies and architectural boundaries. Testing domain isolation ensures that constraints are maintained as the codebase grows. Production systems without boundary enforcement often become monolithic and hard to test.
+
+---
+
+## Advanced Considerations
+
+Framework choices like Ash, Commanded, and Nerves create significant architectural constraints that are difficult to change later. Ash's powerful query builder and declarative approach simplify common patterns but can be opaque when debugging complex permission logic or custom filters at scale. Event sourcing with Commanded is powerful for audit trails but creates a different mental model for state management — replaying events to derive current state has CPU and latency costs that aren't apparent in traditional CRUD systems.
+
+Nerves requires understanding the full embedded system stack — from bootloader configuration to over-the-air update mechanisms. A Nerves system that works on your development board may fail in production due to hardware variations, network conditions, or power supply issues. NX's numerical computing is powerful but requires understanding GPU acceleration trade-offs and memory management for large datasets. Livebook provides interactive development but shouldn't be used for production deployments without careful containerization and resource isolation.
+
+The integration between these frameworks and traditional BEAM patterns (supervisors, processes, GenServers) requires careful design. A Commanded projection that rebuilds state from the event log can consume all available CPU, starving other services. NX autograd computations can create unexpected memory usage if not carefully managed. Nerves systems are memory-constrained; performance assumptions from desktop Elixir don't hold. Always prototype these frameworks in realistic environments before committing to them in production systems to validate assumptions.
+
 
 ## Trade-offs and production gotchas
 
@@ -526,7 +568,7 @@ priority-9 invoice PDF; they live in different queues. If you need global
 priorities, collapse them into one queue.
 
 **8. When NOT to use Oban.** High-fanout pub/sub (use Phoenix.PubSub), real-time
-streaming (Broadway/GenStage), or ephemeral intra-node tasks (exercise 44). If
+streaming (Broadway/GenStage), or ephemeral intra-node tasks. If
 you don't already run Postgres, the operational overhead isn't worth it for
 low-volume workloads — use a simple in-VM scheduler or Oban's SQLite engine.
 
@@ -570,3 +612,13 @@ of work per job can push ~2,500 jobs/sec.
 - [Oban telemetry guide — hexdocs.pm](https://hexdocs.pm/oban/Oban.Telemetry.html)
 - [Dashbit — Ecto Multi & Oban](https://dashbit.co/blog/oban-recipes-part-1-unique-jobs)
 - [AWS — Exponential Backoff and Jitter](https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

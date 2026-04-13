@@ -2,15 +2,22 @@
 
 **Project**: `attr_accumulator` — build a lightweight route registry DSL using `Module.register_attribute/3` with `accumulate: true`, and understand the difference vs regular attributes.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 3–5 hours
-
 ---
 
 ## Project context
 
 You are building `tiny_router`, a minimalist HTTP routing module where each route is
 declared at the top of the user's module:
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
 
 ```elixir
 defmodule MyApp.Router do
@@ -41,6 +48,12 @@ attr_accumulator/
 │   └── tiny_router_test.exs
 └── mix.exs
 ```
+
+---
+
+## Why accumulator attributes and not a GenServer registry
+
+A GenServer would centralize state but force every route declaration through a message round-trip at boot, re-introducing a serial bottleneck and complicating hot code reload. Accumulator attributes keep the data inside each module's own BEAM chunk, let the compiler emit a direct jump table, and survive releases with zero coupling.
 
 ---
 
@@ -98,9 +111,25 @@ register early, before any `@routes` write.
 
 ---
 
+## Design decisions
+
+**Option A — shared Registry GenServer**
+- Pros: mutable across modules at runtime; single state model.
+- Cons: one process bottleneck; loses compile-time validation; cross-module coordination is runtime work.
+
+**Option B — accumulator attribute + `@before_compile`** (chosen)
+- Pros: zero-cost at runtime; compile-time enumeration; mirrors Phoenix/Ecto/Plug internals.
+- Cons: per-module scope only; requires recompile to change; prepend-then-reverse subtlety.
+
+→ Chose **B** because the DSL is declarative and closed at compile time; a runtime registry adds a process for no observable win.
+
+---
+
 ## Implementation
 
 ### Step 1: `lib/attr_accumulator/dispatcher.ex`
+
+**Objective**: Unroll accumulated routes into dispatch/2 clauses with parameter extraction so matching is O(1) BEAM jump table.
 
 ```elixir
 defmodule AttrAccumulator.Dispatcher do
@@ -173,6 +202,8 @@ end
 
 ### Step 2: `lib/attr_accumulator/tiny_router.ex`
 
+**Objective**: Register accumulator attribute and @before_compile hook so route/4 macro prepends to ordered list idempotently.
+
 ```elixir
 defmodule AttrAccumulator.TinyRouter do
   @moduledoc """
@@ -212,6 +243,8 @@ end
 
 ### Step 3: Example user module
 
+**Objective**: Exercise the DSL to confirm route/4 declarations read declaratively and bind to router module.
+
 ```elixir
 defmodule AttrAccumulator.Sample.Router do
   use AttrAccumulator.TinyRouter
@@ -224,6 +257,8 @@ end
 ```
 
 ### Step 4: Tests
+
+**Objective**: Assert static route matches, parameter extraction, 404 fallback, and persist: true introspection works.
 
 ```elixir
 defmodule AttrAccumulator.TinyRouterTest do
@@ -270,6 +305,27 @@ defmodule AttrAccumulator.TinyRouterTest do
   end
 end
 ```
+
+### Why this works
+
+Registering with `accumulate: true` turns `@routes x` into a prepend into a per-module list. `@before_compile` fires before the module is sealed, reverses the list back into declaration order, and splices one `def dispatch/2` clause per entry into the module body. The BEAM compiler then optimizes the clauses into a single jump table, so the DSL costs nothing at dispatch time.
+
+---
+
+## Advanced Considerations: Macro Hygiene and Compile-Time Validation
+
+Macros execute at compile time, walking the AST and returning new AST. That power is easy to abuse: a macro that generates variables can shadow outer scope bindings, or a quote block that references variables directly can fail if the macro is used in a context where those variables don't exist. The `unquote` mechanism is the escape hatch, but misusing it leads to hard-to-debug compile errors.
+
+Macro hygiene is about capturing intent correctly. A `defmacro` that takes `:my_option` and uses it directly might match an unrelated `:my_option` from the caller's scope. The idiomatic pattern is to use `unquote` for values that should be "from the outside" and keep AST nodes quoted for safety. The `quote` block's binding of `var!` and `binding!` provides escape valves for the rare case when shadowing is intentional.
+
+Compile-time validation unlocks errors that would otherwise surface at runtime. A macro can call functions to validate input, generate code conditionally, or fail the build with `IO.warn`. Schema libraries like `Ecto` and `Ash` use macros to define fields at compile time, so runtime queries are guaranteed type-safe. The cost is cognitive load: developers must reason about both the code as written and the code generated.
+
+---
+
+
+## Deep Dive: Metaprogramming Patterns and Production Implications
+
+Metaprogramming (macros, AST manipulation) requires testing at compile time and runtime. The challenge is that macro tests often involve parsing and expanding code, which couples tests to compiler internals. Production bugs in macros can corrupt entire modules; testing macros rigorously is non-negotiable.
 
 ---
 
@@ -323,6 +379,13 @@ Benchee.run(%{
   "dispatch /users/:id" => fn -> AttrAccumulator.Sample.Router.dispatch(:get, ["users", "99"]) end
 })
 ```
+
+---
+
+## Reflection
+
+- If two teams need to share a registry of routes across modules, would you still use accumulator attributes, or switch to a registry process? What failure mode appears first as the app grows?
+- Your DSL now runs inside releases where hot code reload is used daily. Which of the current guarantees (compile-time validation, zero-cost dispatch, introspection) breaks first, and how do you defend it?
 
 ---
 

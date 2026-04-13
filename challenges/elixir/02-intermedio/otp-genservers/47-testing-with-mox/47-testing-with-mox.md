@@ -37,6 +37,19 @@ mockable_gs/
 ---
 
 
+### Dependencies (`mix.exs`)
+
+```elixir
+def deps do
+  {exunit},
+  {genserver},
+  {mox},
+  {mycase},
+  {ok},
+  {record},
+  {reply},
+end
+```
 ## Why X and not Y
 
 - **Why not Meck?** Meck patches modules at runtime; Mox uses explicit behaviours, compile-time checked, concurrency-safe.
@@ -105,6 +118,9 @@ codebases usually prefer `allow/3`.
 
 ### Step 1: Create the project
 
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
+
 ```bash
 mix new mockable_gs
 cd mockable_gs
@@ -120,6 +136,9 @@ end
 
 ### Step 2: `lib/mockable_gs/clock.ex`
 
+**Objective**: Implement `clock.ex` — the GenServer callback shape that determines blocking vs fire-and-forget semantics and state invariants.
+
+
 ```elixir
 defmodule MockableGs.Clock do
   @moduledoc """
@@ -134,6 +153,9 @@ end
 
 ### Step 3: `lib/mockable_gs/system_clock.ex`
 
+**Objective**: Implement `system_clock.ex` — the GenServer callback shape that determines blocking vs fire-and-forget semantics and state invariants.
+
+
 ```elixir
 defmodule MockableGs.SystemClock do
   @moduledoc "Production implementation of `MockableGs.Clock` using `System.os_time/1`."
@@ -146,6 +168,9 @@ end
 ```
 
 ### Step 4: `lib/mockable_gs.ex`
+
+**Objective**: Implement `mockable_gs.ex` — the GenServer callback shape that determines blocking vs fire-and-forget semantics and state invariants.
+
 
 ```elixir
 defmodule MockableGs do
@@ -200,6 +225,9 @@ end
 
 ### Step 5: `test/test_helper.exs`
 
+**Objective**: Implement `test_helper.exs` — the GenServer callback shape that determines blocking vs fire-and-forget semantics and state invariants.
+
+
 ```elixir
 ExUnit.start()
 
@@ -212,6 +240,9 @@ Application.put_env(:mockable_gs, :clock, MockableGs.ClockMock)
 ```
 
 ### Step 6: `test/mockable_gs_test.exs`
+
+**Objective**: Write `mockable_gs_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
 
 ```elixir
 defmodule MockableGsTest do
@@ -272,6 +303,9 @@ end
 ```
 
 ### Step 7: Run
+
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
 
 ```bash
 mix deps.get
@@ -340,3 +374,17 @@ external collaborators.
 - [`Behaviour` in Elixir](https://hexdocs.pm/elixir/typespecs.html#behaviours)
 - [`Application` config at runtime](https://hexdocs.pm/elixir/Application.html#get_env/3)
 - Saša Jurić, *Elixir in Action* — section on testing OTP code
+
+
+## Advanced Considerations
+
+GenServer is the foundation of stateful concurrent systems in Elixir. Advanced patterns emerge from understanding the synchronous/asynchronous nature of callbacks and state evolution.
+
+**State evolution and message handling:**
+A GenServer's state is private, evolving only through synchronous (`handle_call`) or asynchronous (`handle_cast`) message handlers. The key insight: `handle_call` blocks the caller until the handler returns; `handle_cast` is fire-and-forget. Use `call` for operations requiring acknowledgment or returning results; use `cast` for notifications. Mixing them incorrectly leads to deadlocks (caller waiting forever) or lost updates (state changed before caller knows).
+
+**Advanced reply patterns:**
+The tuple `{:reply, reply, state}` is the standard, but you can split reply and state persistence. Use `:noreply` in `handle_call` if you need to send the reply later (e.g., after an async operation). The `:hibernate` flag tells the VM to garbage-collect the process and switch to a lightweight state — useful for long-lived processes that spend time idle.
+
+**Debugging and observability:**
+`format_status/2` controls how a GenServer appears in `:observer` and logs. It's critical for large state structures (hide sensitive fields, summarize collections). In production, comprehensive logging in callbacks (not just errors) reveals timing issues, message flow anomalies, and resource leaks before they become critical.

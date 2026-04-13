@@ -6,7 +6,7 @@
 
 ## Project context
 
-`:recon_trace` (previous exercise) is the right tool 95% of the time. The
+Runtime tracing is essential for production debugging. The standard `:recon_trace` tool handles 95% of cases. The
 remaining 5% is when you need something `recon_trace` does not expose: a
 tracer process you own and drive yourself, trace flags on a specific pid
 rather than a function, local-call tracing (`:dbg.tpl/3`) that catches
@@ -173,6 +173,8 @@ partial trace can haunt the node until the next restart.
 
 ### Step 1: `mix.exs`
 
+**Objective**: Include `:runtime_tools` in `extra_applications` so `:dbg` is loaded alongside the OTP app boot.
+
 ```elixir
 defmodule DbgTpl.MixProject do
   use Mix.Project
@@ -187,6 +189,8 @@ end
 
 ### Step 2: `lib/dbg_tpl/application.ex`
 
+**Objective**: Supervise `DbgTpl.Tracer` under `:one_for_one` so a crashed tracer auto-recovers without leaking active patterns.
+
 ```elixir
 defmodule DbgTpl.Application do
   @moduledoc false
@@ -200,6 +204,8 @@ end
 ```
 
 ### Step 3: `lib/dbg_tpl/patterns.ex`
+
+**Objective**: Build typed match specs for `:dbg.tp/tpl` so callers compose filters without hand-rolling Erlang MS tuples.
 
 ```elixir
 defmodule DbgTpl.Patterns do
@@ -233,6 +239,8 @@ end
 ```
 
 ### Step 4: `lib/dbg_tpl/call_pairing.ex`
+
+**Objective**: Pair `:call` with `:return_from` per pid via an ETS stack so recursion unwinds to correct elapsed timings.
 
 ```elixir
 defmodule DbgTpl.CallPairing do
@@ -322,6 +330,8 @@ end
 ```
 
 ### Step 5: `lib/dbg_tpl/tracer.ex`
+
+**Objective**: Own the `:dbg` tracer inside a GenServer that arms patterns and fan-outs paired events to subscribers.
 
 ```elixir
 defmodule DbgTpl.Tracer do
@@ -442,6 +452,8 @@ end
 
 ### Step 6: `test/dbg_tpl/tracer_test.exs`
 
+**Objective**: Exercise arm, filter, and disarm flows against `String.upcase/1` to prove pairing and pattern isolation end-to-end.
+
 ```elixir
 defmodule DbgTpl.TracerTest do
   use ExUnit.Case, async: false
@@ -455,41 +467,45 @@ defmodule DbgTpl.TracerTest do
     :ok
   end
 
-  test "paired call/return with elapsed time" do
-    Tracer.arm(String, :upcase, 1, Patterns.any_call_with_return(1))
+  describe "DbgTpl.Tracer" do
+    test "paired call/return with elapsed time" do
+      Tracer.arm(String, :upcase, 1, Patterns.any_call_with_return(1))
 
-    String.upcase("hello")
+      String.upcase("hello")
 
-    assert_receive {:dbg_tpl, event}, 1_000
-    assert event.mfa == {String, :upcase, 1}
-    assert event.args == ["hello"]
-    assert event.result == "HELLO"
-    assert event.elapsed_us >= 0
-  end
+      assert_receive {:dbg_tpl, event}, 1_000
+      assert event.mfa == {String, :upcase, 1}
+      assert event.args == ["hello"]
+      assert event.result == "HELLO"
+      assert event.elapsed_us >= 0
+    end
 
-  test "first_arg_equals filters unmatched calls" do
-    Tracer.arm(String, :upcase, 1, Patterns.first_arg_equals(1, "watch_me"))
+    test "first_arg_equals filters unmatched calls" do
+      Tracer.arm(String, :upcase, 1, Patterns.first_arg_equals(1, "watch_me"))
 
-    String.upcase("ignored")
-    String.upcase("watch_me")
+      String.upcase("ignored")
+      String.upcase("watch_me")
 
-    assert_receive {:dbg_tpl, %{args: ["watch_me"]}}, 1_000
-    refute_receive {:dbg_tpl, %{args: ["ignored"]}}, 100
-  end
+      assert_receive {:dbg_tpl, %{args: ["watch_me"]}}, 1_000
+      refute_receive {:dbg_tpl, %{args: ["ignored"]}}, 100
+    end
 
-  test "disarm_all clears patterns and subsequent calls are silent" do
-    Tracer.arm(String, :downcase, 1, Patterns.any_call_with_return(1))
-    String.downcase("HI")
-    assert_receive {:dbg_tpl, _}, 500
+    test "disarm_all clears patterns and subsequent calls are silent" do
+      Tracer.arm(String, :downcase, 1, Patterns.any_call_with_return(1))
+      String.downcase("HI")
+      assert_receive {:dbg_tpl, _}, 500
 
-    Tracer.disarm_all()
-    String.downcase("QUIET")
-    refute_receive {:dbg_tpl, _}, 200
+      Tracer.disarm_all()
+      String.downcase("QUIET")
+      refute_receive {:dbg_tpl, _}, 200
+    end
   end
 end
 ```
 
 ### Step 7: Exploratory usage in `iex`
+
+**Objective**: Drive an IEx session that arms `:erlang.length/1` and confirms paired events arrive via `flush/0`.
 
 ```elixir
 # iex -S mix
@@ -523,6 +539,46 @@ IO.puts("avg: #{time_us / 10_000} µs/op")
 ```
 
 Target: operation should complete in the low-microsecond range on modern hardware; deviations by >2× indicate a regression worth investigating.
+
+## Deep Dive: BEAM Scheduler Tuning and Memory Profiling in Production
+
+The BEAM scheduler is not "magic" — it's a preemptive work-stealing scheduler that divides CPU time 
+into reductions (bytecode instructions). Understanding scheduler tuning is critical when you suspect 
+latency spikes in production.
+
+**Key concepts**:
+- **Reductions budget**: By default, a process gets ~2000 reductions before yielding to another process.
+  Heavy CPU work (binary matching, list recursion) can exhaust the budget and cause tail latency.
+- **Dirty schedulers**: If a process does CPU-intensive work (crypto, compression, numerical), it blocks 
+  the main scheduler. Use dirty NIFs or `spawn_opt(..., [{:fullsweep_after, 0}])` for GC tuning.
+- **Heap tuning per process**: `Process.flag(:min_heap_size, ...)` reserves heap upfront, reducing GC 
+  pauses. Measure; don't guess.
+
+**Memory profiling workflow**:
+1. Run `recon:memory/0` in iex; identify top 10 memory consumers by type (atoms, binaries, ets).
+2. If binaries dominate, check for refc binary leaks (binary held by process that should have been freed).
+3. Use `eprof` or `fprof` for function-level CPU attribution; `recon:proc_window/3` for process memory trends.
+
+**Production pattern**: Deploy with `+K true` (async IO), `-env ERL_MAX_PORTS 65536` (port limit), 
+`+T 9` (async threads). Measure GC time with `erlang:statistics(garbage_collection)` — if >5% of uptime, 
+tune heap or reduce allocation pressure. Never assume defaults are optimal for YOUR workload.
+
+---
+
+## Advanced Considerations
+
+Understanding BEAM internals at production scale requires deep knowledge of scheduler behavior, memory models, and garbage collection dynamics. The soft real-time guarantees of BEAM only hold under specific conditions — high system load, uneven process distribution across schedulers, or GC pressure can break predictable latency completely. Monitor `erlang:statistics(run_queue)` in production to catch scheduler saturation before it degrades latency significantly. The difference between immediate, offheap, and continuous GC garbage collection strategies can significantly impact tail latencies in systems with millions of messages per second and sustained memory pressure.
+
+Process reductions and the reduction counter affect scheduler fairness fundamentally. A process that runs for extended periods without yielding can starve other processes, even though the scheduler treats it fairly by reduction count per scheduling interval. This is especially critical in pipelines processing large data structures or performing recursive computations where yielding points are infrequent and difficult to predict. The BEAM's preemption model is deterministic per reduction, making performance testing reproducible but sometimes hiding race conditions that only manifest under specific load patterns and GC interactions.
+
+The interaction between ETS, Mnesia, and process message queues creates subtle bottlenecks in distributed systems. ETS reads don't block other processes, but writes require acquiring locks; understanding when your workload transitions from read-heavy to write-heavy is crucial for capacity planning. Port drivers and NIFs bypass the BEAM scheduler entirely, which can lead to unexpected priority inversions if not carefully managed. Always profile with `eprof` and `fprof` in realistic production-like environments before deployment to catch performance surprises.
+
+
+## Deep Dive: Otp Patterns and Production Implications
+
+OTP primitives (GenServer, Supervisor, Application) are tested through their public interfaces, not by inspecting internal state. This discipline forces correct design: if you can't test a behavior without peeking into the server's state, the behavior is not public. Production systems with tight integration tests on GenServer internals are fragile and hard to refactor.
+
+---
 
 ## Trade-offs and production gotchas
 
@@ -593,3 +649,13 @@ atomic counter rather than sending messages.
 - [Fred Hébert — tracing patterns](https://ferd.ca/) — blog posts on when to choose raw `:dbg` over wrappers
 - [`ex2ms`](https://hexdocs.pm/ex2ms/readme.html) — Elixir macro alternative to `fun2ms` for match specs
 - [`:erlang.trace/3` and friends](https://www.erlang.org/doc/man/erlang.html#trace-3) — lower layer below `:dbg`
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

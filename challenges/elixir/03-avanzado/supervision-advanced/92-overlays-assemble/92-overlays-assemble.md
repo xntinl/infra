@@ -1,8 +1,6 @@
 # Release Overlays and Custom Assemble Steps
 
 **Project**: `overlays_assemble` — a release that bundles migration SQL, a Swagger UI, and a node-bootstrap script into the tarball.
-**Difficulty**: ★★★★☆
-**Estimated time**: 3–6 hours
 
 ---
 
@@ -124,9 +122,35 @@ The boot script exports `RELEASE_ROOT` before the VM starts.
 
 ---
 
+## Design decisions
+
+**Option A — copy extra files with a post-release shell script**
+- Pros: trivial to add; no Elixir knowledge required.
+- Cons: release tarball is incomplete until the script runs; CI must orchestrate two steps; no guarantee overlay files stay in sync with release version.
+
+**Option B — `releases.overlays` + custom `:assemble` steps** (chosen)
+- Pros: the tarball is the deliverable; Mix runs the steps in a known phase; permission bits and precedence are predictable.
+- Cons: partial-failure cleanup is manual; slow custom steps inflate build time.
+
+→ Chose **B** because the shipping artefact should be self-sufficient, and shell post-processing is exactly the bug the release tooling was designed to remove.
+
+---
+
 ## Implementation
 
 ### Step 1: `mix.exs`
+
+**Objective**: Declare the project, dependencies, and OTP application in `mix.exs`.
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
 
 ```elixir
 defmodule OverlaysAssemble.MixProject do
@@ -190,6 +214,8 @@ end
 
 ### Step 2: `lib/overlays_assemble/application.ex`
 
+**Objective**: Define the OTP application and supervision tree in `lib/overlays_assemble/application.ex`.
+
 ```elixir
 defmodule OverlaysAssemble.Application do
   @moduledoc false
@@ -204,6 +230,8 @@ end
 ```
 
 ### Step 3: `lib/overlays_assemble/service.ex`
+
+**Objective**: Implement the module in `lib/overlays_assemble/service.ex`.
 
 ```elixir
 defmodule OverlaysAssemble.Service do
@@ -255,6 +283,8 @@ end
 
 ### Step 4: `rel/overlays/bin/node_bootstrap.sh`
 
+**Objective**: Implement rel/overlays/bin/node_bootstrap.sh.
+
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
@@ -267,6 +297,8 @@ exec "$RELEASE_ROOT/bin/overlays_assemble" "$@"
 
 ### Step 5: `rel/overlays/licenses/THIRD_PARTY.md`
 
+**Objective**: Implement rel/overlays/licenses/THIRD_PARTY.md.
+
 ```markdown
 # Third-party licenses bundled with overlays_assemble
 
@@ -276,12 +308,16 @@ exec "$RELEASE_ROOT/bin/overlays_assemble" "$@"
 
 ### Step 6: `rel/migrations/20260101000000_init.sql`
 
+**Objective**: Implement rel/migrations/20260101000000_init.sql.
+
 ```sql
 -- Version-controlled schema migration.
 CREATE TABLE IF NOT EXISTS health (id SERIAL PRIMARY KEY, ts TIMESTAMPTZ DEFAULT NOW());
 ```
 
 ### Step 7: `priv/swagger/index.html`
+
+**Objective**: Implement priv/swagger/index.html.
 
 ```html
 <!doctype html>
@@ -291,11 +327,15 @@ CREATE TABLE IF NOT EXISTS health (id SERIAL PRIMARY KEY, ts TIMESTAMPTZ DEFAULT
 
 ### Step 8: `priv/swagger/openapi.json`
 
+**Objective**: Implement `priv/swagger/openapi.json`.
+
 ```json
 {"openapi": "3.0.3", "info": {"title": "overlays_assemble", "version": "0.1.0"}, "paths": {}}
 ```
 
 ### Step 9: `test/release_layout_test.exs`
+
+**Objective**: Write tests in `test/release_layout_test.exs` covering behavior and edge cases.
 
 ```elixir
 defmodule OverlaysAssemble.ReleaseLayoutTest do
@@ -313,51 +353,59 @@ defmodule OverlaysAssemble.ReleaseLayoutTest do
     end
   end
 
-  test "VERSION is stamped with version + git sha", %{release_dir: dir} do
-    content = File.read!(Path.join(dir, "VERSION"))
-    assert content =~ "version=0.1.0"
-    assert content =~ "git_sha="
-  end
+  describe "OverlaysAssemble.ReleaseLayout" do
+    test "VERSION is stamped with version + git sha", %{release_dir: dir} do
+      content = File.read!(Path.join(dir, "VERSION"))
+      assert content =~ "version=0.1.0"
+      assert content =~ "git_sha="
+    end
 
-  test "migrations are copied by the custom step", %{release_dir: dir} do
-    assert File.exists?(Path.join(dir, "migrations/20260101000000_init.sql"))
-  end
+    test "migrations are copied by the custom step", %{release_dir: dir} do
+      assert File.exists?(Path.join(dir, "migrations/20260101000000_init.sql"))
+    end
 
-  test "bootstrap script is present and executable via overlay", %{release_dir: dir} do
-    path = Path.join(dir, "bin/node_bootstrap.sh")
-    assert File.exists?(path)
-  end
+    test "bootstrap script is present and executable via overlay", %{release_dir: dir} do
+      path = Path.join(dir, "bin/node_bootstrap.sh")
+      assert File.exists?(path)
+    end
 
-  test "licenses overlay is at release root", %{release_dir: dir} do
-    assert File.exists?(Path.join(dir, "licenses/THIRD_PARTY.md"))
-  end
+    test "licenses overlay is at release root", %{release_dir: dir} do
+      assert File.exists?(Path.join(dir, "licenses/THIRD_PARTY.md"))
+    end
 
-  test "swagger priv asset survives :assemble", %{release_dir: dir} do
-    glob = Path.wildcard(Path.join(dir, "lib/overlays_assemble-*/priv/swagger/index.html"))
-    assert glob != []
+    test "swagger priv asset survives :assemble", %{release_dir: dir} do
+      glob = Path.wildcard(Path.join(dir, "lib/overlays_assemble-*/priv/swagger/index.html"))
+      assert glob != []
+    end
   end
 end
 ```
 
 ### Step 10: `test/overlays_assemble_test.exs`
 
+**Objective**: Write tests in `test/overlays_assemble_test.exs` covering behavior and edge cases.
+
 ```elixir
 defmodule OverlaysAssembleTest do
   use ExUnit.Case, async: true
 
-  test "version_info returns dev defaults when VERSION is absent" do
-    info = OverlaysAssemble.Service.version_info()
-    assert %{version: _, git_sha: _, built_at: _} = info
-  end
+  describe "OverlaysAssemble" do
+    test "version_info returns dev defaults when VERSION is absent" do
+      info = OverlaysAssemble.Service.version_info()
+      assert %{version: _, git_sha: _, built_at: _} = info
+    end
 
-  test "swagger_path points inside priv" do
-    path = OverlaysAssemble.Service.swagger_path()
-    assert path =~ "swagger/index.html"
+    test "swagger_path points inside priv" do
+      path = OverlaysAssemble.Service.swagger_path()
+      assert path =~ "swagger/index.html"
+    end
   end
 end
 ```
 
 ### Step 11: Build and inspect
+
+**Objective**: Build and inspect.
 
 ```bash
 MIX_ENV=prod mix release
@@ -368,6 +416,23 @@ _build/prod/rel/overlays_assemble/bin/overlays_assemble eval "IO.inspect(Overlay
 
 Expected output of the `eval`: a map with `version: "0.1.0"`, `git_sha: "<7 hex>"`,
 `built_at: "<ISO-8601>"`.
+
+---
+
+## Advanced Considerations: Partitioned Supervisors and Custom Restart Strategies
+
+A standard Supervisor is a single process managing a static tree. For thousands of children, a single supervisor becomes a bottleneck: all supervisor callbacks run on one process, and supervisor restart logic is sequential. PartitionSupervisor (OTP 25+) spawns N independent supervisors, each managing a subset of children. Hashing the child ID determines which partition supervises it, distributing load and enabling horizontal scaling.
+
+Custom restart strategies (via `Supervisor.init/2` callback) allow logic beyond the defaults. A strategy might prioritize restarting dependent services in a specific order, or apply backoff based on restart frequency. The downside is complexity: custom logic is harder to test and reason about, and mistakes cascade. Start with defaults and profile before adding custom behavior.
+
+Selective restart via `:rest_for_one` or `:one_for_all` affects failure isolation. `:one_for_all` restarts all children when one fails (simulating a total system failure), which can be necessary for consistency but is expensive. `:rest_for_one` restarts the failed child and any started after it, balancing isolation and dependencies. Understanding which strategy fits your architecture prevents cascading failures and unnecessary restarts.
+
+---
+
+
+## Deep Dive: Property Patterns and Production Implications
+
+Property-based testing inverts the testing mindset: instead of writing examples, you state invariants (properties) and let a generator find counterexamples. StreamData's shrinking capability is its superpower—when a property fails on a 10,000-element list, the framework reduces it to the minimal list that still fails, cutting debugging time from hours to minutes. The trade-off is that properties require rigorous thinking about domain constraints, and not every invariant is worth expressing as a property. Teams that adopt property testing often find bugs in specifications themselves, not just implementations.
 
 ---
 
@@ -411,7 +476,13 @@ a tarball or container layer, overlays are the idiomatic tool.
 
 ---
 
-## Performance notes
+### Why this works
+
+Overlays are applied after `:assemble` writes the primary release, so their precedence is deterministic: later overlays win. Custom steps operate on the `%Mix.Release{}` struct, which gives you typed access to paths instead of relying on string concatenation. Together they make "the tarball is the deliverable" an invariant instead of a hope.
+
+---
+
+## Benchmark
 
 Measure `MIX_ENV=prod mix release` time before and after adding overlays. Empirically,
 copying a few MB of static assets adds < 200ms. A custom step doing
@@ -420,6 +491,15 @@ copying a few MB of static assets adds < 200ms. A custom step doing
 To benchmark, use `time mix release` and compare against a bare release without steps.
 If build time is dominated by `:assemble` itself (typical), your custom steps are not
 the bottleneck.
+
+Target: overlay copy overhead ≤ 200 ms for a few MB of static assets; custom steps < 1 s in the common case.
+
+---
+
+## Reflection
+
+1. Your overlays include a 20 MB Swagger UI. Does it belong in the release tarball, in a sidecar container, or on an S3 bucket fetched at boot? Argue from both image-size and update-cadence perspectives.
+2. A new custom step wants to run database migrations at release time. Why is this almost certainly wrong, and what is the correct home for that logic in a release-based deployment?
 
 ---
 

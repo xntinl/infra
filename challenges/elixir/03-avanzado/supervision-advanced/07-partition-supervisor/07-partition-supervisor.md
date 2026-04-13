@@ -113,8 +113,85 @@ defp deps do
 end
 ```
 
+### Dependencies (mix.exs)
+
+```elixir
+```elixir
+# Old: single process
+GenServer.call(UsageCounter, {:incr, tenant_id})
+
+# New: one of N partitions
+GenServer.call(
+  {:via, PartitionSupervisor, {UsageCounter.Partitions, tenant_id}},
+  {:incr, tenant_id}
+)
+```
+
+The `{:via, PartitionSupervisor, {name, key}}` tuple resolves to the pid of the partition responsible for `key`. Resolution is `partition_index = :erlang.phash2(key, partitions)` — deterministic, stateless, no lookup.
+
+### 3. Choosing the partition count
+
+The sweet spot is **`System.schedulers_online/0`** or a small multiple (2×, 4×). More partitions do NOT help if there's only one scheduler to run them. Fewer partitions than cores wastes capacity.
+
+```elixir
+partitions: System.schedulers_online()   # sensible default
+```
+
+For workloads with long sync I/O blocking each partition (DB calls), go higher — 4×–8× schedulers — so other partitions can run while peers wait.
+
+### 4. `:erlang.phash2/2` and hot keys
+
+Routing is per key. If 80 % of your traffic hits `tenant_id = "acme"`, 80 % of your load lands on ONE partition regardless of how many you configured. `PartitionSupervisor` does NOT solve hotspots; it solves *spread*. For skewed workloads, shard by `{tenant_id, request_id}` or by `:rand.uniform(partitions)` for a read-only path.
+
+### 5. Partition death semantics
+
+When partition 3 crashes, `Supervisor` restarts it. During the restart window (typically <1 ms), calls routed to partition 3 fail with `:noproc` or timeout. This is identical to the classic GenServer-dies-during-call race. Keep idempotent ops or add a retry wrapper.
+
+```
+                 PartitionSupervisor(name: UsageCounter.Partitions, n=8)
+                 /      |      |      |      |      |      |      \
+          UC#0   UC#1   UC#2   UC#3   UC#4   UC#5   UC#6   UC#7
+          (pids registered internally, resolved by phash2(key, 8))
+```
+
+---
+
+## Why `PartitionSupervisor` and not ETS `:update_counter`
+
+ETS with `:update_counter` gives O(1) atomic increments and beats any GenServer on raw throughput — but it is *just* a number. The counter participates in rate-limit decisions that need per-tenant ordering, telemetry hooks on each increment, and an eventual flush-to-DB. ETS forces you to bolt on a separate process for those concerns, recreating the serialization point you were trying to avoid. `PartitionSupervisor` keeps the GenServer contract (serial, stateful, attachable side effects) while spreading load across schedulers. You lose ~2× raw throughput vs. ETS, but you keep the abstraction.
+
+---
+
+## Design decisions
+
+**Option A — hand-rolled N-copy Registry with manual hashing**
+- Pros: arbitrary routing (consistent hashing, jump hash, custom load metric); fine-grained control over rebalance semantics.
+- Cons: every call site rewrites the routing boilerplate; Registry-lookup cost per call; more moving parts.
+
+**Option B — `PartitionSupervisor` with `{:via, PartitionSupervisor, ...}`** (chosen)
+- Pros: stock OTP primitive since Elixir 1.14; routing is a `phash2` + named lookup; child specs stay vanilla; consistent behaviour across teams.
+- Cons: no rebalance on partition count change (reshard = full migration); no built-in hot-key mitigation; single-node only.
+
+→ Chose **B** because the workload is single-node, partition count is chosen at boot, and the uniform ergonomics win against the flexibility that a hand-rolled registry would provide.
+
+---
+
+## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    {:benchee, "~> 1.3", only: :dev}
+  ]
+end
+```
+
 
 ### Step 1: Application supervisor
+
+**Objective**: Wire PartitionSupervisor with partitions=System.schedulers_online/0 so mailbox load spreads across cores without manual hashing.
 
 ```elixir
 # lib/partition_sup_demo/application.ex
@@ -137,6 +214,8 @@ end
 ```
 
 ### Step 2: The counter
+
+**Objective**: Use {:via, PartitionSupervisor, {name, key}} so phash2(key, partitions) deterministically routes to stable partition without registry lookup.
 
 ```elixir
 # lib/partition_sup_demo/usage_counter.ex
@@ -195,6 +274,8 @@ end
 
 ### Step 3: Tests
 
+**Objective**: Verify phash2 stability (same key→same partition), aggregation works across partitions, concurrent writers don't serialize.
+
 ```elixir
 # test/partition_sup_demo/usage_counter_test.exs
 defmodule PartitionSupDemo.UsageCounterTest do
@@ -202,38 +283,42 @@ defmodule PartitionSupDemo.UsageCounterTest do
 
   alias PartitionSupDemo.UsageCounter
 
-  test "counter per tenant is independent" do
-    UsageCounter.incr("alice", 3)
-    UsageCounter.incr("bob", 5)
-    assert UsageCounter.get("alice") == 3
-    assert UsageCounter.get("bob") == 5
-  end
+  describe "PartitionSupDemo.UsageCounter" do
+    test "counter per tenant is independent" do
+      UsageCounter.incr("alice", 3)
+      UsageCounter.incr("bob", 5)
+      assert UsageCounter.get("alice") == 3
+      assert UsageCounter.get("bob") == 5
+    end
 
-  test "same tenant always routes to the same partition (stable under hash)" do
-    p1 = GenServer.whereis({:via, PartitionSupervisor, {UsageCounter.Partitions, "acme"}})
-    p2 = GenServer.whereis({:via, PartitionSupervisor, {UsageCounter.Partitions, "acme"}})
-    assert p1 == p2 and is_pid(p1)
-  end
+    test "same tenant always routes to the same partition (stable under hash)" do
+      p1 = GenServer.whereis({:via, PartitionSupervisor, {UsageCounter.Partitions, "acme"}})
+      p2 = GenServer.whereis({:via, PartitionSupervisor, {UsageCounter.Partitions, "acme"}})
+      assert p1 == p2 and is_pid(p1)
+    end
 
-  test "total aggregates across partitions" do
-    UsageCounter.incr("t-#{System.unique_integer()}", 1)
-    UsageCounter.incr("t-#{System.unique_integer()}", 1)
-    UsageCounter.incr("t-#{System.unique_integer()}", 1)
-    assert UsageCounter.total() >= 3
-  end
+    test "total aggregates across partitions" do
+      UsageCounter.incr("t-#{System.unique_integer()}", 1)
+      UsageCounter.incr("t-#{System.unique_integer()}", 1)
+      UsageCounter.incr("t-#{System.unique_integer()}", 1)
+      assert UsageCounter.total() >= 3
+    end
 
-  test "concurrent writers to different tenants do not serialize" do
-    tasks =
-      for i <- 1..1_000 do
-        Task.async(fn -> UsageCounter.incr("tenant-#{i}", 1) end)
-      end
+    test "concurrent writers to different tenants do not serialize" do
+      tasks =
+        for i <- 1..1_000 do
+          Task.async(fn -> UsageCounter.incr("tenant-#{i}", 1) end)
+        end
 
-    assert Enum.all?(Task.await_many(tasks, 5_000), &is_integer/1)
+      assert Enum.all?(Task.await_many(tasks, 5_000), &is_integer/1)
+    end
   end
 end
 ```
 
 ### Step 4: Benchmark — single vs partitioned
+
+**Objective**: Quantify the mailbox-contention cliff: single GenServer vs N partitions under parallel load, measuring ips and p99.
 
 ```elixir
 # bench/contention_bench.exs
@@ -275,6 +360,23 @@ Expected on an 8-core machine with `parallel: 8`:
 ### Why this works
 
 `{:via, PartitionSupervisor, {name, key}}` resolves deterministically via `:erlang.phash2(key, N)`: no registry lookup, no hop, just a hash. Each partition is an independent scheduler citizen, so the mailbox bottleneck that pinned one core becomes N mailboxes across N cores. The cost is a single additional indirection per call (~0.3 µs), dwarfed by the contention relief. Partition count = `System.schedulers_online/0` keeps each partition on its own scheduler without oversubscription.
+
+---
+
+## Advanced Considerations: Partitioned Supervisors and Custom Restart Strategies
+
+A standard Supervisor is a single process managing a static tree. For thousands of children, a single supervisor becomes a bottleneck: all supervisor callbacks run on one process, and supervisor restart logic is sequential. PartitionSupervisor (OTP 25+) spawns N independent supervisors, each managing a subset of children. Hashing the child ID determines which partition supervises it, distributing load and enabling horizontal scaling.
+
+Custom restart strategies (via `Supervisor.init/2` callback) allow logic beyond the defaults. A strategy might prioritize restarting dependent services in a specific order, or apply backoff based on restart frequency. The downside is complexity: custom logic is harder to test and reason about, and mistakes cascade. Start with defaults and profile before adding custom behavior.
+
+Selective restart via `:rest_for_one` or `:one_for_all` affects failure isolation. `:one_for_all` restarts all children when one fails (simulating a total system failure), which can be necessary for consistency but is expensive. `:rest_for_one` restarts the failed child and any started after it, balancing isolation and dependencies. Understanding which strategy fits your architecture prevents cascading failures and unnecessary restarts.
+
+---
+
+
+## Deep Dive: Supervisor Patterns and Production Implications
+
+Supervisor trees define fault tolerance at the application level. Testing supervisor restart strategies (one_for_one, rest_for_one, one_for_all) requires reasoning about side effects of crashes across multiple children. The insight is that your test should verify not just that a child restarts, but that dependent state (ETS tables, connections, message queues) is properly initialized after restart. Production incidents often involve restart loops under load—a supervisor that works fine in quiet tests can spin wildly when children fail faster than they recover.
 
 ---
 

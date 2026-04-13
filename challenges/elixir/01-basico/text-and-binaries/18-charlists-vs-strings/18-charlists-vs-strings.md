@@ -136,7 +136,20 @@ When an Erlang function returns `'enoent'` (a charlist), convert with
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Charlists ('string') ≠ binaries ("string") — Erlang libraries return charlist errors; compare against atoms.
 
 ```bash
 mix new proto_parser
@@ -144,6 +157,8 @@ cd proto_parser
 ```
 
 ### Step 2: `mix.exs`
+
+**Objective**: Boilerplate; focus on how tests depend on module structure — module aliases must match namespaces.
 
 ```elixir
 defmodule ProtoParser.MixProject do
@@ -164,6 +179,8 @@ end
 ```
 
 ### Step 3: `lib/proto_parser/message.ex`
+
+**Objective**: Structs with @enforce_keys prevent partial construction; payload: String.t() forces downstream code to not guess charlist.
 
 ```elixir
 defmodule ProtoParser.Message do
@@ -187,6 +204,8 @@ end
 ```
 
 ### Step 4: `lib/proto_parser/decoder.ex`
+
+**Objective**: Binary pattern matching <<::big-unsigned-integer-size(16)>> compiles to native byte ops; zero-copy, O(1) parsing.
 
 ```elixir
 defmodule ProtoParser.Decoder do
@@ -296,6 +315,8 @@ end
 ```
 
 ### Step 5: Tests
+
+**Objective**: Test truncation vs corruption as distinct errors; encode/decode round-trip validates symmetry and payload padding.
 
 ```elixir
 # test/proto_parser/decoder_test.exs
@@ -418,6 +439,8 @@ end
 
 ### Step 6: Run and verify
 
+**Objective**: --warnings-as-errors catches unused imports and variable shadowing; test failures surface at build time, not in production.
+
 ```bash
 mix compile --warnings-as-errors
 mix test --trace
@@ -425,6 +448,37 @@ mix test --trace
 
 ---
 
+
+
+---
+## Key Concepts
+
+### 1. Charlists Are Lists of Character Codes
+
+```elixir
+iex> 'hello'
+[104, 101, 108, 108, 111]
+
+iex> "hello"
+"hello"
+```
+
+Single quotes create charlists (lists of integers). Double quotes create strings (UTF-8 binaries). They are not interchangeable. Erlang functions sometimes expect charlists; modern Elixir prefers strings.
+
+### 2. Pattern Matching Differs
+
+```elixir
+[h | t] = 'hello'  # h = 104, t = [101, 108, 108, 111]
+[h | t] = "hello"  # ERROR: strings don't support head/tail pattern matching directly
+```
+
+Charlists match as lists; strings don't. This is a common gotcha when interfacing with Erlang libraries.
+
+### 3. Use Strings, Not Charlists
+
+Modern Elixir uses strings (binaries) everywhere. Charlists remain for Erlang interop. Unless you're calling Erlang functions that expect charlists, stick with strings.
+
+---
 ## Trade-off analysis
 
 | Aspect                 | Binary pattern match (this) | :binary.part/3 + manual offsets | External parser (NimbleParsec) |

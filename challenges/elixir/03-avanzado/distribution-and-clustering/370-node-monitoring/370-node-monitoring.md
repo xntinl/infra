@@ -97,6 +97,8 @@ end
 
 ### Step 1: Event struct
 
+**Objective**: Normalize `:nodeup` and `:nodedown` raw tuples into a typed struct with reason and node_type for telemetry.
+
 ```elixir
 # lib/cluster_observer/event.ex
 defmodule ClusterObserver.Event do
@@ -127,6 +129,8 @@ end
 ```
 
 ### Step 2: The monitor GenServer
+
+**Objective**: Subscribe to `:net_kernel` distribution events, emit telemetry, and buffer history queue for observability queries.
 
 ```elixir
 # lib/cluster_observer/monitor.ex
@@ -200,6 +204,8 @@ end
 ```
 
 ### Step 3: Supervision
+
+**Objective**: Start Monitor GenServer under supervision so distribution events flow continuously from boot.
 
 ```elixir
 # lib/cluster_observer/application.ex
@@ -316,6 +322,24 @@ Benchee.run(
 
 Target: handling > 200k synthetic events/second, since the handler is pure in-memory work (enqueue + telemetry fan-out). Real `:nodeup`/`:nodedown` rates are orders of magnitude lower (one per node crash), so throughput is never the constraint; latency of detection is.
 
+## Deep Dive
+
+Distributed Erlang relies on a heartbeat mechanism (net_kernel tick) to detect node failure, but the network is fundamentally asynchronous—split-brain scenarios are inevitable. A partitioned cluster may have two sets of nodes, each believing the other is dead. Libraries like Horde and Phoenix.PubSub solve this with quorum-aware consensus, but they add latency and complexity. At scale, choose your consistency model explicitly: eventual consistency (via Redis PubSub) is faster but allows temporary divergence; strong consistency (via Horde DLM or distributed transactions) is slower but guarantees atomicity. For global registries, the order of operations matters—registering a process before its monitor is live creates race conditions. In multi-region setups, latency between nodes compounds these issues; consider regional clusters with a lightweight coordinator rather than a fully meshed topology.
+## Advanced Considerations
+
+Distributed Elixir systems require careful consideration of network partitions, consistent hashing for distributed state, and the interaction between clustering libraries and node discovery mechanisms. Network partitions are not rare edge cases; they happen regularly in cloud deployments due to maintenance windows and infrastructure issues. A system that works perfectly during local testing but fails under network partitions indicates insufficient failure handling throughout the codebase. Split-brain scenarios where multiple network partitions lead to different cluster views require explicit recovery mechanisms that are often business-specific and context-dependent.
+
+Horde and distributed registries provide eventual consistency guarantees, but "eventual" can mean minutes during network partitions. Applications must handle the case where the same name is registered on multiple nodes simultaneously without coordination. Consistent hashing for distributed services requires understanding rebalancing costs — a single node failure can cause significant key redistribution and thundering herd problems if not carefully managed. The cost of distributed consensus using algorithms like Raft is high; choose it only when consistency is more important than availability and can afford the performance cost.
+
+Global state replication across nodes creates synchronization challenges at scale. Choosing between replicating everywhere versus replicating to specific nodes affects both consistency latency and network bandwidth utilization fundamentally. Node monitoring and heartbeat mechanisms require careful timeout tuning — too aggressive and you get false positives during network hiccups; too conservative and you don't detect actual failures quickly enough for recovery. The EPMD (Erlang Port Mapper Daemon) is a critical component that can become a bottleneck in large clusters and requires careful capacity planning.
+
+
+## Deep Dive: Cluster Patterns and Production Implications
+
+Clustering distributes computation across nodes using Erlang's distribution protocol. Testing clusters requires simulating node failures, network partitions, and message delays—challenges that single-node tests don't expose. Production clusters fail in ways that cluster tests reveal: nodes can become isolated (stuck), messages can be reordered, and consensus is expensive.
+
+---
+
 ## Trade-offs and production gotchas
 
 1. **Net tick timeout is 60 s by default**: if a node goes silent but the TCP connection stays open (frozen VM, paused container), you will not see `:nodedown` for up to 60 s. Tune `net_ticktime` in `vm.args` (lower value = faster detection, more false positives). 15–20 s is common in containerized environments.
@@ -336,3 +360,13 @@ Two BEAM nodes A and B hold an open distribution connection. You pause the conta
 - [Erlang distribution tuning — Fred Hebert](https://ferd.ca/)
 - [BEAM distribution deep dive](https://blog.erlang.org/erlang-21-otp-netsplit/)
 - [`erts :net_ticktime`](https://www.erlang.org/doc/man/kernel_app.html#net_ticktime)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

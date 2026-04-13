@@ -5,9 +5,6 @@ whose `start_link/1` validates its options with
 [NimbleOptions](https://hexdocs.pm/nimble_options/), generating
 documentation from the schema and raising clear errors on misuse.
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 1–2 hours
-
 ---
 
 ## Project context
@@ -85,9 +82,37 @@ drift from your validation.
 
 ---
 
+## Design decisions
+
+**Option A — hand-rolled `Keyword.fetch!/2` + `case` validations per option**
+- Pros: no dependency; totally explicit; easy to step through in a debugger.
+- Cons: typos like `timout:` silently ignored; docs drift from code; every library reinvents the same shape; error messages are ad hoc.
+
+**Option B — declare a schema and call `NimbleOptions.validate!/2` (chosen)**
+- Pros: fail-fast on unknown keys and wrong types; auto-generate docs from the same schema via `NimbleOptions.docs/1`; consistent error messages across libraries; tiny dep with no transitive deps.
+- Cons: one more thing to learn; schema vocabulary (`{:or, ...}`, `{:list, {:tuple, ...}}`) can get dense for complex configs.
+
+→ Chose **B** because every library in the Dashbit orbit (Broadway, Nx, LiveView) uses it, and the docs-stay-in-sync guarantee alone pays for itself.
+
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"ecto", "~> 1.0"},
+    {:"phoenix", "~> 1.0"},
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
 
 ```bash
 mix new nimble_opts_demo
@@ -103,6 +128,9 @@ end
 ```
 
 ### Step 2: `lib/nimble_opts_demo.ex`
+
+**Objective**: Implement `nimble_opts_demo.ex` — the integration seam where external protocol semantics meet Elixir domain code.
+
 
 ```elixir
 defmodule NimbleOptsDemo do
@@ -186,6 +214,9 @@ end
 ```
 
 ### Step 3: `test/nimble_opts_demo_test.exs`
+
+**Objective**: Write `nimble_opts_demo_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
 
 ```elixir
 defmodule NimbleOptsDemoTest do
@@ -289,6 +320,21 @@ mix test
 
 ---
 
+
+## Key Concepts
+
+External integrations in Elixir split across multiple patterns: Ecto for relational databases with changesets and migrations; Telemetry for metrics and observability; HTTP libraries like Req or Finch for REST APIs; and specialized parsers like Jason, NimbleCSV, and NimbleParsec for data formats. Choosing the right tool avoids the trap of one library solving everything poorly.
+
+Ecto is the de facto standard for databases because changesets encode validation before queries, migrations manage schema evolution, and the Repo pattern separates query logic from business logic. Migrations are version-controlled SQL, ensuring reproducible deployments. For integrating external services, Req is the modern HTTP client with built-in retry, redirect, and error handling policies.
+
+Telemetry decouples metrics collection from application code: you emit events and let listeners subscribe. This separation keeps business logic clean and metrics infrastructure pluggable. Use metrics, not print statements, in production.
+
+## Key Concepts
+
+NimbleOptions validates option lists using a simple schema. Instead of manually checking required/optional keys, you define a schema and call `NimbleOptions.validate/2`. This centralizes validation and provides clear error messages. It's valuable for library code where options come from users; for internal functions, keyword list contracts are often clearer.
+
+---
+
 ## Trade-offs and production gotchas
 
 **1. Validate once, at the boundary**
@@ -324,6 +370,14 @@ large configs, generate docs into a separate `.md` file.
   schema. Split into smaller schemas per component.
 
 ---
+
+## Benchmark
+
+<!-- benchmark N/A: integration/configuration exercise -->
+
+## Reflection
+
+- `NimbleOptions` rejects unknown keys, which protects against typos but also breaks forward compatibility: a new version that adds an option fails old callers who pass it in advance. How do Broadway and LiveView reconcile that tension, and what would it cost you to adopt the same pattern in a library you own?
 
 ## Resources
 

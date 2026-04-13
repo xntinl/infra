@@ -2,9 +2,6 @@
 
 **Project**: `plug_pipeline` — a standalone HTTP middleware stack (request ID, structured logging, timing, auth) built from scratch without Phoenix.
 
-**Difficulty**: ★★★★☆
-**Estimated time**: 3–5 hours
-
 ---
 
 ## Project context
@@ -44,6 +41,12 @@ plug_pipeline/
         │   └── api_key_test.exs
         └── endpoint_test.exs
 ```
+
+---
+
+## Why pipeline and not inline middleware
+
+Cross-cutting concerns in controllers duplicate per controller and drift. A pipeline declares the order once; adding a new concern touches one file; removing one likewise.
 
 ---
 
@@ -171,9 +174,183 @@ structured line.
 
 ---
 
+## Design decisions
+
+**Option A — inline every concern in the controller action**
+- Pros: one place to read the request flow.
+- Cons: cross-cutting concerns duplicate; controllers grow unbounded.
+
+**Option B — Plug pipeline with ordered middleware** (chosen)
+- Pros: each concern is a named plug, composable and testable in isolation.
+- Cons: pipeline order becomes load-bearing; debugging requires reading the pipeline definition.
+
+→ Chose **B** because concerns like auth, rate limiting, logging, and CSRF are cross-cutting by definition; a pipeline is the natural home.
+
+---
+
 ## Implementation
 
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a `mix new --sup` app with Plug + Bandit so the pipeline runs under a supervised HTTP server without Phoenix overhead.
+
+```bash
+mix new plug_pipeline --sup
+cd plug_pipeline
+```
+
+`mix.exs` deps:
+
+```elixir
+defp deps do
+  [
+    {:plug, "~> 1.16"},
+    {:bandit, "~> 1.5"},
+    {:jason, "~> 1.4"}
+  ]
+end
+```
+
+### Dependencies (mix.exs)
+
+```elixir
+```elixir
+@callback init(opts) :: opts_compiled
+@callback call(conn, opts_compiled) :: Plug.Conn.t()
+```
+
+`init/1` runs **at compile time** (when `use Plug.Builder` compiles the pipeline).
+Its return value is baked into the bytecode that calls `call/2`. That's how Plug
+achieves zero-overhead composition: no runtime options map lookup.
+
+`call/2` runs per request. It takes a `Plug.Conn`, returns a transformed
+`Plug.Conn`. That's it — the entire spec.
+
+```
+     Plug.Conn (struct carrying the request) ───▶ call/2 ───▶ Plug.Conn (possibly mutated)
+```
+
+---
+
+### 2. Module plugs vs. function plugs
+
+**Module plug** — full module with `init/1` and `call/2`. Preferred for reusable
+middleware:
+
+```elixir
+defmodule MyPlug do
+  @behaviour Plug
+  def init(opts), do: opts
+  def call(conn, _opts), do: conn
+end
+```
+
+**Function plug** — a single function with arity 2 that takes a conn and opts.
+Used inline inside a pipeline for one-off transforms:
+
+```elixir
+plug :authenticate
+
+defp authenticate(conn, _opts) do
+  # ...
+  conn
+end
+```
+
+Same runtime semantics; module plug is just a module around the function.
+
+---
+
+### 3. `Plug.Builder` — composing a pipeline
+
+`use Plug.Builder` turns a module into a plug that invokes a sequence of
+plugs in order. The order is the order of `plug` declarations.
+
+```elixir
+defmodule MyPipeline do
+  use Plug.Builder
+
+  plug Plugs.RequestId
+  plug Plugs.StructuredLogger
+  plug Plugs.ApiKey, allowed: ["secret-1", "secret-2"]
+  plug :final_handler
+
+  defp final_handler(conn, _opts), do: Plug.Conn.send_resp(conn, 200, "ok")
+end
+```
+
+Under the hood, `Plug.Builder` builds a nested `call/2` at compile time. The
+macro generates code roughly equivalent to:
+
+```elixir
+def call(conn, opts) do
+  conn = Plugs.RequestId.call(conn, @request_id_opts)
+  conn = Plugs.StructuredLogger.call(conn, @logger_opts)
+  conn = Plugs.ApiKey.call(conn, @api_key_opts)
+  final_handler(conn, [])
+end
+```
+
+Pure function composition. No middleware framework, no magic.
+
+---
+
+### 4. Halting the pipeline
+
+Any plug can short-circuit the rest of the pipeline by calling `Plug.Conn.halt/1`:
+
+```
+conn = conn |> put_status(401) |> send_resp(401, "unauthorized") |> halt()
+```
+
+`Plug.Builder`'s generated `call/2` checks `conn.halted` between plugs and skips
+the remainder when set. This is how `ApiKey` refuses a request without letting
+`StructuredLogger` or `Upstream` observe it — except you usually WANT the logger
+to run even on rejections, so the order matters.
+
+---
+
+### 5. `register_before_send/2` — run code at response time
+
+Some work must happen after the body has been computed but before the socket
+flushes: adding response headers, recording final status, emitting metrics.
+`Plug.Conn.register_before_send/2` registers a callback that runs when
+`send_resp/3` is called:
+
+```elixir
+def call(conn, _opts) do
+  conn = put_req_header(conn, "x-request-id", request_id)
+  register_before_send(conn, fn conn ->
+    put_resp_header(conn, "x-request-id", request_id)
+  end)
+end
+```
+
+This is how `Plug.Logger` measures duration: start timer in `call/2`, compute
+elapsed in the `before_send` callback, log both request and response in one
+structured line.
+
+---
+
+## Design decisions
+
+**Option A — inline every concern in the controller action**
+- Pros: one place to read the request flow.
+- Cons: cross-cutting concerns duplicate; controllers grow unbounded.
+
+**Option B — Plug pipeline with ordered middleware** (chosen)
+- Pros: each concern is a named plug, composable and testable in isolation.
+- Cons: pipeline order becomes load-bearing; debugging requires reading the pipeline definition.
+
+→ Chose **B** because concerns like auth, rate limiting, logging, and CSRF are cross-cutting by definition; a pipeline is the natural home.
+
+---
+
+## Implementation
+
+### Step 1: Create the project
+
+**Objective**: Bootstrap a `mix new --sup` app with Plug + Bandit so the pipeline runs under a supervised HTTP server without Phoenix overhead.
 
 ```bash
 mix new plug_pipeline --sup
@@ -193,6 +370,8 @@ end
 ```
 
 ### Step 2: `lib/plug_pipeline/plugs/request_id.ex`
+
+**Objective**: Honour inbound `X-Request-ID` when present and generate a URL-safe random one otherwise, propagating it to response headers for trace correlation.
 
 ```elixir
 defmodule PlugPipeline.Plugs.RequestId do
@@ -229,6 +408,8 @@ end
 
 ### Step 3: `lib/plug_pipeline/plugs/timing.ex`
 
+**Objective**: Measure duration via `System.monotonic_time/0` inside `register_before_send/2` so the value is immune to wall-clock jumps.
+
 ```elixir
 defmodule PlugPipeline.Plugs.Timing do
   @moduledoc """
@@ -256,6 +437,8 @@ end
 ```
 
 ### Step 4: `lib/plug_pipeline/plugs/structured_logger.ex`
+
+**Objective**: Emit one JSON line per response in `before_send` so log aggregators parse a stable schema, not interleaved Logger tuples.
 
 ```elixir
 defmodule PlugPipeline.Plugs.StructuredLogger do
@@ -290,6 +473,8 @@ end
 ```
 
 ### Step 5: `lib/plug_pipeline/plugs/api_key.ex`
+
+**Objective**: Gate on `X-API-Key` against a `MapSet` allow-list and `halt/1` on failure so rejected requests still surface through the earlier logger plug.
 
 ```elixir
 defmodule PlugPipeline.Plugs.ApiKey do
@@ -347,6 +532,8 @@ end
 
 ### Step 6: The endpoint — `lib/plug_pipeline/endpoint.ex`
 
+**Objective**: Compose plugs via `Plug.Builder` so RequestId->Timing->Logger run before ApiKey, guaranteeing 401 responses are traced and timed.
+
 ```elixir
 defmodule PlugPipeline.Endpoint do
   @moduledoc "The composed pipeline. Order matters — read the comments."
@@ -392,6 +579,8 @@ end
 
 ### Step 7: Supervise Bandit — `lib/plug_pipeline/application.ex`
 
+**Objective**: Mount Bandit as a supervised child pointing at the endpoint so the listener restarts on crash without taking down the VM.
+
 ```elixir
 defmodule PlugPipeline.Application do
   @moduledoc false
@@ -409,6 +598,8 @@ end
 ```
 
 ### Step 8: Tests
+
+**Objective**: Use `Plug.Test.conn/3` to exercise each plug in isolation and the composed pipeline end-to-end, asserting header propagation and halt semantics.
 
 `test/plug_pipeline/plugs/request_id_test.exs`:
 
@@ -522,6 +713,27 @@ end
 mix test
 ```
 
+### Why this works
+
+Each plug is a module with `init/1` and `call/2`. The pipeline composes them in order, threading the `conn` through each. Any plug can halt the pipeline by calling `halt/1`, which short-circuits downstream plugs.
+
+---
+
+## Advanced Considerations: LiveView Real-Time Patterns and Pubsub Scale
+
+LiveView bridges the browser and BEAM via WebSocket, allowing server-side renders to push incremental DOM diffs to the client. A LiveView process is long-lived, receiving events (clicks, form submissions) and broadcasting updates. For real-time features (collaborative editing, live notifications), LiveView processes subscribe to PubSub topics and receive broadcast messages.
+
+Phoenix.PubSub partitions topics across a pool of processes, allowing horizontal scaling. By default, `:local` mode uses in-memory ETS; `:redis` mode distributes across nodes via Redis. At scale (thousands of concurrent LiveViews), topic fanout can bottleneck: broadcasting to a million subscribers means delivering one million messages. The BEAM handles this, but the network cost matters on multi-node deployments.
+
+`Presence` module tracks which users are viewing which pages, syncing state via PubSub. A presence join/leave is broadcast to all nodes, allowing real-time "who's online" updates. Under partition, presence state can diverge; the library uses unique presence keys to detect and reconcile. Operationally, watching presence on every page load can amplify server load if users are flaky (mobile networks, browser reloads). Consider presence only for features where it's user-facing (collaborative editors, live sports scoreboards).
+
+---
+
+
+## Deep Dive: Streaming Patterns and Production Implications
+
+Stream-based pipelines in Elixir achieve backpressure and composability by deferring computation until consumption. Unlike eager list operations that allocate all intermediate structures, Streams are lazy chains that produce one element at a time, reducing memory footprint and enabling infinite sequences. The BEAM scheduler yields between Stream operations, allowing multiple concurrent pipelines to interleave fairly. At scale (processing millions of rows or events), the difference between eager and lazy evaluation becomes the difference between consistent latency and garbage collection pauses. Production systems benefit most when Streams are composed at library boundaries, not scattered across the codebase.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -557,8 +769,8 @@ libraries (Phoenix uses it for action name, etc.). Don't put your data in
 `private` — you may collide with a library you import later.
 
 **7. When NOT to use `Plug.Builder`**
-If you have dynamic routing (different pipelines per path), use `Plug.Router`
-(exercise 58). `Plug.Builder` is for a single straight-through pipeline.
+If you have dynamic routing (different pipelines per path), use `Plug.Router`.
+`Plug.Builder` is for a single straight-through pipeline.
 Mixing routing into a `Builder` pipeline with `case` statements is harder to
 read than `Plug.Router`'s dispatch.
 
@@ -590,6 +802,25 @@ compiles to straight function calls with no reflection.
 
 Compare the hot path by removing `StructuredLogger` — you should see a
 measurable drop, confirming the logger is the heaviest component.
+
+---
+
+## Benchmark
+
+```elixir
+# :timer.tc / Benchee measurement sketch
+{time_us, _} = :timer.tc(fn -> :ok end)
+IO.puts("elapsed: #{time_us} us")
+```
+
+Target: each plug adds 1-10 us; 10-plug pipeline stays under 100 us overhead.
+
+---
+
+## Reflection
+
+- Two plugs in your pipeline both need the same expensive computation. Where do you cache it, and does that still feel like good separation of concerns?
+- A plug needs to run only for specific routes. Do you branch inside the plug, use pipeline scoping, or split into multiple pipelines? Which gives the clearest reading order?
 
 ---
 

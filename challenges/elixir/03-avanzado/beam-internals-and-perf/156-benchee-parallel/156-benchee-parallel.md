@@ -155,6 +155,8 @@ A low mean with a fat tail is the classic signature of contention.
 
 ### Step 1: `mix.exs`
 
+**Objective**: Pin `{:benchee, "~> 1.3"}` so the three counter variants share one benchmarking harness without extra dev-only tooling.
+
 ```elixir
 defmodule BencheeParallel.MixProject do
   use Mix.Project
@@ -168,6 +170,8 @@ end
 ```
 
 ### Step 2: `lib/benchee_parallel/application.ex`
+
+**Objective**: Boot the GenServer, ETS, and atomics counters under `:one_for_one` so each benchmark target is always alive.
 
 ```elixir
 defmodule BencheeParallel.Application do
@@ -188,6 +192,8 @@ end
 ```
 
 ### Step 3: `lib/benchee_parallel/genserver_counter.ex`
+
+**Objective**: Serialize increments through a single GenServer mailbox to establish the worst-case contention baseline.
 
 ```elixir
 defmodule BencheeParallel.GenserverCounter do
@@ -213,6 +219,8 @@ end
 ```
 
 ### Step 4: `lib/benchee_parallel/ets_counter.ex`
+
+**Objective**: Use `:ets.update_counter/4` with `write_concurrency: true` to expose row-lock serialization on hot single-key writes.
 
 ```elixir
 defmodule BencheeParallel.EtsCounter do
@@ -251,6 +259,8 @@ end
 
 ### Step 5: `lib/benchee_parallel/atomics_counter.ex`
 
+**Objective**: Back the counter with lock-free `:counters` stored in `:persistent_term` so readers never hop a process boundary.
+
 ```elixir
 defmodule BencheeParallel.AtomicsCounter do
   @moduledoc """
@@ -283,6 +293,8 @@ end
 
 ### Step 6: `bench/counters_bench.exs`
 
+**Objective**: Run each counter at `parallel: 1` and `parallel: schedulers_online()` so contention shows up as an order-of-magnitude delta.
+
 ```elixir
 alias BencheeParallel.{GenserverCounter, EtsCounter, AtomicsCounter}
 
@@ -308,6 +320,8 @@ Benchee.run(scenarios, Keyword.put(common, :parallel, System.schedulers_online()
 
 ### Step 7: `test/benchee_parallel/counters_test.exs`
 
+**Objective**: Validate concurrent-load correctness and verify atomics-faster ordering so lock-free CAS outperforms GenServer serialization.
+
 ```elixir
 defmodule BencheeParallel.CountersTest do
   use ExUnit.Case, async: false
@@ -323,51 +337,55 @@ defmodule BencheeParallel.CountersTest do
     :ok
   end
 
-  test "all three counters increment correctly under concurrent load" do
-    tasks =
-      for _ <- 1..8 do
-        Task.async(fn ->
-          for _ <- 1..1_000 do
-            EtsCounter.incr()
-            AtomicsCounter.incr()
-          end
+  describe "BencheeParallel.Counters" do
+    test "all three counters increment correctly under concurrent load" do
+      tasks =
+        for _ <- 1..8 do
+          Task.async(fn ->
+            for _ <- 1..1_000 do
+              EtsCounter.incr()
+              AtomicsCounter.incr()
+            end
+          end)
+        end
+
+      Task.await_many(tasks, 10_000)
+
+      assert EtsCounter.value() == 8_000
+      assert AtomicsCounter.value() == 8_000
+    end
+
+    test "atomics is strictly faster than genserver under parallel load" do
+      # Not a full benchmark — just a sanity check that the order is correct.
+      n = 500
+
+      atomics_time =
+        :timer.tc(fn ->
+          Task.async_stream(1..8, fn _ -> for _ <- 1..n, do: AtomicsCounter.incr() end,
+            max_concurrency: 8
+          )
+          |> Stream.run()
         end)
-      end
+        |> elem(0)
 
-    Task.await_many(tasks, 10_000)
+      genserver_time =
+        :timer.tc(fn ->
+          Task.async_stream(1..8, fn _ -> for _ <- 1..n, do: GenserverCounter.incr() end,
+            max_concurrency: 8
+          )
+          |> Stream.run()
+        end)
+        |> elem(0)
 
-    assert EtsCounter.value() == 8_000
-    assert AtomicsCounter.value() == 8_000
-  end
-
-  test "atomics is strictly faster than genserver under parallel load" do
-    # Not a full benchmark — just a sanity check that the order is correct.
-    n = 500
-
-    atomics_time =
-      :timer.tc(fn ->
-        Task.async_stream(1..8, fn _ -> for _ <- 1..n, do: AtomicsCounter.incr() end,
-          max_concurrency: 8
-        )
-        |> Stream.run()
-      end)
-      |> elem(0)
-
-    genserver_time =
-      :timer.tc(fn ->
-        Task.async_stream(1..8, fn _ -> for _ <- 1..n, do: GenserverCounter.incr() end,
-          max_concurrency: 8
-        )
-        |> Stream.run()
-      end)
-      |> elem(0)
-
-    assert atomics_time < genserver_time
+      assert atomics_time < genserver_time
+    end
   end
 end
 ```
 
 ### Step 8: Run the benchmark
+
+**Objective**: Measure serial vs parallel throughput (ips) and tail latencies (p99) to quantify contention penalty across all three variants.
 
 ```bash
 # Bind schedulers for reproducible results
@@ -380,6 +398,46 @@ ERL_FLAGS="+sbt db" mix run bench/counters_bench.exs
 ### Why this works
 
 The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
+
+## Deep Dive: BEAM Scheduler Tuning and Memory Profiling in Production
+
+The BEAM scheduler is not "magic" — it's a preemptive work-stealing scheduler that divides CPU time 
+into reductions (bytecode instructions). Understanding scheduler tuning is critical when you suspect 
+latency spikes in production.
+
+**Key concepts**:
+- **Reductions budget**: By default, a process gets ~2000 reductions before yielding to another process.
+  Heavy CPU work (binary matching, list recursion) can exhaust the budget and cause tail latency.
+- **Dirty schedulers**: If a process does CPU-intensive work (crypto, compression, numerical), it blocks 
+  the main scheduler. Use dirty NIFs or `spawn_opt(..., [{:fullsweep_after, 0}])` for GC tuning.
+- **Heap tuning per process**: `Process.flag(:min_heap_size, ...)` reserves heap upfront, reducing GC 
+  pauses. Measure; don't guess.
+
+**Memory profiling workflow**:
+1. Run `recon:memory/0` in iex; identify top 10 memory consumers by type (atoms, binaries, ets).
+2. If binaries dominate, check for refc binary leaks (binary held by process that should have been freed).
+3. Use `eprof` or `fprof` for function-level CPU attribution; `recon:proc_window/3` for process memory trends.
+
+**Production pattern**: Deploy with `+K true` (async IO), `-env ERL_MAX_PORTS 65536` (port limit), 
+`+T 9` (async threads). Measure GC time with `erlang:statistics(garbage_collection)` — if >5% of uptime, 
+tune heap or reduce allocation pressure. Never assume defaults are optimal for YOUR workload.
+
+---
+
+## Advanced Considerations
+
+Understanding BEAM internals at production scale requires deep knowledge of scheduler behavior, memory models, and garbage collection dynamics. The soft real-time guarantees of BEAM only hold under specific conditions — high system load, uneven process distribution across schedulers, or GC pressure can break predictable latency completely. Monitor `erlang:statistics(run_queue)` in production to catch scheduler saturation before it degrades latency significantly. The difference between immediate, offheap, and continuous GC garbage collection strategies can significantly impact tail latencies in systems with millions of messages per second and sustained memory pressure.
+
+Process reductions and the reduction counter affect scheduler fairness fundamentally. A process that runs for extended periods without yielding can starve other processes, even though the scheduler treats it fairly by reduction count per scheduling interval. This is especially critical in pipelines processing large data structures or performing recursive computations where yielding points are infrequent and difficult to predict. The BEAM's preemption model is deterministic per reduction, making performance testing reproducible but sometimes hiding race conditions that only manifest under specific load patterns and GC interactions.
+
+The interaction between ETS, Mnesia, and process message queues creates subtle bottlenecks in distributed systems. ETS reads don't block other processes, but writes require acquiring locks; understanding when your workload transitions from read-heavy to write-heavy is crucial for capacity planning. Port drivers and NIFs bypass the BEAM scheduler entirely, which can lead to unexpected priority inversions if not carefully managed. Always profile with `eprof` and `fprof` in realistic production-like environments before deployment to catch performance surprises.
+
+
+## Deep Dive: Otp Patterns and Production Implications
+
+OTP primitives (GenServer, Supervisor, Application) are tested through their public interfaces, not by inspecting internal state. This discipline forces correct design: if you can't test a behavior without peeking into the server's state, the behavior is not public. Production systems with tight integration tests on GenServer internals are fragile and hard to refactor.
+
+---
 
 ## Trade-offs and production gotchas
 
@@ -460,3 +518,13 @@ counter.
 - [Amdahl's Law — Wikipedia](https://en.wikipedia.org/wiki/Amdahl%27s_law) — the theory behind the ceiling
 - [Eric Meadows-Jönsson — ETS write_concurrency internals](https://elixir-lang.org/blog/) — how key-hash bucket locks work
 - [Discord scaling story](https://discord.com/blog/how-discord-scaled-elixir-to-5-000-000-concurrent-users) — scheduler binding and lock-free counters in anger
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

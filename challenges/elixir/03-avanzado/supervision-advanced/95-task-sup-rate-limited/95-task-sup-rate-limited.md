@@ -1,8 +1,6 @@
 # Rate-Limited Task.Supervisor with a Local Token Bucket
 
 **Project**: `rate_limited_tasks` — a Task.Supervisor gated by a per-process token bucket that throttles task starts to a fixed rate.
-**Difficulty**: ★★★★☆
-**Estimated time**: 3–6 hours
 
 ---
 
@@ -124,9 +122,35 @@ thousandths-of-a-token (integers) so ETS `update_counter` stays valid.
 
 ---
 
+## Design decisions
+
+**Option A — `Task.async_stream` with `max_concurrency`**
+- Pros: single-line solution; built-in.
+- Cons: limits concurrency, not rate; a fast downstream still lets you burst well past the target rate.
+
+**Option B — `Task.Supervisor` gated by an ETS-backed token bucket** (chosen)
+- Pros: rate limit is a real rate, not a proxy; `:ets.update_counter` makes token acquisition lock-free; refill is monotonic-time based, not wall-clock.
+- Cons: more code; bucket restart resets state unless owned by a supervisor above the worker tree.
+
+→ Chose **B** because "10 tasks/sec" and "at most 10 in flight" are different guarantees, and downstream systems usually care about the rate.
+
+---
+
 ## Implementation
 
 ### Step 1: `mix.exs`
+
+**Objective**: Declare the project, dependencies, and OTP application in `mix.exs`.
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
 
 ```elixir
 defmodule RateLimitedTasks.MixProject do
@@ -149,6 +173,8 @@ end
 
 ### Step 2: `lib/rate_limited_tasks/application.ex`
 
+**Objective**: Define the OTP application and supervision tree in `lib/rate_limited_tasks/application.ex`.
+
 ```elixir
 defmodule RateLimitedTasks.Application do
   @moduledoc false
@@ -168,6 +194,8 @@ end
 ```
 
 ### Step 3: `lib/rate_limited_tasks/token_bucket.ex`
+
+**Objective**: Implement the module in `lib/rate_limited_tasks/token_bucket.ex`.
 
 ```elixir
 defmodule RateLimitedTasks.TokenBucket do
@@ -264,6 +292,8 @@ end
 
 ### Step 4: `lib/rate_limited_tasks/supervisor.ex`
 
+**Objective**: Implement the module in `lib/rate_limited_tasks/supervisor.ex`.
+
 ```elixir
 defmodule RateLimitedTasks.Supervisor do
   @moduledoc """
@@ -312,49 +342,55 @@ end
 
 ### Step 5: `test/token_bucket_test.exs`
 
+**Objective**: Write tests in `test/token_bucket_test.exs` covering behavior and edge cases.
+
 ```elixir
 defmodule RateLimitedTasks.TokenBucketTest do
   use ExUnit.Case, async: false
 
   alias RateLimitedTasks.TokenBucket
 
-  test "take succeeds when bucket has tokens" do
-    assert :ok = TokenBucket.take(:api_bucket, 1)
-  end
-
-  test "take fails after capacity is exhausted at high rate" do
-    # Drain the bucket
-    for _ <- 1..200 do
-      _ = TokenBucket.take(:api_bucket, 1)
+  describe "RateLimitedTasks.TokenBucket" do
+    test "take succeeds when bucket has tokens" do
+      assert :ok = TokenBucket.take(:api_bucket, 1)
     end
 
-    # Refill rate is 50/s => small window should yield a denial
-    assert {:error, _} = TokenBucket.take(:api_bucket, 1)
-  end
+    test "take fails after capacity is exhausted at high rate" do
+      # Drain the bucket
+      for _ <- 1..200 do
+        _ = TokenBucket.take(:api_bucket, 1)
+      end
 
-  test "bucket refills after waiting" do
-    # Drain
-    for _ <- 1..200, do: TokenBucket.take(:api_bucket, 1)
+      # Refill rate is 50/s => small window should yield a denial
+      assert {:error, _} = TokenBucket.take(:api_bucket, 1)
+    end
 
-    Process.sleep(100)
-    # 100 ms * 50 tokens/s = ~5 tokens
-    results = for _ <- 1..3, do: TokenBucket.take(:api_bucket, 1)
-    assert Enum.all?(results, &(&1 == :ok))
-  end
+    test "bucket refills after waiting" do
+      # Drain
+      for _ <- 1..200, do: TokenBucket.take(:api_bucket, 1)
 
-  test "wait_and_take succeeds within budget" do
-    for _ <- 1..200, do: TokenBucket.take(:api_bucket, 1)
-    assert :ok = TokenBucket.wait_and_take(:api_bucket, 1, 500)
-  end
+      Process.sleep(100)
+      # 100 ms * 50 tokens/s = ~5 tokens
+      results = for _ <- 1..3, do: TokenBucket.take(:api_bucket, 1)
+      assert Enum.all?(results, &(&1 == :ok))
+    end
 
-  test "wait_and_take times out when budget is too short" do
-    for _ <- 1..200, do: TokenBucket.take(:api_bucket, 1)
-    assert {:error, :timeout} = TokenBucket.wait_and_take(:api_bucket, 1, 1)
+    test "wait_and_take succeeds within budget" do
+      for _ <- 1..200, do: TokenBucket.take(:api_bucket, 1)
+      assert :ok = TokenBucket.wait_and_take(:api_bucket, 1, 500)
+    end
+
+    test "wait_and_take times out when budget is too short" do
+      for _ <- 1..200, do: TokenBucket.take(:api_bucket, 1)
+      assert {:error, :timeout} = TokenBucket.wait_and_take(:api_bucket, 1, 1)
+    end
   end
 end
 ```
 
 ### Step 6: `test/supervisor_test.exs`
+
+**Objective**: Write tests in `test/supervisor_test.exs` covering behavior and edge cases.
 
 ```elixir
 defmodule RateLimitedTasks.SupervisorTest do
@@ -362,26 +398,30 @@ defmodule RateLimitedTasks.SupervisorTest do
 
   alias RateLimitedTasks.Supervisor, as: RLT
 
-  test "start_immediate returns rate_limited under burst" do
-    # Burn the bucket
-    for _ <- 1..200 do
-      _ = RLT.start(fn -> :ok end, :immediate)
+  describe "RateLimitedTasks.Supervisor" do
+    test "start_immediate returns rate_limited under burst" do
+      # Burn the bucket
+      for _ <- 1..200 do
+        _ = RLT.start(fn -> :ok end, :immediate)
+      end
+
+      assert {:error, :rate_limited} = RLT.start(fn -> :ok end, :immediate)
     end
 
-    assert {:error, :rate_limited} = RLT.start(fn -> :ok end, :immediate)
-  end
+    test "async waits within budget" do
+      # Drain
+      for _ <- 1..200, do: RLT.start(fn -> :ok end, :immediate)
 
-  test "async waits within budget" do
-    # Drain
-    for _ <- 1..200, do: RLT.start(fn -> :ok end, :immediate)
-
-    assert {:ok, %Task{} = t} = RLT.async(fn -> 42 end, {:wait, 500})
-    assert 42 == Task.await(t)
+      assert {:ok, %Task{} = t} = RLT.async(fn -> 42 end, {:wait, 500})
+      assert 42 == Task.await(t)
+    end
   end
 end
 ```
 
 ### Step 7: `bench/limiter_bench.exs`
+
+**Objective**: Implement the script in `bench/limiter_bench.exs`.
 
 ```elixir
 # Reset bucket to avoid warm-start bias
@@ -405,6 +445,23 @@ Benchee.run(
 ```
 
 Expected on modern hardware: `bare` ~ 8 µs, `rate-limited` ~ 10 µs. Limiter overhead ~ 2 µs.
+
+---
+
+## Advanced Considerations: Partitioned Supervisors and Custom Restart Strategies
+
+A standard Supervisor is a single process managing a static tree. For thousands of children, a single supervisor becomes a bottleneck: all supervisor callbacks run on one process, and supervisor restart logic is sequential. PartitionSupervisor (OTP 25+) spawns N independent supervisors, each managing a subset of children. Hashing the child ID determines which partition supervises it, distributing load and enabling horizontal scaling.
+
+Custom restart strategies (via `Supervisor.init/2` callback) allow logic beyond the defaults. A strategy might prioritize restarting dependent services in a specific order, or apply backoff based on restart frequency. The downside is complexity: custom logic is harder to test and reason about, and mistakes cascade. Start with defaults and profile before adding custom behavior.
+
+Selective restart via `:rest_for_one` or `:one_for_all` affects failure isolation. `:one_for_all` restarts all children when one fails (simulating a total system failure), which can be necessary for consistency but is expensive. `:rest_for_one` restarts the failed child and any started after it, balancing isolation and dependencies. Understanding which strategy fits your architecture prevents cascading failures and unnecessary restarts.
+
+---
+
+
+## Deep Dive: Property Patterns and Production Implications
+
+Property-based testing inverts the testing mindset: instead of writing examples, you state invariants (properties) and let a generator find counterexamples. StreamData's shrinking capability is its superpower—when a property fails on a 10,000-element list, the framework reduces it to the minimal list that still fails, cutting debugging time from hours to minutes. The trade-off is that properties require rigorous thinking about domain constraints, and not every invariant is worth expressing as a property. Teams that adopt property testing often find bugs in specifications themselves, not just implementations.
 
 ---
 
@@ -450,6 +507,10 @@ limits with thousands of tenants, one ETS cell per tenant scales fine, but you n
 per-tenant GC — the `api_gateway` rate limiter from the resilience-patterns section
 is the better template.
 
+### Why this works
+
+The token bucket expresses the rate limit as a refill-plus-take algebra. `:ets.update_counter` performs atomic subtraction without a GenServer round-trip, so the hot path is measured in hundreds of nanoseconds. Refill is derived from monotonic time, which immunizes the limiter against wall-clock adjustments. The Task.Supervisor only starts the child if the take succeeds, which means admission control and execution are structurally separate.
+
 ---
 
 ## Benchmark
@@ -466,6 +527,15 @@ Target numbers for the sample code on an M1 / modern x86:
 
 If you see > 10x this on `take/2`, you're likely going through a GenServer — verify the
 hot path calls `:ets.lookup` directly, not a `GenServer.call`.
+
+Target: `take/2` ≤ 2 µs p99; rate-limited `start/2` ≤ 20 µs p99 including admission.
+
+---
+
+## Reflection
+
+1. You need per-tenant limits for 10k tenants. Does the single-bucket ETS pattern scale, or do you shard buckets per tenant? What GC policy keeps memory bounded as tenants churn?
+2. A bucket restart resets state to full capacity. Under which deployment scenarios is that a correctness bug versus an acceptable drift, and how would you detect the difference in production?
 
 ---
 

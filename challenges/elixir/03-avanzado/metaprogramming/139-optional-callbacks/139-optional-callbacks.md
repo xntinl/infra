@@ -2,9 +2,6 @@
 
 **Project**: `optional_callbacks` — design a plugin system where most hooks are optional, guard every call with `Code.ensure_loaded?/1` + `function_exported?/3`, and understand why the combination matters in releases.
 
-**Difficulty**: ★★★★☆
-**Estimated time**: 3–5 hours
-
 ---
 
 ## Project context
@@ -35,6 +32,12 @@ optional_callbacks/
 │   └── optional_callbacks_test.exs
 └── mix.exs
 ```
+
+---
+
+## Why optional callbacks and not mandatory stubs
+
+Mandatory callbacks force users to write trivial stubs just to satisfy the compiler. Optional callbacks let the framework ask `function_exported?/3` once at init and pick the right code path.
 
 ---
 
@@ -95,9 +98,35 @@ if the listed callback does not exist in the behaviour at all.
 
 ---
 
+## Design decisions
+
+**Option A — require every callback**
+- Pros: exhaustiveness at compile time; no `function_exported?/3` branches.
+- Cons: forces stub implementations; bloats modules that only need half the API.
+
+**Option B — `@optional_callbacks` + runtime detection** (chosen)
+- Pros: lean implementations; clear intent per callback.
+- Cons: introduces a dispatch branch; needs careful documentation so users know what to implement.
+
+→ Chose **B** because the behaviour models a real 'has extension points' contract, not a rigid interface.
+
+---
+
 ## Implementation
 
 ### Step 1: `lib/optional_callbacks/psp.ex`
+
+**Objective**: Define @callback list and @optional_callbacks list so PSPs skip unneeded stubs at compile time.
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
 
 ```elixir
 defmodule OptionalCallbacks.PSP do
@@ -124,6 +153,8 @@ end
 
 ### Step 2: `lib/optional_callbacks/psps/stripe.ex`
 
+**Objective**: Implement all required and optional callbacks with @impl true to define conformance baseline.
+
 ```elixir
 defmodule OptionalCallbacks.PSPs.Stripe do
   @behaviour OptionalCallbacks.PSP
@@ -147,6 +178,8 @@ end
 
 ### Step 3: `lib/optional_callbacks/psps/wire_transfer.ex`
 
+**Objective**: Implement only charge/2 required callback, omit all optional ones, to show minimal PSP valid without stubs.
+
 ```elixir
 defmodule OptionalCallbacks.PSPs.WireTransfer do
   @behaviour OptionalCallbacks.PSP
@@ -160,6 +193,8 @@ end
 ```
 
 ### Step 4: `lib/optional_callbacks/psps/paypal.ex`
+
+**Objective**: Implement charge, refund, void but omit capture/webhook_validate to show selective capability adoption.
 
 ```elixir
 defmodule OptionalCallbacks.PSPs.PayPal do
@@ -179,6 +214,8 @@ end
 ```
 
 ### Step 5: `lib/optional_callbacks/orchestrator.ex`
+
+**Objective**: Probe PSPs with Code.ensure_loaded? + function_exported?/3 before dispatch, return :not_supported gracefully.
 
 ```elixir
 defmodule OptionalCallbacks.Orchestrator do
@@ -224,6 +261,8 @@ end
 ```
 
 ### Step 6: Tests
+
+**Objective**: Assert capabilities/1 returns correct subsets, dispatch routes correctly, unsupported callbacks return :not_supported.
 
 ```elixir
 defmodule OptionalCallbacksTest do
@@ -276,6 +315,27 @@ defmodule OptionalCallbacksTest do
 end
 ```
 
+### Why this works
+
+`@optional_callbacks [fun: arity]` tells the compiler not to warn when the callback is missing. The framework calls `function_exported?/3` (ideally once, cached) and either invokes the user function or falls back to a default. The cost is a one-time check per process or startup.
+
+---
+
+## Advanced Considerations: Macro Hygiene and Compile-Time Validation
+
+Macros execute at compile time, walking the AST and returning new AST. That power is easy to abuse: a macro that generates variables can shadow outer scope bindings, or a quote block that references variables directly can fail if the macro is used in a context where those variables don't exist. The `unquote` mechanism is the escape hatch, but misusing it leads to hard-to-debug compile errors.
+
+Macro hygiene is about capturing intent correctly. A `defmacro` that takes `:my_option` and uses it directly might match an unrelated `:my_option` from the caller's scope. The idiomatic pattern is to use `unquote` for values that should be "from the outside" and keep AST nodes quoted for safety. The `quote` block's binding of `var!` and `binding!` provides escape valves for the rare case when shadowing is intentional.
+
+Compile-time validation unlocks errors that would otherwise surface at runtime. A macro can call functions to validate input, generate code conditionally, or fail the build with `IO.warn`. Schema libraries like `Ecto` and `Ash` use macros to define fields at compile time, so runtime queries are guaranteed type-safe. The cost is cognitive load: developers must reason about both the code as written and the code generated.
+
+---
+
+
+## Deep Dive: Metaprogramming Patterns and Production Implications
+
+Metaprogramming (macros, AST manipulation) requires testing at compile time and runtime. The challenge is that macro tests often involve parsing and expanding code, which couples tests to compiler internals. Production bugs in macros can corrupt entire modules; testing macros rigorously is non-negotiable.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -309,6 +369,25 @@ is the right tool. For "encode any value", use protocols.
 **8. When NOT to use optional callbacks.** If 90% of impls will provide the "optional"
 callback anyway, make it required and accept the minor compilation friction. If
 25% of implementations leave it out, optional is correct.
+
+---
+
+## Benchmark
+
+```elixir
+# :timer.tc / Benchee measurement sketch
+{time_us, _} = :timer.tc(fn -> :ok end)
+IO.puts("elapsed: #{time_us} us")
+```
+
+Target: one-time `function_exported?/3` check cached away; hot path identical to mandatory-callback behaviour.
+
+---
+
+## Reflection
+
+- If your behaviour has 8 optional callbacks, does the `function_exported?/3` dance still win over requiring stubs? Where is the break-even?
+- How would you enforce that a user overrides at least one of two mutually exclusive optional callbacks, without giving up compile-time checks entirely?
 
 ---
 

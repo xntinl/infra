@@ -185,6 +185,8 @@ That's where CRDTs end and domain logic begins.
 
 ### Step 1: Mix setup
 
+**Objective**: Create minimal Mix project so CRDT data types can be composed without external deps."""
+
 ```elixir
 defmodule SplitBrainDemo.MixProject do
   use Mix.Project
@@ -198,6 +200,8 @@ end
 ```
 
 ### Step 2: LWW register with hybrid logical clock
+
+**Objective**: Implement HLC-timestamped last-write-wins so concurrent partition updates converge to single value."""
 
 ```elixir
 defmodule SplitBrainDemo.LwwRegister do
@@ -286,6 +290,8 @@ end
 
 ### Step 3: G-Counter
 
+**Objective**: Implement grow-only counter with per-node slots so increments commute and merge is O(1) pointwise-max."""
+
 ```elixir
 defmodule SplitBrainDemo.GCounter do
   @moduledoc """
@@ -318,6 +324,8 @@ end
 ```
 
 ### Step 4: PN-Counter
+
+**Objective**: Implement inc/dec counter as pair of G-Counters so merge preserves both positive and negative increments."""
 
 ```elixir
 defmodule SplitBrainDemo.PNCounter do
@@ -352,6 +360,8 @@ end
 ```
 
 ### Step 5: Quorum counter
+
+**Objective**: Enforce majority-quorum writes so minority partition rejects increments until heal reconciles via epoch."""
 
 ```elixir
 defmodule SplitBrainDemo.QuorumCounter do
@@ -427,42 +437,46 @@ end
 
 ### Step 6: Tests
 
+**Objective**: Assert merge is commutative/associative so CRDTs are mathematically sound under arbitrary partition order."""
+
 ```elixir
 defmodule SplitBrainDemo.GCounterTest do
   use ExUnit.Case, async: true
 
   alias SplitBrainDemo.GCounter
 
-  test "merge is commutative" do
-    a = %GCounter{entries: %{:a@x => 3, :b@x => 5}}
-    b = %GCounter{entries: %{:a@x => 1, :b@x => 7, :c@x => 2}}
+  describe "SplitBrainDemo.GCounter" do
+    test "merge is commutative" do
+      a = %GCounter{entries: %{:a@x => 3, :b@x => 5}}
+      b = %GCounter{entries: %{:a@x => 1, :b@x => 7, :c@x => 2}}
 
-    assert GCounter.merge(a, b) == GCounter.merge(b, a)
-  end
+      assert GCounter.merge(a, b) == GCounter.merge(b, a)
+    end
 
-  test "merge is associative" do
-    a = %GCounter{entries: %{:a@x => 3}}
-    b = %GCounter{entries: %{:a@x => 5, :b@x => 2}}
-    c = %GCounter{entries: %{:b@x => 1, :c@x => 4}}
+    test "merge is associative" do
+      a = %GCounter{entries: %{:a@x => 3}}
+      b = %GCounter{entries: %{:a@x => 5, :b@x => 2}}
+      c = %GCounter{entries: %{:b@x => 1, :c@x => 4}}
 
-    left = GCounter.merge(GCounter.merge(a, b), c)
-    right = GCounter.merge(a, GCounter.merge(b, c))
-    assert left == right
-  end
+      left = GCounter.merge(GCounter.merge(a, b), c)
+      right = GCounter.merge(a, GCounter.merge(b, c))
+      assert left == right
+    end
 
-  test "merge is idempotent" do
-    a = %GCounter{entries: %{:a@x => 3, :b@x => 5}}
-    assert GCounter.merge(a, a) == a
-  end
+    test "merge is idempotent" do
+      a = %GCounter{entries: %{:a@x => 3, :b@x => 5}}
+      assert GCounter.merge(a, a) == a
+    end
 
-  test "concurrent increments both preserved after merge" do
-    # node a increments locally 3 times
-    a = GCounter.new() |> Map.put(:entries, %{:a@x => 3})
-    # node b increments locally 5 times
-    b = GCounter.new() |> Map.put(:entries, %{:b@x => 5})
+    test "concurrent increments both preserved after merge" do
+      # node a increments locally 3 times
+      a = GCounter.new() |> Map.put(:entries, %{:a@x => 3})
+      # node b increments locally 5 times
+      b = GCounter.new() |> Map.put(:entries, %{:b@x => 5})
 
-    merged = GCounter.merge(a, b)
-    assert GCounter.value(merged) == 8
+      merged = GCounter.merge(a, b)
+      assert GCounter.value(merged) == 8
+    end
   end
 end
 ```
@@ -473,32 +487,34 @@ defmodule SplitBrainDemo.LwwRegisterTest do
 
   alias SplitBrainDemo.LwwRegister
 
-  test "later clock wins on merge" do
-    a = LwwRegister.new(:a) |> LwwRegister.set("v1")
-    Process.sleep(5)
-    b = a |> LwwRegister.set("v2")
+  describe "SplitBrainDemo.LwwRegister" do
+    test "later clock wins on merge" do
+      a = LwwRegister.new(:a) |> LwwRegister.set("v1")
+      Process.sleep(5)
+      b = a |> LwwRegister.set("v2")
 
-    merged = LwwRegister.merge(a, b)
-    assert LwwRegister.value(merged) == "v2"
-  end
+      merged = LwwRegister.merge(a, b)
+      assert LwwRegister.value(merged) == "v2"
+    end
 
-  test "merge is commutative" do
-    a = LwwRegister.new() |> LwwRegister.set("a")
-    Process.sleep(2)
-    b = LwwRegister.new() |> LwwRegister.set("b")
+    test "merge is commutative" do
+      a = LwwRegister.new() |> LwwRegister.set("a")
+      Process.sleep(2)
+      b = LwwRegister.new() |> LwwRegister.set("b")
 
-    assert LwwRegister.merge(a, b).value == LwwRegister.merge(b, a).value
-  end
+      assert LwwRegister.merge(a, b).value == LwwRegister.merge(b, a).value
+    end
 
-  test "ties are broken by node name, not randomly" do
-    now = System.system_time(:millisecond)
+    test "ties are broken by node name, not randomly" do
+      now = System.system_time(:millisecond)
 
-    a = %LwwRegister{value: "one", clock: {now, 0, :"aaa@x"}}
-    b = %LwwRegister{value: "two", clock: {now, 0, :"bbb@x"}}
+      a = %LwwRegister{value: "one", clock: {now, 0, :"aaa@x"}}
+      b = %LwwRegister{value: "two", clock: {now, 0, :"bbb@x"}}
 
-    # :bbb@x > :aaa@x in term order
-    assert LwwRegister.merge(a, b).value == "two"
-    assert LwwRegister.merge(b, a).value == "two"
+      # :bbb@x > :aaa@x in term order
+      assert LwwRegister.merge(a, b).value == "two"
+      assert LwwRegister.merge(b, a).value == "two"
+    end
   end
 end
 ```
@@ -509,39 +525,41 @@ defmodule SplitBrainDemo.PartitionHealTest do
 
   alias SplitBrainDemo.{GCounter, LwwRegister, PNCounter}
 
-  test "PNCounter — concurrent updates on both sides converge" do
-    # Simulate: before split, counter is at 10
-    initial = PNCounter.new() |> PNCounter.inc(10)
+  describe "SplitBrainDemo.PartitionHeal" do
+    test "PNCounter — concurrent updates on both sides converge" do
+      # Simulate: before split, counter is at 10
+      initial = PNCounter.new() |> PNCounter.inc(10)
 
-    # Node A's copy receives 3 more increments during partition
-    side_a =
-      Enum.reduce(1..3, initial, fn _, acc ->
-        # Simulate node(), since we're on a single VM, we can't truly differentiate
-        # but the math still demonstrates convergence
-        PNCounter.inc(acc)
-      end)
+      # Node A's copy receives 3 more increments during partition
+      side_a =
+        Enum.reduce(1..3, initial, fn _, acc ->
+          # Simulate node(), since we're on a single VM, we can't truly differentiate
+          # but the math still demonstrates convergence
+          PNCounter.inc(acc)
+        end)
 
-    # Node B's copy receives 2 decrements during partition
-    side_b =
-      Enum.reduce(1..2, initial, fn _, acc -> PNCounter.dec(acc) end)
+      # Node B's copy receives 2 decrements during partition
+      side_b =
+        Enum.reduce(1..2, initial, fn _, acc -> PNCounter.dec(acc) end)
 
-    # Heal: merge both sides — order doesn't matter
-    merged1 = PNCounter.merge(side_a, side_b)
-    merged2 = PNCounter.merge(side_b, side_a)
-    assert PNCounter.value(merged1) == PNCounter.value(merged2)
-  end
+      # Heal: merge both sides — order doesn't matter
+      merged1 = PNCounter.merge(side_a, side_b)
+      merged2 = PNCounter.merge(side_b, side_a)
+      assert PNCounter.value(merged1) == PNCounter.value(merged2)
+    end
 
-  test "LWW — data loss on concurrent writes, documented behavior" do
-    a = LwwRegister.new("initial")
-    Process.sleep(2)
+    test "LWW — data loss on concurrent writes, documented behavior" do
+      a = LwwRegister.new("initial")
+      Process.sleep(2)
 
-    # simulate two sides of a partition writing concurrently
-    side_a = LwwRegister.set(a, "A-value")
-    side_b = LwwRegister.set(a, "B-value")
+      # simulate two sides of a partition writing concurrently
+      side_a = LwwRegister.set(a, "A-value")
+      side_b = LwwRegister.set(a, "B-value")
 
-    merged = LwwRegister.merge(side_a, side_b)
-    # one of them wins; the other's value is lost — this is LWW, not a bug
-    assert merged.value in ["A-value", "B-value"]
+      merged = LwwRegister.merge(side_a, side_b)
+      # one of them wins; the other's value is lost — this is LWW, not a bug
+      assert merged.value in ["A-value", "B-value"]
+    end
   end
 end
 ```
@@ -552,6 +570,24 @@ end
 ### Why this works
 
 The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
+
+## Deep Dive
+
+Distributed Erlang relies on a heartbeat mechanism (net_kernel tick) to detect node failure, but the network is fundamentally asynchronous—split-brain scenarios are inevitable. A partitioned cluster may have two sets of nodes, each believing the other is dead. Libraries like Horde and Phoenix.PubSub solve this with quorum-aware consensus, but they add latency and complexity. At scale, choose your consistency model explicitly: eventual consistency (via Redis PubSub) is faster but allows temporary divergence; strong consistency (via Horde DLM or distributed transactions) is slower but guarantees atomicity. For global registries, the order of operations matters—registering a process before its monitor is live creates race conditions. In multi-region setups, latency between nodes compounds these issues; consider regional clusters with a lightweight coordinator rather than a fully meshed topology.
+## Advanced Considerations
+
+Distributed Elixir systems require careful consideration of network partitions, consistent hashing for distributed state, and the interaction between clustering libraries and node discovery mechanisms. Network partitions are not rare edge cases; they happen regularly in cloud deployments due to maintenance windows and infrastructure issues. A system that works perfectly during local testing but fails under network partitions indicates insufficient failure handling throughout the codebase. Split-brain scenarios where multiple network partitions lead to different cluster views require explicit recovery mechanisms that are often business-specific and context-dependent.
+
+Horde and distributed registries provide eventual consistency guarantees, but "eventual" can mean minutes during network partitions. Applications must handle the case where the same name is registered on multiple nodes simultaneously without coordination. Consistent hashing for distributed services requires understanding rebalancing costs — a single node failure can cause significant key redistribution and thundering herd problems if not carefully managed. The cost of distributed consensus using algorithms like Raft is high; choose it only when consistency is more important than availability and can afford the performance cost.
+
+Global state replication across nodes creates synchronization challenges at scale. Choosing between replicating everywhere versus replicating to specific nodes affects both consistency latency and network bandwidth utilization fundamentally. Node monitoring and heartbeat mechanisms require careful timeout tuning — too aggressive and you get false positives during network hiccups; too conservative and you don't detect actual failures quickly enough for recovery. The EPMD (Erlang Port Mapper Daemon) is a critical component that can become a bottleneck in large clusters and requires careful capacity planning.
+
+
+## Deep Dive: Cluster Patterns and Production Implications
+
+Clustering distributes computation across nodes using Erlang's distribution protocol. Testing clusters requires simulating node failures, network partitions, and message delays—challenges that single-node tests don't expose. Production clusters fail in ways that cluster tests reveal: nodes can become isolated (stuck), messages can be reordered, and consensus is expensive.
+
+---
 
 ## Trade-offs and production gotchas
 
@@ -642,3 +678,13 @@ Expected: G-Counter merge at 100 entries is ~10-25 µs (pure map operations); LW
 - [`:delta_crdt` hex package](https://hex.pm/packages/delta_crdt) — production-ready delta-CRDT in Elixir
 - [Horde's CRDT usage](https://github.com/derekkraan/horde) — real-world case study
 - [Chris Keathley — "Distributed Elixir"](https://keathley.io/) — patterns blog
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

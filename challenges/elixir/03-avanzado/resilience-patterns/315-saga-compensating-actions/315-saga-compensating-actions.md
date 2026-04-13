@@ -69,6 +69,16 @@ If compensation itself fails, you have a *real* inconsistency. Log it, alert, an
 
 ### Dependencies (`mix.exs`)
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
+
 ```elixir
 defmodule BookingSaga.MixProject do
   use Mix.Project
@@ -78,6 +88,8 @@ end
 ```
 
 ### Step 1: Step struct (`lib/booking_saga/step.ex`)
+
+**Objective**: Encode forward action and its compensator in one struct so business rollback logic lives alongside forward logic without separate reverse tables.
 
 ```elixir
 defmodule BookingSaga.Step do
@@ -95,6 +107,8 @@ end
 ```
 
 ### Step 2: Saga executor (`lib/booking_saga/saga.ex`)
+
+**Objective**: Accumulate completed steps in LIFO stack so compensation runs in exact reverse order and failures are logged without distributed transaction overhead.
 
 ```elixir
 defmodule BookingSaga.Saga do
@@ -192,6 +206,8 @@ Use the second version — it is the real one we'll test.
 
 ### Step 3: Simulated services
 
+**Objective**: Inject success/failure outcomes via Process.put/get so test scenarios control booking results without external service mocks or network calls.
+
 ```elixir
 defmodule BookingSaga.Flight do
   def book(_state) do
@@ -237,6 +253,8 @@ end
 ```
 
 ### Step 4: Example saga construction
+
+**Objective**: Assemble booking saga as data structure so executor is reusable and saga logic is transparent without inheritance or mutable state.
 
 ```elixir
 defmodule BookingSaga.TripSaga do
@@ -355,6 +373,23 @@ IO.puts("avg: #{t / 10_000} µs")
 ```
 
 Expected: < 50µs per saga in-memory. Real-world sagas are dominated by network I/O, not orchestration cost.
+
+## Advanced Considerations: Circuit Breakers and Bulkheads in Production
+
+A circuit breaker monitors downstream service health and rejects new requests when failures exceed a threshold, failing fast instead of queuing indefinitely. States: `:closed` (normal), `:open` (fast-fail), `:half_open` (testing recovery). A timeout-based pattern monitors; once requests succeed again, the circuit closes. Half-open tests with a single request; if it succeeds, all requests resume.
+
+Bulkheads isolate resource pools so one slow endpoint doesn't starve others. A GenServer pool with a bounded queue (e.g., `:queue.len(state) >= 100`) can return `{:error, :overloaded}` immediately, preventing queue buildup. Combined with exponential backoff on the client (caller retries with increasing delays), this creates a natural circuit breaker behavior without explicit state.
+
+Graceful degradation means serving stale data or reduced functionality when a service is slow. A cached value with a 5-minute TTL is acceptable for many reads; serve it if the live source is timing out. Feature flags allow disabling expensive operations at runtime. Cascading timeout windows (outer service times out after 5s, inner calls must complete in 3s) prevent unbounded waiting. The cost is complexity: tracking degradation modes, testing failure scenarios, and ensuring data consistency under partial failures.
+
+---
+
+
+## Deep Dive: Resilience Patterns and Production Implications
+
+Resilience patterns (circuit breakers, timeouts, retries) are easy to implement but hard to test. The insight is that resilience patterns must be tested under failure: timeouts matter only when calls actually take time, retries matter only when transient failures occur. Production systems with untested resilience patterns often fail gracefully in test and catastrophically in production.
+
+---
 
 ## Trade-offs and production gotchas
 

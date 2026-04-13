@@ -1,8 +1,6 @@
 # Deferred Replies with `GenServer.reply/2`
 
 **Project**: `reply_async_gs` — decoupling the caller's reply from the callback that received it.
-**Difficulty**: ★★★★☆
-**Estimated time**: 3–5 hours
 
 ---
 
@@ -56,6 +54,16 @@ reply_async_gs/
 when it built the `call`. You can **store it, pass it across processes,
 send it in messages, and reply from anywhere** — as long as you only
 reply once.
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
 
 ```elixir
 def handle_call(:work, from, state) do
@@ -140,9 +148,25 @@ which is a no-op but leaves the partner work wasted.
 
 ---
 
+## Design decisions
+
+**Option A — do the slow I/O inside `handle_call` and reply synchronously**
+- Pros: simplest code; no bookkeeping.
+- Cons: serializes all callers behind the slowest request; mailbox grows linearly with concurrent load.
+
+**Option B — `{:noreply, state}` + `Task.Supervisor.async_nolink` + `GenServer.reply/2`** (chosen)
+- Pros: the server keeps processing other messages while the work runs; concurrency scales with the task supervisor.
+- Cons: you manage a pending-replies map; late replies after caller timeouts must be discarded; crashes in the task must not take down the server.
+
+→ Chose **B** because the cost of serial processing is exactly the wall-clock you eliminate, and the bookkeeping is localized.
+
+---
+
 ## Implementation
 
 ### Step 1: `mix.exs`
+
+**Objective**: Build stdlib-only so async-reply pattern shown strictly via GenServer.reply/2 and Task.Supervisor.
 
 ```elixir
 defmodule ReplyAsyncGs.MixProject do
@@ -153,6 +177,8 @@ end
 ```
 
 ### Step 2: `lib/reply_async_gs/application.ex`
+
+**Objective**: Wire Task.Supervisor alongside broker so in-flight partner calls survive broker restart cleanly.
 
 ```elixir
 defmodule ReplyAsyncGs.Application do
@@ -172,6 +198,8 @@ end
 ```
 
 ### Step 3: `lib/reply_async_gs/fake_partner.ex`
+
+**Objective**: Stub slow partner SSO with deterministic sleep and branchable tokens, concurrency wins measured without flake.
 
 ```elixir
 defmodule ReplyAsyncGs.FakePartner do
@@ -193,6 +221,8 @@ end
 ```
 
 ### Step 4: `lib/reply_async_gs/auth_broker.ex`
+
+**Objective**: Return {:noreply, state} stashing from by task ref so partner latency overlaps across callers, no serialization.
 
 ```elixir
 defmodule ReplyAsyncGs.AuthBroker do
@@ -279,6 +309,8 @@ end
 
 ### Step 5: `test/reply_async_gs/auth_broker_test.exs`
 
+**Objective**: Prove concurrent calls complete in parallel, crashed partner task surfaces error not hang.
+
 ```elixir
 defmodule ReplyAsyncGs.AuthBrokerTest do
   use ExUnit.Case, async: false
@@ -291,58 +323,77 @@ defmodule ReplyAsyncGs.AuthBrokerTest do
     %{pid: pid}
   end
 
-  test "successful authentication replies with user_id", %{pid: pid} do
-    assert {:ok, %{user_id: _}} = AuthBroker.authenticate(pid, "good_token")
-  end
+  describe "ReplyAsyncGs.AuthBroker" do
+    test "successful authentication replies with user_id", %{pid: pid} do
+      assert {:ok, %{user_id: _}} = AuthBroker.authenticate(pid, "good_token")
+    end
 
-  test "server stays responsive to new calls while one is in flight", %{pid: pid} do
-    # Start a slow call in another process; it will wait ~50 ms.
-    parent = self()
-    spawn_link(fn ->
-      send(parent, {:slow_result, AuthBroker.authenticate(pid, "slow_token")})
-    end)
-
-    # The server should accept new work immediately — not be blocked.
-    {us, {:ok, _}} =
-      :timer.tc(fn -> AuthBroker.authenticate(pid, "fast_token") end)
-
-    # Both calls took ~50 ms in parallel; this one must not be ~100 ms.
-    assert us < 90_000
-
-    assert_receive {:slow_result, {:ok, _}}, 500
-  end
-
-  test "partner error is forwarded to caller", %{pid: pid} do
-    assert {:error, :unauthorized} = AuthBroker.authenticate(pid, "bad_token")
-  end
-
-  test "partner crash surfaces as :task_crash", %{pid: pid} do
-    assert {:error, {:task_crash, _}} = AuthBroker.authenticate(pid, "boom")
-  end
-
-  test "caller timeout does not leave server in a bad state", %{pid: pid} do
-    # Partner always takes 50 ms here; ask for timeout = 10 ms so the caller exits.
-    caller_pid = self()
-
-    task =
-      Task.async(fn ->
-        try do
-          AuthBroker.authenticate(pid, "will_timeout", 10)
-          send(caller_pid, :unexpected_success)
-        catch
-          :exit, {:timeout, _} -> send(caller_pid, :caller_timed_out)
-        end
+    test "server stays responsive to new calls while one is in flight", %{pid: pid} do
+      # Start a slow call in another process; it will wait ~50 ms.
+      parent = self()
+      spawn_link(fn ->
+        send(parent, {:slow_result, AuthBroker.authenticate(pid, "slow_token")})
       end)
 
-    assert_receive :caller_timed_out, 200
+      # The server should accept new work immediately — not be blocked.
+      {us, {:ok, _}} =
+        :timer.tc(fn -> AuthBroker.authenticate(pid, "fast_token") end)
 
-    # Give the task a moment to finish; server should still work.
-    Process.sleep(80)
-    assert {:ok, _} = AuthBroker.authenticate(pid, "subsequent")
-    Task.await(task, 500)
+      # Both calls took ~50 ms in parallel; this one must not be ~100 ms.
+      assert us < 90_000
+
+      assert_receive {:slow_result, {:ok, _}}, 500
+    end
+
+    test "partner error is forwarded to caller", %{pid: pid} do
+      assert {:error, :unauthorized} = AuthBroker.authenticate(pid, "bad_token")
+    end
+
+    test "partner crash surfaces as :task_crash", %{pid: pid} do
+      assert {:error, {:task_crash, _}} = AuthBroker.authenticate(pid, "boom")
+    end
+
+    test "caller timeout does not leave server in a bad state", %{pid: pid} do
+      # Partner always takes 50 ms here; ask for timeout = 10 ms so the caller exits.
+      caller_pid = self()
+
+      task =
+        Task.async(fn ->
+          try do
+            AuthBroker.authenticate(pid, "will_timeout", 10)
+            send(caller_pid, :unexpected_success)
+          catch
+            :exit, {:timeout, _} -> send(caller_pid, :caller_timed_out)
+          end
+        end)
+
+      assert_receive :caller_timed_out, 200
+
+      # Give the task a moment to finish; server should still work.
+      Process.sleep(80)
+      assert {:ok, _} = AuthBroker.authenticate(pid, "subsequent")
+      Task.await(task, 500)
+    end
   end
 end
 ```
+
+---
+
+## Advanced Considerations: Supervision and Hot Code Upgrade Patterns
+
+The OTP supervision tree is the backbone of Elixir's fault tolerance. A DynamicSupervisor can spawn workers on demand and track them, but if a worker crashes before it's supervised, messages to it drop silently. Equally, a `:temporary` worker that crashes is restarted zero times — useful for one-off tasks, but requires the caller to handle crashes. `:transient` restarts on non-normal exits; `:permanent` always restarts.
+
+`handle_continue` callbacks and `:hibernate` reduce memory overhead in long-lived processes. After initializing, a GenServer can return `{:noreply, state, {:continue, :do_work}}` to defer expensive work past the `init/1` call, keeping the supervisor's synchronous startup fast. Hibernation moves a process's heap to disk, freeing RAM at the cost of latency when the process receives its next message.
+
+Hot code upgrades via `sys:replace_state/2` or `:sys.replace_state/3` allow changing code without restarting the VM, but only if state structure is forward- and backward-compatible. In practice, code changes that alter state shape (adding or removing fields) require a migration function. The `:code.purge/1` and `:code.load_file/1` cycle reloads the module, but old pids still run old code until they return to the scheduler. Design for graceful degradation: code that cannot upgrade hot should acknowledge that in docs and operational runbooks.
+
+---
+
+
+## Deep Dive: Async Patterns and Production Implications
+
+Async tests parallelize at the process level, with each test running in its own process mailbox. The consequence is that shared mutable state (Mox registry, ETS tables, Application.put_env) becomes a race condition if tests modify it concurrently. The solution is process-isolated state: Mox's private mode, Ecto.Sandbox, and tags like `@tag :global`. The discipline required to write correct async tests surfaces hidden race conditions in the system under test.
 
 ---
 
@@ -394,9 +445,13 @@ bound calls (HTTP, DB, filesystem) where serial processing is the
 enemy. For CPU-bound parallelism, launch a pool of GenServers or use
 `Flow`/`GenStage` instead.
 
+### Why this works
+
+The `from` tuple is a plain value — nothing in OTP requires the reply to come from the same callback invocation that received the call. By returning `{:noreply, state}` and storing `from`, the server tells the caller "I'll respond later" and frees its mailbox immediately. `async_nolink` ensures the task's crash does not propagate into the server, and the pending-replies map is how the server correlates each async completion back to the right waiter.
+
 ---
 
-## Performance notes
+## Benchmark
 
 Compare throughput of synchronous vs deferred-reply under a stub partner
 with 50 ms latency:
@@ -418,6 +473,15 @@ On an M2 laptop:
 
 The ~70× improvement is approximately the product of concurrency and
 partner latency divided by server CPU overhead per call.
+
+Target: throughput under N concurrent I/O-bound callers ≈ N × synchronous throughput up to the Task.Supervisor concurrency cap.
+
+---
+
+## Reflection
+
+1. Your pending-replies map grows unbounded when callers disconnect silently. Do you prune on caller monitor `:DOWN`, on a periodic sweep, or on reply arrival? Which strategy survives a 10× caller churn best?
+2. The partner you call sometimes returns a response after the caller's timeout has elapsed. Should the server discard the late reply, log it, or retry a downstream compensating action? Justify in terms of idempotency.
 
 ---
 

@@ -179,6 +179,8 @@ will not help you.
 
 ### Step 1: Project skeleton
 
+**Objective**: Scaffold supervised app to tune :net_kernel heartbeats and measure ticktime impact on failure detection."""
+
 ```elixir
 defmodule NetKernelTuning.MixProject do
   use Mix.Project
@@ -201,6 +203,8 @@ end
 ```
 
 ### Step 2: Runtime config — setting ticktime correctly
+
+**Objective**: Set kernel.net_ticktime per topology (LAN vs WAN) so failure detection tuning survives rolling deploy."""
 
 ```elixir
 # config/runtime.exs
@@ -228,6 +232,8 @@ before any peer connection is attempted. `runtime.exs` runs late.
 ```
 
 ### Step 3: Partition reporter
+
+**Objective**: Trap :net_kernel.monitor_nodes events and log with net_ticktime context to distinguish false positives."""
 
 ```elixir
 defmodule NetKernelTuning.PartitionReporter do
@@ -274,6 +280,8 @@ end
 ```
 
 ### Step 4: Latency probe
+
+**Objective**: Measure :erpc RTT to peers periodically so WAN degradation is detected before :net_kernel splits."""
 
 ```elixir
 defmodule NetKernelTuning.LatencyProbe do
@@ -346,6 +354,8 @@ end
 
 ### Step 5: Application-layer heartbeat
 
+**Objective**: Poll peer run_queue via :erpc to catch scheduler stalls that :net_kernel heartbeat misses."""
+
 ```elixir
 defmodule NetKernelTuning.Heartbeat do
   @moduledoc """
@@ -414,6 +424,8 @@ end
 
 ### Step 6: Supervisor wiring
 
+**Objective**: Start PartitionReporter before probes so node membership events are captured with RTT history."""
+
 ```elixir
 defmodule NetKernelTuning.Application do
   @moduledoc false
@@ -435,6 +447,8 @@ end
 
 ### Step 7: Tests
 
+**Objective**: Assert LatencyProbe and Heartbeat handle bogus nodes fast without waiting for net_ticktime expiry."""
+
 ```elixir
 defmodule NetKernelTuning.HeartbeatTest do
   use ExUnit.Case, async: false
@@ -451,23 +465,25 @@ defmodule NetKernelTuning.HeartbeatTest do
     %{peer: peer, node: node}
   end
 
-  test "probe succeeds against a healthy peer", %{node: node} do
-    assert {:ok, rtt_ms} = NetKernelTuning.LatencyProbe.probe(node, 1_000)
-    assert rtt_ms >= 0
-    assert rtt_ms < 500
-  end
+  describe "NetKernelTuning.Heartbeat" do
+    test "probe succeeds against a healthy peer", %{node: node} do
+      assert {:ok, rtt_ms} = NetKernelTuning.LatencyProbe.probe(node, 1_000)
+      assert rtt_ms >= 0
+      assert rtt_ms < 500
+    end
 
-  test "probe fails fast against a bogus node" do
-    t0 = System.monotonic_time(:millisecond)
-    assert {:error, _} = NetKernelTuning.LatencyProbe.probe(:"nonexistent@127.0.0.1", 200)
-    elapsed = System.monotonic_time(:millisecond) - t0
-    assert elapsed < 800
-  end
+    test "probe fails fast against a bogus node" do
+      t0 = System.monotonic_time(:millisecond)
+      assert {:error, _} = NetKernelTuning.LatencyProbe.probe(:"nonexistent@127.0.0.1", 200)
+      elapsed = System.monotonic_time(:millisecond) - t0
+      assert elapsed < 800
+    end
 
-  test "get_net_ticktime returns the configured value" do
-    # OTP rounds to the nearest valid value; just assert it's a positive integer.
-    assert is_integer(:net_kernel.get_net_ticktime())
-    assert :net_kernel.get_net_ticktime() > 0
+    test "get_net_ticktime returns the configured value" do
+      # OTP rounds to the nearest valid value; just assert it's a positive integer.
+      assert is_integer(:net_kernel.get_net_ticktime())
+      assert :net_kernel.get_net_ticktime() > 0
+    end
   end
 end
 ```
@@ -484,21 +500,23 @@ defmodule NetKernelTuning.PartitionReporterTest do
     :ok
   end
 
-  test "logs nodeup when peer connects" do
-    log =
-      capture_log(fn ->
-        {:ok, peer, _node} =
-          :peer.start_link(%{name: :flap, host: ~c"127.0.0.1", longnames: true})
+  describe "NetKernelTuning.PartitionReporter" do
+    test "logs nodeup when peer connects" do
+      log =
+        capture_log(fn ->
+          {:ok, peer, _node} =
+            :peer.start_link(%{name: :flap, host: ~c"127.0.0.1", longnames: true})
 
-        # let the nodeup message propagate
-        Process.sleep(200)
-        :peer.stop(peer)
-        Process.sleep(200)
-      end)
+          # let the nodeup message propagate
+          Process.sleep(200)
+          :peer.stop(peer)
+          Process.sleep(200)
+        end)
 
-    assert log =~ "nodeup"
-    assert log =~ "nodedown"
-    assert log =~ "ticktime="
+      assert log =~ "nodeup"
+      assert log =~ "nodedown"
+      assert log =~ "ticktime="
+    end
   end
 end
 ```
@@ -521,6 +539,24 @@ IO.puts("avg: #{time_us / 10_000} µs/op")
 ```
 
 Target: operation should complete in the low-microsecond range on modern hardware; deviations by >2× indicate a regression worth investigating.
+
+## Deep Dive
+
+Distributed Erlang relies on a heartbeat mechanism (net_kernel tick) to detect node failure, but the network is fundamentally asynchronous—split-brain scenarios are inevitable. A partitioned cluster may have two sets of nodes, each believing the other is dead. Libraries like Horde and Phoenix.PubSub solve this with quorum-aware consensus, but they add latency and complexity. At scale, choose your consistency model explicitly: eventual consistency (via Redis PubSub) is faster but allows temporary divergence; strong consistency (via Horde DLM or distributed transactions) is slower but guarantees atomicity. For global registries, the order of operations matters—registering a process before its monitor is live creates race conditions. In multi-region setups, latency between nodes compounds these issues; consider regional clusters with a lightweight coordinator rather than a fully meshed topology.
+## Advanced Considerations
+
+Distributed Elixir systems require careful consideration of network partitions, consistent hashing for distributed state, and the interaction between clustering libraries and node discovery mechanisms. Network partitions are not rare edge cases; they happen regularly in cloud deployments due to maintenance windows and infrastructure issues. A system that works perfectly during local testing but fails under network partitions indicates insufficient failure handling throughout the codebase. Split-brain scenarios where multiple network partitions lead to different cluster views require explicit recovery mechanisms that are often business-specific and context-dependent.
+
+Horde and distributed registries provide eventual consistency guarantees, but "eventual" can mean minutes during network partitions. Applications must handle the case where the same name is registered on multiple nodes simultaneously without coordination. Consistent hashing for distributed services requires understanding rebalancing costs — a single node failure can cause significant key redistribution and thundering herd problems if not carefully managed. The cost of distributed consensus using algorithms like Raft is high; choose it only when consistency is more important than availability and can afford the performance cost.
+
+Global state replication across nodes creates synchronization challenges at scale. Choosing between replicating everywhere versus replicating to specific nodes affects both consistency latency and network bandwidth utilization fundamentally. Node monitoring and heartbeat mechanisms require careful timeout tuning — too aggressive and you get false positives during network hiccups; too conservative and you don't detect actual failures quickly enough for recovery. The EPMD (Erlang Port Mapper Daemon) is a critical component that can become a bottleneck in large clusters and requires careful capacity planning.
+
+
+## Deep Dive: Cluster Patterns and Production Implications
+
+Clustering distributes computation across nodes using Erlang's distribution protocol. Testing clusters requires simulating node failures, network partitions, and message delays—challenges that single-node tests don't expose. Production clusters fail in ways that cluster tests reveal: nodes can become isolated (stuck), messages can be reordered, and consensus is expensive.
+
+---
 
 ## Trade-offs and production gotchas
 
@@ -595,3 +631,13 @@ increasing significantly, the change is a win.
 - [Dashbit — "When the BEAM disconnects"](https://dashbit.co/blog) — real-world partition war stories
 - [Discord engineering — "Scaling Elixir"](https://discord.com/blog/how-discord-scaled-elixir-to-5-000-000-concurrent-users) — distribution tuning at scale
 - [`:peer` docs](https://www.erlang.org/doc/man/peer.html) — lab tool for the tests
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

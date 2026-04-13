@@ -8,7 +8,7 @@
 
 You are joining a fintech that maintains a core banking ledger. The incumbent system is a CRUD Postgres database with a trigger-based audit log — auditors complain it is unreliable and business wants temporal queries ("show me the balance as of 2024-12-31 23:59"). The team decided to rewrite the ledger using CQRS + event sourcing with [Commanded](https://github.com/commanded/commanded), the de-facto Elixir library for this pattern.
 
-Your task is the **write side**: the aggregate that enforces the invariants of a bank account. Projections and read models come in exercise 66. This exercise focuses on the three pillars of the command side: the aggregate module, commands (validated intent), and events (immutable facts). You will learn how Commanded dispatches commands, how aggregate state is rebuilt from events, and why invariants belong in the aggregate — not in the database.
+Your task is the **write side**: the aggregate that enforces the invariants of a bank account. Projections and read models are covered separately. This exercise focuses on the three pillars of the command side: the aggregate module, commands (validated intent), and events (immutable facts). You will learn how Commanded dispatches commands, how aggregate state is rebuilt from events, and why invariants belong in the aggregate — not in the database.
 
 The business rules, distilled after three workshops with the treasury team:
 
@@ -121,6 +121,8 @@ Choose your aggregate boundary carefully: too big (`Bank`) and every command ser
 
 ### Step 1: `mix.exs`
 
+**Objective**: Pin `{:commanded, "~> 1.4"}` — the library dictates aggregate, router, and dispatcher contracts; version lock avoids silent wire-format drift.
+
 ```elixir
 defmodule CommandedAggregates.MixProject do
   use Mix.Project
@@ -148,6 +150,8 @@ end
 ```
 
 ### Step 2: Commands — plain structs with enforced keys
+
+**Objective**: Model commands as imperative intents with `@enforce_keys` — missing fields fail at construction, not mid-dispatch.
 
 ```elixir
 # lib/commanded_aggregates/commands/open_account.ex
@@ -183,6 +187,8 @@ end
 
 ### Step 3: Events — past-tense facts
 
+**Objective**: Encode events as JSON-serializable past-tense facts — once written, they are immutable history the aggregate folds over on replay.
+
 ```elixir
 # lib/commanded_aggregates/events/account_opened.ex
 defmodule CommandedAggregates.Events.AccountOpened do
@@ -210,6 +216,8 @@ end
 ```
 
 ### Step 4: The aggregate — `lib/commanded_aggregates/account.ex`
+
+**Objective**: Keep `execute/2` side-effect-free and `apply/2` total — replay must never raise, otherwise stream rehydration becomes unrecoverable.
 
 ```elixir
 defmodule CommandedAggregates.Account do
@@ -324,6 +332,8 @@ end
 
 ### Step 5: Lifespan and router — `lib/commanded_aggregates/router.ex`
 
+**Objective**: Bound aggregate memory via lifespan hooks and route commands by `account_id` — idle aggregates hibernate, errors force shutdown.
+
 ```elixir
 defmodule CommandedAggregates.Account.Lifespan do
   @behaviour Commanded.Aggregates.AggregateLifespan
@@ -353,6 +363,8 @@ end
 
 ### Step 6: Application — `lib/commanded_aggregates/application.ex`
 
+**Objective**: Configure the `Commanded.Application` with the in-memory event store adapter — good for tests, swap to EventStore or Postgres for production.
+
 ```elixir
 defmodule CommandedAggregates.App do
   use Commanded.Application,
@@ -377,6 +389,8 @@ end
 ```
 
 ### Step 7: Tests — `test/commanded_aggregates/account_test.exs`
+
+**Objective**: Drive the aggregate via `App.dispatch/1` — this validates the full command→event path through the router, not just `execute/2` in isolation.
 
 ```elixir
 defmodule CommandedAggregates.AccountTest do
@@ -457,6 +471,8 @@ end
 
 ### Step 8: Run
 
+**Objective**: Run `mix test` — green suite proves that command validation, event folding, and aggregate lifecycle all compose through Commanded.
+
 ```bash
 mix deps.get
 mix test
@@ -468,6 +484,14 @@ mix test
 ### Why this works
 
 The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
+
+
+## Key Concepts: Event Sourcing and Command/Aggregate Patterns
+
+Commanded is a framework for event sourcing. Instead of storing current state (like `%User{name: "Alice", age: 30}`), you store events: `[UserCreated{id: 1}, NameChanged{id: 1, new_name: "Bob"}]`. Aggregates are entities that handle commands and produce events. Example: `UserAggregate.execute(cmd: ChangeNameCommand)` produces `NameChangedEvent`.
+
+The benefit: full audit trail (you see every change), time-travel debugging (replay events to any point), and temporal queries ("who had this email in 2020?"). The cost: higher complexity, eventual consistency for read models, and larger storage. Commanded provides the boilerplate: you write aggregate logic, it handles event storage, projection, and replay. Good fit for finance, compliance, and audit-heavy domains.
+
 
 ## Benchmark
 
@@ -481,6 +505,21 @@ IO.puts("avg: #{time_us / 10_000} µs/op")
 
 Target: operation should complete in the low-microsecond range on modern hardware; deviations by >2× indicate a regression worth investigating.
 
+## Deep Dive: Domain Patterns and Production Implications
+
+Domain-specific frameworks enforce module dependencies and architectural boundaries. Testing domain isolation ensures that constraints are maintained as the codebase grows. Production systems without boundary enforcement often become monolithic and hard to test.
+
+---
+
+## Advanced Considerations
+
+Framework choices like Ash, Commanded, and Nerves create significant architectural constraints that are difficult to change later. Ash's powerful query builder and declarative approach simplify common patterns but can be opaque when debugging complex permission logic or custom filters at scale. Event sourcing with Commanded is powerful for audit trails but creates a different mental model for state management — replaying events to derive current state has CPU and latency costs that aren't apparent in traditional CRUD systems.
+
+Nerves requires understanding the full embedded system stack — from bootloader configuration to over-the-air update mechanisms. A Nerves system that works on your development board may fail in production due to hardware variations, network conditions, or power supply issues. NX's numerical computing is powerful but requires understanding GPU acceleration trade-offs and memory management for large datasets. Livebook provides interactive development but shouldn't be used for production deployments without careful containerization and resource isolation.
+
+The integration between these frameworks and traditional BEAM patterns (supervisors, processes, GenServers) requires careful design. A Commanded projection that rebuilds state from the event log can consume all available CPU, starving other services. NX autograd computations can create unexpected memory usage if not carefully managed. Nerves systems are memory-constrained; performance assumptions from desktop Elixir don't hold. Always prototype these frameworks in realistic environments before committing to them in production systems to validate assumptions.
+
+
 ## Trade-offs and production gotchas
 
 **1. `apply/2` must be total and deterministic**
@@ -490,7 +529,7 @@ A raising `apply/2` poisons the stream — every subsequent replay crashes. If y
 Structural validation (required fields, positive amounts, string lengths) should happen BEFORE dispatch — use Ecto.Changeset in a command factory. The aggregate enforces invariants that require state (balance, status). Pushing structural checks into the aggregate wastes replay cost.
 
 **3. Aggregate size matters**
-Long-lived aggregates accumulate thousands of events. A `GlobalLedger` aggregate with a million events takes seconds to rehydrate. Split by natural boundary (per-account) and introduce snapshotting (exercise 266) once streams exceed ~1000 events.
+Long-lived aggregates accumulate thousands of events. A `GlobalLedger` aggregate with a million events takes seconds to rehydrate. Split by natural boundary (per-account) and introduce snapshotting once streams exceed ~1000 events.
 
 **4. Event schema evolution**
 Events live forever in the event store. Renaming a field or deleting an event type breaks replay for historical data. Use **upcasting** (translating old events to new schemas at load time) instead of altering stored events. Plan this before shipping.
@@ -499,7 +538,7 @@ Events live forever in the event store. Renaming a field or deleting an event ty
 Timestamps belong on the event, captured in `execute/2`. Replaying events years later must produce the exact same state — reading `DateTime.utc_now()` in `apply/2` makes state non-deterministic.
 
 **6. The aggregate is NOT a query model**
-Never expose aggregate state to controllers. Projections (exercise 66) build optimized read models. Querying the aggregate forces a rehydration and serializes with writes.
+Never expose aggregate state to controllers. Projections build optimized read models. Querying the aggregate forces a rehydration and serializes with writes.
 
 **7. Lifespan eviction trade-off**
 Too short: every command pays the rehydration cost. Too long: memory pressure with many accounts. `:timer.minutes(5)` is a reasonable default; tune by measuring `Commanded.Aggregates.Aggregate` process count and average recovery time.
@@ -544,3 +583,13 @@ On modern hardware with the in-memory adapter expect ~5–10k deposits/sec on a 
 - [Greg Young — "CQRS Documents"](https://cqrs.files.wordpress.com/2010/11/cqrs_documents.pdf) — foundational paper
 - [Martin Fowler — "Event Sourcing"](https://martinfowler.com/eaaDev/EventSourcing.html) — pattern overview
 - [Versioning in an Event Sourced System — Greg Young](https://leanpub.com/esversioning/read) — schema evolution deep-dive
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

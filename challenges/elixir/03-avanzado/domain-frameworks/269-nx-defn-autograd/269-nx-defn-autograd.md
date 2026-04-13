@@ -133,6 +133,8 @@ Never reuse a key — each `split` or `normal` consumes entropy. Shadowing `key`
 
 ### Step 1: `mix.exs`
 
+**Objective**: Pin `nx` and `exla` — EXLA is the JIT compiler that turns `defn` into fused kernels; without it autograd is pure-Elixir slow.
+
 ```elixir
 defmodule NxAutograd.MixProject do
   use Mix.Project
@@ -155,6 +157,8 @@ end
 
 ### Step 2: `config/config.exs`
 
+**Objective**: Wire EXLA as the default backend and `defn` compiler — one config switch moves every tensor op onto GPU/XLA without touching call sites.
+
 ```elixir
 import Config
 config :nx, default_backend: EXLA.Backend
@@ -162,6 +166,8 @@ config :nx, :default_defn_options, compiler: EXLA
 ```
 
 ### Step 3: `lib/nx_autograd/linear_regression.ex`
+
+**Objective**: Contrast the normal equation against gradient descent — closed-form validates the autodiff path on a convex loss where both must agree.
 
 ```elixir
 defmodule NxAutograd.LinearRegression do
@@ -228,6 +234,8 @@ end
 
 ### Step 4: `lib/nx_autograd/logistic_regression.ex`
 
+**Objective**: Use BCE-with-logits instead of sigmoid+BCE — the fused form is numerically stable at saturated logits where the naive version loses precision.
+
 ```elixir
 defmodule NxAutograd.LogisticRegression do
   @moduledoc "Binary classification with numerically-stable BCE-with-logits loss."
@@ -274,6 +282,8 @@ end
 ```
 
 ### Step 5: `lib/nx_autograd/mlp.ex`
+
+**Objective**: Stack ReLU + log-softmax in `defn` — `Nx.Defn.grad` walks the composition automatically, so backprop needs no hand-rolled chain rule.
 
 ```elixir
 defmodule NxAutograd.MLP do
@@ -335,6 +345,8 @@ end
 
 ### Step 6: `lib/nx_autograd/optim.ex`
 
+**Objective**: Write SGD, momentum, and Adam as `defn` over parameter trees — one shape contract lets the same optimizer drive linreg, logreg, and the MLP.
+
 ```elixir
 defmodule NxAutograd.Optim do
   @moduledoc """
@@ -394,32 +406,36 @@ Note on `adam_update`: the clean version uses a single `deep_reduce` that walks 
 
 ### Step 7: Tests
 
+**Objective**: Assert that gradient-descent converges to the closed-form solution — any divergence points to a broken `defn` or an unstable loss.
+
 ```elixir
 # test/nx_autograd/linear_regression_test.exs
 defmodule NxAutograd.LinearRegressionTest do
   use ExUnit.Case, async: true
   alias NxAutograd.LinearRegression
 
-  test "recovers a linear relationship" do
-    # y = 2x + 1 plus tiny noise
-    x = Nx.iota({100, 1}) |> Nx.divide(10.0)
-    y = Nx.add(Nx.multiply(x, 2.0), 1.0)
+  describe "NxAutograd.LinearRegression" do
+    test "recovers a linear relationship" do
+      # y = 2x + 1 plus tiny noise
+      x = Nx.iota({100, 1}) |> Nx.divide(10.0)
+      y = Nx.add(Nx.multiply(x, 2.0), 1.0)
 
-    params = LinearRegression.train(x, y, epochs: 300, lr: 0.05)
+      params = LinearRegression.train(x, y, epochs: 300, lr: 0.05)
 
-    assert_in_delta Nx.to_number(params.w[[0, 0]]), 2.0, 0.05
-    assert_in_delta Nx.to_number(params.b), 1.0, 0.1
-  end
+      assert_in_delta Nx.to_number(params.w[[0, 0]]), 2.0, 0.05
+      assert_in_delta Nx.to_number(params.b), 1.0, 0.1
+    end
 
-  test "gradient has same shape as parameters" do
-    x = Nx.iota({10, 3}) |> Nx.as_type(:f32)
-    y = Nx.broadcast(1.0, {10, 1})
-    params = %{w: Nx.broadcast(0.0, {3, 1}), b: Nx.tensor(0.0)}
+    test "gradient has same shape as parameters" do
+      x = Nx.iota({10, 3}) |> Nx.as_type(:f32)
+      y = Nx.broadcast(1.0, {10, 1})
+      params = %{w: Nx.broadcast(0.0, {3, 1}), b: Nx.tensor(0.0)}
 
-    {_loss, grads} = Nx.Defn.value_and_grad(params, &LinearRegression.mse(&1, x, y))
+      {_loss, grads} = Nx.Defn.value_and_grad(params, &LinearRegression.mse(&1, x, y))
 
-    assert Nx.shape(grads.w) == {3, 1}
-    assert Nx.shape(grads.b) == {}
+      assert Nx.shape(grads.w) == {3, 1}
+      assert Nx.shape(grads.b) == {}
+    end
   end
 end
 ```
@@ -430,34 +446,38 @@ defmodule NxAutograd.LogisticRegressionTest do
   use ExUnit.Case, async: true
   alias NxAutograd.LogisticRegression
 
-  test "separates linearly separable data" do
-    key = Nx.Random.key(7)
-    {x_pos, key} = Nx.Random.normal(key, 2.0, 0.5, shape: {50, 2})
-    {x_neg, _}   = Nx.Random.normal(key, -2.0, 0.5, shape: {50, 2})
+  describe "NxAutograd.LogisticRegression" do
+    test "separates linearly separable data" do
+      key = Nx.Random.key(7)
+      {x_pos, key} = Nx.Random.normal(key, 2.0, 0.5, shape: {50, 2})
+      {x_neg, _}   = Nx.Random.normal(key, -2.0, 0.5, shape: {50, 2})
 
-    x = Nx.concatenate([x_pos, x_neg], axis: 0)
-    y = Nx.concatenate([Nx.broadcast(1.0, {50, 1}), Nx.broadcast(0.0, {50, 1})], axis: 0)
+      x = Nx.concatenate([x_pos, x_neg], axis: 0)
+      y = Nx.concatenate([Nx.broadcast(1.0, {50, 1}), Nx.broadcast(0.0, {50, 1})], axis: 0)
 
-    params = LogisticRegression.train(x, y, epochs: 500, lr: 0.1)
-    preds = params |> LogisticRegression.predict_proba(x) |> Nx.greater(0.5)
-    acc = preds |> Nx.equal(y) |> Nx.mean() |> Nx.to_number()
+      params = LogisticRegression.train(x, y, epochs: 500, lr: 0.1)
+      preds = params |> LogisticRegression.predict_proba(x) |> Nx.greater(0.5)
+      acc = preds |> Nx.equal(y) |> Nx.mean() |> Nx.to_number()
 
-    assert acc > 0.98
-  end
+      assert acc > 0.98
+    end
 
-  test "BCE-with-logits does not produce NaN for large logits" do
-    params = %{w: Nx.broadcast(100.0, {1, 1}), b: Nx.tensor(0.0)}
-    x = Nx.tensor([[1.0]])
-    y = Nx.tensor([[1.0]])
+    test "BCE-with-logits does not produce NaN for large logits" do
+      params = %{w: Nx.broadcast(100.0, {1, 1}), b: Nx.tensor(0.0)}
+      x = Nx.tensor([[1.0]])
+      y = Nx.tensor([[1.0]])
 
-    loss = LogisticRegression.bce_with_logits(params, x, y) |> Nx.to_number()
-    refute is_float(loss) and loss != loss   # NaN check: NaN != NaN
-    assert is_float(loss)
+      loss = LogisticRegression.bce_with_logits(params, x, y) |> Nx.to_number()
+      refute is_float(loss) and loss != loss   # NaN check: NaN != NaN
+      assert is_float(loss)
+    end
   end
 end
 ```
 
 ### Step 8: Benchmark
+
+**Objective**: Benchmark `grad` on a 1k×20 problem under EXLA — the JIT cost amortizes after the first call, and the measurement proves it.
 
 ```elixir
 # bench/grad_bench.exs
@@ -501,6 +521,24 @@ IO.puts("avg: #{time_us / 10_000} µs/op")
 ```
 
 Target: operation should complete in the low-microsecond range on modern hardware; deviations by >2× indicate a regression worth investigating.
+
+## Deep Dive
+
+Specialized frameworks like Ash (business logic), Commanded (event sourcing), and Nx (numerical computing) abstract away common infrastructure but impose architectural constraints. Ash's declarative resource definitions simplify authorization and querying at the cost of reduced flexibility—deeply nested association policies can degrade query performance. Commanded's event store and aggregate roots enforce event sourcing discipline, making audit trails and temporal queries natural, but require careful snapshot strategy to avoid replaying years of events. Nx brings numerical computing to Elixir, but JIT compilation and lazy evaluation introduce latency; production models benefit from ahead-of-time compilation for inference. For IoT (Nerves), firmware updates must be atomic and resumable—OTA rollback on failure is non-negotiable. Choose frameworks that align with your scaling assumptions: Ash scales horizontally via read replicas; Commanded scales via sharding; Nx scales via distributed training.
+## Advanced Considerations
+
+Framework choices like Ash, Commanded, and Nerves create significant architectural constraints that are difficult to change later. Ash's powerful query builder and declarative approach simplify common patterns but can be opaque when debugging complex permission logic or custom filters at scale. Event sourcing with Commanded is powerful for audit trails but creates a different mental model for state management — replaying events to derive current state has CPU and latency costs that aren't apparent in traditional CRUD systems.
+
+Nerves requires understanding the full embedded system stack — from bootloader configuration to over-the-air update mechanisms. A Nerves system that works on your development board may fail in production due to hardware variations, network conditions, or power supply issues. NX's numerical computing is powerful but requires understanding GPU acceleration trade-offs and memory management for large datasets. Livebook provides interactive development but shouldn't be used for production deployments without careful containerization and resource isolation.
+
+The integration between these frameworks and traditional BEAM patterns (supervisors, processes, GenServers) requires careful design. A Commanded projection that rebuilds state from the event log can consume all available CPU, starving other services. NX autograd computations can create unexpected memory usage if not carefully managed. Nerves systems are memory-constrained; performance assumptions from desktop Elixir don't hold. Always prototype these frameworks in realistic environments before committing to them in production systems to validate assumptions.
+
+
+## Deep Dive: Domain Patterns and Production Implications
+
+Domain-specific frameworks enforce module dependencies and architectural boundaries. Testing domain isolation ensures that constraints are maintained as the codebase grows. Production systems without boundary enforcement often become monolithic and hard to test.
+
+---
 
 ## Trade-offs and production gotchas
 
@@ -549,3 +587,13 @@ The conclusion is blunt: never run real training on `BinaryBackend`. It exists s
 - [JAX autodiff cookbook](https://docs.jax.dev/en/latest/notebooks/autodiff_cookbook.html) — Nx's `grad` semantics are deliberately JAX-compatible; this is the best written reference.
 - [XLA operation semantics](https://openxla.org/xla/operation_semantics) — when EXLA traces slowly, reading the underlying HLO tells you why.
 - [Dashbit — "Nx in production"](https://dashbit.co/blog) — ongoing series on the ML stack.
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

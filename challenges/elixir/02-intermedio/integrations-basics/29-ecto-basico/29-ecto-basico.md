@@ -2,9 +2,6 @@
 
 **Project**: `ecto_intro` — a single-schema app with SQLite-backed `Repo`, a migration, and CRUD tests.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -93,9 +90,36 @@ changeset code doesn't change.
 
 ---
 
+## Design decisions
+
+**Option A — use `Postgrex` for tests and ship Postgres from day one**
+- Pros: parity with production; all of Postgres's types (`jsonb`, arrays, enums) available; concurrent writer tests work.
+- Cons: tests need a running Postgres; CI/onboarding friction; overkill for a pedagogical CRUD exercise.
+
+**Option B — `ecto_sqlite3` for the intro, adapter-swappable later (chosen)**
+- Pros: zero external service; instant tests; the `Repo`/`Schema`/`Changeset` code is adapter-agnostic; Sandbox works against SQLite too.
+- Cons: SQLite doesn't match Postgres exactly (no `jsonb`, relaxed typing, limited concurrent writers) — subtle bugs can hide until you swap adapters.
+
+→ Chose **B** because the lesson is the Ecto split (Repo / Schema / Changeset / Query), not DB administration; keeping tests dependency-free lowers the barrier without locking the design to SQLite.
+
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"ecto", "~> 1.0"},
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
 
 ```bash
 mix new ecto_intro --sup
@@ -106,6 +130,9 @@ cd ecto_intro
 we need because `Repo` is a supervised process.
 
 ### Step 2: `mix.exs`
+
+**Objective**: Declare dependencies and project config in `mix.exs`.
+
 
 ```elixir
 defmodule EctoIntro.MixProject do
@@ -149,6 +176,9 @@ Run `mix deps.get`.
 
 ### Step 3: `config/config.exs`
 
+**Objective**: Implement `config.exs` — the integration seam where external protocol semantics meet Elixir domain code.
+
+
 ```elixir
 import Config
 
@@ -164,6 +194,9 @@ config :ecto_intro, EctoIntro.Repo,
 
 ### Step 4: `lib/ecto_intro/repo.ex`
 
+**Objective**: Implement `repo.ex` — the integration seam where external protocol semantics meet Elixir domain code.
+
+
 ```elixir
 defmodule EctoIntro.Repo do
   use Ecto.Repo,
@@ -173,6 +206,9 @@ end
 ```
 
 ### Step 5: `lib/ecto_intro/application.ex`
+
+**Objective**: Wire `application.ex` to start the supervision tree that boots Repo and external adapters in the correct order before serving traffic.
+
 
 ```elixir
 defmodule EctoIntro.Application do
@@ -191,6 +227,9 @@ end
 ```
 
 ### Step 6: `lib/ecto_intro/user.ex`
+
+**Objective**: Implement `user.ex` — the integration seam where external protocol semantics meet Elixir domain code.
+
 
 ```elixir
 defmodule EctoIntro.User do
@@ -236,6 +275,9 @@ end
 
 ### Step 7: `priv/repo/migrations/20260101000000_create_users.exs`
 
+**Objective**: Implement `20260101000000_create_users.exs` — the integration seam where external protocol semantics meet Elixir domain code.
+
+
 ```elixir
 defmodule EctoIntro.Repo.Migrations.CreateUsers do
   use Ecto.Migration
@@ -253,6 +295,9 @@ end
 ```
 
 ### Step 8: `lib/ecto_intro.ex`
+
+**Objective**: Implement `ecto_intro.ex` — the integration seam where external protocol semantics meet Elixir domain code.
+
 
 ```elixir
 defmodule EctoIntro do
@@ -284,6 +329,9 @@ end
 
 ### Step 9: `test/test_helper.exs`
 
+**Objective**: Implement `test_helper.exs` — the integration seam where external protocol semantics meet Elixir domain code.
+
+
 ```elixir
 ExUnit.start()
 
@@ -292,6 +340,9 @@ Ecto.Adapters.SQL.Sandbox.mode(EctoIntro.Repo, :manual)
 ```
 
 ### Step 10: `test/ecto_intro_test.exs`
+
+**Objective**: Write `ecto_intro_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
 
 ```elixir
 defmodule EctoIntroTest do
@@ -360,11 +411,29 @@ end
 
 ### Step 11: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
 
 The `test` alias drops/creates/migrates the DB first.
+
+---
+
+
+## Key Concepts
+
+External integrations in Elixir split across multiple patterns: Ecto for relational databases with changesets and migrations; Telemetry for metrics and observability; HTTP libraries like Req or Finch for REST APIs; and specialized parsers like Jason, NimbleCSV, and NimbleParsec for data formats. Choosing the right tool avoids the trap of one library solving everything poorly.
+
+Ecto is the de facto standard for databases because changesets encode validation before queries, migrations manage schema evolution, and the Repo pattern separates query logic from business logic. Migrations are version-controlled SQL, ensuring reproducible deployments. For integrating external services, Req is the modern HTTP client with built-in retry, redirect, and error handling policies.
+
+Telemetry decouples metrics collection from application code: you emit events and let listeners subscribe. This separation keeps business logic clean and metrics infrastructure pluggable. Use metrics, not print statements, in production.
+
+## Key Concepts
+
+Ecto is Elixir's standard library for database access. A Repo is the entry point—queries go through it. Schemas map database tables to Elixir structs; queries are built with the query DSL (`from u in User, where: u.age > 18`). Changesets represent changes and validations—they separate reads (queries) from writes (changesets). This structure enforces a clean boundary: databases are accessed through a single module (the Repo). Ecto supports Postgres, MySQL, SQLite, and others through adapters. The learning curve is steep (schemas, migrations, query syntax, changesets) but the payoff is huge: type-safe queries, automatic SQL generation, built-in validations.
 
 ---
 
@@ -404,6 +473,14 @@ simpler. For non-tabular stores (Redis, Mnesia, ETS), Ecto doesn't help.
 For "I just want a map in memory", Agent/ETS is 100× less ceremony.
 
 ---
+
+## Benchmark
+
+<!-- benchmark N/A: integration/configuration exercise -->
+
+## Reflection
+
+- `cast/3` silently drops unknown keys as a mass-assignment guard, but it also silently drops typos — a form field named `emial` never reaches the DB and you get a "required" error on `email` instead of a "you wrote it wrong" error. In a context-module API, what's the cheapest instrumentation you could add to surface this difference without weakening the mass-assignment protection?
 
 ## Resources
 

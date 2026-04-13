@@ -157,12 +157,16 @@ eventually crashes the tracer and possibly the node. Mitigations:
 
 ### Step 1: project
 
+**Objective**: Scaffold supervised app so Killswitch GenServer survives ad-hoc trace sessions and enforces single panic() entry point.
+
 ```bash
 mix new tracing_toolkit --sup
 cd tracing_toolkit
 ```
 
 ### Step 2: `mix.exs`
+
+**Objective**: Pin `:recon` so `:recon_trace` count/timeout limits prevent mailbox floods that melt production BEAM nodes.
 
 ```elixir
 defmodule TracingToolkit.MixProject do
@@ -178,6 +182,8 @@ end
 
 ### Step 3: `lib/tracing_toolkit/application.ex`
 
+**Objective**: Start Killswitch so single panic() call clears all active `:recon_trace` + `:dbg` without hunting individual tag IDs.
+
 ```elixir
 defmodule TracingToolkit.Application do
   @moduledoc false
@@ -192,6 +198,8 @@ end
 ```
 
 ### Step 4: `lib/tracing_toolkit/killswitch.ex`
+
+**Objective**: Maintain MapSet of active trace tags so `panic()` atomically stops `:recon_trace` + `:dbg` without manual tag enumeration.
 
 ```elixir
 defmodule TracingToolkit.Killswitch do
@@ -250,6 +258,8 @@ end
 
 ### Step 5: `lib/tracing_toolkit/sys_trace.ex`
 
+**Objective**: Wrap `:sys.trace` with auto-registration + cleanup so GenServer callback logs (handle_call, terminate) surface without scheduler pause.
+
 ```elixir
 defmodule TracingToolkit.SysTrace do
   @moduledoc """
@@ -299,6 +309,8 @@ end
 
 ### Step 6: `lib/tracing_toolkit/call_trace.ex`
 
+**Objective**: Enforce `max_messages ≤ 1000` + `timeout_ms ≤ 60s` guards so unlimited-trace code never escapes into production.
+
 ```elixir
 defmodule TracingToolkit.CallTrace do
   @moduledoc """
@@ -345,6 +357,8 @@ end
 ```
 
 ### Step 7: `lib/tracing_toolkit/msg_trace.ex`
+
+**Objective**: Collect send/receive events via bounded mailbox so message trace never exhausts scheduler reductions or tracer memory.
 
 ```elixir
 defmodule TracingToolkit.MsgTrace do
@@ -402,6 +416,8 @@ end
 
 ### Step 8: tests
 
+**Objective**: Validate killswitch state isolation and :recon_trace timeout guards prevent mailbox overflow during edge cases.
+
 ```elixir
 # test/tracing_toolkit/sys_trace_test.exs
 defmodule TracingToolkit.SysTraceTest do
@@ -424,17 +440,19 @@ defmodule TracingToolkit.SysTraceTest do
     :ok
   end
 
-  test "state/1 returns the GenServer state" do
-    Counter.bump()
-    Counter.bump()
-    assert SysTrace.state(Counter) == 2
-  end
+  describe "TracingToolkit.SysTrace" do
+    test "state/1 returns the GenServer state" do
+      Counter.bump()
+      Counter.bump()
+      assert SysTrace.state(Counter) == 2
+    end
 
-  test "with_trace/2 enables and disables tracing" do
-    result = SysTrace.with_trace(Counter, fn -> Counter.bump() end)
-    assert result == 1
-    # After returning, tracing is disabled
-    refute Counter in TracingToolkit.Killswitch.active()
+    test "with_trace/2 enables and disables tracing" do
+      result = SysTrace.with_trace(Counter, fn -> Counter.bump() end)
+      assert result == 1
+      # After returning, tracing is disabled
+      refute Counter in TracingToolkit.Killswitch.active()
+    end
   end
 end
 ```
@@ -455,31 +473,35 @@ defmodule TracingToolkit.CallTraceTest do
     :ok
   end
 
-  test "calls/4 rejects unbounded limits" do
-    assert_raise FunctionClauseError, fn ->
-      CallTrace.calls({Math, :add, :_}, 100_000, 100)
+  describe "TracingToolkit.CallTrace" do
+    test "calls/4 rejects unbounded limits" do
+      assert_raise FunctionClauseError, fn ->
+        CallTrace.calls({Math, :add, :_}, 100_000, 100)
+      end
+
+      assert_raise FunctionClauseError, fn ->
+        CallTrace.calls({Math, :add, :_}, 10, 10_000_000)
+      end
     end
 
-    assert_raise FunctionClauseError, fn ->
-      CallTrace.calls({Math, :add, :_}, 10, 10_000_000)
+    test "calls/4 returns the number of processes matching the spec" do
+      count = CallTrace.calls({Math, :add, 2}, 10, 500)
+      assert is_integer(count) and count >= 0
+      CallTrace.stop()
     end
-  end
 
-  test "calls/4 returns the number of processes matching the spec" do
-    count = CallTrace.calls({Math, :add, 2}, 10, 500)
-    assert is_integer(count) and count >= 0
-    CallTrace.stop()
-  end
-
-  test "panic/0 clears all active traces" do
-    _ = CallTrace.calls({Math, :add, 2}, 10, 500)
-    assert Killswitch.panic() == :ok
-    assert Killswitch.active() == []
+    test "panic/0 clears all active traces" do
+      _ = CallTrace.calls({Math, :add, 2}, 10, 500)
+      assert Killswitch.panic() == :ok
+      assert Killswitch.active() == []
+    end
   end
 end
 ```
 
 ### Step 9: runbook-style usage
+
+**Objective**: Showcase incident workflow: live :sys.get_state/1 → bounded :recon_trace.calls/3 → panic/0 cleanup without manual tag enumeration.
 
 ```
 iex> :sys.get_state(PaymentWorker)
@@ -511,6 +533,46 @@ IO.puts("avg: #{time_us / 10_000} µs/op")
 ```
 
 Target: operation should complete in the low-microsecond range on modern hardware; deviations by >2× indicate a regression worth investigating.
+
+## Deep Dive: BEAM Scheduler Tuning and Memory Profiling in Production
+
+The BEAM scheduler is not "magic" — it's a preemptive work-stealing scheduler that divides CPU time 
+into reductions (bytecode instructions). Understanding scheduler tuning is critical when you suspect 
+latency spikes in production.
+
+**Key concepts**:
+- **Reductions budget**: By default, a process gets ~2000 reductions before yielding to another process.
+  Heavy CPU work (binary matching, list recursion) can exhaust the budget and cause tail latency.
+- **Dirty schedulers**: If a process does CPU-intensive work (crypto, compression, numerical), it blocks 
+  the main scheduler. Use dirty NIFs or `spawn_opt(..., [{:fullsweep_after, 0}])` for GC tuning.
+- **Heap tuning per process**: `Process.flag(:min_heap_size, ...)` reserves heap upfront, reducing GC 
+  pauses. Measure; don't guess.
+
+**Memory profiling workflow**:
+1. Run `recon:memory/0` in iex; identify top 10 memory consumers by type (atoms, binaries, ets).
+2. If binaries dominate, check for refc binary leaks (binary held by process that should have been freed).
+3. Use `eprof` or `fprof` for function-level CPU attribution; `recon:proc_window/3` for process memory trends.
+
+**Production pattern**: Deploy with `+K true` (async IO), `-env ERL_MAX_PORTS 65536` (port limit), 
+`+T 9` (async threads). Measure GC time with `erlang:statistics(garbage_collection)` — if >5% of uptime, 
+tune heap or reduce allocation pressure. Never assume defaults are optimal for YOUR workload.
+
+---
+
+## Advanced Considerations
+
+Understanding BEAM internals at production scale requires deep knowledge of scheduler behavior, memory models, and garbage collection dynamics. The soft real-time guarantees of BEAM only hold under specific conditions — high system load, uneven process distribution across schedulers, or GC pressure can break predictable latency completely. Monitor `erlang:statistics(run_queue)` in production to catch scheduler saturation before it degrades latency significantly. The difference between immediate, offheap, and continuous GC garbage collection strategies can significantly impact tail latencies in systems with millions of messages per second and sustained memory pressure.
+
+Process reductions and the reduction counter affect scheduler fairness fundamentally. A process that runs for extended periods without yielding can starve other processes, even though the scheduler treats it fairly by reduction count per scheduling interval. This is especially critical in pipelines processing large data structures or performing recursive computations where yielding points are infrequent and difficult to predict. The BEAM's preemption model is deterministic per reduction, making performance testing reproducible but sometimes hiding race conditions that only manifest under specific load patterns and GC interactions.
+
+The interaction between ETS, Mnesia, and process message queues creates subtle bottlenecks in distributed systems. ETS reads don't block other processes, but writes require acquiring locks; understanding when your workload transitions from read-heavy to write-heavy is crucial for capacity planning. Port drivers and NIFs bypass the BEAM scheduler entirely, which can lead to unexpected priority inversions if not carefully managed. Always profile with `eprof` and `fprof` in realistic production-like environments before deployment to catch performance surprises.
+
+
+## Deep Dive: Otp Patterns and Production Implications
+
+OTP primitives (GenServer, Supervisor, Application) are tested through their public interfaces, not by inspecting internal state. This discipline forces correct design: if you can't test a behavior without peeking into the server's state, the behavior is not public. Production systems with tight integration tests on GenServer internals are fragile and hard to refactor.
+
+---
 
 ## Trade-offs and production gotchas
 
@@ -581,3 +643,13 @@ read the results, then widen the filter.
 - [`:dbg` User's Guide](https://www.erlang.org/doc/apps/runtime_tools/tracing_in_erlang.html)
 - [Saša Jurić: Debugging live systems](https://www.theerlangelist.com/) — The Erlang-elist blog
 - [`:erlang.trace/3` reference](https://www.erlang.org/doc/man/erlang.html#trace-3)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

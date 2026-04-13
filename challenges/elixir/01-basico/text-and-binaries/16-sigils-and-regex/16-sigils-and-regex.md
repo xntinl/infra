@@ -91,7 +91,21 @@ return positional lists — fine for one-off parses, brittle for structured data
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"jason", "~> 1.0"},
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Sigils compile regex patterns at module load time; invalid patterns fail the build, not production.
 
 ```bash
 mix new log_filter
@@ -100,6 +114,8 @@ mkdir -p test/fixtures
 ```
 
 ### Step 2: `mix.exs`
+
+**Objective**: Configure escript entry point; demonstrate OptionParser for CLI flag parsing and alias resolution.
 
 ```elixir
 defmodule LogFilter.MixProject do
@@ -125,6 +141,8 @@ end
 ```
 
 ### Step 3: `lib/log_filter/parser.ex`
+
+**Objective**: Named captures (.named_captures/2) make regex output refactor-safe; numbered captures are brittle at 5+ groups.
 
 ```elixir
 defmodule LogFilter.Parser do
@@ -181,6 +199,8 @@ end
 
 ### Step 4: `lib/log_filter/filter.ex`
 
+**Objective**: Membership test against ranges (in/2) is O(1) when compiled to a guards check; arrays require O(n) scan.
+
 ```elixir
 defmodule LogFilter.Filter do
   @moduledoc """
@@ -231,6 +251,8 @@ end
 ```
 
 ### Step 5: `lib/log_filter/cli.ex`
+
+**Objective**: Streams + Enum.reduce composably process files without buffering; File.stream! opens lazy, not on construction.
 
 ```elixir
 defmodule LogFilter.CLI do
@@ -319,6 +341,8 @@ end
 
 ### Step 6: Test fixture
 
+**Objective**: Fixture files test edge cases (malformed lines) that real logs contain; missing test data hides bugs.
+
 ```
 # test/fixtures/access.log
 192.168.1.10 - - [12/Apr/2026:10:15:32 +0000] "GET /api/users HTTP/1.1" 200 1234 "-" "curl/8.0"
@@ -330,6 +354,8 @@ malformed line that will not parse
 ```
 
 ### Step 7: Tests
+
+**Objective**: Test _empty_ results and _boundary_ values (204 no-content, '-' missing bytes); regex does not validate semantics.
 
 ```elixir
 # test/log_filter/parser_test.exs
@@ -438,6 +464,8 @@ end
 
 ### Step 8: Run and verify
 
+**Objective**: --warnings-as-errors catches typos in module names that only fail at runtime in production.
+
 ```bash
 mix deps.get
 mix compile --warnings-as-errors
@@ -449,6 +477,24 @@ mix escript.build
 
 ---
 
+
+
+---
+## Key Concepts
+
+### 1. Sigils are Syntactic Sugar for Common Patterns
+
+Sigils are shortcuts: `~w[foo bar baz]` for word lists, `~r/[aeiou]/` for regex. They compile to standard Elixir values—the sigil is just syntax sugar. Sigils make code more readable and avoid escaping.
+
+### 2. Regex Modifiers Change Matching Behavior
+
+`~r/hello/i` for case-insensitive, `~r/foo/m` for multiline (^ and $ match line boundaries). Read the Erlang `:re` module docs for full semantics. Common gotcha: `^` and `$` anchor to the whole string by default, not line boundaries, unless you use `/m`.
+
+### 3. `String.split/2` Is Often Simpler Than Regex
+
+For simple cases, avoid regex. `String.split("a,b,c", ",")` is simpler than `~r/,/`. Regex shines for complex patterns. For splitting, join, and simple operations, use the `String` module—it's faster and more readable.
+
+---
 ## Trade-off analysis
 
 | Aspect                   | Regex with named captures (this)   | String.split / Enum.at               |

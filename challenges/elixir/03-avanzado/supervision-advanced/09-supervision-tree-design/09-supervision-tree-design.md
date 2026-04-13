@@ -151,8 +151,68 @@ defp deps do
 end
 ```
 
+### Dependencies (mix.exs)
+
+```elixir
+```elixir
+[Infra.Supervisor,  Domain.Supervisor,  Edge.Supervisor]
+   ↑ starts first    ↑ can query DB     ↑ can call domain
+```
+
+During shutdown: Edge drains first, then Domain, then Infra last — so outbound requests can still query the DB while draining.
+
+### 4. `:one_for_one` at leaves
+
+Within `Infra`, DB, cache, and message bus are independent — each can flap without affecting the others. `:one_for_one`. If ALL three repeatedly fail, the budget expires and `Infra.Supervisor` dies, which triggers `:rest_for_one` at the root.
+
+### 5. Identifying boundaries: the "same tier" test
+
+Two children belong in the SAME supervisor if:
+- they have the same failure radius (either both affect users or neither does)
+- they share restart policy (`:permanent` vs `:transient`)
+- their startup order can be ignored OR is naturally encoded by list order
+
+They belong in DIFFERENT supervisors if:
+- one is a hard dependency of the other (and you want explicit `:rest_for_one`)
+- they have different `max_restarts` budgets (telemetry: generous; payments: strict)
+- one owns shared state (ETS table) the other reads from
+
+---
+
+## Why layered supervisors and not a flat `:one_for_one`
+
+A flat list treats every child as interchangeable. It cannot express "DB crash must cascade to consumers" (needs `:rest_for_one`) and it cannot express "telemetry flap must not reach payments" (needs isolation). Layering gives you both axes: inter-subsystem dataflow at the root (`:rest_for_one`), intra-subsystem peer independence at the leaves (`:one_for_one`). Flat trees scale in line count but not in expressiveness; at ~10+ children the "27-child flat list" anti-pattern becomes a correctness problem, not a style problem.
+
+---
+
+## Design decisions
+
+**Option A — single root supervisor with all 27 workers flat**
+- Pros: no indirection; `Supervisor.which_children/1` returns everything at once.
+- Cons: impossible to encode inter-subsystem dependencies; restart budget shared across unrelated concerns; any flap pressures the whole root.
+
+**Option B — three-level tree (root → subsystem → workers)** (chosen)
+- Pros: failure domain boundaries are first-class; `:rest_for_one` at root encodes dataflow; subsystems can have independent budgets; trivial to add a new subsystem without touching existing ones.
+- Cons: more files; more cognitive load; `:rest_for_one` ordering pitfalls (Observability-last trap described above).
+
+→ Chose **B** because each of the four subsystems has distinct failure semantics and must be reasoned about independently. Flat supervision is the right default for < 5 children; above that it stops scaling organizationally.
+
+---
+
+## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  []
+end
+```
+
 
 ### Step 1: Root application
+
+**Objective**: Order root children by dataflow (Observability, Infra, Domain, Edge) so `:rest_for_one` tears down the right downstream.
 
 ```elixir
 # lib/tree_design/application.ex
@@ -181,6 +241,8 @@ end
 ```
 
 ### Step 2: Infra — `:one_for_one` of independent resources
+
+**Objective**: Isolate DbPool, Cache, and MessageBus so a cache blip never drops database connections held by unrelated queries.
 
 ```elixir
 # lib/tree_design/infra/supervisor.ex
@@ -240,6 +302,8 @@ end
 ```
 
 ### Step 3: Domain — `:rest_for_one` pipeline
+
+**Objective**: Chain Inventory → Pricing → Orders with `:rest_for_one` so a stock recount invalidates cached prices before orders commit.
 
 ```elixir
 # lib/tree_design/domain/supervisor.ex
@@ -301,6 +365,8 @@ end
 
 ### Step 4: Edge — `:one_for_one` (http and jobs are peers)
 
+**Objective**: Keep HTTP and JobRunner as peers since each owns its own sockets — coupling their restarts would waste availability.
+
 ```elixir
 # lib/tree_design/edge/supervisor.ex
 defmodule TreeDesign.Edge.Supervisor do
@@ -335,6 +401,8 @@ end
 
 ### Step 5: Observability
 
+**Objective**: Boot observability first so incident-era logs and metrics exist before the subsystems that will crash come alive.
+
 ```elixir
 # lib/tree_design/observability/supervisor.ex
 defmodule TreeDesign.Observability.Supervisor do
@@ -362,60 +430,64 @@ end
 
 ### Step 6: Topology tests — encode the design
 
+**Objective**: Freeze child order and strategy as executable tests — newcomers reorder siblings every few months and break dataflow assumptions.
+
 ```elixir
 # test/tree_design/tree_topology_test.exs
 defmodule TreeDesign.TreeTopologyTest do
   use ExUnit.Case, async: false
 
-  test "root children start in declared order" do
-    children = Supervisor.which_children(TreeDesign.Supervisor)
-    ids = Enum.map(children, fn {id, _, _, _} -> id end) |> Enum.reverse()
+  describe "TreeDesign.TreeTopology" do
+    test "root children start in declared order" do
+      children = Supervisor.which_children(TreeDesign.Supervisor)
+      ids = Enum.map(children, fn {id, _, _, _} -> id end) |> Enum.reverse()
 
-    assert ids == [
-             TreeDesign.Observability.Supervisor,
-             TreeDesign.Infra.Supervisor,
-             TreeDesign.Domain.Supervisor,
-             TreeDesign.Edge.Supervisor
-           ]
-  end
+      assert ids == [
+               TreeDesign.Observability.Supervisor,
+               TreeDesign.Infra.Supervisor,
+               TreeDesign.Domain.Supervisor,
+               TreeDesign.Edge.Supervisor
+             ]
+    end
 
-  test "infra crash restarts domain and edge (rest_for_one at root)" do
-    pid_obs = Process.whereis(TreeDesign.Observability.Supervisor)
-    pid_domain = Process.whereis(TreeDesign.Domain.Supervisor)
-    pid_edge = Process.whereis(TreeDesign.Edge.Supervisor)
-    pid_infra = Process.whereis(TreeDesign.Infra.Supervisor)
+    test "infra crash restarts domain and edge (rest_for_one at root)" do
+      pid_obs = Process.whereis(TreeDesign.Observability.Supervisor)
+      pid_domain = Process.whereis(TreeDesign.Domain.Supervisor)
+      pid_edge = Process.whereis(TreeDesign.Edge.Supervisor)
+      pid_infra = Process.whereis(TreeDesign.Infra.Supervisor)
 
-    ref = Process.monitor(pid_infra)
-    Process.exit(pid_infra, :kill)
-    assert_receive {:DOWN, ^ref, :process, ^pid_infra, _}, 500
+      ref = Process.monitor(pid_infra)
+      Process.exit(pid_infra, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^pid_infra, _}, 500
 
-    wait_until(fn ->
-      pid_domain_new = Process.whereis(TreeDesign.Domain.Supervisor)
-      pid_edge_new = Process.whereis(TreeDesign.Edge.Supervisor)
+      wait_until(fn ->
+        pid_domain_new = Process.whereis(TreeDesign.Domain.Supervisor)
+        pid_edge_new = Process.whereis(TreeDesign.Edge.Supervisor)
 
-      is_pid(pid_domain_new) and pid_domain_new != pid_domain and
-        is_pid(pid_edge_new) and pid_edge_new != pid_edge
-    end)
+        is_pid(pid_domain_new) and pid_domain_new != pid_domain and
+          is_pid(pid_edge_new) and pid_edge_new != pid_edge
+      end)
 
-    # Observability is BEFORE infra in the rest_for_one order → untouched.
-    assert Process.whereis(TreeDesign.Observability.Supervisor) == pid_obs
-  end
+      # Observability is BEFORE infra in the rest_for_one order → untouched.
+      assert Process.whereis(TreeDesign.Observability.Supervisor) == pid_obs
+    end
 
-  test "leaf inventory crash does not affect orders' siblings above" do
-    pid_inv = Process.whereis(TreeDesign.Domain.Inventory)
-    pid_pricing = Process.whereis(TreeDesign.Domain.Pricing)
-    pid_orders = Process.whereis(TreeDesign.Domain.Orders)
+    test "leaf inventory crash does not affect orders' siblings above" do
+      pid_inv = Process.whereis(TreeDesign.Domain.Inventory)
+      pid_pricing = Process.whereis(TreeDesign.Domain.Pricing)
+      pid_orders = Process.whereis(TreeDesign.Domain.Orders)
 
-    ref = Process.monitor(pid_inv)
-    Process.exit(pid_inv, :kill)
-    assert_receive {:DOWN, ^ref, :process, ^pid_inv, _}, 500
+      ref = Process.monitor(pid_inv)
+      Process.exit(pid_inv, :kill)
+      assert_receive {:DOWN, ^ref, :process, ^pid_inv, _}, 500
 
-    wait_until(fn ->
-      pricing_new = Process.whereis(TreeDesign.Domain.Pricing)
-      orders_new = Process.whereis(TreeDesign.Domain.Orders)
-      # rest_for_one: inventory crash restarts pricing and orders
-      pricing_new != pid_pricing and orders_new != pid_orders
-    end)
+      wait_until(fn ->
+        pricing_new = Process.whereis(TreeDesign.Domain.Pricing)
+        orders_new = Process.whereis(TreeDesign.Domain.Orders)
+        # rest_for_one: inventory crash restarts pricing and orders
+        pricing_new != pid_pricing and orders_new != pid_orders
+      end)
+    end
   end
 
   defp wait_until(fun, timeout \\ 1_000) do
@@ -436,6 +508,23 @@ end
 ### Why this works
 
 Placing `Observability.Supervisor` first in the root list keeps it untouched by any `:rest_for_one` cascade — passive observers never need to restart because of dataflow changes. `Infra` → `Domain` → `Edge` after it encodes the real dependency chain: a DB flap cascades forward through domain and edge, exactly where stale caches and open connections need reset. Each subsystem runs its own budget, so a flap in Edge cannot use up Infra's restart budget, and the root stays tight (5/30) so OS-level supervisors can intervene on whole-app instability.
+
+---
+
+## Advanced Considerations: Partitioned Supervisors and Custom Restart Strategies
+
+A standard Supervisor is a single process managing a static tree. For thousands of children, a single supervisor becomes a bottleneck: all supervisor callbacks run on one process, and supervisor restart logic is sequential. PartitionSupervisor (OTP 25+) spawns N independent supervisors, each managing a subset of children. Hashing the child ID determines which partition supervises it, distributing load and enabling horizontal scaling.
+
+Custom restart strategies (via `Supervisor.init/2` callback) allow logic beyond the defaults. A strategy might prioritize restarting dependent services in a specific order, or apply backoff based on restart frequency. The downside is complexity: custom logic is harder to test and reason about, and mistakes cascade. Start with defaults and profile before adding custom behavior.
+
+Selective restart via `:rest_for_one` or `:one_for_all` affects failure isolation. `:one_for_all` restarts all children when one fails (simulating a total system failure), which can be necessary for consistency but is expensive. `:rest_for_one` restarts the failed child and any started after it, balancing isolation and dependencies. Understanding which strategy fits your architecture prevents cascading failures and unnecessary restarts.
+
+---
+
+
+## Deep Dive: Property Patterns and Production Implications
+
+Property-based testing inverts the testing mindset: instead of writing examples, you state invariants (properties) and let a generator find counterexamples. StreamData's shrinking capability is its superpower—when a property fails on a 10,000-element list, the framework reduces it to the minimal list that still fails, cutting debugging time from hours to minutes. The trade-off is that properties require rigorous thinking about domain constraints, and not every invariant is worth expressing as a property. Teams that adopt property testing often find bugs in specifications themselves, not just implementations.
 
 ---
 

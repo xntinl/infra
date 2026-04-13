@@ -112,8 +112,19 @@ defp deps do
 end
 ```
 
+### Dependencies (mix.exs)
+
+```elixir
+```elixir
+defp deps do
+  []
+end
+```
+
 
 ### Step 1: `mix.exs`
+
+**Objective**: Define OTP application with `mod: {Application, []}` so supervisor boot doesn't block on init/1 before handle_continue runs.
 
 ```elixir
 defmodule ContinueRecoveryGs.MixProject do
@@ -130,6 +141,8 @@ end
 ```
 
 ### Step 2: `lib/continue_recovery_gs/dets_store.ex`
+
+**Objective**: Abstract :dets file operations behind stable interface so recovery logic decouples from disk I/O serialization details.
 
 ```elixir
 defmodule ContinueRecoveryGs.DetsStore do
@@ -158,6 +171,8 @@ end
 ```
 
 ### Step 3: `lib/continue_recovery_gs/offsets.ex`
+
+**Objective**: Defer DETS hydration to handle_continue/2 with mailbox priority so supervisor boot + registration happen before recovery latency blocks callers.
 
 ```elixir
 defmodule ContinueRecoveryGs.Offsets do
@@ -259,6 +274,8 @@ end
 
 ### Step 4: `lib/continue_recovery_gs/application.ex`
 
+**Objective**: Build supervision tree that binds worker lifecycle to DETS handle so termination always flushes final state before close.
+
 ```elixir
 defmodule ContinueRecoveryGs.Application do
   use Application
@@ -272,6 +289,8 @@ end
 ```
 
 ### Step 5: `test/continue_recovery_gs/recovery_test.exs`
+
+**Objective**: Assert init returns < 5ms (supervisor timeout) while handle_continue hydrates DETS independently, proving non-blocking boot.
 
 ```elixir
 defmodule ContinueRecoveryGs.RecoveryTest do
@@ -290,33 +309,35 @@ defmodule ContinueRecoveryGs.RecoveryTest do
     start_supervised!({Offsets, path: path, store: store})
   end
 
-  test "init returns fast regardless of recovery work", ctx do
-    t0 = System.monotonic_time(:microsecond)
-    start(ctx)
-    elapsed_ms = (System.monotonic_time(:microsecond) - t0) / 1000
-    assert elapsed_ms < 50
-  end
+  describe "ContinueRecoveryGs.Recovery" do
+    test "init returns fast regardless of recovery work", ctx do
+      t0 = System.monotonic_time(:microsecond)
+      start(ctx)
+      elapsed_ms = (System.monotonic_time(:microsecond) - t0) / 1000
+      assert elapsed_ms < 50
+    end
 
-  test "offsets survive a process restart", ctx do
-    start(ctx)
-    Offsets.set("topic-a", 42)
-    Offsets.set("topic-b", 99)
-    :ok = Offsets.snapshot_now()
+    test "offsets survive a process restart", ctx do
+      start(ctx)
+      Offsets.set("topic-a", 42)
+      Offsets.set("topic-b", 99)
+      :ok = Offsets.snapshot_now()
 
-    stop_supervised!(Offsets)
+      stop_supervised!(Offsets)
 
-    start(ctx)
-    Process.sleep(20)
+      start(ctx)
+      Process.sleep(20)
 
-    assert Offsets.get("topic-a") == 42
-    assert Offsets.get("topic-b") == 99
-  end
+      assert Offsets.get("topic-a") == 42
+      assert Offsets.get("topic-b") == 99
+    end
 
-  test "recovery runs in handle_continue, not init", ctx do
-    start(ctx)
-    # By the time this call is handled, handle_continue has already executed
-    # because continuations have message priority over casts and calls.
-    assert Offsets.get("nonexistent") == nil
+    test "recovery runs in handle_continue, not init", ctx do
+      start(ctx)
+      # By the time this call is handled, handle_continue has already executed
+      # because continuations have message priority over casts and calls.
+      assert Offsets.get("nonexistent") == nil
+    end
   end
 end
 ```
@@ -324,6 +345,23 @@ end
 ### Why this works
 
 `{:continue, :recover}` runs with mailbox priority: OTP dispatches it before any `call`/`cast`/`info`, so callers observe a fully hydrated `offsets` map on their first request. The `snapshot_armed?` flag debounces writes: one timer coalesces a burst of `set/2` into a single `:dets.sync`, giving O(1) disk pressure per second regardless of write rate. `terminate/2` is an optimization, not a correctness guarantee — the periodic snapshot is what survives `:kill`.
+
+---
+
+## Advanced Considerations: Supervision and Hot Code Upgrade Patterns
+
+The OTP supervision tree is the backbone of Elixir's fault tolerance. A DynamicSupervisor can spawn workers on demand and track them, but if a worker crashes before it's supervised, messages to it drop silently. Equally, a `:temporary` worker that crashes is restarted zero times — useful for one-off tasks, but requires the caller to handle crashes. `:transient` restarts on non-normal exits; `:permanent` always restarts.
+
+`handle_continue` callbacks and `:hibernate` reduce memory overhead in long-lived processes. After initializing, a GenServer can return `{:noreply, state, {:continue, :do_work}}` to defer expensive work past the `init/1` call, keeping the supervisor's synchronous startup fast. Hibernation moves a process's heap to disk, freeing RAM at the cost of latency when the process receives its next message.
+
+Hot code upgrades via `sys:replace_state/2` or `:sys.replace_state/3` allow changing code without restarting the VM, but only if state structure is forward- and backward-compatible. In practice, code changes that alter state shape (adding or removing fields) require a migration function. The `:code.purge/1` and `:code.load_file/1` cycle reloads the module, but old pids still run old code until they return to the scheduler. Design for graceful degradation: code that cannot upgrade hot should acknowledge that in docs and operational runbooks.
+
+---
+
+
+## Deep Dive: Otp Patterns and Production Implications
+
+OTP primitives (GenServer, Supervisor, Application) are tested through their public interfaces, not by inspecting internal state. This discipline forces correct design: if you can't test a behavior without peeking into the server's state, the behavior is not public. Production systems with tight integration tests on GenServer internals are fragile and hard to refactor.
 
 ---
 

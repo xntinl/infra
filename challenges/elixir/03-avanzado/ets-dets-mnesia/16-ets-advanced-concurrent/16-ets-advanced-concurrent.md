@@ -2,9 +2,6 @@
 
 **Project**: `ets_concurrent_deep` — a synthetic workload lab to measure how `read_concurrency`, `write_concurrency` and `decentralized_counters` shift throughput on a multi-core box.
 
-**Difficulty**: ★★★★☆
-**Estimated time**: 3–6 hours
-
 ---
 
 ## Project context
@@ -38,6 +35,12 @@ ets_concurrent_deep/
 │   └── ets_concurrent_deep_test.exs
 └── mix.exs
 ```
+
+---
+
+## Why direct ETS and not GenServer-wrapped
+
+A GenServer is a single process. Any workload that can run concurrently will contend on its mailbox. ETS exposes a shared concurrent data structure with no intermediary process, eliminating the bottleneck entirely.
 
 ---
 
@@ -83,7 +86,7 @@ as `write_concurrency` for `set` and `bag`. Still, set it explicitly so the inte
 ### 4. Compressed tables are orthogonal
 
 `:compressed` trades CPU for RAM and has nothing to do with concurrency. Do not turn it on while
-chasing latency; you'll regress. It's covered in exercise 119.
+chasing latency; you'll regress.
 
 ### 5. Scheduler alignment: why pinning matters for benchmarks
 
@@ -93,10 +96,53 @@ true contention. Always run the benchmark with `parallel: System.schedulers_onli
 
 ---
 
+## Design decisions
+
+**Option A — GenServer-wrapped state**
+- Pros: serialized access; easy invariants.
+- Cons: one message queue for all reads and writes; scales to one core.
+
+**Option B — ETS with `:read_concurrency` / `:write_concurrency`** (chosen)
+- Pros: readers and writers touch the table directly; scales with cores.
+- Cons: multi-key invariants require the caller's discipline.
+
+→ Chose **B** because when the data structure is a simple key-value and the workload is concurrent, ETS wins decisively.
+
+---
+
 ## Implementation
 
 ### Step 1: `mix.exs`
 
+**Objective**: Pin `{:benchee, "~> 1.3"}` so the parallel-reader benchmark can measure scheduler-contention shapes.
+
+```elixir
+defmodule EtsConcurrentDeep.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :ets_concurrent_deep,
+      version: "0.1.0",
+      elixir: "~> 1.16",
+      start_permanent: Mix.env() == :prod,
+      deps: deps()
+    ]
+  end
+
+  def application do
+    [extra_applications: [:logger], mod: {EtsConcurrentDeep.Application, []}]
+  end
+
+  defp deps do
+    [{:benchee, "~> 1.3", only: [:dev, :test]}]
+  end
+end
+```
+
+### Dependencies (mix.exs)
+
+```elixir
 ```elixir
 defmodule EtsConcurrentDeep.MixProject do
   use Mix.Project
@@ -123,6 +169,8 @@ end
 
 ### Step 2: `lib/ets_concurrent_deep/application.ex`
 
+**Objective**: Boot a minimal supervisor since tables are spawned per benchmark and owned by the running task, not the tree.
+
 ```elixir
 defmodule EtsConcurrentDeep.Application do
   @moduledoc false
@@ -134,6 +182,8 @@ end
 ```
 
 ### Step 3: `lib/ets_concurrent_deep/table.ex`
+
+**Objective**: Factory four ETS profiles (baseline, read_conc, write_conc, full_conc) so the bench can isolate each concurrency flag's impact.
 
 ```elixir
 defmodule EtsConcurrentDeep.Table do
@@ -171,6 +221,8 @@ end
 
 ### Step 4: `lib/ets_concurrent_deep/workload.ex`
 
+**Objective**: Emit a 19:1 read/write hot-path workload so the benchmark reflects realistic cache traffic, not a synthetic best case.
+
 ```elixir
 defmodule EtsConcurrentDeep.Workload do
   @moduledoc """
@@ -207,6 +259,8 @@ end
 
 ### Step 5: `bench/run.exs`
 
+**Objective**: Drive each profile under `parallel: schedulers_online()` to quantify how each flag reshapes the lock-contention curve.
+
 ```elixir
 alias EtsConcurrentDeep.{Table, Workload}
 
@@ -233,6 +287,8 @@ Benchee.run(jobs,
 ```
 
 ### Step 6: `test/ets_concurrent_deep_test.exs`
+
+**Objective**: Assert each profile sets the declared flags and that 8 concurrent workers never crash or corrupt the table.
 
 ```elixir
 defmodule EtsConcurrentDeepTest do
@@ -277,11 +333,17 @@ end
 
 ### Step 7: Run it
 
+**Objective**: Run the Benchee script and confirm the `read_conc` vs `baseline` throughput gap widens with scheduler count.
+
 ```bash
 mix deps.get
 mix test
 mix run bench/run.exs
 ```
+
+### Why this works
+
+`:read_concurrency` tunes the table's lock granularity for readers; `:write_concurrency` does the same for writers. With both enabled, readers and writers scale independently up to core count, at the cost of slightly slower single-threaded operations.
 
 ---
 
@@ -299,6 +361,24 @@ Measured on a 12-core x86_64, OTP 26, BEAM with `+sbt db`:
 Your absolute numbers will differ; the **shape** should not. If `read_conc` is not at least 2x
 over baseline with 8+ schedulers, verify that the BEAM is actually using more than one scheduler
 (`:erlang.system_info(:schedulers_online)`).
+
+---
+
+## Deep Dive
+
+ETS (Erlang Term Storage) is RAM-only and process-linked; table destruction triggers if the owner crashes, causing silent data loss in careless designs. Match specifications (match_specs) are micro-programs that filter/transform data at the C layer, orders of magnitude faster than fetching all records and filtering in Elixir. Mnesia adds disk persistence and replication but introduces transaction overhead and deadlock potential; dirty operations bypass locks for speed but sacrifice consistency guarantees. For caching, named tables (public by design) are globally visible but require careful name management; consider ETS sharding (multiple small tables) to reduce lock contention on hot keys. DETS (Disk ETS) persists to disk but is single-process bottleneck and slower than a real database. At scale, prefer ETS for in-process state and Mnesia/PostgreSQL for shared, persistent data.
+## Advanced Considerations
+
+ETS and DETS performance characteristics change dramatically based on access patterns and table types. Ordered sets provide range queries but slower access than hash tables; set types don't support duplicate keys while bags do. The `heir` option for ETS tables is essential for fault tolerance — when a table owner crashes, the heir process can take ownership and prevent data loss. Without it, the table is lost immediately. Mnesia replicates entire tables across nodes; choosing which nodes should have replicas and whether they're RAM or disk replicas affects both consistency guarantees and network traffic during cluster operations.
+
+DETS persistence comes with significant performance implications — writes are synchronous to disk by default, creating latency spikes. Using `sync: false` improves throughput but risks data loss on crashes. The maximum DETS table size is limited by available memory and the file system; planning capacity requires understanding your growth patterns. Mnesia's transaction system provides ACID guarantees, but dirty operations bypass these guarantees for performance. Understanding when to use dirty reads versus transactional reads significantly impacts both correctness and latency.
+
+Debugging ETS and DETS issues is challenging because problems often emerge under load when many processes contend for the same table. Table memory fragmentation is invisible to code but can exhaust memory. Using match specs instead of iteration over large tables can dramatically improve performance but requires careful construction. The interaction between ETS, replication, and distributed systems creates subtle consistency issues — a node with a stale ETS replica can serve incorrect data during network partitions. Always monitor table sizes and replication status with structured logging.
+
+
+## Deep Dive: Etsdets Patterns and Production Implications
+
+ETS tables are in-memory, non-distributed key-value stores with tunable semantics (ordered_set, duplicate_bag). Under concurrent read/write load, ETS table semantics matter: bag semantics allow fast appends but slow deletes; ordered_set allows range queries but slower inserts. Testing ETS behavior under concurrent load is non-trivial; single-threaded tests miss lock contention. Production ETS tables often fail under load due to concurrency assumptions that quiet tests don't exercise.
 
 ---
 
@@ -329,6 +409,13 @@ a list and pass them in.
 **7. When NOT to use this.** For low-traffic tables (< 10k ops/s) the flags cost more in code
 complexity and memory than they save. Default to unflagged `:ets.new/2` and enable flags only
 after a profiler (`:recon`, `:observer`) points at ETS contention.
+
+---
+
+## Reflection
+
+- If your ETS workload needs multi-key atomicity, do you switch to Mnesia, wrap in a GenServer, or build a lock table? What are the trade-offs?
+- `:decentralized_counters` changes behavior on multi-socket machines. How do you know if you need it, and what does enabling it cost on a small machine?
 
 ---
 

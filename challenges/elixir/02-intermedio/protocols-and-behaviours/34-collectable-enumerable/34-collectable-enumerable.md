@@ -99,9 +99,29 @@ opt out.
 
 ---
 
+### Dependencies (`mix.exs`)
+
+```elixir
+def deps do
+  [
+    {cont},
+    {done},
+    {error},
+    {exunit},
+    {halt},
+    {halted},
+    {ok},
+    {suspend},
+    {suspended},
+  ]
+end
+```
 ## Implementation
 
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
 
 ```bash
 mix new custom_bag
@@ -109,6 +129,9 @@ cd custom_bag
 ```
 
 ### Step 2: `lib/bag.ex`
+
+**Objective**: Implement `bag.ex` — polymorphism via dispatch on the data's type (protocol) or via an explicit contract (behaviour).
+
 
 ```elixir
 defmodule Bag do
@@ -192,6 +215,9 @@ end
 
 ### Step 3: `test/bag_test.exs`
 
+**Objective**: Write `bag_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+
 ```elixir
 defmodule BagTest do
   use ExUnit.Case, async: true
@@ -248,6 +274,9 @@ end
 
 ### Step 4: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -257,6 +286,14 @@ mix test
 `Enumerable.reduce/3` is a four-clause state machine that honors `:cont` (keep going), `:halt` (stop now), and `:suspend` (return a continuation) — those three states are what make `Enum.take/2`, `Stream.zip/2`, and lazy interop work. `count/1` is `{:ok, total}` because the count map makes size an O(map-values) operation, but `slice/1` returns `{:error, __MODULE__}` because there is no meaningful random-access order for a multiset. `Collectable.into/1` returns a 2-arity collector that funnels `{:cont, elem}` through `Bag.put/2` and cleanly handles `:halt` for error paths.
 
 ---
+
+
+## Key Concepts: Enumerable and Collectable Protocols
+
+`Enumerable` lets you use `Enum.map/filter/reduce` on custom collections. `Collectable` is the inverse: it lets you build a collection incrementally (`Enum.into/2`). Together they enable composition: any enumerable can be into any collectable.
+
+Example: implement `Enumerable` on your custom tree, and you can `Enum.map(tree, fn x -> x * 2 end)`. Implement `Collectable`, and you can `Enum.into(list, new_tree())` to build a tree from a list. Most users don't implement these; `Enum` has fallbacks. But for domain-specific collections, these protocols are essential.
+
 
 ## Benchmark
 
@@ -319,3 +356,17 @@ explicit traversal functions (`walk_bfs/1`, `walk_dfs/1`) instead.
 - [`Collectable` — Elixir stdlib](https://hexdocs.pm/elixir/Collectable.html)
 - [`Stream` — lazy enumerables](https://hexdocs.pm/elixir/Stream.html)
 - ["Writing assertive code with Elixir" — José Valim](http://blog.plataformatec.com.br/2014/09/writing-assertive-code-with-elixir/)
+
+
+## Key Concepts
+
+Protocols and behaviors are Elixir's mechanism for ad-hoc and static polymorphism. They solve different problems and are often confused.
+
+**Protocols:**
+Dispatch based on the type/struct of the first argument at runtime. A protocol defines a contract (e.g., `Enumerable`); any type can implement it by adding a corresponding implementation block. Protocols excel when you control neither the type nor the caller — e.g., a library that needs to iterate any collection. The fallback is `:any` — if no specific implementation exists, the `:any` handler is tried. This enables "optional" protocol implementations.
+
+**Behaviours:**
+Static polymorphism enforced at compile time. A module implements a behavior by defining callbacks (functions). Behaviors are about contracts between modules, not types. Use when you need multiple implementations of the same interface and the caller chooses which to use (e.g., different database adapters, different strategies). Callbacks are checked at compile time — missing a required callback is a compiler error.
+
+**Architectural patterns:**
+Behaviors excel in plugin systems (user defines modules conforming to the behavior). Protocols excel in type-driven dispatch (any type can conform). Mix both: a behavior can require that its callbacks operate on types that implement a protocol. Example: `MyAdapter` behavior requiring callbacks that work with `Enumerable` types.

@@ -131,7 +131,21 @@ and the dependency is trivial.
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
 
 ```bash
 mix new select_ms_demo
@@ -141,6 +155,9 @@ cd select_ms_demo
 Add `{:ex2ms, "~> 1.6"}` to `deps` in `mix.exs`, then `mix deps.get`.
 
 ### Step 2: `lib/select_ms_demo.ex`
+
+**Objective**: Implement `select_ms_demo.ex` — the access pattern that exposes the trade-off between ETS concurrency flags, match specs, and lookup cost.
+
 
 ```elixir
 defmodule SelectMsDemo do
@@ -229,6 +246,9 @@ end
 
 ### Step 3: `test/select_ms_demo_test.exs`
 
+**Objective**: Write `select_ms_demo_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+
 ```elixir
 defmodule SelectMsDemoTest do
   use ExUnit.Case, async: true
@@ -288,6 +308,9 @@ end
 
 ### Step 4: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix deps.get
 mix test
@@ -304,6 +327,14 @@ into that triple-list at compile time, so you get BEAM-level error reporting
 instead of runtime `:badarg`.
 
 ---
+
+
+## Key Concepts: Match Specs and Advanced Filtering
+
+Match specs are a specialized mini-language for ETS pattern matching and filtering. A match spec is a list of rules: `[{pattern, guards, result}]`. The pattern matches tuples; guards filter them (e.g., `{:>, :'$1', 10}`); the result is what `select/2` returns.
+
+Example: `[{User{_id: :'$1', age: :'$2'}, [{:>, :'$2', 18}], [:'$1']}]` selects IDs of users over 18. Match specs run on the ETS side, so they're much faster than Enum filtering. The learning curve is steep (the syntax is cryptic), but it's essential for high-performance ETS queries. Tools like `:ets.test_ms/2` help debug match specs interactively.
+
 
 ## Benchmark
 
@@ -326,6 +357,12 @@ IO.puts("select+spec: #{us_spec}µs  tab2list+filter: #{us_elixir}µs")
 Target esperado: el filtro con match spec debería ser 3–10× más rápido para
 un ratio de match de ~50%, porque evita copiar las filas descartadas al
 heap del caller.
+
+---
+
+## Key Concepts
+
+ETS match specs (`ets:select/2`) are the advanced query API, allowing guards and computed transformations. Instead of just pattern matching, you can filter with complex conditions and return computed values. This is how you implement "count all entries older than NOW" or "sum values for all matching keys" in a single atomic call. Match specs are expressive and fast but cryptic to read—the syntax is intentionally terse for performance reasons. The specification includes patterns, guards (conditions), and return values. Use them sparingly; most queries are clearer expressed as simple pattern loops. Understanding basic specs opens powerful optimizations, but overusing them makes code unmaintainable. Reserve match specs for performance-critical sections where the atomic, in-database aggregation is essential.
 
 ---
 

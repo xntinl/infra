@@ -143,7 +143,72 @@ defp deps do
 end
 ```
 
+### Dependencies (mix.exs)
+
+```elixir
+```elixir
+%{
+  id: PricingEngine,
+  start: {PricingEngine, :start_link, []},
+  shutdown: 5_000,          # ms to drain before brutal_kill
+  restart: :permanent,
+  type: :worker
+}
+```
+
+`:brutal_kill` issues `Process.exit(pid, :kill)` immediately — no `terminate/2` callback runs. Reserve it for stateless tasks. For anything with downstream effects (open sockets, file writes, in-flight requests), use a positive timeout so `terminate/2` can flush.
+
+### 5. Failure propagation inverts the tree
+
+A supervisor that exhausts its restart budget dies with reason `:shutdown`. Its parent then treats that like any other child death — applying the parent's strategy. This is how "escalation" happens in OTP: failure domains absorb small crashes locally; only persistent, unrecoverable faults travel upward.
+
+```
+                  Application Supervisor (:one_for_one, 3/5)
+                 /              |               \
+         MarketData        Telemetry          Session
+      (:rest_for_one,    (:one_for_one,    (:one_for_all,
+          10/30)              3/60)            3/5)
+         / | \                / \               / \
+      Feed Eng Router    Reporter Shipper   Auth  Rpc
+```
+
+If `Feed` flaps 11 times in 30 s, `MarketData` supervisor exits. `Application` supervisor sees a child died → restarts MarketData. If THAT happens 3 times in 5 s, the whole app is dead.
+
+---
+
+## Why mixed strategies and not `:one_for_one` everywhere
+
+`:one_for_one` is the safe default but it lies about dataflow. A uniform `:one_for_one` tree lets `PricingEngine` serve stale prices for 20 s while `MarketDataFeed` restarts — a financial correctness bug, not a crash. The strategies are not style preferences; they are declarative constraints on *what consistency the subsystem requires after a failure*. `:rest_for_one` says "downstream must die with upstream"; `:one_for_all` says "these children share state and none makes sense alone"; `:one_for_one` says "these are genuinely independent". Choosing uniformly wastes the mechanism.
+
+---
+
+## Design decisions
+
+**Option A — `:one_for_one` root with children picking their own internal strategy**
+- Pros: failures contained per subsystem; root stays stable.
+- Cons: requires a subsystem supervisor per concern (one extra layer); slightly more wiring.
+
+**Option B — single root `:rest_for_one` with all leaf workers flat** (rejected)
+- Pros: flat tree, easy to read.
+- Cons: a telemetry crash would restart market data; conflates independent subsystems; restart budget becomes meaningless.
+
+→ Chose **A** because each subsystem has its own dataflow semantics (pipeline vs. shared state vs. independent) and its own restart-budget needs. Nesting is the cost of expressing those truthfully.
+
+---
+
+## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  []
+end
+```
+
 ### Step 1: Application and root supervisor
+
+**Objective**: Wire root as :one_for_one with tight 3/5 restart budget so persistent faults bubble up to systemd instead of flapping forever.
 
 ```elixir
 # lib/advanced_strategies/application.ex
@@ -170,6 +235,8 @@ end
 ```
 
 ### Step 2: Market data subsystem — `:rest_for_one`
+
+**Objective**: Declare Feed → PricingEngine → OrderRouter as pipeline so upstream crashes cascade downstream, preventing stale price serving.
 
 ```elixir
 # lib/advanced_strategies/market_data/supervisor.ex
@@ -281,6 +348,8 @@ end
 
 ### Step 3: Session subsystem — `:one_for_all`
 
+**Objective**: Couple AuthToken and RpcChannel via :one_for_all so TLS key invalidation kills both instead of leaving orphaned state.
+
 ```elixir
 # lib/advanced_strategies/session/supervisor.ex
 defmodule AdvancedStrategies.Session.Supervisor do
@@ -338,6 +407,8 @@ end
 
 ### Step 4: Telemetry subsystem — `:one_for_one`
 
+**Objective**: Keep metrics and log shipping independent so a reporter bug never suppresses logs that would diagnose it.
+
 ```elixir
 # lib/advanced_strategies/telemetry/supervisor.ex
 defmodule AdvancedStrategies.Telemetry.Supervisor do
@@ -382,6 +453,8 @@ end
 ```
 
 ### Step 5: Tests
+
+**Objective**: Assert the tree's topology — child order, restart fanout, budget exhaustion — since those contracts silently drift during refactors.
 
 ```elixir
 # test/advanced_strategies/strategies_test.exs
@@ -500,6 +573,23 @@ end
 ### Why this works
 
 Each subsystem supervisor encodes its dependency topology directly into the strategy: `:rest_for_one` with ordered children for the market-data pipeline, `:one_for_all` for the session bundle whose TLS key is shared, `:one_for_one` for unrelated telemetry. The restart budgets match the failure characteristics — tight on root for OS-level escalation, generous on upstream-sensitive pipelines. This composition makes a `PricingEngine` bug impossible to leave a stale-price window, because `:rest_for_one` guarantees the router is torn down alongside.
+
+---
+
+## Advanced Considerations: Partitioned Supervisors and Custom Restart Strategies
+
+A standard Supervisor is a single process managing a static tree. For thousands of children, a single supervisor becomes a bottleneck: all supervisor callbacks run on one process, and supervisor restart logic is sequential. PartitionSupervisor (OTP 25+) spawns N independent supervisors, each managing a subset of children. Hashing the child ID determines which partition supervises it, distributing load and enabling horizontal scaling.
+
+Custom restart strategies (via `Supervisor.init/2` callback) allow logic beyond the defaults. A strategy might prioritize restarting dependent services in a specific order, or apply backoff based on restart frequency. The downside is complexity: custom logic is harder to test and reason about, and mistakes cascade. Start with defaults and profile before adding custom behavior.
+
+Selective restart via `:rest_for_one` or `:one_for_all` affects failure isolation. `:one_for_all` restarts all children when one fails (simulating a total system failure), which can be necessary for consistency but is expensive. `:rest_for_one` restarts the failed child and any started after it, balancing isolation and dependencies. Understanding which strategy fits your architecture prevents cascading failures and unnecessary restarts.
+
+---
+
+
+## Deep Dive: Property Patterns and Production Implications
+
+Property-based testing inverts the testing mindset: instead of writing examples, you state invariants (properties) and let a generator find counterexamples. StreamData's shrinking capability is its superpower—when a property fails on a 10,000-element list, the framework reduces it to the minimal list that still fails, cutting debugging time from hours to minutes. The trade-off is that properties require rigorous thinking about domain constraints, and not every invariant is worth expressing as a property. Teams that adopt property testing often find bugs in specifications themselves, not just implementations.
 
 ---
 

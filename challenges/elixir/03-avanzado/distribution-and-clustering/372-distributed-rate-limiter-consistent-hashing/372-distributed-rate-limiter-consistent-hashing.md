@@ -88,6 +88,8 @@ end
 
 ### Step 1: The hash ring
 
+**Objective**: Build a consistent hash ring with virtual nodes over `:gb_trees` so ownership lookup is O(log n) and node churn reshuffles ~1/n keys.
+
 ```elixir
 # lib/edge_rate_limiter/ring.ex
 defmodule EdgeRateLimiter.Ring do
@@ -150,6 +152,8 @@ end
 
 ### Step 2: The per-node shard — local ETS counter
 
+**Objective**: Keep per-client timestamps in a public ETS bag so sliding-window checks stay lock-free for readers and self-garbage-collect.
+
 ```elixir
 # lib/edge_rate_limiter/shard.ex
 defmodule EdgeRateLimiter.Shard do
@@ -204,6 +208,8 @@ end
 
 ### Step 3: The cluster-aware limiter — forward to the owner
 
+**Objective**: Cache the ring in `:persistent_term` and forward non-local keys via `:rpc.call/5` so every node sees one authoritative counter per client.
+
 ```elixir
 # lib/edge_rate_limiter/limiter.ex
 defmodule EdgeRateLimiter.Limiter do
@@ -257,6 +263,8 @@ end
 ```
 
 ### Step 4: Supervision
+
+**Objective**: Use `:rest_for_one` so a limiter crash rebuilds the ring before the shard resumes serving forwarded requests.
 
 ```elixir
 # lib/edge_rate_limiter/application.ex
@@ -401,6 +409,24 @@ Benchee.run(
 
 Target: `check — local owner` < 15 µs on a warm table. Cross-node checks (via `:rpc.call`) add ~200–500 µs depending on RTT.
 
+## Deep Dive
+
+Distributed Erlang relies on a heartbeat mechanism (net_kernel tick) to detect node failure, but the network is fundamentally asynchronous—split-brain scenarios are inevitable. A partitioned cluster may have two sets of nodes, each believing the other is dead. Libraries like Horde and Phoenix.PubSub solve this with quorum-aware consensus, but they add latency and complexity. At scale, choose your consistency model explicitly: eventual consistency (via Redis PubSub) is faster but allows temporary divergence; strong consistency (via Horde DLM or distributed transactions) is slower but guarantees atomicity. For global registries, the order of operations matters—registering a process before its monitor is live creates race conditions. In multi-region setups, latency between nodes compounds these issues; consider regional clusters with a lightweight coordinator rather than a fully meshed topology.
+## Advanced Considerations
+
+Distributed Elixir systems require careful consideration of network partitions, consistent hashing for distributed state, and the interaction between clustering libraries and node discovery mechanisms. Network partitions are not rare edge cases; they happen regularly in cloud deployments due to maintenance windows and infrastructure issues. A system that works perfectly during local testing but fails under network partitions indicates insufficient failure handling throughout the codebase. Split-brain scenarios where multiple network partitions lead to different cluster views require explicit recovery mechanisms that are often business-specific and context-dependent.
+
+Horde and distributed registries provide eventual consistency guarantees, but "eventual" can mean minutes during network partitions. Applications must handle the case where the same name is registered on multiple nodes simultaneously without coordination. Consistent hashing for distributed services requires understanding rebalancing costs — a single node failure can cause significant key redistribution and thundering herd problems if not carefully managed. The cost of distributed consensus using algorithms like Raft is high; choose it only when consistency is more important than availability and can afford the performance cost.
+
+Global state replication across nodes creates synchronization challenges at scale. Choosing between replicating everywhere versus replicating to specific nodes affects both consistency latency and network bandwidth utilization fundamentally. Node monitoring and heartbeat mechanisms require careful timeout tuning — too aggressive and you get false positives during network hiccups; too conservative and you don't detect actual failures quickly enough for recovery. The EPMD (Erlang Port Mapper Daemon) is a critical component that can become a bottleneck in large clusters and requires careful capacity planning.
+
+
+## Deep Dive: Distributed Patterns and Production Implications
+
+Distributed testing with Peer spawns multiple Erlang nodes in separate BEAM instances, allowing you to test actual node failure, network partitions, and message delays. This is essential for OTP applications but adds latency and complexity. The key insight is that distributed tests reveal assumptions about network reliability that single-node tests cannot—timeouts, partial failures, and split-brain scenarios are invisible to local tests.
+
+---
+
 ## Trade-offs and production gotchas
 
 1. **Cross-node RTT dominates tail latency**: if your LB sprays requests uniformly, ~(N-1)/N of checks are cross-node. Co-locating clients via sticky sessions dramatically improves p99.
@@ -421,3 +447,13 @@ Your cluster doubles from 4 nodes to 8 during a deploy. Approximately what fract
 - [`:persistent_term` docs](https://www.erlang.org/doc/man/persistent_term.html)
 - [DynamoDB paper — Amazon, 2007](https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf)
 - [`Hash rings explained — Davidovich`](https://www.toptal.com/big-data/consistent-hashing)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

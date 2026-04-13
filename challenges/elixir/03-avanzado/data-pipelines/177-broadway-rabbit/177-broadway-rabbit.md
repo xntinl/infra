@@ -126,6 +126,8 @@ Start at `prefetch_count = processor_concurrency * 2`.
 
 ### Step 1: Deps
 
+**Objective**: Pin `broadway_rabbitmq` and the raw `amqp` client so topology declaration and ack callbacks share one stable ABI.
+
 ```elixir
 defp deps do
   [
@@ -137,6 +139,8 @@ end
 ```
 
 ### Step 2: Rabbit topology setup
+
+**Objective**: Declare exchanges, DLX, and queue bindings idempotently at boot so broker state never drifts from code.
 
 ```elixir
 defmodule BroadwayRabbitAdv.RabbitSetup do
@@ -172,6 +176,8 @@ end
 ```
 
 ### Step 3: Pipeline
+
+**Objective**: Split ack outcomes into success, transient requeue, and permanent DLX so poison pills cannot starve healthy traffic.
 
 ```elixir
 defmodule BroadwayRabbitAdv.Pipeline do
@@ -262,6 +268,8 @@ end
 
 ### Step 4: Order service (fake)
 
+**Objective**: Stub deterministic stock outcomes — `:ok`, out-of-stock, DB timeout — so every ack branch exercises under test.
+
 ```elixir
 defmodule BroadwayRabbitAdv.OrderService do
   @spec debit_stock(map()) :: :ok | {:error, :out_of_stock | :db_timeout}
@@ -272,6 +280,8 @@ end
 ```
 
 ### Step 5: Application
+
+**Objective**: Open the AMQP connection and declare topology before starting Broadway so the producer never subscribes to a missing queue.
 
 ```elixir
 defmodule BroadwayRabbitAdv.Application do
@@ -290,6 +300,8 @@ end
 
 ### Step 6: Tests
 
+**Objective**: Unit-test `handle_message/3` via `NoopAcknowledger` so ack decisions are asserted without a live broker.
+
 ```elixir
 defmodule BroadwayRabbitAdv.PipelineTest do
   use ExUnit.Case, async: false
@@ -300,50 +312,52 @@ defmodule BroadwayRabbitAdv.PipelineTest do
   # We test handle_message in isolation (unit test). Integration tests
   # would publish into a real RabbitMQ and assert DLX arrivals.
 
-  test "well-formed order returns success" do
-    msg = %Message{
-      data: Jason.encode!(%{id: 1, sku: "A", qty: 1}),
-      metadata: %{headers: :undefined},
-      acknowledger: {Broadway.NoopAcknowledger, nil, nil}
-    }
+  describe "BroadwayRabbitAdv.Pipeline" do
+    test "well-formed order returns success" do
+      msg = %Message{
+        data: Jason.encode!(%{id: 1, sku: "A", qty: 1}),
+        metadata: %{headers: :undefined},
+        acknowledger: {Broadway.NoopAcknowledger, nil, nil}
+      }
 
-    out = Pipeline.handle_message(:default, msg, %{})
-    assert out.status == :ok
-  end
+      out = Pipeline.handle_message(:default, msg, %{})
+      assert out.status == :ok
+    end
 
-  test "out-of-stock is a permanent failure (reject)" do
-    msg = %Message{
-      data: Jason.encode!(%{id: 1, sku: "OOS", qty: 1}),
-      metadata: %{headers: :undefined},
-      acknowledger: {Broadway.NoopAcknowledger, nil, nil}
-    }
+    test "out-of-stock is a permanent failure (reject)" do
+      msg = %Message{
+        data: Jason.encode!(%{id: 1, sku: "OOS", qty: 1}),
+        metadata: %{headers: :undefined},
+        acknowledger: {Broadway.NoopAcknowledger, nil, nil}
+      }
 
-    out = Pipeline.handle_message(:default, msg, %{})
-    assert {:failed, :out_of_stock} = out.status
-  end
+      out = Pipeline.handle_message(:default, msg, %{})
+      assert {:failed, :out_of_stock} = out.status
+    end
 
-  test "db timeout with low attempts is transient (requeue)" do
-    msg = %Message{
-      data: Jason.encode!(%{id: 1, sku: "FLAKY", qty: 1}),
-      metadata: %{headers: :undefined},
-      acknowledger: {Broadway.NoopAcknowledger, nil, nil}
-    }
+    test "db timeout with low attempts is transient (requeue)" do
+      msg = %Message{
+        data: Jason.encode!(%{id: 1, sku: "FLAKY", qty: 1}),
+        metadata: %{headers: :undefined},
+        acknowledger: {Broadway.NoopAcknowledger, nil, nil}
+      }
 
-    out = Pipeline.handle_message(:default, msg, %{})
-    assert {:failed, :db_timeout} = out.status
-  end
+      out = Pipeline.handle_message(:default, msg, %{})
+      assert {:failed, :db_timeout} = out.status
+    end
 
-  test "db timeout after 5 attempts is permanent" do
-    deaths = for i <- 1..5, do: %{"count" => i}
+    test "db timeout after 5 attempts is permanent" do
+      deaths = for i <- 1..5, do: %{"count" => i}
 
-    msg = %Message{
-      data: Jason.encode!(%{id: 1, sku: "FLAKY", qty: 1}),
-      metadata: %{headers: [{"x-death", :array, deaths}]},
-      acknowledger: {Broadway.NoopAcknowledger, nil, nil}
-    }
+      msg = %Message{
+        data: Jason.encode!(%{id: 1, sku: "FLAKY", qty: 1}),
+        metadata: %{headers: [{"x-death", :array, deaths}]},
+        acknowledger: {Broadway.NoopAcknowledger, nil, nil}
+      }
 
-    out = Pipeline.handle_message(:default, msg, %{})
-    assert {:failed, {:max_retries, :db_timeout}} = out.status
+      out = Pipeline.handle_message(:default, msg, %{})
+      assert {:failed, {:max_retries, :db_timeout}} = out.status
+    end
   end
 end
 ```
@@ -366,6 +380,24 @@ IO.puts("avg: #{time_us / 10_000} µs/op")
 ```
 
 Target: operation should complete in the low-microsecond range on modern hardware; deviations by >2× indicate a regression worth investigating.
+
+## Deep Dive
+
+Data pipelines in Elixir leverage the Actor model to coordinate work across producer, consumer, and batcher stages. GenStage provides the foundation—a demand-driven backpressure mechanism that prevents memory bloat when producers exceed consumer capacity. Broadway abstracts this further, handling subscriptions, acknowledgments, and error propagation automatically. Understanding pipeline topology is critical at scale: a misconfigured batcher can serialize work and kill throughput; conversely, excessive partitioning fragments state and increases GC pressure. In production systems, always measure latency and memory per stage—Broadway's metrics integration with Telemetry makes this traceable. Consider exactly-once delivery semantics early; most pipelines require idempotency keys or deduplication at the consumer boundary. For high-volume Kafka scenarios, partition alignment (matching Broadway partitions to Kafka partitions) is essential to avoid rebalancing storms.
+## Advanced Considerations
+
+Data pipeline implementations at scale require careful consideration of backpressure, memory buffering, and failure recovery semantics. Broadway and Genstage provide demand-driven processing, but understanding the exact flow of backpressure through your pipeline is essential to avoid either starving producers or overwhelming buffers. The interaction between batcher timeouts and consumer demand can create unexpected latencies when tuples are held waiting for either a size threshold or time threshold to be reached. In systems processing millions of events, even a 100ms batch timeout can impact end-to-end latency dramatically.
+
+Idempotency and exactly-once semantics are not automatic — they require architectural decisions about checkpointing and deduplication strategies. Writing checkpoints too frequently becomes a bottleneck; writing them too infrequently means lost progress on failure and potential duplicates. The choice between in-process ETS-based deduplication versus external stores (Redis, database) changes your failure recovery story fundamentally. Broadway's acknowledgment system is flexible but requires explicit design; missing acknowledgments can cause data loss or duplicates in production environments where failures are common.
+
+When handling external systems (databases, message queues, APIs), transient failures and circuit-breaker patterns become essential. A single slow downstream service can cause backpressure to ripple through your entire pipeline catastrophically. Consider implementing bulkhead patterns where certain pipeline stages have isolated pools of workers to prevent cascading failures. For ETL pipelines combining Ecto with streaming, managing database connection pools and transaction contexts requires careful coordination to prevent connection exhaustion.
+
+
+## Deep Dive: Streaming Patterns and Production Implications
+
+Stream-based pipelines in Elixir achieve backpressure and composability by deferring computation until consumption. Unlike eager list operations that allocate all intermediate structures, Streams are lazy chains that produce one element at a time, reducing memory footprint and enabling infinite sequences. The BEAM scheduler yields between Stream operations, allowing multiple concurrent pipelines to interleave fairly. At scale (processing millions of rows or events), the difference between eager and lazy evaluation becomes the difference between consistent latency and garbage collection pauses. Production systems benefit most when Streams are composed at library boundaries, not scattered across the codebase.
+
+---
 
 ## Trade-offs and production gotchas
 
@@ -432,3 +464,13 @@ to ~2.4k msgs/sec.
 - [Reliability guide — RabbitMQ](https://www.rabbitmq.com/reliability.html)
 - [BroadwayRabbitMQ source](https://github.com/dashbitco/broadway_rabbitmq/blob/main/lib/broadway_rabbitmq/producer.ex)
 - [Elixir AMQP client](https://github.com/pma/amqp)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

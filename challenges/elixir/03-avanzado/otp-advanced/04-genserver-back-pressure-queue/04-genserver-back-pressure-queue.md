@@ -35,6 +35,16 @@ backpressure_queue/
 
 ### 1. `:erlang.process_info(pid, :message_queue_len)`
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
+
 ```elixir
 {:message_queue_len, n} = :erlang.process_info(self(), :message_queue_len)
 ```
@@ -114,6 +124,8 @@ Already included in Step 1: `{:benchee, "~> 1.3", only: :dev}`.
 
 ### Step 1: `mix.exs`
 
+**Objective**: Restrict Benchee to `:dev` so burst load testing never ships in release, back-pressure gate remains production-only.
+
 ```elixir
 defmodule BackpressureQueue.MixProject do
   use Mix.Project
@@ -131,6 +143,8 @@ end
 ```
 
 ### Step 2: `lib/backpressure_queue/overflow_disk.ex`
+
+**Objective**: Spool deferred events to append-only file so memory-bounded bursts survive without shedding load past capacity.
 
 ```elixir
 defmodule BackpressureQueue.OverflowDisk do
@@ -161,6 +175,8 @@ end
 ```
 
 ### Step 3: `lib/backpressure_queue/normalizer.ex`
+
+**Objective**: Check :message_queue_len in handle_call with hysteresis so producers see overload synchronously, avoiding silent mailbox flood.
 
 ```elixir
 defmodule BackpressureQueue.Normalizer do
@@ -247,6 +263,8 @@ end
 
 ### Step 4: `lib/backpressure_queue/application.ex`
 
+**Objective**: Supervise Normalizer with :one_for_one so crashes isolate to gate alone, preserving spill file and upstream producers.
+
 ```elixir
 defmodule BackpressureQueue.Application do
   use Application
@@ -261,6 +279,8 @@ end
 
 ### Step 5: `test/backpressure_queue/normalizer_test.exs`
 
+**Objective**: Blast 2k concurrent submits per policy so :reject fails fast and :defer round-trips events through spill file.
+
 ```elixir
 defmodule BackpressureQueue.NormalizerTest do
   use ExUnit.Case, async: false
@@ -273,46 +293,48 @@ defmodule BackpressureQueue.NormalizerTest do
     :ok
   end
 
-  test "accepts events under the high-water mark" do
-    for i <- 1..50, do: assert :ok == Normalizer.submit(%{id: i})
-    assert Normalizer.stats().accepted == 50
-  end
+  describe "BackpressureQueue.Normalizer" do
+    test "accepts events under the high-water mark" do
+      for i <- 1..50, do: assert :ok == Normalizer.submit(%{id: i})
+      assert Normalizer.stats().accepted == 50
+    end
 
-  test "rejects events above the high-water mark with :reject policy" do
-    # Saturate by spawning many concurrent callers that each hold the mailbox.
-    # We simulate overload by bumping the flag directly via lots of casts that
-    # queue behind our call. Simpler: call stats after slamming with 2000 submits
-    # from concurrent tasks and observe rejections.
-    tasks =
-      for i <- 1..2_000 do
-        Task.async(fn -> Normalizer.submit(%{id: i}, :reject) end)
+    test "rejects events above the high-water mark with :reject policy" do
+      # Saturate by spawning many concurrent callers that each hold the mailbox.
+      # We simulate overload by bumping the flag directly via lots of casts that
+      # queue behind our call. Simpler: call stats after slamming with 2000 submits
+      # from concurrent tasks and observe rejections.
+      tasks =
+        for i <- 1..2_000 do
+          Task.async(fn -> Normalizer.submit(%{id: i}, :reject) end)
+        end
+
+      results = Task.await_many(tasks, 30_000)
+      rejected = Enum.count(results, &(&1 == {:error, :overload}))
+      accepted = Enum.count(results, &(&1 == :ok))
+
+      # We cannot predict exact numbers but at least one must be rejected under
+      # this concurrency level, and every response must be one of the valid shapes.
+      assert accepted + rejected == 2_000
+      assert rejected >= 1
+    end
+
+    test "defers events above the high-water mark with :defer policy" do
+      tasks =
+        for i <- 1..2_000 do
+          Task.async(fn -> Normalizer.submit(%{id: i}, :defer) end)
+        end
+
+      results = Task.await_many(tasks, 30_000)
+      deferred = Enum.count(results, &(&1 == {:ok, :deferred}))
+
+      # Every response is :ok or {:ok, :deferred}; no crashes.
+      assert Enum.all?(results, fn r -> r == :ok or r == {:ok, :deferred} end)
+
+      if deferred > 0 do
+        drained = BackpressureQueue.OverflowDisk.drain("priv/overflow/events.log")
+        assert length(drained) == deferred
       end
-
-    results = Task.await_many(tasks, 30_000)
-    rejected = Enum.count(results, &(&1 == {:error, :overload}))
-    accepted = Enum.count(results, &(&1 == :ok))
-
-    # We cannot predict exact numbers but at least one must be rejected under
-    # this concurrency level, and every response must be one of the valid shapes.
-    assert accepted + rejected == 2_000
-    assert rejected >= 1
-  end
-
-  test "defers events above the high-water mark with :defer policy" do
-    tasks =
-      for i <- 1..2_000 do
-        Task.async(fn -> Normalizer.submit(%{id: i}, :defer) end)
-      end
-
-    results = Task.await_many(tasks, 30_000)
-    deferred = Enum.count(results, &(&1 == {:ok, :deferred}))
-
-    # Every response is :ok or {:ok, :deferred}; no crashes.
-    assert Enum.all?(results, fn r -> r == :ok or r == {:ok, :deferred} end)
-
-    if deferred > 0 do
-      drained = BackpressureQueue.OverflowDisk.drain("priv/overflow/events.log")
-      assert length(drained) == deferred
     end
   end
 end
@@ -321,6 +343,23 @@ end
 ### Why this works
 
 The gate runs *inside* the GenServer's `handle_call`, which is the only point where `:message_queue_len` reflects a meaningful value for decision-making — at any other point a cast could arrive between measurement and decision. Hysteresis (`@high_water` = 500, `@low_water` = 300) stops the flag from flapping under steady-state load near the threshold. `call` (not `cast`) is essential: only `call` gives the producer a synchronous reply that carries the overload verdict back.
+
+---
+
+## Advanced Considerations: Supervision and Hot Code Upgrade Patterns
+
+The OTP supervision tree is the backbone of Elixir's fault tolerance. A DynamicSupervisor can spawn workers on demand and track them, but if a worker crashes before it's supervised, messages to it drop silently. Equally, a `:temporary` worker that crashes is restarted zero times — useful for one-off tasks, but requires the caller to handle crashes. `:transient` restarts on non-normal exits; `:permanent` always restarts.
+
+`handle_continue` callbacks and `:hibernate` reduce memory overhead in long-lived processes. After initializing, a GenServer can return `{:noreply, state, {:continue, :do_work}}` to defer expensive work past the `init/1` call, keeping the supervisor's synchronous startup fast. Hibernation moves a process's heap to disk, freeing RAM at the cost of latency when the process receives its next message.
+
+Hot code upgrades via `sys:replace_state/2` or `:sys.replace_state/3` allow changing code without restarting the VM, but only if state structure is forward- and backward-compatible. In practice, code changes that alter state shape (adding or removing fields) require a migration function. The `:code.purge/1` and `:code.load_file/1` cycle reloads the module, but old pids still run old code until they return to the scheduler. Design for graceful degradation: code that cannot upgrade hot should acknowledge that in docs and operational runbooks.
+
+---
+
+
+## Deep Dive: Otp Patterns and Production Implications
+
+OTP primitives (GenServer, Supervisor, Application) are tested through their public interfaces, not by inspecting internal state. This discipline forces correct design: if you can't test a behavior without peeking into the server's state, the behavior is not public. Production systems with tight integration tests on GenServer internals are fragile and hard to refactor.
 
 ---
 

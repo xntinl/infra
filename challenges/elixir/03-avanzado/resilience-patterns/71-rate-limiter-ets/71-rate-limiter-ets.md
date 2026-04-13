@@ -7,7 +7,7 @@
 ## Project context
 
 You're building `api_gateway`, an internal HTTP gateway that routes traffic to microservices.
-Routing is already working (previous exercises). The next step is to protect downstream
+The gateway is operational. The next step is to protect downstream
 services from abusive clients.
 
 Project structure at this point:
@@ -104,6 +104,8 @@ process dies, the table is destroyed) but is not the bottleneck for reads.
 
 ### Step 1: Create the project
 
+**Objective**: Initialize supervised Mix project with rate_limiter subdirectory and test/bench scaffolding for incremental development.
+
 ```bash
 mix new api_gateway --sup
 cd api_gateway
@@ -114,6 +116,20 @@ mkdir -p bench
 
 ### Step 2: `mix.exs` — add benchee as a dev dependency
 
+**Objective**: Add benchee to :dev only so throughput microbenchmarks don't bloat production releases or impact startup.
+
+```elixir
+# mix.exs
+defp deps do
+  [
+    {:benchee, "~> 1.3", only: :dev}
+  ]
+end
+```
+
+### Dependencies (mix.exs)
+
+```elixir
 ```elixir
 # mix.exs
 defp deps do
@@ -124,6 +140,8 @@ end
 ```
 
 ### Step 3: `lib/api_gateway/rate_limiter/server.ex`
+
+**Objective**: Use :bag ETS table for lock-free reads on check/3 while GenServer owns write (record/1) and periodic cleanup to prevent timestamp leaks.
 
 `# TODO` marks what you need to implement. `# HINT` gives direction without spoiling
 the solution. Do not change the public function signatures — the tests depend on them.
@@ -234,6 +252,8 @@ end
 
 ### Step 4: Given tests — must pass without modification
 
+**Objective**: Lock sliding-window semantics, expired-entry behavior, and 100-reader concurrency against a frozen test contract the implementation must satisfy.
+
 Copy this file exactly. Your implementation must make all 4 tests pass.
 
 ```elixir
@@ -310,6 +330,8 @@ end
 
 ### Step 5: Run the tests
 
+**Objective**: Run the suite with `--trace` so concurrent-read and expiry cases surface ordering bugs early instead of masking them behind parallel runners.
+
 ```bash
 mix test test/api_gateway/rate_limiter_test.exs --trace
 ```
@@ -318,6 +340,8 @@ All 4 tests fail initially — that's expected. Your job is to implement `Server
 until all of them pass.
 
 ### Step 6: Concurrency benchmark
+
+**Objective**: Measure `check/3` under parallel load with empty vs heavy buckets so regressions in the ETS read path surface as ops/sec deltas.
 
 Once tests pass, measure real throughput:
 
@@ -415,6 +439,29 @@ IO.puts("avg: #{time_us / 10_000} µs/op")
 ```
 
 Target: operation should complete in the low-microsecond range on modern hardware; deviations by >2× indicate a regression worth investigating.
+
+---
+
+## Deep Dive: Sliding Window Implementations and Memory Trade-offs
+
+Sliding window rate limiting approximates continuous tracking by partitioning time into small buckets and counting events within a rolling window. Unlike fixed windows that allow spikes at boundaries (counting resets every minute exactly), sliding windows spread the limit evenly. A 100-requests-per-minute limit with 1-minute sliding window prevents both 50 requests in second 59 and 50 in second 1 (which would happen in fixed windows).
+
+The ETS-based approach stores a map of bucket keys to event counts, incrementing buckets as requests arrive and discarding old buckets. At high request rates (millions per second), bucket creation and cleanup become CPU-intensive. Each request performs reads and writes to the ETS table, consuming lock contention budget. The granularity choice matters: 1-second buckets for a 1-minute window means 60 buckets per key; finer granularity (100ms buckets) increases precision but consumes more memory and lock contention.
+
+Memory growth is subtle: under sustained load at the limit, bucket count stays bounded (60 for 1-minute window, 1-second granularity). But under peak load spikes, temporary over-provisioning of memory is common. A GenServer-based alternative trades ETS's concurrency for simpler code but creates single-process bottlenecks at high request rates. Hybrid approaches use ETS for hot counts with periodic GenServer checkpoints for durability, balancing responsiveness and persistence.
+
+---
+
+## Advanced Considerations: Circuit Breakers and Bulkheads in Production
+
+A circuit breaker monitors downstream service health and rejects new requests when failures exceed a threshold, failing fast instead of queuing indefinitely. States: `:closed` (normal), `:open` (fast-fail), `:half_open` (testing recovery). A timeout-based pattern monitors; once requests succeed again, the circuit closes. Half-open tests with a single request; if it succeeds, all requests resume.
+
+Bulkheads isolate resource pools so one slow endpoint doesn't starve others. A GenServer pool with a bounded queue (e.g., `:queue.len(state) >= 100`) can return `{:error, :overloaded}` immediately, preventing queue buildup. Combined with exponential backoff on the client (caller retries with increasing delays), this creates a natural circuit breaker behavior without explicit state.
+
+Graceful degradation means serving stale data or reduced functionality when a service is slow. A cached value with a 5-minute TTL is acceptable for many reads; serve it if the live source is timing out. Feature flags allow disabling expensive operations at runtime. Cascading timeout windows (outer service times out after 5s, inner calls must complete in 3s) prevent unbounded waiting. The cost is complexity: tracking degradation modes, testing failure scenarios, and ensuring data consistency under partial failures.
+
+---
+
 
 ## Reflection
 

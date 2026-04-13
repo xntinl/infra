@@ -144,6 +144,8 @@ telemetry. This is the same pattern Broadway uses when consumers fall behind.
 
 ### Step 1: Create the project
 
+**Objective**: Boot a supervised OTP app with dependencies to ensure Registry, Outbox, and Telemetry restart on crashes.
+
 ```bash
 mix new event_bus_built --sup
 cd event_bus_built
@@ -161,6 +163,8 @@ end
 ```
 
 ### Step 2: `lib/event_bus/application.ex`
+
+**Objective**: Start partitioned Registry with duplicate keys, DynamicSupervisor for subscribers, Outbox and Telemetry under supervision.
 
 ```elixir
 defmodule EventBus.Application do
@@ -185,6 +189,8 @@ end
 ```
 
 ### Step 3: `lib/event_bus/bus.ex`
+
+**Objective**: Expose a non-blocking publish API with wildcard topic matching — `Registry.dispatch/3` fans out per-subscriber without blocking the caller.
 
 ```elixir
 defmodule EventBus.Bus do
@@ -258,6 +264,8 @@ end
 ```
 
 ### Step 4: `lib/event_bus/subscriber.ex`
+
+**Objective**: Wrap user handlers in a supervised GenServer — crashes stay contained; `{:error, _}` leaves the envelope in the outbox for redelivery.
 
 ```elixir
 defmodule EventBus.Subscriber do
@@ -337,6 +345,8 @@ end
 
 ### Step 5: `lib/event_bus/outbox.ex`
 
+**Objective**: Back per-subscriber buffers with ETS plus a periodic sweep — at-least-once-local delivery without touching disk.
+
 ```elixir
 defmodule EventBus.Outbox do
   @moduledoc """
@@ -396,6 +406,8 @@ end
 
 ### Step 6: `lib/event_bus/telemetry.ex`
 
+**Objective**: Attach a logger to publish, lag, exception, and sweep events — observability is wired at the bus boundary, not sprinkled inside handlers.
+
 ```elixir
 defmodule EventBus.Telemetry do
   @moduledoc false
@@ -425,6 +437,8 @@ end
 ```
 
 ### Step 7: Tests
+
+**Objective**: Exercise publish, wildcard matching, and at-least-once redelivery — three seams that together prove the bus composes correctly.
 
 ```elixir
 # test/event_bus/bus_test.exs
@@ -538,6 +552,8 @@ end
 
 ### Step 8: Run it
 
+**Objective**: Run `mix test` — green suite proves fan-out, supervision, and outbox redelivery compose end-to-end.
+
 ```bash
 mix test
 ```
@@ -548,6 +564,14 @@ mix test
 ### Why this works
 
 The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
+
+
+## Key Concepts: Event Broadcasting and Pub-Sub Patterns
+
+An event bus is a message broker that decouples senders from receivers. Instead of Process A calling Process B directly, A publishes an event (e.g., `{:user_created, user_id}`), and any subscriber interested in that event receives it. Multiple subscribers can react independently.
+
+Implementation options: simple `Registry` with `Phoenix.PubSub` (works locally), or distributed options like RabbitMQ or Kafka for cross-node or persistent events. The pattern is especially useful when many components need to react to state changes without tight coupling. A common gotcha: event handlers are fire-and-forget by default (cast semantics). If a handler fails, the event is lost unless you add retry logic (e.g., via Oban). For critical workflows, consider event sourcing (storing all events in a log) instead of immediate side effects.
+
 
 ## Benchmark
 
@@ -561,13 +585,28 @@ IO.puts("avg: #{time_us / 10_000} µs/op")
 
 Target: operation should complete in the low-microsecond range on modern hardware; deviations by >2× indicate a regression worth investigating.
 
+## Deep Dive: Domain Patterns and Production Implications
+
+Domain-specific frameworks enforce module dependencies and architectural boundaries. Testing domain isolation ensures that constraints are maintained as the codebase grows. Production systems without boundary enforcement often become monolithic and hard to test.
+
+---
+
+## Advanced Considerations
+
+Framework choices like Ash, Commanded, and Nerves create significant architectural constraints that are difficult to change later. Ash's powerful query builder and declarative approach simplify common patterns but can be opaque when debugging complex permission logic or custom filters at scale. Event sourcing with Commanded is powerful for audit trails but creates a different mental model for state management — replaying events to derive current state has CPU and latency costs that aren't apparent in traditional CRUD systems.
+
+Nerves requires understanding the full embedded system stack — from bootloader configuration to over-the-air update mechanisms. A Nerves system that works on your development board may fail in production due to hardware variations, network conditions, or power supply issues. NX's numerical computing is powerful but requires understanding GPU acceleration trade-offs and memory management for large datasets. Livebook provides interactive development but shouldn't be used for production deployments without careful containerization and resource isolation.
+
+The integration between these frameworks and traditional BEAM patterns (supervisors, processes, GenServers) requires careful design. A Commanded projection that rebuilds state from the event log can consume all available CPU, starving other services. NX autograd computations can create unexpected memory usage if not carefully managed. Nerves systems are memory-constrained; performance assumptions from desktop Elixir don't hold. Always prototype these frameworks in realistic environments before committing to them in production systems to validate assumptions.
+
+
 ## Trade-offs and production gotchas
 
 **1. In-VM only.** Across nodes use `Phoenix.PubSub` with the `PG2` adapter or a
 real broker. This bus intentionally avoids distribution — it's a primitive.
 
 **2. Outbox is not durable.** If the node crashes, outbox entries die with ETS.
-For true durability back the outbox with Ecto, or delegate to Oban (exercise 46).
+For true durability back the outbox with Ecto, or delegate to Oban.
 
 **3. `Registry.dispatch/3` holds a read lock per partition.** Long-running dispatch
 callbacks block writers on that shard. Keep the lambda tiny — match and `send/2`.
@@ -643,3 +682,13 @@ the same Registry primitive.
 - [Broadway back-pressure design — dashbit.co/blog](https://dashbit.co/blog/introducing-broadway)
 - [`:telemetry` conventions — hexdocs.pm](https://hexdocs.pm/telemetry/readme.html)
 - [Saša Jurić — "To spawn, or not to spawn?"](https://www.theerlangelist.com/article/spawn_or_not)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

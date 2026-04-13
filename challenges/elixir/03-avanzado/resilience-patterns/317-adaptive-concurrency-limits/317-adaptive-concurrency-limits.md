@@ -63,6 +63,16 @@ Clients acquire a permit before calling downstream. Permit released on completio
 
 ### Dependencies (`mix.exs`)
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
+
 ```elixir
 defmodule AdaptiveLimiter.MixProject do
   use Mix.Project
@@ -72,6 +82,8 @@ end
 ```
 
 ### Step 1: Application
+
+**Objective**: Configure per-downstream limiter with min_limit/max_limit so each dependency auto-discovers its saturation point without hardcoded capacity numbers.
 
 ```elixir
 defmodule AdaptiveLimiter.Application do
@@ -90,6 +102,8 @@ end
 ```
 
 ### Step 2: Gradient algorithm (`lib/adaptive_limiter/gradient.ex`)
+
+**Objective**: Express Vegas control law as pure function so limit computation is independent of GenServer and testable with deterministic RTT inputs.
 
 ```elixir
 defmodule AdaptiveLimiter.Gradient do
@@ -126,6 +140,8 @@ end
 ```
 
 ### Step 3: Limiter (`lib/adaptive_limiter/limiter.ex`)
+
+**Objective**: Gate on permit acquisition and feed RTT samples back to gradient so limit grows on low-latency success and shrinks when queueing increases.
 
 ```elixir
 defmodule AdaptiveLimiter.Limiter do
@@ -335,6 +351,23 @@ IO.puts("avg: #{t / 50_000} µs")
 ```
 
 Expected: ~3-5µs per acquire+release (single GenServer, two messages). For higher throughput, partition by key into N limiters.
+
+## Advanced Considerations: Circuit Breakers and Bulkheads in Production
+
+A circuit breaker monitors downstream service health and rejects new requests when failures exceed a threshold, failing fast instead of queuing indefinitely. States: `:closed` (normal), `:open` (fast-fail), `:half_open` (testing recovery). A timeout-based pattern monitors; once requests succeed again, the circuit closes. Half-open tests with a single request; if it succeeds, all requests resume.
+
+Bulkheads isolate resource pools so one slow endpoint doesn't starve others. A GenServer pool with a bounded queue (e.g., `:queue.len(state) >= 100`) can return `{:error, :overloaded}` immediately, preventing queue buildup. Combined with exponential backoff on the client (caller retries with increasing delays), this creates a natural circuit breaker behavior without explicit state.
+
+Graceful degradation means serving stale data or reduced functionality when a service is slow. A cached value with a 5-minute TTL is acceptable for many reads; serve it if the live source is timing out. Feature flags allow disabling expensive operations at runtime. Cascading timeout windows (outer service times out after 5s, inner calls must complete in 3s) prevent unbounded waiting. The cost is complexity: tracking degradation modes, testing failure scenarios, and ensuring data consistency under partial failures.
+
+---
+
+
+## Deep Dive: Resilience Patterns and Production Implications
+
+Resilience patterns (circuit breakers, timeouts, retries) are easy to implement but hard to test. The insight is that resilience patterns must be tested under failure: timeouts matter only when calls actually take time, retries matter only when transient failures occur. Production systems with untested resilience patterns often fail gracefully in test and catastrophically in production.
+
+---
 
 ## Trade-offs and production gotchas
 

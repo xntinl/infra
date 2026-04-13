@@ -90,7 +90,20 @@ unambiguous user-facing representation.
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Protocols dispatch on type; implement Inspect for debugging/logging of domain types without leaking internals.
 
 ```bash
 mix new domain_display
@@ -98,6 +111,8 @@ cd domain_display
 ```
 
 ### Step 2: `mix.exs`
+
+**Objective**: Boilerplate; focus on testing custom Inspect output — it's hard to debug without it.
 
 ```elixir
 defmodule DomainDisplay.MixProject do
@@ -120,6 +135,8 @@ end
 ```
 
 ### Step 3: `lib/domain_display/money.ex`
+
+**Objective**: Money is opaque; avoid string manipulation — cents + ISO atom prevents rounding errors and silly bugs.
 
 ```elixir
 defmodule DomainDisplay.Money do
@@ -210,6 +227,8 @@ end
 
 ### Step 4: `lib/domain_display/email.ex`
 
+**Objective**: Domain types hide parsing logic; downstreams don't parse/validate again — single source of truth.
+
 ```elixir
 defmodule DomainDisplay.Email do
   @moduledoc """
@@ -267,6 +286,8 @@ end
 
 ### Step 5: `lib/domain_display/user_id.ex`
 
+**Objective**: NewType pattern (struct wrapping a single field) makes passing wrong ID type a compile-time type error.
+
 ```elixir
 defmodule DomainDisplay.UserId do
   @moduledoc """
@@ -301,6 +322,8 @@ end
 ```
 
 ### Step 6: Tests
+
+**Objective**: Test Inspect protocol output — it's the only UI users of your type see when debugging.
 
 ```elixir
 # test/domain_display/money_test.exs
@@ -430,6 +453,8 @@ end
 
 ### Step 7: Run the tests
 
+**Objective**: --warnings-as-errors finds unused matches in protocols; test coverage validates all clauses fire.
+
 ```bash
 mix test --trace
 ```
@@ -445,6 +470,19 @@ m           # shows #Money<€19.99>
 
 ---
 
+
+## Key Concepts
+
+### 1. The `String.Chars` Protocol Converts Types to Strings
+When you interpolate a value in a string, Elixir calls `to_string/1`, which uses the `String.Chars` protocol. Implementing it for your types makes them automatically stringify.
+
+### 2. `String.Chars` vs `Inspect`
+`String.Chars` converts to user-friendly strings. `Inspect` converts to Elixir syntax (for debugging). `#{user}` calls `String.Chars`; `IO.inspect(user)` calls `Inspect`.
+
+### 3. Default Implementations
+Most types have default `String.Chars` implementations. For custom types, implement the protocol to control how they stringify.
+
+---
 ## Trade-off analysis
 
 | Aspect | Protocols (this impl) | Behaviours | Plain functions |

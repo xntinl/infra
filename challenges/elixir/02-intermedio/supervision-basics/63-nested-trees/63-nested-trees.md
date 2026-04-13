@@ -117,12 +117,18 @@ end
 
 ### Step 1: Create the project
 
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
+
 ```bash
 mix new nested_trees
 cd nested_trees
 ```
 
 ### Step 2: `lib/nested_trees/worker.ex`
+
+**Objective**: Implement `worker.ex` — a worker whose crash behavior is the whole point — it exists so the supervisor strategy can be observed.
+
 
 ```elixir
 defmodule NestedTrees.Worker do
@@ -151,6 +157,9 @@ end
 ```
 
 ### Step 3: `lib/nested_trees/subtree_a.ex` and `subtree_b.ex`
+
+**Objective**: Provide `lib/nested_trees/subtree_a.ex` and `subtree_b.ex` — these are the supporting fixtures the main module depends on to make its concept demonstrable.
+
 
 ```elixir
 defmodule NestedTrees.SubtreeA do
@@ -187,6 +196,9 @@ end
 
 ### Step 4: `lib/nested_trees/root.ex`
 
+**Objective**: Implement `root.ex` — a worker whose crash behavior is the whole point — it exists so the supervisor strategy can be observed.
+
+
 ```elixir
 defmodule NestedTrees.Root do
   @moduledoc """
@@ -213,6 +225,9 @@ end
 ```
 
 ### Step 5: `test/nested_trees_test.exs`
+
+**Objective**: Write `nested_trees_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
 
 ```elixir
 defmodule NestedTreesTest do
@@ -288,6 +303,9 @@ end
 
 ### Step 6: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -343,3 +361,17 @@ pool] and that's fine. Premature nesting is architecture theater.
 - [Elixir getting started — Supervisor and Application](https://hexdocs.pm/elixir/supervisor-and-application.html)
 - [Erlang OTP Design Principles — Supervision Trees](https://www.erlang.org/doc/design_principles/sup_princ.html)
 - ["Designing Elixir Systems with OTP" — Bruce Tate & James Gray (Pragmatic)](https://pragprog.com/titles/jgotp/designing-elixir-systems-with-otp/)
+
+
+## Advanced Considerations
+
+Supervision trees encode your application's fault tolerance strategy. The tree structure, restart policy, and shutdown semantics directly determine behavior during crashes, dependencies, and graceful shutdown.
+
+**Supervision tree design:**
+A well-designed tree mirrors data/message flow: dependencies point upward. If process A depends on process B, B should be higher in the tree (started first, shut down last). Supervisor strategies (`:one_for_one`, `:one_for_all`, `:rest_for_one`) define the scope of cascading restarts. `:one_for_one` isolates failures (each crash restarts only that child); `:one_for_all` is for tightly-coupled groups (e.g., a reader-writer pair).
+
+**Restart strategies and intensity:**
+`max_restarts: 3, max_seconds: 5` means "if 3+ restarts occur in 5 seconds, kill the supervisor." This circuit-breaker pattern prevents restart loops that consume resources. The key decision: should a crashing child take down the whole app (escalate to parent) or just itself? Transient/temporary children exit "cleanly" and don't trigger restarts — useful for request handlers.
+
+**Error propagation and shutdown ordering:**
+When a supervisor exits, it sends `:shutdown` to children in reverse start order (LIFO). Children have `shutdown: 5000` milliseconds to terminate gracefully before hard killing. Nested supervisors propagate this signal recursively. Understanding this order prevents resource leaks: a child waiting on another child's graceful shutdown will deadlock if not designed carefully.

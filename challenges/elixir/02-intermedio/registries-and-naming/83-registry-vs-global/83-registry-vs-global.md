@@ -106,9 +106,31 @@ This exercise exists because the wrong choice is almost always an *overreach*: `
 
 ---
 
+### Dependencies (`mix.exs`)
+
+```elixir
+def deps do
+  [
+    {DOWN},
+    {already_started},
+    {counter},
+    {error},
+    {exunit},
+    {genserver},
+    {global},
+    {k},
+    {ok},
+    {reply},
+    {via},
+  ]
+end
+```
 ## Implementation
 
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
 
 ```bash
 mix new naming_compared --sup
@@ -116,6 +138,9 @@ cd naming_compared
 ```
 
 ### Step 2: `lib/naming_compared/counter.ex`
+
+**Objective**: Implement `counter.ex` — the naming/lookup strategy that decides how processes are addressed under concurrency and failure.
+
 
 ```elixir
 defmodule NamingCompared.Counter do
@@ -145,6 +170,9 @@ end
 
 ### Step 3: `lib/naming_compared/application.ex`
 
+**Objective**: Wire `application.ex` to start the supervision tree that starts the Registry before any via-tuple lookup can happen.
+
+
 ```elixir
 defmodule NamingCompared.Application do
   @moduledoc false
@@ -162,6 +190,9 @@ end
 ```
 
 ### Step 4: `lib/naming_compared.ex`
+
+**Objective**: Implement `naming_compared.ex` — the naming/lookup strategy that decides how processes are addressed under concurrency and failure.
+
 
 ```elixir
 defmodule NamingCompared do
@@ -189,6 +220,9 @@ end
 ```
 
 ### Step 5: `test/naming_compared_test.exs`
+
+**Objective**: Write `naming_compared_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
 
 ```elixir
 defmodule NamingComparedTest do
@@ -256,6 +290,9 @@ end
 ```
 
 ### Step 6: Run
+
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
 
 ```bash
 mix test
@@ -345,3 +382,15 @@ is pointless.
 - [`GenServer` — name registration](https://hexdocs.pm/elixir/GenServer.html#module-name-registration)
 - [Horde — distributed supervisor + registry](https://hexdocs.pm/horde/readme.html)
 - [Saša Jurić — "To spawn, or not to spawn?"](https://www.theerlangelist.com/article/spawn_or_not) — when naming makes sense
+
+
+## Key Concepts
+
+Registry patterns in Elixir provide distributed name resolution through a central registry process. Unlike traditional naming services, Elixir registries are per-node by default but can be partitioned globally. Process name resolution follows a lookup chain: local registry → distributed registry (if configured) → `:global` → fallback mechanisms.
+
+**Critical concepts:**
+- **Via tuple pattern** `{:via, module, name}`: Enables pluggable naming backends. The registry module intercepts `:whereis`, `:register`, `:unregister` calls, allowing both local and distributed strategies.
+- **Partitioned registries** (`Registry.start_link(partitions: 8)`): Reduce contention by sharding the registry across multiple ETS tables. Each partition handles independent name lookups, improving throughput under high concurrency.
+- **Clustering implications**: Global registries across nodes require consensus. Elixir's registry design favors availability (CAP theorem) — a node can register locally and replicate asynchronously. This is why `:global` exists separately from local registries.
+
+**Senior-level gotcha**: Mixing local and global registration without explicit sync logic can cause "phantom" processes — a process registered locally appears available to local callers but fails remote calls. Always make registry scope explicit in your architecture.

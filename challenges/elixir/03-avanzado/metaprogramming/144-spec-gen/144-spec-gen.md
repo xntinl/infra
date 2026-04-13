@@ -2,15 +2,22 @@
 
 **Project**: `spec_gen` — a macro that reads compact type annotations from a sibling attribute and emits `@spec` for each function automatically, keeping types and code in sync.
 
-**Difficulty**: ★★★★☆
-**Estimated time**: 3–5 hours
-
 ---
 
 ## Project context
 
 Your team enforces Dialyzer in CI. Adding `@spec` to every function is tedious, and
 specs drift when signatures change. You want a compact notation:
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
 
 ```elixir
 defmodule Calculator do
@@ -48,6 +55,12 @@ spec_gen/
 
 ---
 
+## Why generated specs and not missing ones
+
+Generated functions without specs are invisible to Dialyzer and partially invisible to ExDoc. Emitting `@spec` during code generation keeps both tools honest.
+
+---
+
 ## Core concepts
 
 ### 1. `@spec` is just an attribute with an AST
@@ -82,9 +95,25 @@ Failures should report the user's file:line, not the macro's. Use
 
 ---
 
+## Design decisions
+
+**Option A — write specs by hand next to every function**
+- Pros: reviewers see the contract at the call site; Dialyzer picks it up cleanly.
+- Cons: specs drift from generated function lists; DSLs leave them missing.
+
+**Option B — emit `@spec` alongside generated functions** (chosen)
+- Pros: Dialyzer coverage for generated code; docs stay accurate.
+- Cons: spec building is macro work; type escaping is subtle.
+
+→ Chose **B** because without generated specs, Dialyzer misses the main body of the module and docs lose type info.
+
+---
+
 ## Implementation
 
 ### Step 1: `lib/spec_gen/types.ex`
+
+**Objective**: Map short type aliases (i, f, b, bool) to full typespec AST via quote so macro can expand them.
 
 ```elixir
 defmodule SpecGen.Types do
@@ -123,6 +152,8 @@ end
 ```
 
 ### Step 2: `lib/spec_gen/spec_gen.ex`
+
+**Objective**: Implement deftyped/3 macro that parses short type annotations, expands them, and emits @spec + def together.
 
 ```elixir
 defmodule SpecGen do
@@ -212,6 +243,8 @@ end
 
 ### Step 3: Sample usage
 
+**Objective**: Demonstrate deftyped with Calculator.add/halve/noop so users see DSL ergonomics.
+
 ```elixir
 defmodule SpecGen.Sample.Calculator do
   use SpecGen
@@ -243,6 +276,8 @@ end
 ```
 
 ### Step 4: Tests
+
+**Objective**: Assert function is emitted, @spec is attached and Dialyzer-readable, unknown types and non-atoms raise CompileError.
 
 ```elixir
 defmodule SpecGenTest do
@@ -292,6 +327,27 @@ defmodule SpecGenTest do
 end
 ```
 
+### Why this works
+
+Inside the macro, the field types are available as AST fragments. Splicing them into a `@spec` attribute that precedes the `def` attaches them to the emitted function. The compiler and Dialyzer treat them as hand-written specs.
+
+---
+
+## Advanced Considerations: Macro Hygiene and Compile-Time Validation
+
+Macros execute at compile time, walking the AST and returning new AST. That power is easy to abuse: a macro that generates variables can shadow outer scope bindings, or a quote block that references variables directly can fail if the macro is used in a context where those variables don't exist. The `unquote` mechanism is the escape hatch, but misusing it leads to hard-to-debug compile errors.
+
+Macro hygiene is about capturing intent correctly. A `defmacro` that takes `:my_option` and uses it directly might match an unrelated `:my_option` from the caller's scope. The idiomatic pattern is to use `unquote` for values that should be "from the outside" and keep AST nodes quoted for safety. The `quote` block's binding of `var!` and `binding!` provides escape valves for the rare case when shadowing is intentional.
+
+Compile-time validation unlocks errors that would otherwise surface at runtime. A macro can call functions to validate input, generate code conditionally, or fail the build with `IO.warn`. Schema libraries like `Ecto` and `Ash` use macros to define fields at compile time, so runtime queries are guaranteed type-safe. The cost is cognitive load: developers must reason about both the code as written and the code generated.
+
+---
+
+
+## Deep Dive: Metaprogramming Patterns and Production Implications
+
+Metaprogramming (macros, AST manipulation) requires testing at compile time and runtime. The challenge is that macro tests often involve parsing and expanding code, which couples tests to compiler internals. Production bugs in macros can corrupt entire modules; testing macros rigorously is non-negotiable.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -325,6 +381,19 @@ must appear BEFORE the `deftyped` call (it targets the next `def`). Document.
 by hand is clearer and tool-friendlier (IDE autocomplete, goto-definition).
 Generators shine when you have hundreds of near-identical wrappers (e.g. API
 clients generated from an OpenAPI schema).
+
+---
+
+## Benchmark
+
+<!-- benchmark N/A: tema conceptual / plumbing de compile-time -->
+
+---
+
+## Reflection
+
+- A generated function has a dynamic return type depending on input shape. Do you emit a union spec, or drop to `term()`? What does each choice cost you in Dialyzer signal?
+- Would you accept a PR that removes generated specs to cut compile time? What evidence would change your answer?
 
 ---
 

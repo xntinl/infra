@@ -2,26 +2,22 @@
 
 **Project**: `bind_quoted_demo` — a deeper look at `quote bind_quoted: [...]`, comparing it head-to-head with inline `unquote/1`, and showing the three canonical use cases where `bind_quoted` is strictly better.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
 
-Exercise 92 introduced `bind_quoted` as the fix for accidental
-duplicate evaluation. This exercise zooms in and shows **three distinct
-situations** where `bind_quoted` matters:
+Dado `quote bind_quoted: [x: expr]`, el compilador evalúa `expr` una
+vez en expand-time y bindea el resultado a una `x` hygienic dentro del
+bloque generado. Esa regla tiene tres payoffs distintos:
 
-1. **Loops at compile time** — generating N function heads from a list,
-   where every head embeds a value. `unquote` inside `for` interacts
-   poorly with the macro expansion; `bind_quoted` handles it
-   transparently.
-2. **Shared sub-expressions** — the side-effect-once pattern from
-   exercise 92.
-3. **Accidental variable capture** — avoiding a hygiene pitfall where
-   `unquote` of an expression referencing caller variables propagates
-   surprising bindings.
+1. **Loops en compile-time** — generar N function heads desde una
+   lista, donde cada head embede un valor.
+2. **Subexpresiones compartidas** — evaluar una expresión en runtime
+   una sola vez y referenciar el resultado muchas veces dentro del
+   bloque generado.
+3. **Captura accidental de variables** — evitar un pitfall de hygiene
+   donde `unquote` de una expresión referenciando variables del caller
+   propaga bindings sorpresivos.
 
 By the end you'll have a short mental rule: **values → `bind_quoted`;
 user code → `unquote`**.
@@ -36,6 +32,15 @@ bind_quoted_demo/
 │   └── bind_quoted_demo_test.exs
 └── mix.exs
 ```
+
+---
+
+## Why `bind_quoted` by default and not "unquote first, refactor later"
+
+Empezar con `unquote(expr)` por ser menos caracteres lleva a descubrir
+un bug de duplicación o shadowing seis meses después. Defaultear a
+`bind_quoted` elimina la clase de bug antes que empiece; `unquote`
+queda reservado para code blocks del usuario.
 
 ---
 
@@ -90,9 +95,41 @@ practice you notice errors later (at runtime) with `unquote`, whereas
 
 ---
 
+## Design decisions
+
+**Option A — Usar `unquote` uniformemente**
+- Pros: Un modelo mental para cada splice.
+- Cons: Depende de que cada contribuidor recuerde "no compartir
+  expresiones"; loops y valores con side effects son footguns.
+
+**Option B — `bind_quoted` para valores, `unquote` para code/patterns** (elegida)
+- Pros: Garantía del compilador; pattern positions usan `unquote`
+  explícitamente.
+- Cons: Dos modelos mentales.
+
+→ Elegida **B** porque el split mapea a qué diseñó cada mecanismo.
+
+---
+
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"ecto", "~> 1.0"},
+    {:"phoenix", "~> 1.0"},
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
 
 ```bash
 mix new bind_quoted_demo
@@ -100,6 +137,9 @@ cd bind_quoted_demo
 ```
 
 ### Step 2: `lib/bind_quoted_demo.ex`
+
+**Objective**: Implement `bind_quoted_demo.ex` — AST manipulation that runs at compile time — making the macro's hygiene and unquoting choices observable.
+
 
 ```elixir
 defmodule BindQuotedDemo do
@@ -168,6 +208,9 @@ end
 
 ### Step 3: A consumer module for the generator macros
 
+**Objective**: Provide A consumer module for the generator macros — these are the supporting fixtures the main module depends on to make its concept demonstrable.
+
+
 ```elixir
 defmodule BindQuotedDemo.Codes do
   @moduledoc "Generated error-code lookup. Exists to exercise defcodes/1."
@@ -198,6 +241,9 @@ end
 ```
 
 ### Step 4: `test/bind_quoted_demo_test.exs`
+
+**Objective**: Write `bind_quoted_demo_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
 
 ```elixir
 defmodule BindQuotedDemoTest do
@@ -250,9 +296,49 @@ end
 
 ### Step 5: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
+
+### Why this works
+
+`bind_quoted: [k: expr]` evalúa `expr` en expand-time, escapa el
+resultado con `Macro.escape/1`, y emite una asignación hygienic
+`k = value` al tope del bloque. Las posiciones de pattern (dentro de
+`def`, `case`, function-head args) siguen requiriendo `unquote(k)`
+porque el compilador debe ver el AST del pattern.
+
+---
+
+
+## Deep Dive: State Management and Message Handling Patterns
+
+Understanding state transitions is central to reliable OTP systems. Every `handle_call` or `handle_cast` receives current state and returns new state—immutability forces explicit reasoning. This prevents entire classes of bugs: missing state updates are immediately visible.
+
+Key insight: separate pure logic (state → new state) from side effects (logging, external calls). Move pure logic to private helpers; use handlers for orchestration. This makes servers testable—test pure functions independently.
+
+In production, monitor state size and mutation frequency. Unbounded growth is a memory leak; excessive mutations signal hot spots needing optimization. Always profile before reaching for performance solutions like ETS.
+
+## Benchmark
+
+```elixir
+require BindQuotedDemo
+
+{val, _} =
+  :timer.tc(fn ->
+    Enum.each(1..1_000_000, fn _ ->
+      BindQuotedDemo.Config.version()
+    end)
+  end)
+
+IO.puts("getter: #{val}µs / 1M calls")
+```
+
+Target esperado: ~0.1µs por call; función generada es indistinguible
+de una función escrita a mano.
 
 ---
 
@@ -290,6 +376,17 @@ readable. Pick a team convention; don't mix them randomly in one file.
 When you're injecting a *code block* that should execute at the call
 site (the `do:` of an `unless`, the body of a `with`, a lambda the user
 passed). Those are code, not values — `unquote` is the right tool.
+
+---
+
+## Reflection
+
+- El equipo mantiene un DSL con ~40 macros que mezclan `unquote` y
+  `bind_quoted` según el gusto del autor. ¿Qué regla convertís en
+  lint rule para que el estilo converja?
+- `defkv` necesita un valor calculado a partir de otro ya bound
+  (`full_name` = `first` <> `last`). ¿Lo hacés en el macro o en el
+  body del getter? Analizá qué se fosiliza.
 
 ---
 

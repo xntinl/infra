@@ -150,12 +150,16 @@ isolation.
 
 ### Step 1: Create the project
 
+**Objective**: Bootstrap a supervised OTP application — `--sup` gives us the supervision tree the scheduler requires to restart runners on crashes.
+
 ```bash
 mix new job_scheduler_built --sup
 cd job_scheduler_built
 ```
 
 ### Step 2: `lib/job_scheduler/cron.ex`
+
+**Objective**: Precompile cron expressions into MapSets — `matches?/2` becomes O(1) per field instead of re-parsing strings on every tick.
 
 ```elixir
 defmodule JobScheduler.Cron do
@@ -257,6 +261,8 @@ end
 
 ### Step 3: `lib/job_scheduler/backoff.ex`
 
+**Objective**: Apply full-jitter exponential backoff capped at 60s to avoid thundering-herd retries when many jobs fail simultaneously.
+
 ```elixir
 defmodule JobScheduler.Backoff do
   @moduledoc """
@@ -276,6 +282,8 @@ end
 ```
 
 ### Step 4: `lib/job_scheduler/job.ex`
+
+**Objective**: Model a job as an immutable spec with enforced keys — `overlap` and `max_attempts` are first-class scheduling concerns, not ad-hoc flags.
 
 ```elixir
 defmodule JobScheduler.Job do
@@ -301,6 +309,8 @@ end
 ```
 
 ### Step 5: `lib/job_scheduler/runner.ex`
+
+**Objective**: Isolate each invocation in a temporary Task — crashes stay contained, retries happen in-process, telemetry brackets start/stop/exception.
 
 ```elixir
 defmodule JobScheduler.Runner do
@@ -361,6 +371,8 @@ end
 ```
 
 ### Step 6: `lib/job_scheduler/scheduler.ex`
+
+**Objective**: Anchor the tick to the wall clock (not `:timer.send_interval/2`) so schedule drift stays bounded and overlap policy is enforced per-job.
 
 ```elixir
 defmodule JobScheduler.Scheduler do
@@ -453,6 +465,8 @@ end
 
 ### Step 7: `lib/job_scheduler/application.ex`
 
+**Objective**: Start the DynamicSupervisor before the Scheduler — the scheduler depends on being able to spawn runner children when it fires its first tick.
+
 ```elixir
 defmodule JobScheduler.Application do
   @moduledoc false
@@ -471,6 +485,8 @@ end
 ```
 
 ### Step 8: Tests
+
+**Objective**: Cover the three seams independently — cron parsing, backoff bounds, and end-to-end scheduler dispatch via `assert_receive`.
 
 ```elixir
 # test/job_scheduler/cron_test.exs
@@ -568,6 +584,8 @@ end
 
 ### Step 9: Run
 
+**Objective**: Run `mix test` — the async scheduler test is the integration signal that supervision, Cron, and Runner compose correctly.
+
 ```bash
 mix test
 ```
@@ -590,6 +608,24 @@ IO.puts("avg: #{time_us / 10_000} µs/op")
 ```
 
 Target: operation should complete in the low-microsecond range on modern hardware; deviations by >2× indicate a regression worth investigating.
+
+## Deep Dive
+
+Specialized frameworks like Ash (business logic), Commanded (event sourcing), and Nx (numerical computing) abstract away common infrastructure but impose architectural constraints. Ash's declarative resource definitions simplify authorization and querying at the cost of reduced flexibility—deeply nested association policies can degrade query performance. Commanded's event store and aggregate roots enforce event sourcing discipline, making audit trails and temporal queries natural, but require careful snapshot strategy to avoid replaying years of events. Nx brings numerical computing to Elixir, but JIT compilation and lazy evaluation introduce latency; production models benefit from ahead-of-time compilation for inference. For IoT (Nerves), firmware updates must be atomic and resumable—OTA rollback on failure is non-negotiable. Choose frameworks that align with your scaling assumptions: Ash scales horizontally via read replicas; Commanded scales via sharding; Nx scales via distributed training.
+## Advanced Considerations
+
+Framework choices like Ash, Commanded, and Nerves create significant architectural constraints that are difficult to change later. Ash's powerful query builder and declarative approach simplify common patterns but can be opaque when debugging complex permission logic or custom filters at scale. Event sourcing with Commanded is powerful for audit trails but creates a different mental model for state management — replaying events to derive current state has CPU and latency costs that aren't apparent in traditional CRUD systems.
+
+Nerves requires understanding the full embedded system stack — from bootloader configuration to over-the-air update mechanisms. A Nerves system that works on your development board may fail in production due to hardware variations, network conditions, or power supply issues. NX's numerical computing is powerful but requires understanding GPU acceleration trade-offs and memory management for large datasets. Livebook provides interactive development but shouldn't be used for production deployments without careful containerization and resource isolation.
+
+The integration between these frameworks and traditional BEAM patterns (supervisors, processes, GenServers) requires careful design. A Commanded projection that rebuilds state from the event log can consume all available CPU, starving other services. NX autograd computations can create unexpected memory usage if not carefully managed. Nerves systems are memory-constrained; performance assumptions from desktop Elixir don't hold. Always prototype these frameworks in realistic environments before committing to them in production systems to validate assumptions.
+
+
+## Deep Dive: Domain Patterns and Production Implications
+
+Domain-specific frameworks enforce module dependencies and architectural boundaries. Testing domain isolation ensures that constraints are maintained as the codebase grows. Production systems without boundary enforcement often become monolithic and hard to test.
+
+---
 
 ## Trade-offs and production gotchas
 
@@ -657,3 +693,13 @@ from job duration. Measure with:
 - [`DateTime` module — hexdocs.pm](https://hexdocs.pm/elixir/DateTime.html)
 - [Fred Hébert — Stuff Goes Bad: Erlang in Anger](https://www.erlang-in-anger.com/) — chapters on long-running tasks and retries
 - [Chris Keathley — "Good and Bad Elixir"](https://keathley.io/blog/good-and-bad-elixir.html) — process design principles
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

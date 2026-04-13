@@ -6,9 +6,6 @@ arbitrary size, parsing lazily through a `Stream` pipeline backed by
 header mapping, and composable transformations. Memory use stays flat
 regardless of file size.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–4 hours
-
 ---
 
 ## Project context
@@ -89,9 +86,35 @@ row and zip into maps afterward.
 
 ---
 
+## Design decisions
+
+**Option A — `File.read!/1` + `String.split/2` + manual parsing**
+- Pros: trivial to understand; no dep.
+- Cons: loads the whole file in RAM; breaks on quoted fields containing commas/newlines; can't handle gigabyte inputs.
+
+**Option B — `File.stream!/3` piped into `NimbleCSV.parse_stream/2` with `:binary.copy/1` on retained columns (chosen)**
+- Pros: O(row) memory regardless of file size; correct RFC-4180 handling; compile-time specialised dialects; composes with `Stream.filter` / `Stream.transform` naturally.
+- Cons: lazy pipelines are surprising the first time (`Stream.map` does nothing without a sink); forgetting `:binary.copy/1` pins the whole read buffer; error surface is spread across `File`, `NimbleCSV`, and downstream steps.
+
+→ Chose **B** because anything above ~10 MB makes Option A impractical, and the sub-binary copy rule is exactly the kind of subtlety that belongs in a didactic exercise.
+
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
 
 ```bash
 mix new csv_stream_lib
@@ -109,6 +132,9 @@ end
 
 ### Step 2: `test/fixtures/sample.csv`
 
+**Objective**: Provide `test/fixtures/sample.csv` — these are the supporting fixtures the main module depends on to make its concept demonstrable.
+
+
 ```csv
 id,name,email,signup
 1,Ada Lovelace,ada@analytical.engine,2024-01-15
@@ -118,6 +144,9 @@ id,name,email,signup
 ```
 
 ### Step 3: `lib/csv_stream_lib/parser.ex`
+
+**Objective**: Implement `parser.ex` — the integration seam where external protocol semantics meet Elixir domain code.
+
 
 ```elixir
 defmodule CsvStreamLib.Parser do
@@ -135,6 +164,9 @@ end
 ```
 
 ### Step 4: `lib/csv_stream_lib.ex`
+
+**Objective**: Implement `csv_stream_lib.ex` — the integration seam where external protocol semantics meet Elixir domain code.
+
 
 ```elixir
 defmodule CsvStreamLib do
@@ -208,6 +240,9 @@ end
 ```
 
 ### Step 5: `test/csv_stream_lib_test.exs`
+
+**Objective**: Write `csv_stream_lib_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
 
 ```elixir
 defmodule CsvStreamLibTest do
@@ -294,6 +329,21 @@ mix test
 
 ---
 
+
+## Key Concepts
+
+External integrations in Elixir split across multiple patterns: Ecto for relational databases with changesets and migrations; Telemetry for metrics and observability; HTTP libraries like Req or Finch for REST APIs; and specialized parsers like Jason, NimbleCSV, and NimbleParsec for data formats. Choosing the right tool avoids the trap of one library solving everything poorly.
+
+Ecto is the de facto standard for databases because changesets encode validation before queries, migrations manage schema evolution, and the Repo pattern separates query logic from business logic. Migrations are version-controlled SQL, ensuring reproducible deployments. For integrating external services, Req is the modern HTTP client with built-in retry, redirect, and error handling policies.
+
+Telemetry decouples metrics collection from application code: you emit events and let listeners subscribe. This separation keeps business logic clean and metrics infrastructure pluggable. Use metrics, not print statements, in production.
+
+## Key Concepts
+
+CSV files are line-based; streaming them with `Stream` and the CSV library enables processing multi-gigabyte files without loading into memory. `File.stream!/1` reads line by line; `CSV.decode/1` parses each line; `Stream` lazily chains operations. This is the pattern for data pipelines: stream → parse → transform → output. The trade-off: streams are lazy, so errors surface late; eager loading would fail fast. For production data pipelines, error handling at the stream level is essential.
+
+---
+
 ## Trade-offs and production gotchas
 
 **1. Forgetting `:binary.copy/1` causes "memory leaks"**
@@ -326,6 +376,14 @@ same wall-clock time. Streaming pays off above ~100 MB and becomes
 mandatory above a few GB.
 
 ---
+
+## Benchmark
+
+<!-- benchmark N/A: integration/configuration exercise -->
+
+## Reflection
+
+- The test asserts memory growth stays under 5 MB while processing 50k rows. If you removed the `:binary.copy/1` calls and stored every row in a list via `Enum.to_list/1`, roughly how would that 5 MB bound change, and *why* — what is being pinned that the copy was releasing?
 
 ## Resources
 

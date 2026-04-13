@@ -130,7 +130,21 @@ but noisy for a teaching example.
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
 
 ```bash
 mix new ets_access_modes
@@ -138,6 +152,9 @@ cd ets_access_modes
 ```
 
 ### Step 2: `lib/ets_access_modes.ex`
+
+**Objective**: Implement `ets_access_modes.ex` — the access pattern that exposes the trade-off between ETS concurrency flags, match specs, and lookup cost.
+
 
 ```elixir
 defmodule EtsAccessModes do
@@ -249,6 +266,9 @@ end
 
 ### Step 3: `test/ets_access_modes_test.exs`
 
+**Objective**: Write `ets_access_modes_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+
 ```elixir
 defmodule EtsAccessModesTest do
   use ExUnit.Case, async: true
@@ -318,6 +338,9 @@ end
 
 ### Step 4: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -331,6 +354,14 @@ and attempting reads/writes from the test process — each mode's rule falls
 out as a predictable `ArgumentError` pattern or a successful call.
 
 ---
+
+
+## Key Concepts: Named vs. Anonymous Tables and Access Control
+
+When you create an ETS table with `:ets.new(:my_table, [:set, :named_table])`, the atom `:my_table` becomes a global identifier across the entire BEAM node. Any process can call `:ets.lookup(:my_table, key)` without holding a reference—just the atom. This is convenient for caches you want globally accessible (e.g., `Registry` uses a named `:_registry_supervisor_cache` table internally). Without `:named_table`, `:ets.new(:info, [:set])` returns an opaque `tid()` reference, and only processes holding that reference can access the table.
+
+Access control is separate. `:public` tables allow any process to insert, update, and delete. `:protected` (the default) allows only the owner to write but any process to read—this is the most common pattern for shared caches. `:private` restricts all access to the owner. A best practice: use non-named tables (the returned reference) for library internal state, and only use `:named_table` when you're building a VM-global service (and document the atom to avoid collisions). For applications, named tables should be clearly scoped: `:my_app.cache`, not just `:cache`.
+
 
 ## Benchmark
 
@@ -356,6 +387,12 @@ Target esperado: en máquinas de 8+ cores, `read_concurrency: true` reduce
 el tiempo total en 20–50% bajo alta concurrencia de lectura. Con bajo
 paralelismo (<4 lectores), la diferencia puede ser negativa por el costo
 extra de escritura.
+
+---
+
+## Key Concepts
+
+ETS tables can be named (lookup by atom) or unnamed (lookup by table ID), and public (all processes) or private (creator only). Named tables are convenient for singletons (one cache per app) but create coupling—any code can access them, which is sometimes intended and sometimes dangerous. Unnamed tables are safer but require passing the table ID. Public tables allow concurrent access from any process; private tables are accessible only from the creating process. Choose based on isolation needs: a cache shared across the app uses named+public; a temporary work table uses unnamed+private. A producer-consumer pair using a work queue might use unnamed+public (producer knows the ID, passes to consumer). The naming choice is a design decision: public named tables are convenient but create implicit dependencies across your code.
 
 ---
 

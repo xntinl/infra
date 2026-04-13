@@ -84,6 +84,8 @@ end
 
 ### Step 1: the function under budget
 
+**Objective**: Implement prefix lookup with a stated p95 budget of 50µs so regression tests have a named contract to defend.
+
 ```elixir
 # lib/search_index/trie.ex
 defmodule SearchIndex.Trie do
@@ -139,6 +141,8 @@ end
 ```
 
 ### Step 2: CI regression test with budget assertion
+
+**Objective**: Sample 1000 `:timer.tc` runs after warmup and assert p95 against the budget so GC outliers don't mask real regressions.
 
 ```elixir
 # test/search_index/trie_regression_test.exs
@@ -205,6 +209,8 @@ end
 
 ### Step 3: exploratory Benchee script (for local profiling)
 
+**Objective**: Use Benchee at 100/1k/10k sizes with warmup and memory stats so engineers see scaling behaviour before promoting a budget into CI.
+
 ```elixir
 # bench/index_bench.exs
 alias SearchIndex.Trie
@@ -231,6 +237,8 @@ Benchee.run(
 ```
 
 ### Step 4: test.exs wiring
+
+**Objective**: Tag performance tests and `exclude: [:performance]` in `test_helper.exs` so TDD stays fast and regression budgets run only in the CI stage that owns them.
 
 ```elixir
 # test/test_helper.exs
@@ -264,6 +272,21 @@ mix test --only performance
 ```
 
 Expected wall clock: < 500ms for the whole file.
+
+## Deep Dive: Benchmark Patterns and Production Implications
+
+Benchmarking in Elixir requires statistical rigor: a single run means nothing. Tools like Benchee measure distribution, not just mean time. The mistake most engineers make is benchmarking in isolation (single process) and then deploying to a system under concurrent load where cache hits, scheduler contention, and garbage collection behave differently. Production performance tuning must account for these realities.
+
+---
+
+## Advanced Considerations
+
+Production testing strategies require careful attention to resource management and test isolation across multiple concurrent test processes. In large codebases, tests can consume significant memory and CPU resources, especially when using concurrent testing without proper synchronization and cleanup. The BEAM scheduler's preemptive nature means test processes may interfere with each other if shared resources aren't properly isolated at the process boundary. Pay careful attention to how Ecto's sandbox mode interacts with your supervision tree — if you have GenServers that hold state across tests, the sandbox rollback mechanism may leave phantom processes in your monitoring systems that continue consuming resources until forced cleanup occurs.
+
+When scaling tests to production-grade test suites, consider the cost of stub verification and the memory overhead of generated test cases. Each property-based test invocation can create thousands of synthetic test cases, potentially causing garbage collection pressure that's invisible during local testing but becomes critical in CI/CD pipelines running long test suites continuously. The interaction between concurrent tests and ETS tables (often used in caches and registry patterns) requires explicit `inherited: true` options to prevent unexpected sharing between test processes, which can cause mysterious failures when tests run in different orders or under load.
+
+For distributed testing scenarios using tools like `Peer`, network simulation can mask real latency issues and failure modes. Test timeouts that work locally may fail in CI due to scheduler contention and GC pauses. Always include substantial buffers for timeout values and monitor actual execution times under load. The coordination between multiple test nodes requires careful cleanup — a failure in test coordination can leave zombie processes consuming resources indefinitely. Implement proper telemetry hooks within your test helpers to diagnose production-like scenarios and capture performance characteristics.
+
 
 ## Trade-offs and production gotchas
 
@@ -305,3 +328,13 @@ into an orchestrated retuning project?
 - [`:timer.tc/1`](https://www.erlang.org/doc/man/timer.html#tc-1)
 - [Gil Tene — How NOT to measure latency](https://www.infoq.com/presentations/latency-pitfalls/)
 - [ExUnit tags and filtering](https://hexdocs.pm/ex_unit/ExUnit.Case.html#module-tags)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

@@ -88,14 +88,29 @@ You need a client that reacts differently to each class.
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Organize errors/transport/client into modules so exception hierarchy is visible at directory level.
 
 ```bash
 mix new retry_http
 cd retry_http
 ```
 
-### Step 2: `mix.exs`
+### Step 2: `mix.exs` and others (reading to find all Steps...)
+
+**Objective**: Keep the dep list empty so the exception machinery rests on stdlib alone — `defexception` and `rescue` are fully self-contained.
 
 ```elixir
 defmodule RetryHttp.MixProject do
@@ -118,6 +133,8 @@ end
 ```
 
 ### Step 3: `lib/retry_http/errors.ex`
+
+**Objective**: Use `defexception` to give each failure mode a nominal type, so `rescue` can branch on category instead of parsing error messages.
 
 ```elixir
 defmodule RetryHttp.Errors do
@@ -166,6 +183,8 @@ end
   in a string. Logging and metrics can key off the field.
 
 ### Step 4: `lib/retry_http/transport.ex`
+
+**Objective**: Inject a fake transport behind a behaviour so tests can deterministically raise each exception class without any real network.
 
 ```elixir
 defmodule RetryHttp.Transport do
@@ -216,6 +235,8 @@ end
 ```
 
 ### Step 5: `lib/retry_http/client.ex`
+
+**Objective**: Keep retry logic out of the transport so `try/rescue` lives at the public boundary, where the retry policy is the business rule.
 
 ```elixir
 defmodule RetryHttp.Client do
@@ -293,6 +314,8 @@ end
   on the exception semantics.
 
 ### Step 6: Tests
+
+**Objective**: Exercise each exception branch so the retry policy is contract-checked: transient faults retry, permanent faults bubble out.
 
 ```elixir
 # test/retry_http/client_test.exs
@@ -376,6 +399,8 @@ end
 
 ### Step 7: Run and verify
 
+**Objective**: Run the suite to confirm no rescue block silently swallows an unrecognised exception — the classic "broad rescue" bug.
+
 ```bash
 mix test --trace
 mix compile --warnings-as-errors
@@ -385,6 +410,33 @@ All 7 tests must pass.
 
 ---
 
+
+
+---
+## Key Concepts
+
+### 1. Exceptions Are for Exceptional Conditions
+
+Exceptions represent things that should not happen in normal operation (bugs, system failures). Use `{:ok, result}` / `{:error, reason}` for expected failures (validation, not found). This distinction keeps code readable and performant.
+
+### 2. Exception Types Matter for Rescue
+
+```elixir
+try do
+  File.read!("nonexistent.txt")
+rescue
+  e in File.Error -> handle_io_error(e)
+  e in RuntimeError -> handle_runtime_error(e)
+end
+```
+
+Different exceptions trigger different handlers. Catching all exceptions (bare `rescue`) is rarely correct—you usually want specific types.
+
+### 3. Exception Handling is Expensive
+
+Raising and catching involves stack unwinding. For frequently-occurring failures (validation), use tuples. For rare, unexpected errors, exceptions are fine.
+
+---
 ## Trade-off analysis
 
 | Failure class              | Mechanism                       | Why                                            |

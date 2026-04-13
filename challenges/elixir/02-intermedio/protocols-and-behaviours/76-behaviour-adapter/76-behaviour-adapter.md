@@ -102,9 +102,25 @@ test trivial and never flakes on network. This is standard practice —
 
 ---
 
+### Dependencies (`mix.exs`)
+
+```elixir
+def deps do
+  [
+    {config},
+    {error},
+    {exunit},
+    {notifier_delivery},
+    {ok},
+  ]
+end
+```
 ## Implementation
 
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
 
 ```bash
 mix new notifier_adapter
@@ -112,6 +128,9 @@ cd notifier_adapter
 ```
 
 ### Step 2: `lib/notifier.ex`
+
+**Objective**: Implement `notifier.ex` — polymorphism via dispatch on the data's type (protocol) or via an explicit contract (behaviour).
+
 
 ```elixir
 defmodule Notifier do
@@ -146,6 +165,9 @@ end
 
 ### Step 3: `lib/notifier/email.ex`
 
+**Objective**: Implement `email.ex` — polymorphism via dispatch on the data's type (protocol) or via an explicit contract (behaviour).
+
+
 ```elixir
 defmodule Notifier.Email do
   @moduledoc """
@@ -176,6 +198,9 @@ end
 
 ### Step 4: `lib/notifier/slack.ex`
 
+**Objective**: Implement `slack.ex` — polymorphism via dispatch on the data's type (protocol) or via an explicit contract (behaviour).
+
+
 ```elixir
 defmodule Notifier.Slack do
   @moduledoc """
@@ -202,6 +227,9 @@ end
 
 ### Step 5: `lib/notifier/test_adapter.ex`
 
+**Objective**: Implement `test_adapter.ex` — polymorphism via dispatch on the data's type (protocol) or via an explicit contract (behaviour).
+
+
 ```elixir
 defmodule Notifier.TestAdapter do
   @moduledoc """
@@ -222,6 +250,9 @@ end
 
 ### Step 6: `config/config.exs`
 
+**Objective**: Implement `config.exs` — polymorphism via dispatch on the data's type (protocol) or via an explicit contract (behaviour).
+
+
 ```elixir
 import Config
 
@@ -230,6 +261,9 @@ config :notifier_adapter, :adapter, Notifier.Email
 ```
 
 ### Step 7: `test/notifier_test.exs`
+
+**Objective**: Write `notifier_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
 
 ```elixir
 defmodule NotifierTest do
@@ -292,6 +326,9 @@ end
 ```
 
 ### Step 8: Run
+
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
 
 ```bash
 mix test
@@ -365,3 +402,17 @@ to a behaviour the day you add the second backend.
 - [`Bamboo.Adapter`](https://hexdocs.pm/bamboo/Bamboo.Adapter.html)
 - [`Mox`](https://hexdocs.pm/mox/Mox.html) — for explicit mocks over behaviours
 - ["Mocks and explicit contracts" — José Valim](http://blog.plataformatec.com.br/2015/10/mocks-and-explicit-contracts/)
+
+
+## Key Concepts
+
+Protocols and behaviors are Elixir's mechanism for ad-hoc and static polymorphism. They solve different problems and are often confused.
+
+**Protocols:**
+Dispatch based on the type/struct of the first argument at runtime. A protocol defines a contract (e.g., `Enumerable`); any type can implement it by adding a corresponding implementation block. Protocols excel when you control neither the type nor the caller — e.g., a library that needs to iterate any collection. The fallback is `:any` — if no specific implementation exists, the `:any` handler is tried. This enables "optional" protocol implementations.
+
+**Behaviours:**
+Static polymorphism enforced at compile time. A module implements a behavior by defining callbacks (functions). Behaviors are about contracts between modules, not types. Use when you need multiple implementations of the same interface and the caller chooses which to use (e.g., different database adapters, different strategies). Callbacks are checked at compile time — missing a required callback is a compiler error.
+
+**Architectural patterns:**
+Behaviors excel in plugin systems (user defines modules conforming to the behavior). Protocols excel in type-driven dispatch (any type can conform). Mix both: a behavior can require that its callbacks operate on types that implement a protocol. Example: `MyAdapter` behavior requiring callbacks that work with `Enumerable` types.

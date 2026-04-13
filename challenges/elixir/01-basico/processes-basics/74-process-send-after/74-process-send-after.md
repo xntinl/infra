@@ -2,9 +2,6 @@
 
 **Project**: `timeout_canceller` — schedules tasks with a deadline and cancels them before they fire.
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 1–2 hours
-
 ---
 
 ## Project context
@@ -79,9 +76,42 @@ dedicated timer process.
 
 ---
 
+## Why `Process.send_after` and not a spawned sleeper
+
+- Spawning `spawn(fn -> Process.sleep(n); send(dest, msg) end)` works but creates N processes for N timers — memory and scheduler cost scale linearly.
+- `Process.send_after/3` uses the BEAM's timer wheel, a shared data structure optimised for millions of outstanding timers — effectively free per timer.
+- `:timer.send_after/3` also exists but delegates to a single `:timer` GenServer — it's a bottleneck. Prefer `Process.send_after/3`.
+
+---
+
+## Design decisions (abbreviated for efficiency)
+
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  # BEAM primitives only.
+  []
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Build single module so Process.send_after/3 and cancel_timer/1 timer wheel mechanics are visible without GenServer noise.
 
 ```bash
 mix new timeout_canceller
@@ -89,6 +119,8 @@ cd timeout_canceller
 ```
 
 ### Step 2: `lib/timeout_canceller.ex`
+
+**Objective**: Return timer ref so caller can cancel/read idempotently and deadline stays cancellable even mid-flight.
 
 ```elixir
 defmodule TimeoutCanceller do
@@ -169,6 +201,8 @@ end
 ```
 
 ### Step 3: `test/timeout_canceller_test.exs`
+
+**Objective**: Test race window where cancel_timer/1 returns :already_fired so stale message flushing is proven necessary.
 
 ```elixir
 defmodule TimeoutCancellerTest do
@@ -261,9 +295,50 @@ end
 
 ### Step 4: Run
 
+**Objective**: Run test suite to confirm cancel_timer/1 semantics hold under real clock drift on shared CI runners.
+
 ```bash
 mix test
 ```
+
+### Why this works
+
+The BEAM timer wheel is a hash-based data structure optimised for O(1) insertion, O(1) cancellation, and batch processing of expiring timers on each scheduler tick. `Process.send_after/3` inserts a slot and returns the reference immediately — no process is blocked, no thread is idling. `cancel_timer/1` removes the slot; if the timer already fired, the message is in the mailbox and the helper's tagged `receive ... after 0` selectively extracts it without blocking. The `after` block in `with_timeout/2` runs on both normal and exceptional exits, so the flush happens even when `fun/0` raises.
+
+---
+
+
+## Key Concepts
+
+### 1. `Process.send_after/3` Schedules a Message
+The message is delivered after a delay (in milliseconds). You can cancel the timer with the returned reference.
+
+### 2. Timeouts Without Blocking
+This is different from `receive ... after`, which blocks the process. `send_after` schedules asynchronously, allowing your process to continue.
+
+### 3. Common Pattern: Heartbeats
+Schedule periodic messages to implement heartbeats and periodic tasks without a separate timer process.
+
+---
+## Benchmark
+
+```elixir
+# bench/send_after.exs
+{t_setup, refs} = :timer.tc(fn ->
+  Enum.map(1..100_000, fn _ ->
+    Process.send_after(self(), :noop, 60_000)
+  end)
+end)
+
+{t_cancel, _} = :timer.tc(fn ->
+  Enum.each(refs, &Process.cancel_timer/1)
+end)
+
+IO.puts("100k send_after: #{t_setup} µs — #{t_setup / 100_000} µs each")
+IO.puts("100k cancel:    #{t_cancel} µs — #{t_cancel / 100_000} µs each")
+```
+
+Target: < 1 µs per `send_after` and < 1 µs per `cancel_timer` on modern hardware. The timer wheel is designed for millions of outstanding entries — if your profile shows timer setup as a hot spot, you're measuring something else.
 
 ---
 
@@ -296,6 +371,13 @@ production pattern.
 For repeating work with durable scheduling (survives restarts, cluster-wide),
 you want `Oban` or similar. `send_after` is ephemeral — a VM restart forgets
 all pending timers.
+
+---
+
+## Reflection
+
+- Your GenServer schedules a `:tick` every second via `send_after(self(), :tick, 1000)` at the end of each `handle_info(:tick, ...)`. Under load, `handle_info` sometimes takes 1.2s. Is your tick interval now 1s, 1.2s, or drifting? What's the fix that keeps it *exactly* 1s even under load?
+- A caller uses `with_timeout/2` with a 5s budget to call an HTTP client that blocks for 30s. The timer fires, the helper returns `:timeout`, but the caller's process is still blocked in the HTTP call. Why, and what does the production version (`Task.yield/2` + `Task.shutdown/2`) do differently at the OS/scheduler level?
 
 ---
 

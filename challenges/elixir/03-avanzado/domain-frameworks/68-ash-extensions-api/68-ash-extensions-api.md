@@ -6,7 +6,7 @@
 
 ## Project context
 
-You built the `Catalog` domain with Ash resources (exercise 67). Product managers now want a REST API for external partners (stable, cacheable, JSON:API-compatible), a GraphQL endpoint for the mobile app (flexible, single-request), and an internal admin UI for the ops team to manage the catalog without shipping frontend code.
+You are building the `Catalog` domain with Ash resources: a product catalog with categories, products, and pricing. Product managers now want a REST API for external partners (stable, cacheable, JSON:API-compatible), a GraphQL endpoint for the mobile app (flexible, single-request), and an internal admin UI for the ops team to manage the catalog without shipping frontend code.
 
 Hand-writing each of these from scratch is weeks of work and triples the surface where bugs hide. Ash ships three first-party extensions that derive these APIs from the resource definitions:
 
@@ -14,7 +14,7 @@ Hand-writing each of these from scratch is weeks of work and triples the surface
 - [`AshGraphql`](https://hexdocs.pm/ash_graphql/) — Absinthe schema generation from resources.
 - [`AshAdmin`](https://hexdocs.pm/ash_admin/) — LiveView admin UI for CRUD, forms and action invocation.
 
-In this exercise you wire all three onto the `Catalog` domain from the previous exercise. You will learn how one declarative resource turns into three consumer-facing APIs — and what the trade-offs of auto-generation are in production.
+In this exercise you wire all three onto your `Catalog` domain. You will learn how one declarative resource turns into three consumer-facing APIs — and what the trade-offs of auto-generation are in production.
 
 ```
 ash_extensions/
@@ -100,7 +100,7 @@ It is opinionated. For a bespoke internal UI, you will still write LiveView. For
 
 ### 5. All three share the same policies and validations
 
-Because the extensions all go through the Ash action pipeline, authorization and validation rules you wrote in exercise 67 apply uniformly. There is no "REST-only" bypass.
+Because the extensions all go through the Ash action pipeline, authorization and validation rules defined on the resources apply uniformly. There is no "REST-only" bypass.
 
 ---
 
@@ -119,6 +119,8 @@ Because the extensions all go through the Ash action pipeline, authorization and
 ## Implementation
 
 ### Step 1: `mix.exs`
+
+**Objective**: Add Ash extensions (JSON:API, GraphQL, Admin UI) and Phoenix for multi-protocol API exposure.
 
 ```elixir
 defmodule AshExtensions.MixProject do
@@ -152,6 +154,8 @@ end
 
 ### Step 2: Extend the domain — `lib/ash_extensions/catalog/catalog.ex`
 
+**Objective**: Enable AshJsonApi, AshGraphql, and AshAdmin extensions at domain level and configure prefixes/options.
+
 ```elixir
 defmodule AshExtensions.Catalog do
   use Ash.Domain,
@@ -179,6 +183,8 @@ end
 
 ### Step 3: Extend the Product resource
 
+**Objective**: Enable AshJsonApi and AshGraphql on resource to expose read/create/publish actions across protocols.
+
 ```elixir
 defmodule AshExtensions.Catalog.Product do
   use Ash.Resource,
@@ -186,7 +192,7 @@ defmodule AshExtensions.Catalog.Product do
     data_layer: AshPostgres.DataLayer,
     extensions: [AshJsonApi.Resource, AshGraphql.Resource]
 
-  # ... attributes/relationships/actions from exercise 67 ...
+  # ... attributes/relationships/actions from the base Catalog resource ...
 
   postgres do
     table "products"
@@ -281,6 +287,8 @@ end
 ```
 
 ### Step 4: Category and Price — same pattern
+
+**Objective**: Implement: Category and Price — same pattern.
 
 ```elixir
 # lib/ash_extensions/catalog/category.ex
@@ -397,6 +405,8 @@ end
 
 ### Step 5: GraphQL schema — `lib/ash_extensions/graphql_schema.ex`
 
+**Objective**: Define the schema described as: GraphQL schema — `lib/ash_extensions/graphql_schema.ex`.
+
 ```elixir
 defmodule AshExtensions.GraphqlSchema do
   use Absinthe.Schema
@@ -405,6 +415,8 @@ end
 ```
 
 ### Step 6: JSON:API router module
+
+**Objective**: Implement: JSON:API router module.
 
 ```elixir
 defmodule AshExtensions.JsonApiRouter do
@@ -415,6 +427,8 @@ end
 ```
 
 ### Step 7: Phoenix router — `lib/ash_extensions/router.ex`
+
+**Objective**: Implement: Phoenix router — `lib/ash_extensions/router.ex`.
 
 ```elixir
 defmodule AshExtensions.Router do
@@ -457,6 +471,8 @@ end
 
 ### Step 8: Endpoint + Application
 
+**Objective**: Implement: Endpoint + Application.
+
 ```elixir
 defmodule AshExtensions.Endpoint do
   use Phoenix.Endpoint, otp_app: :ash_extensions
@@ -485,6 +501,8 @@ end
 ```
 
 ### Step 9: Tests — `test/api_test.exs`
+
+**Objective**: Provide tests that exercise: Tests — `test/api_test.exs`.
 
 ```elixir
 defmodule AshExtensions.ApiTest do
@@ -548,6 +566,8 @@ end
 
 ### Step 10: Run
 
+**Objective**: Verify the implementation by running the test suite.
+
 ```bash
 mix deps.get
 mix ash_postgres.generate_migrations --name api_initial
@@ -576,6 +596,24 @@ IO.puts("avg: #{time_us / 10_000} µs/op")
 ```
 
 Target: operation should complete in the low-microsecond range on modern hardware; deviations by >2× indicate a regression worth investigating.
+
+## Deep Dive
+
+Specialized frameworks like Ash (business logic), Commanded (event sourcing), and Nx (numerical computing) abstract away common infrastructure but impose architectural constraints. Ash's declarative resource definitions simplify authorization and querying at the cost of reduced flexibility—deeply nested association policies can degrade query performance. Commanded's event store and aggregate roots enforce event sourcing discipline, making audit trails and temporal queries natural, but require careful snapshot strategy to avoid replaying years of events. Nx brings numerical computing to Elixir, but JIT compilation and lazy evaluation introduce latency; production models benefit from ahead-of-time compilation for inference. For IoT (Nerves), firmware updates must be atomic and resumable—OTA rollback on failure is non-negotiable. Choose frameworks that align with your scaling assumptions: Ash scales horizontally via read replicas; Commanded scales via sharding; Nx scales via distributed training.
+## Advanced Considerations
+
+Framework choices like Ash, Commanded, and Nerves create significant architectural constraints that are difficult to change later. Ash's powerful query builder and declarative approach simplify common patterns but can be opaque when debugging complex permission logic or custom filters at scale. Event sourcing with Commanded is powerful for audit trails but creates a different mental model for state management — replaying events to derive current state has CPU and latency costs that aren't apparent in traditional CRUD systems.
+
+Nerves requires understanding the full embedded system stack — from bootloader configuration to over-the-air update mechanisms. A Nerves system that works on your development board may fail in production due to hardware variations, network conditions, or power supply issues. NX's numerical computing is powerful but requires understanding GPU acceleration trade-offs and memory management for large datasets. Livebook provides interactive development but shouldn't be used for production deployments without careful containerization and resource isolation.
+
+The integration between these frameworks and traditional BEAM patterns (supervisors, processes, GenServers) requires careful design. A Commanded projection that rebuilds state from the event log can consume all available CPU, starving other services. NX autograd computations can create unexpected memory usage if not carefully managed. Nerves systems are memory-constrained; performance assumptions from desktop Elixir don't hold. Always prototype these frameworks in realistic environments before committing to them in production systems to validate assumptions.
+
+
+## Deep Dive: Domain Patterns and Production Implications
+
+Domain-specific frameworks enforce module dependencies and architectural boundaries. Testing domain isolation ensures that constraints are maintained as the codebase grows. Production systems without boundary enforcement often become monolithic and hard to test.
+
+---
 
 ## Trade-offs and production gotchas
 
@@ -635,3 +673,13 @@ Benchmark a representative workload with [Wrk](https://github.com/wg/wrk) agains
 - [Absinthe.Complexity docs](https://hexdocs.pm/absinthe/complexity-analysis.html) — GraphQL safety net
 - [Zach Daniel — "Ash 3.0 overview"](https://www.youtube.com/results?search_query=ash+3.0+zach+daniel) — creator's talks
 - [Ash + Phoenix production guide](https://hexdocs.pm/ash_phoenix/) — recommended integration patterns
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

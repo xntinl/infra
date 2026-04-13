@@ -103,6 +103,16 @@ out-of-band commands (start/stop/stats).
 
 No Elixir deps; the Makefile handles C compilation.
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
+
 ```elixir
 defmodule MarketTape.MixProject do
   use Mix.Project
@@ -129,6 +139,8 @@ end
 
 ### Step 1: `Makefile`
 
+**Objective**: Query running BEAM for erl_interface and ERTS paths so compiled driver matches the exact runtime ABI.
+
 ```make
 ERL_EI_INCLUDE := $(shell erl -eval 'io:format("~s", [code:lib_dir(erl_interface, include)])' -s init stop -noshell)
 ERTS_INCLUDE   := $(shell erl -eval 'io:format("~s/erts-~s/include", [code:root_dir(), erlang:system_info(version)])' -s init stop -noshell)
@@ -151,6 +163,8 @@ clean:
 ```
 
 ### Step 2: The driver in C (`c_src/feed_driver.c`)
+
+**Objective**: Accumulate partial bytes across driver_output calls so unaligned feed chunks never lose frames.
 
 ```c
 #include "erl_driver.h"
@@ -280,6 +294,8 @@ DRIVER_INIT(feed_driver) {
 
 ### Step 3: Elixir wrapper (`lib/market_tape/decoder_port.ex`)
 
+**Objective**: Use port_control/3 for side-channel ops so hot-path Port.command never waits for synchronous replies.
+
 ```elixir
 defmodule MarketTape.DecoderPort do
   @moduledoc """
@@ -374,6 +390,8 @@ end
 ```
 
 ### Step 4: Application supervision
+
+**Objective**: Supervise port owner so driver crash triggers stop/cleanup and per-port state rebuilds on restart.
 
 ```elixir
 defmodule MarketTape.Application do
@@ -487,6 +505,23 @@ Benchee.run(
 
 **Expected**: > 1GB/sec decoded throughput on a modern CPU (the decoder is trivial here; a
 real vendor decoder might cut that to 200MB/sec which is still well above a 400Mbps feed).
+
+## Advanced Considerations: NIF Isolation and Scheduler Integration
+
+NIF calls run atomically on a scheduler thread, blocking all other processes on that scheduler until the function returns. For operations exceeding ~1 millisecond, this starvation becomes visible: heartbeat processes delay, ETS owner replies hang, supervision timeouts fire. The BEAM's dirty scheduler pool (8 CPU + 10 IO by default) isolates long NIFs from the main scheduler ring, but they're still a finite resource.
+
+Understanding scheduler capacity is critical. Each dirty CPU scheduler can run ~1,000 100-microsecond operations per second, or ~5 100-millisecond operations. Beyond that, callers queue. A GenServer pool capping concurrency and applying backpressure prevents cascade failures: if the dirty pool saturates, reject new work immediately instead of queuing unboundedly.
+
+Resource management inside NIFs differs from pure Elixir. A `Binary<'a>` is a borrow tied to the NIF call; it cannot escape to threads or be stored in resources. An `OwnedBinary` allocation isn't visible to BEAM's garbage collector, so memory limits must be enforced in the Elixir layer. Hybrid architectures (Port processes for I/O, NIFs for CPU work) offer better observability and failure isolation than trying to do everything in a single NIF crate.
+
+---
+
+
+## Deep Dive: Streaming Patterns and Production Implications
+
+Stream-based pipelines in Elixir achieve backpressure and composability by deferring computation until consumption. Unlike eager list operations that allocate all intermediate structures, Streams are lazy chains that produce one element at a time, reducing memory footprint and enabling infinite sequences. The BEAM scheduler yields between Stream operations, allowing multiple concurrent pipelines to interleave fairly. At scale (processing millions of rows or events), the difference between eager and lazy evaluation becomes the difference between consistent latency and garbage collection pauses. Production systems benefit most when Streams are composed at library boundaries, not scattered across the codebase.
+
+---
 
 ## Trade-offs and production gotchas
 

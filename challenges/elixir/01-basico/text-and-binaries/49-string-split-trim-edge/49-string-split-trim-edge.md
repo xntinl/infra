@@ -69,7 +69,20 @@ web page, NBSP slips past `\s` and your "trim" silently does nothing.
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### Step 1 — Create the project
+
+**Objective**: CSV is deceptively hard (quoted fields contain commas); simple split/trim misses all edge cases in real data.
 
 ```bash
 mix new csv_sanitizer
@@ -77,6 +90,8 @@ cd csv_sanitizer
 ```
 
 ### Step 2 — `lib/csv_sanitizer.ex`
+
+**Objective**: CSV files often have trailing whitespace, CRLF mix, empty lines; sanitize before split to avoid parser churn.
 
 ```elixir
 defmodule CsvSanitizer do
@@ -131,6 +146,8 @@ end
 ```
 
 ### Step 3 — `test/csv_sanitizer_test.exs`
+
+**Objective**: Test CRLF/LF mix, trailing spaces, empty lines, Unicode BOM; dirty real data surfaces bugs in parsing.
 
 ```elixir
 defmodule CsvSanitizerTest do
@@ -189,6 +206,8 @@ end
 
 ### Step 4 — Run the tests
 
+**Objective**: --warnings-as-errors finds dead code in sanitizers; test coverage validates all line-ending scenarios.
+
 ```bash
 mix test
 ```
@@ -197,6 +216,19 @@ All 9 tests should pass.
 
 ---
 
+
+## Key Concepts
+
+### 1. `String.split/2` and `String.split/3` Handle Edge Cases
+The `trim` option removes empty parts. The `parts` option limits splits. These options prevent off-by-one errors in parsing.
+
+### 2. `String.trim/1` Removes Whitespace Globally
+Use `trim_leading` and `trim_trailing` for more control. These functions operate on whitespace, not arbitrary characters.
+
+### 3. Pattern Matching for Precise Control
+For complex parsing, bit syntax gives you more control than string functions. Always prefer explicit extraction over approximate trimming.
+
+---
 ## Trade-offs
 
 | Approach | Best for | Pitfall |

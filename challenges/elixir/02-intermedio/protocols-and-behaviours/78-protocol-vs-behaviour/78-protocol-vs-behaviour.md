@@ -78,9 +78,21 @@ strictly more flexible but costs a bit at the call site.
 
 ---
 
+### Dependencies (`mix.exs`)
+
+```elixir
+def deps do
+  [
+    {exunit},
+  ]
+end
+```
 ## Implementation
 
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
 
 ```bash
 mix new proto_vs_behaviour
@@ -88,6 +100,9 @@ cd proto_vs_behaviour
 ```
 
 ### Step 2: `lib/shape.ex` (protocol)
+
+**Objective**: Provide `lib/shape.ex` (protocol) — these are the supporting fixtures the main module depends on to make its concept demonstrable.
+
 
 ```elixir
 defprotocol Shape do
@@ -102,6 +117,9 @@ end
 ```
 
 ### Step 3: `lib/shape/impls.ex` (protocol impls + structs)
+
+**Objective**: Provide `lib/shape/impls.ex` (protocol impls + structs) — these are the supporting fixtures the main module depends on to make its concept demonstrable.
+
 
 ```elixir
 defmodule Shape.Rectangle do
@@ -127,6 +145,9 @@ end
 
 ### Step 4: `lib/shape_calc.ex` (behaviour)
 
+**Objective**: Provide `lib/shape_calc.ex` (behaviour) — these are the supporting fixtures the main module depends on to make its concept demonstrable.
+
+
 ```elixir
 defmodule ShapeCalc do
   @moduledoc """
@@ -146,6 +167,9 @@ end
 
 ### Step 5: `lib/shape_calc/rectangle.ex` and `circle.ex`
 
+**Objective**: Provide `lib/shape_calc/rectangle.ex` and `circle.ex` — these are the supporting fixtures the main module depends on to make its concept demonstrable.
+
+
 ```elixir
 defmodule ShapeCalc.Rectangle do
   @behaviour ShapeCalc
@@ -163,6 +187,9 @@ end
 ```
 
 ### Step 6: `test/proto_vs_behaviour_test.exs`
+
+**Objective**: Write `proto_vs_behaviour_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
 
 ```elixir
 defmodule ProtoVsBehaviourTest do
@@ -213,6 +240,9 @@ end
 
 ### Step 7: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -227,7 +257,7 @@ to the type ("this shape has an area"), a protocol reads better. No module
 name at call sites; dispatch is implicit and fast after consolidation.
 
 **2. Prefer a behaviour when dispatch is a runtime/config choice**
-Strategy (exercise 77), Adapter (exercise 76), and interpreter patterns
+Strategy, Adapter, and interpreter patterns
 are all behaviour-shaped. The value doesn't tell you which algorithm to
 run — the caller does. Forcing this into a protocol means inventing a
 wrapper struct per strategy, which is backwards.
@@ -257,3 +287,17 @@ adds cost without benefit.
 - [Behaviours — Elixir guide](https://hexdocs.pm/elixir/typespecs.html)
 - ["Writing extensible Elixir with Protocols" — Dashbit](https://dashbit.co/blog/writing-extensible-elixir-with-protocols)
 - ["Mocks and explicit contracts" — José Valim](http://blog.plataformatec.com.br/2015/10/mocks-and-explicit-contracts/)
+
+
+## Key Concepts
+
+Protocols and behaviors are Elixir's mechanism for ad-hoc and static polymorphism. They solve different problems and are often confused.
+
+**Protocols:**
+Dispatch based on the type/struct of the first argument at runtime. A protocol defines a contract (e.g., `Enumerable`); any type can implement it by adding a corresponding implementation block. Protocols excel when you control neither the type nor the caller — e.g., a library that needs to iterate any collection. The fallback is `:any` — if no specific implementation exists, the `:any` handler is tried. This enables "optional" protocol implementations.
+
+**Behaviours:**
+Static polymorphism enforced at compile time. A module implements a behavior by defining callbacks (functions). Behaviors are about contracts between modules, not types. Use when you need multiple implementations of the same interface and the caller chooses which to use (e.g., different database adapters, different strategies). Callbacks are checked at compile time — missing a required callback is a compiler error.
+
+**Architectural patterns:**
+Behaviors excel in plugin systems (user defines modules conforming to the behavior). Protocols excel in type-driven dispatch (any type can conform). Mix both: a behavior can require that its callbacks operate on types that implement a protocol. Example: `MyAdapter` behavior requiring callbacks that work with `Enumerable` types.

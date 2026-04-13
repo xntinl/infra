@@ -88,7 +88,30 @@ defmodule ShareLinks.MixProject do
 end
 ```
 
+### Dependencies (mix.exs)
+
+```elixir
+```elixir
+defmodule ShareLinks.MixProject do
+  use Mix.Project
+  def project, do: [app: :share_links, version: "0.1.0", elixir: "~> 1.16", deps: deps()]
+  def application, do: [mod: {ShareLinks.Application, []}, extra_applications: [:logger, :crypto]]
+
+  defp deps do
+    [
+      {:phoenix, "~> 1.7.14"},
+      {:plug_crypto, "~> 2.0"},
+      {:jason, "~> 1.4"},
+      {:plug_cowboy, "~> 2.7"},
+      {:benchee, "~> 1.3", only: :dev}
+    ]
+  end
+end
+```
+
 ### Step 1: Endpoint config (`config/config.exs` excerpt)
+
+**Objective**: Source `secret_key_base` from the environment so `Phoenix.Token` HMAC keys never ship inside the compiled release.
 
 ```elixir
 # config/config.exs
@@ -104,6 +127,8 @@ config :share_links, ShareLinksWeb.Endpoint,
 **Production note**: generate with `mix phx.gen.secret`; 64 bytes minimum; store in a secret manager, never in the repo.
 
 ### Step 2: Token module — `lib/share_links/tokens.ex`
+
+**Objective**: Scope every token kind to a distinct salt and `max_age` so a reset token cannot be replayed as a share or magic-login token.
 
 ```elixir
 defmodule ShareLinks.Tokens do
@@ -160,6 +185,8 @@ end
 ```
 
 ### Step 3: Controller — `lib/share_links_web/controllers/share_controller.ex`
+
+**Objective**: Map `Phoenix.Token.verify/4` outcomes to distinct HTTP statuses so `:expired` returns 410 and `:invalid` returns 403, not a generic 401.
 
 ```elixir
 defmodule ShareLinksWeb.ShareController do
@@ -252,6 +279,23 @@ Benchee.run(
 ```
 
 **Expected**: `sign` ~40µs, `verify` ~50µs on modern hardware. Both dominated by PBKDF2 key derivation. Enable `:persistent_term` key caching (Plug.Crypto 2.0+ does this automatically) to drop to ~6µs.
+
+## Advanced Considerations: LiveView Real-Time Patterns and Pubsub Scale
+
+LiveView bridges the browser and BEAM via WebSocket, allowing server-side renders to push incremental DOM diffs to the client. A LiveView process is long-lived, receiving events (clicks, form submissions) and broadcasting updates. For real-time features (collaborative editing, live notifications), LiveView processes subscribe to PubSub topics and receive broadcast messages.
+
+Phoenix.PubSub partitions topics across a pool of processes, allowing horizontal scaling. By default, `:local` mode uses in-memory ETS; `:redis` mode distributes across nodes via Redis. At scale (thousands of concurrent LiveViews), topic fanout can bottleneck: broadcasting to a million subscribers means delivering one million messages. The BEAM handles this, but the network cost matters on multi-node deployments.
+
+`Presence` module tracks which users are viewing which pages, syncing state via PubSub. A presence join/leave is broadcast to all nodes, allowing real-time "who's online" updates. Under partition, presence state can diverge; the library uses unique presence keys to detect and reconcile. Operationally, watching presence on every page load can amplify server load if users are flaky (mobile networks, browser reloads). Consider presence only for features where it's user-facing (collaborative editors, live sports scoreboards).
+
+---
+
+
+## Deep Dive: Phoenix Patterns and Production Implications
+
+Phoenix's conn struct represents an HTTP request/response in flight, accumulating transformations through middleware and handler code. Testing a Phoenix endpoint end-to-end (not just the controller) catches middleware order bugs, header mismatches, and plug composition issues. The trade-off is that full integration tests are slower and harder to parallelize than unit tests. Production bugs in auth, CORS, or session handling are often due to middleware assumptions that live tests reveal.
+
+---
 
 ## Trade-offs and production gotchas
 

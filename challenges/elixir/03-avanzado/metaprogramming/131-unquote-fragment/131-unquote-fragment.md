@@ -116,6 +116,18 @@ atom directly to code through the BEAM's apply dispatch.
 
 ### Step 1: `lib/unquote_fragment/rates.ex`
 
+**Objective**: Declare @rates attribute immutable so compile-time loops enumerate and inline exchange rates idempotently.
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
+
 ```elixir
 defmodule UnquoteFragment.Rates do
   @moduledoc "Source of truth for supported currencies and their USD rates."
@@ -140,6 +152,8 @@ end
 ```
 
 ### Step 2: `lib/unquote_fragment/converter.ex`
+
+**Objective**: Use unquote_splicing in for-loop to emit to_usd/to_eur/etc as BEAM jump-table entries with inlined rates.
 
 ```elixir
 defmodule UnquoteFragment.Converter do
@@ -189,6 +203,8 @@ its source rate — zero runtime dictionary lookup.
 
 ### Step 3: A runtime-dispatch variant for comparison
 
+**Objective**: Implement runtime Map.fetch-based convert/2 to baseline the map-lookup overhead against generated dispatch.
+
 ```elixir
 defmodule UnquoteFragment.RuntimeConverter do
   @moduledoc "Traditional runtime-branching version — kept for benchmarking."
@@ -206,6 +222,8 @@ end
 
 ### Step 4: `lib/unquote_fragment/registry.ex`
 
+**Objective**: Query module_info/1 to introspect and list generated to_*/1 functions for doc generation.
+
 ```elixir
 defmodule UnquoteFragment.Registry do
   @moduledoc "Demonstrates introspecting the generated functions at runtime."
@@ -216,6 +234,8 @@ end
 ```
 
 ### Step 5: Tests
+
+**Objective**: Assert generated functions exist for all currencies, round-trip correctly, and match runtime variant numerically.
 
 ```elixir
 defmodule UnquoteFragment.ConverterTest do
@@ -269,6 +289,23 @@ captured via `unquote(rate)`, which splices a literal float into the AST — by
 the time the module loads, every function has its constant baked in. The BEAM
 compiler turns the N clauses into a single jump table keyed by function name,
 which is why dispatch is effectively free.
+
+---
+
+## Advanced Considerations: Macro Hygiene and Compile-Time Validation
+
+Macros execute at compile time, walking the AST and returning new AST. That power is easy to abuse: a macro that generates variables can shadow outer scope bindings, or a quote block that references variables directly can fail if the macro is used in a context where those variables don't exist. The `unquote` mechanism is the escape hatch, but misusing it leads to hard-to-debug compile errors.
+
+Macro hygiene is about capturing intent correctly. A `defmacro` that takes `:my_option` and uses it directly might match an unrelated `:my_option` from the caller's scope. The idiomatic pattern is to use `unquote` for values that should be "from the outside" and keep AST nodes quoted for safety. The `quote` block's binding of `var!` and `binding!` provides escape valves for the rare case when shadowing is intentional.
+
+Compile-time validation unlocks errors that would otherwise surface at runtime. A macro can call functions to validate input, generate code conditionally, or fail the build with `IO.warn`. Schema libraries like `Ecto` and `Ash` use macros to define fields at compile time, so runtime queries are guaranteed type-safe. The cost is cognitive load: developers must reason about both the code as written and the code generated.
+
+---
+
+
+## Deep Dive: Metaprogramming Patterns and Production Implications
+
+Metaprogramming (macros, AST manipulation) requires testing at compile time and runtime. The challenge is that macro tests often involve parsing and expanding code, which couples tests to compiler internals. Production bugs in macros can corrupt entire modules; testing macros rigorously is non-negotiable.
 
 ---
 

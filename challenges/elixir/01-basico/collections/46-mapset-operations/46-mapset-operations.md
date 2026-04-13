@@ -82,7 +82,21 @@ Chose **B** because the problem is literally set algebra and the algorithmic gap
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"jason", "~> 1.0"},
+  ]
+end
+```
+
+
 ### Step 1 — Create the project
+
+**Objective**: Build single module so MapSet vs list trade-off is visible and O(n log n) set algebra cost is proven.
 
 ```bash
 mix new visitor_tracker
@@ -90,6 +104,8 @@ cd visitor_tracker
 ```
 
 ### Step 2 — `lib/visitor_tracker.ex`
+
+**Objective**: Use domain-driven names (returning/new_today/reach) so MapSet.union/intersection/difference map directly to business questions.
 
 ```elixir
 defmodule VisitorTracker do
@@ -163,6 +179,8 @@ end
 
 ### Step 3 — `test/visitor_tracker_test.exs`
 
+**Objective**: Exercise the empty-yesterday branch so retention avoids division-by-zero and the aggregation stays robust on day one.
+
 ```elixir
 defmodule VisitorTrackerTest do
   use ExUnit.Case, async: true
@@ -209,6 +227,8 @@ end
 
 ### Step 4 — Run the tests
 
+**Objective**: Run the suite to confirm set-algebra semantics match the domain wording (returning, new, reach) before any benchmarking.
+
 ```bash
 mix test
 ```
@@ -221,6 +241,19 @@ All 6 tests should pass.
 
 ---
 
+
+## Key Concepts
+
+### 1. MapSets Are Unordered, Unique Collections
+MapSets automatically deduplicate and are implemented as hash arrays, providing O(1) membership testing and insertion.
+
+### 2. MapSet vs List for Membership Testing
+List: O(n) membership check. MapSet: O(1) membership check. If you frequently test membership, use a MapSet.
+
+### 3. Set Operations
+`MapSet.union`, `MapSet.intersection`, `MapSet.difference` are efficient on MapSets. For data deduplication and set math, MapSets are the right choice.
+
+---
 ## Benchmark
 
 ```elixir

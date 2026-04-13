@@ -120,12 +120,18 @@ end
 
 ### Step 1: Create the project
 
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
+
 ```bash
 mix new task_await_many
 cd task_await_many
 ```
 
 ### Step 2: `lib/task_await_many.ex`
+
+**Objective**: Implement `task_await_many.ex` — the concurrency primitive whose back-pressure, linking, and timeout semantics we are isolating.
+
 
 ```elixir
 defmodule TaskAwaitMany do
@@ -190,6 +196,9 @@ end
 
 ### Step 3: `test/task_await_many_test.exs`
 
+**Objective**: Write `task_await_many_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+
 ```elixir
 defmodule TaskAwaitManyTest do
   use ExUnit.Case, async: true
@@ -249,6 +258,9 @@ end
 
 ### Step 4: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -258,6 +270,14 @@ mix test
 ### Why this works
 
 The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+
+## Key Concepts: Concurrent Task Collection and Awaiting
+
+`Task.await_many/2` waits for multiple tasks to complete and collects results in order. This is different from waiting for them one-by-one (sequential) or fire-and-forget (no waiting). It's the right tool when you spawn N workers, do some other work, then gather results.
+
+Example: spawn 10 HTTP requests as tasks, do other work, then await all results. If any task times out (default 5s), the call raises an error. You can handle timeouts with `Task.yield_many/2` instead, which returns partial results and remaining tasks. Gotcha: if a task crashes, `:await` will raise. For fault-tolerant collection, catch exceptions.
 
 
 ## Benchmark
@@ -293,7 +313,7 @@ deadline inside the worker instead of relying on `:brutal_kill`.
 All three strategies block the owner process for up to the timeout.
 That's almost always fine — but if the owner is a high-traffic GenServer,
 it serializes its queue. For "spawn and forget" collection inside a
-GenServer, use a supervised Task and `handle_info` (exercise 52).
+GenServer, use a supervised Task and `handle_info`.
 
 **5. Ownership still applies**
 All three collectors must be called from the process that started the
@@ -301,7 +321,7 @@ tasks. You cannot hand a list of tasks to another process and have it
 collect them.
 
 **6. When NOT to use these collectors**
-- Unbounded input: use `Task.async_stream` with `max_concurrency` (exercise 51).
+- Unbounded input: use `Task.async_stream` with `max_concurrency`.
 - Streaming results to a consumer as they arrive: use
   `Task.async_stream` + `Stream.each/2`.
 - Long-running background jobs — use a proper worker (`Oban`, a

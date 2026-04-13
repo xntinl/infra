@@ -1,8 +1,6 @@
 # Mnesia Fragmented Tables — Sharding Across Nodes
 
 **Project**: `mnesia_fragmented` — a horizontally-sharded event store using `mnesia_frag`.
-**Difficulty**: ★★★★☆
-**Estimated time**: 3–6 hours
 
 ---
 
@@ -45,6 +43,12 @@ mnesia_fragmented/
 
 ---
 
+## Why fragmentation and not a single table
+
+A non-fragmented Mnesia table replicates in full to every participating node. Fragmentation assigns each record to one of N fragments based on a hash of the key, so each node holds only its share.
+
+---
+
 ## Core concepts
 
 ### 1. Fragments are real tables
@@ -66,6 +70,16 @@ physical fragment lookup.
 ### 2. The `mnesia_frag` access module
 
 All operations on a fragmented table must go through this module:
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
 
 ```elixir
 :mnesia.activity(:transaction, fn ->
@@ -112,9 +126,25 @@ during maintenance windows.
 
 ---
 
+## Design decisions
+
+**Option A — single Mnesia table across all nodes**
+- Pros: simple; every node has every record.
+- Cons: does not scale past a few GB per node; replication cost is N^2.
+
+**Option B — fragmented tables with hash-based partitioning** (chosen)
+- Pros: scales horizontally; each node owns a subset; replication cost stays linear.
+- Cons: cross-fragment queries are awkward; rebalancing is manual.
+
+→ Chose **B** because past a certain dataset size there is no other option inside Mnesia.
+
+---
+
 ## Implementation
 
 ### Step 1: `mix.exs`
+
+**Objective**: Declare the project, dependencies, and OTP application in `mix.exs`.
 
 ```elixir
 defmodule MnesiaFragmented.MixProject do
@@ -134,6 +164,8 @@ end
 
 ### Step 2: `lib/mnesia_fragmented/application.ex`
 
+**Objective**: Define the OTP application and supervision tree in `lib/mnesia_fragmented/application.ex`.
+
 ```elixir
 defmodule MnesiaFragmented.Application do
   @moduledoc false
@@ -150,6 +182,8 @@ end
 ```
 
 ### Step 3: `lib/mnesia_fragmented/schema.ex`
+
+**Objective**: Implement the module in `lib/mnesia_fragmented/schema.ex`.
 
 ```elixir
 defmodule MnesiaFragmented.Schema do
@@ -208,6 +242,8 @@ end
 ```
 
 ### Step 4: `lib/mnesia_fragmented/events.ex`
+
+**Objective**: Implement the module in `lib/mnesia_fragmented/events.ex`.
 
 ```elixir
 defmodule MnesiaFragmented.Events do
@@ -284,6 +320,8 @@ end
 
 ### Step 5: `lib/mnesia_fragmented/fragmentation_info.ex`
 
+**Objective**: Implement the module in `lib/mnesia_fragmented/fragmentation_info.ex`.
+
 ```elixir
 defmodule MnesiaFragmented.FragmentationInfo do
   @moduledoc """
@@ -337,6 +375,8 @@ end
 
 ### Step 6: `test/mnesia_fragmented/events_test.exs`
 
+**Objective**: Write tests in `test/mnesia_fragmented/events_test.exs` covering behavior and edge cases.
+
 ```elixir
 defmodule MnesiaFragmented.EventsTest do
   use ExUnit.Case, async: false
@@ -351,53 +391,57 @@ defmodule MnesiaFragmented.EventsTest do
     :ok
   end
 
-  test "put and get round-trip across all fragments" do
-    events =
-      for i <- 1..500 do
-        %{
-          id: "evt-#{i}",
-          type: :signup,
-          payload: %{user: "u-#{i}"}
-        }
-      end
+  describe "MnesiaFragmented.Events" do
+    test "put and get round-trip across all fragments" do
+      events =
+        for i <- 1..500 do
+          %{
+            id: "evt-#{i}",
+            type: :signup,
+            payload: %{user: "u-#{i}"}
+          }
+        end
 
-    Enum.each(events, &Events.put/1)
+      Enum.each(events, &Events.put/1)
 
-    assert Events.count_all() == 500
+      assert Events.count_all() == 500
 
-    # Every event must be retrievable — if we were missing the frag access
-    # module, some keys in non-base fragments would come back :not_found.
-    Enum.each(events, fn %{id: id} ->
-      assert {:ok, %{id: ^id}} = Events.get(id)
-    end)
-  end
+      # Every event must be retrievable — if we were missing the frag access
+      # module, some keys in non-base fragments would come back :not_found.
+      Enum.each(events, fn %{id: id} ->
+        assert {:ok, %{id: ^id}} = Events.get(id)
+      end)
+    end
 
-  test "distribution across fragments is roughly uniform" do
-    for i <- 1..1_000, do: Events.put(%{id: "evt-#{i}", type: :x, payload: %{}})
+    test "distribution across fragments is roughly uniform" do
+      for i <- 1..1_000, do: Events.put(%{id: "evt-#{i}", type: :x, payload: %{}})
 
-    sizes =
-      FragmentationInfo.summary().fragments
-      |> Enum.map(& &1.size)
+      sizes =
+        FragmentationInfo.summary().fragments
+        |> Enum.map(& &1.size)
 
-    # With phash2 + 4 fragments, expect each fragment to hold 250 ± 75 rows.
-    Enum.each(sizes, fn size ->
-      assert size > 150 and size < 350, "fragment imbalance: #{inspect(sizes)}"
-    end)
-  end
+      # With phash2 + 4 fragments, expect each fragment to hold 250 ± 75 rows.
+      Enum.each(sizes, fn size ->
+        assert size > 150 and size < 350, "fragment imbalance: #{inspect(sizes)}"
+      end)
+    end
 
-  test "fragment_for_key/1 matches actual storage" do
-    id = "evt-placement"
-    Events.put(%{id: id, type: :x, payload: %{}})
+    test "fragment_for_key/1 matches actual storage" do
+      id = "evt-placement"
+      Events.put(%{id: id, type: :x, payload: %{}})
 
-    frag = FragmentationInfo.fragment_for_key(id)
-    raw = :mnesia.dirty_read({frag, id})
+      frag = FragmentationInfo.fragment_for_key(id)
+      raw = :mnesia.dirty_read({frag, id})
 
-    assert [{_, ^id, _, _, _}] = raw
+      assert [{_, ^id, _, _, _}] = raw
+    end
   end
 end
 ```
 
 ### Step 7: Exercise fragment management in IEx
+
+**Objective**: Exercise fragment management in IEx.
 
 ```bash
 iex --name frag@127.0.0.1 -S mix
@@ -415,6 +459,28 @@ FragmentationInfo.add_fragment()
 FragmentationInfo.summary()
 # Now 5 fragments, ~2000 rows each after the rebalance.
 ```
+
+### Why this works
+
+`mnesia:change_table_frag/2` sets up the fragmentation scheme. Operations route to the correct fragment via the hash module. Reads and writes scale with fragment count; cross-fragment queries walk all fragments, which is why they are discouraged.
+
+---
+
+## Deep Dive
+
+ETS (Erlang Term Storage) is RAM-only and process-linked; table destruction triggers if the owner crashes, causing silent data loss in careless designs. Match specifications (match_specs) are micro-programs that filter/transform data at the C layer, orders of magnitude faster than fetching all records and filtering in Elixir. Mnesia adds disk persistence and replication but introduces transaction overhead and deadlock potential; dirty operations bypass locks for speed but sacrifice consistency guarantees. For caching, named tables (public by design) are globally visible but require careful name management; consider ETS sharding (multiple small tables) to reduce lock contention on hot keys. DETS (Disk ETS) persists to disk but is single-process bottleneck and slower than a real database. At scale, prefer ETS for in-process state and Mnesia/PostgreSQL for shared, persistent data.
+## Advanced Considerations
+
+ETS and DETS performance characteristics change dramatically based on access patterns and table types. Ordered sets provide range queries but slower access than hash tables; set types don't support duplicate keys while bags do. The `heir` option for ETS tables is essential for fault tolerance — when a table owner crashes, the heir process can take ownership and prevent data loss. Without it, the table is lost immediately. Mnesia replicates entire tables across nodes; choosing which nodes should have replicas and whether they're RAM or disk replicas affects both consistency guarantees and network traffic during cluster operations.
+
+DETS persistence comes with significant performance implications — writes are synchronous to disk by default, creating latency spikes. Using `sync: false` improves throughput but risks data loss on crashes. The maximum DETS table size is limited by available memory and the file system; planning capacity requires understanding your growth patterns. Mnesia's transaction system provides ACID guarantees, but dirty operations bypass these guarantees for performance. Understanding when to use dirty reads versus transactional reads significantly impacts both correctness and latency.
+
+Debugging ETS and DETS issues is challenging because problems often emerge under load when many processes contend for the same table. Table memory fragmentation is invisible to code but can exhaust memory. Using match specs instead of iteration over large tables can dramatically improve performance but requires careful construction. The interaction between ETS, replication, and distributed systems creates subtle consistency issues — a node with a stale ETS replica can serve incorrect data during network partitions. Always monitor table sizes and replication status with structured logging.
+
+
+## Deep Dive: Etsdets Patterns and Production Implications
+
+ETS tables are in-memory, non-distributed key-value stores with tunable semantics (ordered_set, duplicate_bag). Under concurrent read/write load, ETS table semantics matter: bag semantics allow fast appends but slow deletes; ordered_set allows range queries but slower inserts. Testing ETS behavior under concurrent load is non-trivial; single-threaded tests miss lock contention. Production ETS tables often fail under load due to concurrency assumptions that quiet tests don't exercise.
 
 ---
 
@@ -501,6 +567,13 @@ Compared to non-fragmented `disc_copies`, reads are about 1.3-1.6x slower
 (cost of the fragment lookup), writes are slightly slower for the same
 reason. The benefit is entirely in scaling out — you trade latency for
 the ability to add nodes.
+
+---
+
+## Reflection
+
+- Your access pattern is 80% by primary key, 20% by secondary index. Does fragmentation still fit, and what do you do with the secondary-index queries?
+- How do you grow from 4 fragments to 16 without downtime? What does Mnesia give you, and what do you build?
 
 ---
 

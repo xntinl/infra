@@ -67,11 +67,23 @@ Declared as `@on_load :check_config`. The VM invokes `check_config/0` once, righ
 
 ### Dependencies (`mix.exs`)
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
+
 ```elixir
 defp deps, do: []
 ```
 
 ### Step 1: Types
+
+**Objective**: Define validate/2 for :string, :integer, :boolean, :port, {:one_of, list} so schema rules can be type-enforced.
 
 ```elixir
 defmodule StrictConfig.Types do
@@ -91,6 +103,8 @@ end
 ```
 
 ### Step 2: Errors
+
+**Objective**: Define InvalidConfig exception with app, key, reason fields for structured error reporting.
 
 ```elixir
 defmodule StrictConfig.Errors do
@@ -112,6 +126,8 @@ end
 ```
 
 ### Step 3: Schema validation
+
+**Objective**: Implement validate!/3 that traverses schema rules and raises InvalidConfig on type/required violations.
 
 ```elixir
 defmodule StrictConfig.Schema do
@@ -153,6 +169,8 @@ end
 ```
 
 ### Step 4: The `use` macro
+
+**Objective**: Define __using__/1 with compile-time schema checks and @on_load callback that validates Application.get_all_env at load.
 
 ```elixir
 defmodule StrictConfig do
@@ -245,6 +263,8 @@ end
 ```
 
 ### Step 5: Example user module
+
+**Objective**: Define MyApp.EndpointConfig using StrictConfig with host, port, scheme, debug? schema to show real usage.
 
 ```elixir
 defmodule MyApp.EndpointConfig do
@@ -420,6 +440,23 @@ Benchee.run(
 ```
 
 Target: validation cost < 20µs for a 5-key schema. `@on_load` runs once per module load, not per request; absolute speed is marginal, but if you put `validate!/0` in a hot path it should still be cheap enough that "call it every minute for drift detection" is free.
+
+## Advanced Considerations: Macro Hygiene and Compile-Time Validation
+
+Macros execute at compile time, walking the AST and returning new AST. That power is easy to abuse: a macro that generates variables can shadow outer scope bindings, or a quote block that references variables directly can fail if the macro is used in a context where those variables don't exist. The `unquote` mechanism is the escape hatch, but misusing it leads to hard-to-debug compile errors.
+
+Macro hygiene is about capturing intent correctly. A `defmacro` that takes `:my_option` and uses it directly might match an unrelated `:my_option` from the caller's scope. The idiomatic pattern is to use `unquote` for values that should be "from the outside" and keep AST nodes quoted for safety. The `quote` block's binding of `var!` and `binding!` provides escape valves for the rare case when shadowing is intentional.
+
+Compile-time validation unlocks errors that would otherwise surface at runtime. A macro can call functions to validate input, generate code conditionally, or fail the build with `IO.warn`. Schema libraries like `Ecto` and `Ash` use macros to define fields at compile time, so runtime queries are guaranteed type-safe. The cost is cognitive load: developers must reason about both the code as written and the code generated.
+
+---
+
+
+## Deep Dive: Metaprogramming Patterns and Production Implications
+
+Metaprogramming (macros, AST manipulation) requires testing at compile time and runtime. The challenge is that macro tests often involve parsing and expanding code, which couples tests to compiler internals. Production bugs in macros can corrupt entire modules; testing macros rigorously is non-negotiable.
+
+---
 
 ## Trade-offs and production gotchas
 

@@ -104,7 +104,20 @@ is the old Erlang form — prefer the tagged form for clarity.
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Build single module runner to show raise/throw/exit handled distinctly so OTP semantics remain unbroken.
 
 ```bash
 mix new workflow_runner
@@ -112,6 +125,8 @@ cd workflow_runner
 ```
 
 ### Step 2: `lib/workflow_runner.ex`
+
+**Objective**: Rescue raise/catch throw/re-exit on exit so supervisors receive correct signal and operator can categorize failures.
 
 ```elixir
 defmodule WorkflowRunner do
@@ -154,6 +169,8 @@ end
 ```
 
 ### Step 3: `test/workflow_runner_test.exs`
+
+**Objective**: Test all three paths (raise/throw/exit) to prove Reduce.reduce_while + try/catch pattern distinguishes them.
 
 ```elixir
 defmodule WorkflowRunnerTest do
@@ -202,6 +219,8 @@ end
 
 ### Step 4: Run tests
 
+**Objective**: Run the `exit` test via `Task.async` so the re-exit can be observed without tearing down the test process itself.
+
 ```bash
 mix test
 ```
@@ -212,6 +231,19 @@ mix test
 
 ---
 
+
+## Key Concepts
+
+### 1. `raise` Throws Exceptions; `exit` Signals Process Termination; `throw` is for Control Flow
+`raise` — propagates an exception (usually a bug). `exit` — terminates a process (fault tolerance). `throw` — used with `catch` (rare).
+
+### 2. Exit Signals Link Processes
+When a process exits, linked processes receive an exit signal. If they don't trap the signal, they exit too. This is how supervision works.
+
+### 3. Use Exceptions for Programmer Errors, Exits for Control
+Exceptions are for bugs. Exits are for intentional process termination. Mixing them confuses intent.
+
+---
 ## Benchmark
 
 Measure the cost of the three short-circuit mechanisms so you can pick the cheapest one for tight inner loops:
@@ -280,7 +312,7 @@ catching it forces every caller to know about the throw. Return `{:error, reason
 let pattern matching handle it.
 
 **4. Raising generic `RuntimeError` with string messages**
-Callers cannot pattern-match on structure. Define a custom exception (exercise 66) so
+Callers cannot pattern-match on structure. Define a custom exception so
 that `rescue e in MyError` is meaningful.
 
 **5. `try` without `after` when holding resources**

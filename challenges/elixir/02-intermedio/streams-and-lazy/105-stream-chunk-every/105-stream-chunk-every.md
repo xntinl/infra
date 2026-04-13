@@ -30,6 +30,14 @@ chunk_batch/
 
 ---
 
+### Dependencies (`mix.exs`)
+
+```elixir
+def deps do
+  {exunit},
+  {genstage},
+end
+```
 ## Core concepts
 
 ### 1. The four arguments
@@ -100,12 +108,18 @@ fixed-schema writes).
 
 ### Step 1: Create the project
 
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
+
 ```bash
 mix new chunk_batch
 cd chunk_batch
 ```
 
 ### Step 2: `lib/chunk_batch.ex`
+
+**Objective**: Implement `chunk_batch.ex` — the lazy operator whose resource and memory profile only becomes visible when the stream is actually run.
+
 
 ```elixir
 defmodule ChunkBatch do
@@ -165,6 +179,9 @@ end
 
 ### Step 3: `test/chunk_batch_test.exs`
 
+**Objective**: Write `chunk_batch_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+
 ```elixir
 defmodule ChunkBatchTest do
   use ExUnit.Case, async: true
@@ -223,6 +240,9 @@ end
 ```
 
 ### Step 4: Run
+
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
 
 ```bash
 mix test
@@ -289,3 +309,20 @@ smaller representation before windowing.
 - [`Enum.chunk_every/4` — the strict sibling](https://hexdocs.pm/elixir/Enum.html#chunk_every/4)
 - [`Stream.chunk_while/4`](https://hexdocs.pm/elixir/Stream.html#chunk_while/4) — when "when to emit" is runtime-determined
 - [José Valim — Elixir 1.5 release notes](https://elixir-lang.org/blog/2017/07/25/elixir-v1-5-0-released/) — when `chunk_every` replaced the older `chunk/2,4` API
+
+
+## Deep Dive
+
+Streams are lazy, composable data pipelines that process one element at a time without materializing intermediate collections. This is fundamentally different from Enum, which materializes the entire dataset before the next operation.
+
+**Lazy evaluation semantics:**
+Stream operations return a `%Stream{}` struct containing a function. The actual computation is deferred until consumed by a terminal operation (`.run()`, `Enum.to_list()`, etc.). This allows streams to:
+- Chain indefinite sequences (e.g., `Stream.iterate(0, &(&1 + 1))`)
+- Transform without memory bloat (e.g., processing multi-gigabyte files)
+- Compose reusable pipelines as first-class values
+
+**Resource lifecycle in streams:**
+Streams wrapping resources (`Stream.resource/3`) must define cleanup functions. A stream created from a file remains "open" (in terms of the lambda) until the consumer finishes or errors. If the consumer crashes or stops early, the cleanup function still runs — critical for proper file/socket/port management.
+
+**Backpressure and demand:**
+Unlike streams in other languages, Elixir's synchronous streams don't inherently implement backpressure. Backpressure is demand-based: the consumer pulls data at its own pace. `GenStage` and `Flow` add explicit backpressure — the producer waits for the consumer to request more elements. This is why benchmarking matters: a naive stream consumer can overwhelm memory if the pipeline produces faster than it consumes.

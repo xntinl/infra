@@ -110,12 +110,18 @@ end
 
 ### Step 1: Create the project
 
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
+
 ```bash
 mix new external_monitor_gs
 cd external_monitor_gs
 ```
 
 ### Step 2: `lib/external_monitor_gs.ex`
+
+**Objective**: Implement `external_monitor_gs.ex` — the GenServer callback shape that determines blocking vs fire-and-forget semantics and state invariants.
+
 
 ```elixir
 defmodule ExternalMonitorGs do
@@ -247,6 +253,9 @@ end
 
 ### Step 3: `test/external_monitor_gs_test.exs`
 
+**Objective**: Write `external_monitor_gs_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+
 ```elixir
 defmodule ExternalMonitorGsTest do
   use ExUnit.Case, async: true
@@ -338,6 +347,9 @@ end
 
 ### Step 4: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -347,6 +359,14 @@ mix test
 ### Why this works
 
 The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+
+## Key Concepts: Monitoring and Link-based Fault Tolerance
+
+`Process.monitor/1` sets up monitoring: when the monitored process exits, you receive a `{:DOWN, ref, :process, pid, reason}` message. This is different from `Process.link/1`, which crashes your process if the linked process crashes. Monitoring is one-way (you watch them, they don't know); linking is bidirectional.
+
+Use monitoring when you need to react to a process death (clean up resources, restart something). Use linking when you want to share fate (if this dep dies, I die too—used in supervisor-child relationships). For external process handling (managing system processes), monitoring + GenServer restart logic is the pattern.
 
 
 ## Benchmark

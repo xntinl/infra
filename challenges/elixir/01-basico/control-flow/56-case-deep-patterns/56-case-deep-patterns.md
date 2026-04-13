@@ -68,7 +68,20 @@ matching with guards is how you express "shape + numeric range" in one readable 
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### Step 1 — Create the project
+
+**Objective**: Create the project scaffold so the classifier lives as a pure library with no runtime app, keeping the focus on deep pattern matching alone.
 
 ```bash
 mix new http_status_classifier
@@ -76,6 +89,8 @@ cd http_status_classifier
 ```
 
 ### Step 2 — `lib/http_status_classifier/classifier.ex`
+
+**Objective**: Exploit deep pattern matching inside one `case` so every HTTP result shape is dispatched by structure, not conditionals, making the taxonomy explicit and total.
 
 ```elixir
 defmodule HttpStatusClassifier.Classifier do
@@ -140,6 +155,8 @@ end
 
 ### Step 3 — `test/http_status_classifier_test.exs`
 
+**Objective**: Assert each clause is reachable and that unknown shapes fall through deterministically, so a future edit can never silently drop a case.
+
 ```elixir
 defmodule HttpStatusClassifierTest do
   use ExUnit.Case, async: true
@@ -202,6 +219,8 @@ end
 
 ### Step 4 — Run the tests
 
+**Objective**: Run the suite with warnings-as-errors to catch any non-exhaustive `case` the compiler flags as a missing clause.
+
 ```bash
 mix test
 ```
@@ -214,6 +233,19 @@ All 11 tests pass.
 
 The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
 
+
+## Key Concepts
+
+### 1. Case Patterns Can Be Arbitrarily Complex
+You can use nested structures, ranges, guards, and multiple patterns. Each clause is tried in order until one matches.
+
+### 2. Pattern Matching Exhaustiveness
+If you don't handle all cases, a `CaseClauseError` is raised at runtime. Dialyzer can warn about missing patterns. Always include a catch-all `_`.
+
+### 3. Case vs If for Complex Logic
+For logic with many branches, `case` is cleaner than nested `if` statements. Pattern matching makes intent clear.
+
+---
 ## Benchmark
 
 ```elixir

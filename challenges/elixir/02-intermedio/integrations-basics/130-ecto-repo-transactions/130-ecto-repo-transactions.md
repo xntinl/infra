@@ -154,7 +154,22 @@ you run; `Multi` is a plan you submit.
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"ecto", "~> 1.0"},
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
 
 ```bash
 mix new tx_lab --sup
@@ -162,6 +177,9 @@ cd tx_lab
 ```
 
 ### Step 2: `mix.exs`, `config/config.exs`, `repo.ex`, `application.ex`
+
+**Objective**: Provide `mix.exs`, `config/config.exs`, `repo.ex`, `application.ex` — these are the supporting fixtures the main module depends on to make its concept demonstrable.
+
 
 Standard shape — Ecto + SQLite, one Repo child under the Application
 supervisor, `test` alias for drop/create/migrate.
@@ -201,6 +219,9 @@ end
 
 ### Step 3: Migration
 
+**Objective**: Migration.
+
+
 `priv/repo/migrations/20260101000001_create_accounts.exs`:
 
 ```elixir
@@ -219,6 +240,9 @@ end
 ```
 
 ### Step 4: Schema — `lib/tx_lab/account.ex`
+
+**Objective**: Schema — `lib/tx_lab/account.ex`.
+
 
 ```elixir
 defmodule TxLab.Account do
@@ -254,6 +278,9 @@ end
 ```
 
 ### Step 5: The three implementations — `lib/tx_lab.ex`
+
+**Objective**: Provide The three implementations — `lib/tx_lab.ex` — these are the supporting fixtures the main module depends on to make its concept demonstrable.
+
 
 ```elixir
 defmodule TxLab do
@@ -345,12 +372,18 @@ end
 
 ### Step 6: `test/test_helper.exs`
 
+**Objective**: Implement `test_helper.exs` — the integration seam where external protocol semantics meet Elixir domain code.
+
+
 ```elixir
 ExUnit.start()
 Ecto.Adapters.SQL.Sandbox.mode(TxLab.Repo, :manual)
 ```
 
 ### Step 7: `test/tx_lab_test.exs`
+
+**Objective**: Write `tx_lab_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
 
 ```elixir
 defmodule TxLabTest do
@@ -434,6 +467,9 @@ end
 
 ### Step 8: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -451,6 +487,15 @@ concurrent transfers produce a stale-entry error instead of a lost update.
 
 ---
 
+
+## Deep Dive: State Management and Message Handling Patterns
+
+Understanding state transitions is central to reliable OTP systems. Every `handle_call` or `handle_cast` receives current state and returns new state—immutability forces explicit reasoning. This prevents entire classes of bugs: missing state updates are immediately visible.
+
+Key insight: separate pure logic (state → new state) from side effects (logging, external calls). Move pure logic to private helpers; use handlers for orchestration. This makes servers testable—test pure functions independently.
+
+In production, monitor state size and mutation frequency. Unbounded growth is a memory leak; excessive mutations signal hot spots needing optimization. Always profile before reaching for performance solutions like ETS.
+
 ## Benchmark
 
 `:timer.tc(fn -> TxLab.transfer_multi(a.id, b.id, 1) end)` on SQLite
@@ -458,6 +503,12 @@ typically clocks around 1-3 ms including the two SELECTs and two
 UPDATEs; on Postgres with a local socket, closer to 500µs-1ms. Target:
 a simple 4-step transfer should stay under 5ms on commodity hardware;
 higher numbers point at contention or missing indexes on the PK lookups.
+
+---
+
+## Key Concepts
+
+Ecto transactions group multiple database operations into an atomic unit—either all succeed or all rollback. `Repo.transaction/1` runs a function; if any query fails, the whole transaction rolls back to a consistent state. This is essential for multi-step operations: transfer funds from account A to B requires both updates to succeed or neither. Transactions also provide isolation: within a transaction, your reads are consistent, unaffected by concurrent writes outside. The trade-off: long-running transactions lock rows/tables, blocking other operations. Optimize by minimizing transaction scope—do validation outside, execute mutations inside. Database-specific semantics vary: Postgres offers strong isolation; SQLite is more limited.
 
 ---
 

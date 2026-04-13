@@ -108,7 +108,21 @@ tuple anyway.
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
 
 ```bash
 mix new match_object_demo
@@ -116,6 +130,9 @@ cd match_object_demo
 ```
 
 ### Step 2: `lib/match_object_demo.ex`
+
+**Objective**: Implement `match_object_demo.ex` — the access pattern that exposes the trade-off between ETS concurrency flags, match specs, and lookup cost.
+
 
 ```elixir
 defmodule MatchObjectDemo do
@@ -184,6 +201,9 @@ end
 
 ### Step 3: `test/match_object_demo_test.exs`
 
+**Objective**: Write `match_object_demo_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+
 ```elixir
 defmodule MatchObjectDemoTest do
   use ExUnit.Case, async: true
@@ -247,6 +267,9 @@ end
 
 ### Step 4: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -262,6 +285,14 @@ Elixir. The difference between `match/2` and `match_object/2` is purely at
 the return-shape layer; the scanning cost is the same.
 
 ---
+
+
+## Key Concepts: Pattern Matching and Efficient Querying
+
+Match objects are Erlang tuples with placeholders (`:_` or `$N`) that let you query ETS without materializing all results. Instead of reading every tuple and filtering in Elixir, `:ets.match_object/2` applies the pattern on the ETS side, returning only matching tuples. This is much faster for large tables.
+
+For example, `User` records stored as tuples can be queried: `:ets.match_object(table, {:user, :_, :'$2', age: :'$3'})` returns all tuples matching that shape. The downside: match specs have limited syntax (no function calls, no complex logic). For complex queries, `select/2` with match specs (covered in 98) is more powerful but harder to write. Most apps start with match_object for simple patterns.
+
 
 ## Benchmark
 
@@ -282,6 +313,12 @@ IO.puts("match (projection): #{us_proj}µs  match_object (full): #{us_full}µs")
 Target esperado: con tuplas anchas (payload de 256 bytes), `match/2`
 proyectando solo el id es 3–10× más rápido que `match_object/2`, porque el
 copy-out omite los 256 bytes por tupla.
+
+---
+
+## Key Concepts
+
+ETS match patterns enable flexible queries beyond simple key-value lookups. Instead of `ets:lookup(table, key)` (equality only), you can use `ets:match_object(table, pattern)` to find all tuples matching a template—with atoms like `_` (any value) and `:$N` (capture and return specific positions). This is how you query "all posts by user 42" from an ETS bag, or "all cache entries older than X seconds". Match patterns are expressive but come with a cost: they scan the table, so performance degrades with size. For hot queries on large datasets, consider indexes or move to a real database. The syntax uses special placeholders: `_` matches anything without binding, `$1` captures the first field for return, and complex guards can filter further. Most code uses match patterns for occasional lookups; heavy querying suggests moving to Postgres.
 
 ---
 

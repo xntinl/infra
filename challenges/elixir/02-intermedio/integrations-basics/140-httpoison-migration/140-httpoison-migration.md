@@ -6,9 +6,6 @@ written with [`Req`](https://hexdocs.pm/req/), both covered by the same
 test suite. Shows the concrete translation table and why new code should
 prefer Req.
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 2 hours
-
 ---
 
 ## Project context
@@ -94,9 +91,39 @@ Two lines become one; JSON headers are set automatically.
 
 ---
 
+## Design decisions
+
+**Option A — "big bang" replace every `HTTPoison.*` call with `Req.*` across the codebase**
+- Pros: one PR, done; no dual code paths to maintain; fewer deps after cutover.
+- Cons: huge blast radius; error-shape mismatches (`%HTTPoison.Error{}` vs `Mint.TransportError`) surface everywhere at once; rollback is painful; mixed third-party deps still pull HTTPoison in anyway.
+
+**Option B — introduce a domain adapter boundary, then swap implementations behind it (chosen)**
+- Pros: callers see only domain atoms (`:timeout`, `:not_found`); legacy + modern implementations coexist while you migrate; each module's test suite unchanged; rollback is a one-line config flip.
+- Cons: one extra layer of indirection; you have to maintain both implementations until cutover is complete.
+
+→ Chose **B** because migrations that touch every file in a repo at once are how regressions escape review; the adapter boundary makes the change reversible and testable.
+
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"httpoison", "~> 1.0"},
+    {:"jason", "~> 1.0"},
+    {:"plug", "~> 1.0"},
+    {:"poison", "~> 1.0"},
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
 
 ```bash
 mix new http_migration
@@ -118,6 +145,9 @@ end
 ```
 
 ### Step 2: `lib/http_migration/legacy.ex` — HTTPoison
+
+**Objective**: Edit `legacy.ex` — HTTPoison, exposing the integration seam where external protocol semantics meet Elixir domain code.
+
 
 ```elixir
 defmodule HttpMigration.Legacy do
@@ -186,6 +216,9 @@ end
 
 ### Step 3: `lib/http_migration/modern.ex` — Req
 
+**Objective**: Edit `modern.ex` — Req, exposing the integration seam where external protocol semantics meet Elixir domain code.
+
+
 ```elixir
 defmodule HttpMigration.Modern do
   @moduledoc """
@@ -222,6 +255,9 @@ end
 ```
 
 ### Step 4: Tests exercise identical behaviour
+
+**Objective**: Tests exercise identical behaviour.
+
 
 `test/legacy_test.exs` (HTTPoison + Bypass):
 
@@ -314,6 +350,21 @@ mix test
 
 ---
 
+
+## Key Concepts
+
+External integrations in Elixir split across multiple patterns: Ecto for relational databases with changesets and migrations; Telemetry for metrics and observability; HTTP libraries like Req or Finch for REST APIs; and specialized parsers like Jason, NimbleCSV, and NimbleParsec for data formats. Choosing the right tool avoids the trap of one library solving everything poorly.
+
+Ecto is the de facto standard for databases because changesets encode validation before queries, migrations manage schema evolution, and the Repo pattern separates query logic from business logic. Migrations are version-controlled SQL, ensuring reproducible deployments. For integrating external services, Req is the modern HTTP client with built-in retry, redirect, and error handling policies.
+
+Telemetry decouples metrics collection from application code: you emit events and let listeners subscribe. This separation keeps business logic clean and metrics infrastructure pluggable. Use metrics, not print statements, in production.
+
+## Key Concepts
+
+HTTPoison is an older HTTP client; modern code should use Req instead. HTTPoison's API is simpler than Finch but less composable than Req. If you're maintaining HTTPoison code, understanding the migration path (to Req) is valuable. For legacy systems, maintain HTTPoison; for new code, use Req.
+
+---
+
 ## Trade-offs and production gotchas
 
 **1. Migration strategy: adapter boundary first**
@@ -335,7 +386,7 @@ have custom CA bundles, test TLS explicitly before cutover.
 
 **4. Connection pools don't translate 1:1**
 HTTPoison pools via `:hackney_pool`; Req uses Finch pools. When you
-switch, revisit pool sizes (see exercise 134). The hackney defaults are
+switch, revisit pool sizes. The hackney defaults are
 rarely the right Finch defaults.
 
 **5. Async/stream APIs differ significantly**
@@ -357,6 +408,14 @@ features that would be painful in HTTPoison (retries, telemetry, tests),
 or when a fresh service can start on Req from day one.
 
 ---
+
+## Benchmark
+
+<!-- benchmark N/A: integration/configuration exercise -->
+
+## Reflection
+
+- After you migrate, HTTPoison may still live in your deps tree because a third-party library pins it. Does that undermine the reason for migrating (fewer deps, no C NIF), or is the real win elsewhere — and if elsewhere, what does that say about how you should justify the migration to a skeptical reviewer?
 
 ## Resources
 

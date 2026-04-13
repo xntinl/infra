@@ -88,6 +88,8 @@ end
 
 ### Step 1: Supervision tree
 
+**Objective**: Boot libcluster, the Horde registry/supervisor, and a node listener in one tree so CRDT membership tracks BEAM topology from startup.
+
 ```elixir
 # lib/game_sessions/application.ex
 defmodule GameSessions.Application do
@@ -114,6 +116,8 @@ end
 
 ### Step 2: Registry wrapper
 
+**Objective**: Hide Horde behind a `via/1` helper so callers address rooms by id without knowing which node owns the pid.
+
 ```elixir
 # lib/game_sessions/room_registry.ex
 defmodule GameSessions.RoomRegistry do
@@ -136,6 +140,8 @@ end
 ```
 
 ### Step 3: Supervisor wrapper
+
+**Objective**: Configure `Horde.DynamicSupervisor` with active redistribution so rooms rebalance automatically when nodes enter or leave.
 
 ```elixir
 # lib/game_sessions/room_supervisor.ex
@@ -160,6 +166,8 @@ end
 ```
 
 ### Step 4: Node listener (auto-add joining nodes to the member set)
+
+**Objective**: Subscribe to `:net_kernel` events and log topology changes since `members: :auto` already syncs the Horde CRDT membership.
 
 ```elixir
 # lib/game_sessions/node_listener.ex
@@ -189,6 +197,8 @@ end
 ```
 
 ### Step 5: The room process
+
+**Objective**: Register the room GenServer under `{:via, Horde.Registry, …}` so cross-node calls resolve through the CRDT regardless of host.
 
 ```elixir
 # lib/game_sessions/room.ex
@@ -220,6 +230,8 @@ end
 ```
 
 ### Step 6: Public façade
+
+**Objective**: Wrap distributed registry and supervisor calls behind a simple API hiding CRDT topology details from clients.
 
 ```elixir
 # lib/game_sessions/rooms.ex
@@ -332,6 +344,24 @@ Benchee.run(
 
 Target on a single node: `open new room` < 500 µs, `lookup existing room` < 5 µs. On a 3-node cluster expect `open` latency to rise to ~2 ms because of CRDT sync.
 
+## Deep Dive
+
+Distributed Erlang relies on a heartbeat mechanism (net_kernel tick) to detect node failure, but the network is fundamentally asynchronous—split-brain scenarios are inevitable. A partitioned cluster may have two sets of nodes, each believing the other is dead. Libraries like Horde and Phoenix.PubSub solve this with quorum-aware consensus, but they add latency and complexity. At scale, choose your consistency model explicitly: eventual consistency (via Redis PubSub) is faster but allows temporary divergence; strong consistency (via Horde DLM or distributed transactions) is slower but guarantees atomicity. For global registries, the order of operations matters—registering a process before its monitor is live creates race conditions. In multi-region setups, latency between nodes compounds these issues; consider regional clusters with a lightweight coordinator rather than a fully meshed topology.
+## Advanced Considerations
+
+Distributed Elixir systems require careful consideration of network partitions, consistent hashing for distributed state, and the interaction between clustering libraries and node discovery mechanisms. Network partitions are not rare edge cases; they happen regularly in cloud deployments due to maintenance windows and infrastructure issues. A system that works perfectly during local testing but fails under network partitions indicates insufficient failure handling throughout the codebase. Split-brain scenarios where multiple network partitions lead to different cluster views require explicit recovery mechanisms that are often business-specific and context-dependent.
+
+Horde and distributed registries provide eventual consistency guarantees, but "eventual" can mean minutes during network partitions. Applications must handle the case where the same name is registered on multiple nodes simultaneously without coordination. Consistent hashing for distributed services requires understanding rebalancing costs — a single node failure can cause significant key redistribution and thundering herd problems if not carefully managed. The cost of distributed consensus using algorithms like Raft is high; choose it only when consistency is more important than availability and can afford the performance cost.
+
+Global state replication across nodes creates synchronization challenges at scale. Choosing between replicating everywhere versus replicating to specific nodes affects both consistency latency and network bandwidth utilization fundamentally. Node monitoring and heartbeat mechanisms require careful timeout tuning — too aggressive and you get false positives during network hiccups; too conservative and you don't detect actual failures quickly enough for recovery. The EPMD (Erlang Port Mapper Daemon) is a critical component that can become a bottleneck in large clusters and requires careful capacity planning.
+
+
+## Deep Dive: Supervisor Patterns and Production Implications
+
+Supervisor trees define fault tolerance at the application level. Testing supervisor restart strategies (one_for_one, rest_for_one, one_for_all) requires reasoning about side effects of crashes across multiple children. The insight is that your test should verify not just that a child restarts, but that dependent state (ETS tables, connections, message queues) is properly initialized after restart. Production incidents often involve restart loops under load—a supervisor that works fine in quiet tests can spin wildly when children fail faster than they recover.
+
+---
+
 ## Trade-offs and production gotchas
 
 1. **Eventual consistency on start**: a room opened on node A is not immediately visible on node B. If you need strong "exists on this node right now" semantics, use `:global.register_name/2` instead (sync but slower).
@@ -352,3 +382,13 @@ When a node rejoins after a netsplit and Horde has to kill a duplicated process,
 - [DeltaCrdt paper — Almeida et al.](https://arxiv.org/abs/1603.01529)
 - [`Horde.DistributionStrategy` behaviour](https://hexdocs.pm/horde/Horde.DistributionStrategy.html)
 - [Horde source — cluster set-up tests](https://github.com/derekkraan/horde)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

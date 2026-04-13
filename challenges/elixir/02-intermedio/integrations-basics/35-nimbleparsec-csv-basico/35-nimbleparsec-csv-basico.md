@@ -2,9 +2,6 @@
 
 **Project**: `csv_parser_nimble` — a hand-built CSV parser using `NimbleParsec` combinators, including the RFC-4180 double-quote escaping rule.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 3–4 hours
-
 ---
 
 ## Project context
@@ -84,9 +81,37 @@ hot-path code.
 
 ---
 
+## Design decisions
+
+**Option A — `String.split/2` + a regex to peel off quoted fields**
+- Pros: no dep; four lines of code for the happy path.
+- Cons: regex to match RFC-4180 `""`-escaping and embedded newlines inside quoted fields is either wrong or unreadable; every new edge case adds another lookahead; performance degrades non-linearly.
+
+**Option B — a `NimbleParsec` grammar compiled at build time (chosen)**
+- Pros: the grammar reads close to BNF; `reduce/3` folds chars to strings cleanly; compile-time code generation means the parser is as fast as hand-written pattern matching; easy to extend (e.g., a `label/2` for better errors).
+- Cons: the grammar is frozen at compile time (configurable separators require multiple `defparsec`s); non-streaming — the whole file must fit in memory; error messages are positional, not semantic.
+
+→ Chose **B** because any CSV parser that correctly handles `""`-escaped quotes inside quoted fields containing commas and newlines is no longer a toy, and combinators are the only readable way to express that grammar.
+
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"jason", "~> 1.0"},
+    {:"phoenix", "~> 1.0"},
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
 
 ```bash
 mix new csv_parser_nimble
@@ -106,6 +131,9 @@ end
 Run `mix deps.get`.
 
 ### Step 2: `lib/csv_parser_nimble.ex`
+
+**Objective**: Implement `csv_parser_nimble.ex` — the integration seam where external protocol semantics meet Elixir domain code.
+
 
 ```elixir
 defmodule CsvParserNimble do
@@ -209,6 +237,9 @@ end
 
 ### Step 3: `test/csv_parser_nimble_test.exs`
 
+**Objective**: Write `csv_parser_nimble_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+
 ```elixir
 defmodule CsvParserNimbleTest do
   use ExUnit.Case, async: true
@@ -278,11 +309,29 @@ end
 
 ### Step 4: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
 
 ---
+
+
+## Key Concepts
+
+NimbleParsec is a tiny parser combinator library—you build complex parsers by composing simple ones. A CSV parser is canonical: parse rows (comma-separated values), then cells (quoted or unquoted). Combinators include `string/1` (literal match), `integer/0` (parse numbers), `repeat/1` (one or more), and sequencing with `|>`. This is vastly simpler than regexes or manual tokenization for structured formats. NimbleParsec generates machine code (compiled combinators), so it's fast but compile times are longer. Use it for structured parsing (DSLs, config files, protocols); for simple splits, use `String.split/2`. The power comes from composition—build tiny parsers, combine into complex ones without state machines or manual recursion. Perfect for building domain languages or config file parsers.
+
+---
+
+## Deep Dive: Production Patterns and Scaling
+
+Understanding the operational boundaries of your chosen library or pattern is essential. In production, focus on: (1) error handling and partial failures, (2) resource limits (connection pools, mailbox size, memory), (3) observability (metrics, logs, traces), and (4) graceful degradation under load.
+
+Most libraries optimize for happy paths; you must understand failure modes. What happens when an external dependency is slow? When network packets are dropped? When memory pressure increases? Design systems that degrade gracefully: shed load, return partial results, or fail fast rather than hanging indefinitely.
+
+Always measure before optimizing. Profile real workloads, identify bottlenecks, and only then reach for advanced patterns like pooling, caching, or sharding.
 
 ## Trade-offs and production gotchas
 
@@ -322,6 +371,14 @@ input is dirty, you'll need a permissive mode — and you'll cry.
   query languages, config files, protocol headers.
 
 ---
+
+## Benchmark
+
+<!-- benchmark N/A: integration/configuration exercise -->
+
+## Reflection
+
+- `utf8_char` is used inside fields but `ascii_char` for structural punctuation. If you discovered the incoming files are 100% ASCII, switching every `utf8_char` to `ascii_char` would be measurably faster. Before you make the change, what single failure mode would you write a regression test for, and why is that the test that catches the mistake instead of benchmarks?
 
 ## Resources
 

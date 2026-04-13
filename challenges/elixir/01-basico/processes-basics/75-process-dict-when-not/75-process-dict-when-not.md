@@ -2,9 +2,6 @@
 
 **Project**: `request_context` — shows a problematic implementation using `Process.put/get`, then the correct refactor to an `Agent` (and a note on GenServer).
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 1–2 hours
-
 ---
 
 ## Project context
@@ -75,7 +72,21 @@ You're not writing Logger.
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"phoenix", "~> 1.0"},
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Create side-by-side modules for the bad and good approach so the refactor is diffable and the anti-pattern remains visible for comparison.
 
 ```bash
 mix new request_context
@@ -83,6 +94,8 @@ cd request_context
 ```
 
 ### Step 2: `lib/bad_context.ex` — the anti-pattern
+
+**Objective**: Intentionally implement per-process globals with `Process.put/get` so the invisible coupling it creates is witnessed first-hand.
 
 ```elixir
 defmodule BadContext do
@@ -130,6 +143,8 @@ end
 ```
 
 ### Step 3: `lib/good_context.ex` — the refactor
+
+**Objective**: Refactor the same context into explicit state passed through function arguments, restoring referential transparency and testability.
 
 ```elixir
 defmodule GoodContext do
@@ -184,6 +199,8 @@ end
 ```
 
 ### Step 4: `test/request_context_test.exs`
+
+**Objective**: Contrast the two tests: the anti-pattern version needs `setup`/`teardown` of process state, the good one does not — concrete proof of the trade-off.
 
 ```elixir
 defmodule RequestContextTest do
@@ -262,9 +279,34 @@ end
 
 ### Step 5: Run
 
+**Objective**: Run `async: true` to expose how process-dict state survives test isolation — the failure mode is why it is an anti-pattern.
+
 ```bash
 mix test
 ```
+
+### Why this works
+
+`Process.put/2` mutates a per-process key-value store that is entirely invisible to the type system — the function signature of `current_request_id!/0` looks pure but is not. `Agent.get/2` crosses a process boundary via message passing, which is why it survives `Task.async/1`: the Task is a new process with an empty dictionary, but the named Agent is reachable from any process on the node. The "pass as argument" version cuts both concerns: the dependency is visible at the call site and there is no shared state to leak or lose.
+
+---
+
+
+## Key Concepts
+
+### 1. Process Dictionary: Process-Local Storage
+Every process has a dictionary for process-local data. It's faster than Agent because no message passing is involved.
+
+### 2. When NOT to Use It
+The process dictionary is tempting but often a mistake: makes code hard to test, makes refactoring dangerous, doesn't survive process restarts.
+
+### 3. Proper Alternatives
+Use `Agent` for shared state, `GenServer` for complex state, or pass state as function arguments. These are more explicit and testable.
+
+---
+## Benchmark
+
+<!-- benchmark N/A: tema conceptual — the lesson is correctness and design, not throughput. `Process.put/get` is slightly faster than `Agent.get` (in-process vs. message), but that difference is irrelevant compared to the bugs it enables. -->
 
 ---
 
@@ -292,13 +334,20 @@ anything concurrent will silently misbehave.
 - Framework internals that must carry context across a specific call stack without
   threading it through user code (e.g. the `Phoenix.LiveView` internals).
 
-If you're not writing a framework, you don't need it.
+If you're not writing a framework, you don't need the process dictionary.
 
 **5. When NOT to use an Agent either**
 An Agent is a GenServer in a trench coat. It serializes every read and write
 through one process. For per-request data, it's overkill *and* a bottleneck.
 **The correct default is: pass context as an argument.** Agent shows up here
 because the exercise is about illustrating the refactor.
+
+---
+
+## Reflection
+
+- Your team inherits a codebase that uses `Process.put/get` for a request-id context across 200 functions. A full refactor to explicit arguments is a 6-week project. What's the ordered plan — Agent first, then gradual signature migration? Or big-bang? Defend your sequencing by what risk each step actually removes.
+- `Logger.metadata/1` is the one blessed use of the process dictionary. Why is it safe there but dangerous in your code? Identify the precise property of logging that makes the anti-pattern acceptable — and whether that property ever holds in business logic.
 
 ---
 

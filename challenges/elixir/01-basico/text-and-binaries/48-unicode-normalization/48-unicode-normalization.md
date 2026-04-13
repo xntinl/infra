@@ -62,7 +62,20 @@ library is the right answer. Fail fast: know the scope of your algorithm.
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### Step 1 — Create the project
+
+**Objective**: Unicode normalization (NFC vs NFD) affects string comparison — café ≠ café (visually identical, different bytes).
 
 ```bash
 mix new slugger
@@ -70,6 +83,8 @@ cd slugger
 ```
 
 ### Step 2 — `lib/slugger.ex`
+
+**Objective**: NFD decomposition + lowercase + ASCII-only removal is the only correct way to generate slug duplicates from accents.
 
 ```elixir
 defmodule Slugger do
@@ -130,6 +145,8 @@ end
 
 ### Step 3 — `test/slugger_test.exs`
 
+**Objective**: Test composed vs decomposed inputs; URL safety means no spaces, punctuation, or non-ASCII — slugs must be deterministic.
+
 ```elixir
 defmodule SluggerTest do
   use ExUnit.Case, async: true
@@ -184,6 +201,8 @@ end
 
 ### Step 4 — Run the tests
 
+**Objective**: --warnings-as-errors finds dead code in sanitizers; test coverage validates all line-ending scenarios.
+
 ```bash
 mix test
 ```
@@ -192,6 +211,19 @@ All 8 tests should pass.
 
 ---
 
+
+## Key Concepts
+
+### 1. Unicode Normalization Combines Equivalent Characters
+Some characters have multiple representations: é can be a single codepoint or a combination of e + acute accent. These look identical but have different byte sequences.
+
+### 2. NFC vs NFD
+NFC (Composed) — shorter, preferred for storage and comparison. NFD (Decomposed) — useful for systems that need individual components. For most applications, normalize to NFC.
+
+### 3. Comparison After Normalization
+Always normalize before comparing user-supplied text to canonical forms. Otherwise, semantically identical strings fail equality checks.
+
+---
 ## Trade-offs
 
 | Form | Size | Use case |

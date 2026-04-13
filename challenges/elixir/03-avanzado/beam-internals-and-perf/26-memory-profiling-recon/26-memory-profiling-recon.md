@@ -55,7 +55,7 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 ```
 total     = sum of everything BEAM has allocated (not RSS — see below)
 processes = sum of heap + stack + mailbox + PCB for all processes
-binary    = refc binaries > 64 bytes (shared, ref-counted — see exercise 149)
+binary    = refc binaries > 64 bytes (shared, ref-counted)
 ets       = all ETS tables
 code      = loaded BEAM modules (bigger with hot upgrades)
 atom      = atom table (never shrinks! — monitor this)
@@ -104,7 +104,7 @@ attribute-based top-N and `:recon.proc_window/3` for *change over time*.
 
 Binaries over 64 bytes are **not** counted here — they live in the shared
 refc binary pool. A process can keep 2 GB "alive" while showing 50 KB of
-`:memory`. That's the classic binary leak (exercise 149).
+`:memory`. That's the classic binary leak.
 
 ### 5. `:recon_alloc.memory/1` flavors
 
@@ -138,12 +138,16 @@ handle a burst and hasn't been GC'd since (fullsweep_after tuning, 150).
 
 ### Step 1: project
 
+**Objective**: Scaffold supervised app so diagnostic modules remain passive until explicitly invoked from remote shell (no auto-start cost).
+
 ```bash
 mix new memory_profiling --sup
 cd memory_profiling
 ```
 
 ### Step 2: `mix.exs`
+
+**Objective**: Pin `:recon` runtime so `:binary_alloc` usage < 0.5 immediately flags refc binary leaks during incident triage.
 
 ```elixir
 defmodule MemoryProfiling.MixProject do
@@ -163,6 +167,8 @@ end
 
 ### Step 3: `lib/memory_profiling/application.ex`
 
+**Objective**: Start empty supervisor so zero-cost idle state until remote shell query avoids boot latency in non-debugging scenarios.
+
 ```elixir
 defmodule MemoryProfiling.Application do
   @moduledoc false
@@ -176,6 +182,8 @@ end
 ```
 
 ### Step 4: `lib/memory_profiling/node_report.ex`
+
+**Objective**: Aggregate `:erlang.memory/0` buckets against allocated:used ratio so fragmentation % shows whether allocator tuning or app fix matters.
 
 ```elixir
 defmodule MemoryProfiling.NodeReport do
@@ -240,6 +248,8 @@ end
 
 ### Step 5: `lib/memory_profiling/process_report.ex`
 
+**Objective**: Use `:recon.proc_count` and `:recon.proc_window` to rank leaked memory by delta not cumulative, catching new leaks faster than snapshots.
+
 ```elixir
 defmodule MemoryProfiling.ProcessReport do
   @moduledoc """
@@ -279,6 +289,8 @@ end
 ```
 
 ### Step 6: `lib/memory_profiling/alloc_report.ex`
+
+**Objective**: Extract per-allocator usage % so `:eheap_alloc` < 0.5 signals process heap pinned after burst (candidates for explicit GC).
 
 ```elixir
 defmodule MemoryProfiling.AllocReport do
@@ -341,6 +353,8 @@ end
 
 ### Step 7: `lib/memory_profiling/leak_hunter.ex`
 
+**Objective**: Delta per-process memory across window so linear growth caught in 30s avoids 3 AM OOM kill cascade.
+
 ```elixir
 defmodule MemoryProfiling.LeakHunter do
   @moduledoc """
@@ -393,6 +407,8 @@ end
 
 ### Step 8: tests
 
+**Objective**: Validate :erlang.memory/0 bucket shape and :recon.proc_window/3 growth detection across intentional allocator churn patterns.
+
 ```elixir
 # test/memory_profiling/node_report_test.exs
 defmodule MemoryProfiling.NodeReportTest do
@@ -400,20 +416,22 @@ defmodule MemoryProfiling.NodeReportTest do
 
   alias MemoryProfiling.NodeReport
 
-  test "build/0 returns expected buckets" do
-    report = NodeReport.build()
-    assert is_integer(report.total_bytes) and report.total_bytes > 0
-    assert is_integer(report.allocated_bytes) and report.allocated_bytes > 0
-    assert Map.has_key?(report.buckets, :processes)
-    assert Map.has_key?(report.buckets, :ets)
-    assert Map.has_key?(report.buckets, :binary)
-  end
+  describe "MemoryProfiling.NodeReport" do
+    test "build/0 returns expected buckets" do
+      report = NodeReport.build()
+      assert is_integer(report.total_bytes) and report.total_bytes > 0
+      assert is_integer(report.allocated_bytes) and report.allocated_bytes > 0
+      assert Map.has_key?(report.buckets, :processes)
+      assert Map.has_key?(report.buckets, :ets)
+      assert Map.has_key?(report.buckets, :binary)
+    end
 
-  test "format/1 produces human-readable text" do
-    out = NodeReport.build() |> NodeReport.format()
-    assert out =~ "Total:"
-    assert out =~ "Allocated:"
-    assert out =~ "processes"
+    test "format/1 produces human-readable text" do
+      out = NodeReport.build() |> NodeReport.format()
+      assert out =~ "Total:"
+      assert out =~ "Allocated:"
+      assert out =~ "processes"
+    end
   end
 end
 ```
@@ -425,33 +443,37 @@ defmodule MemoryProfiling.ProcessReportTest do
 
   alias MemoryProfiling.ProcessReport
 
-  test "top/2 by memory returns at most N processes" do
-    results = ProcessReport.top(:memory, 5)
-    assert length(results) <= 5
+  describe "MemoryProfiling.ProcessReport" do
+    test "top/2 by memory returns at most N processes" do
+      results = ProcessReport.top(:memory, 5)
+      assert length(results) <= 5
 
-    for r <- results do
-      assert is_pid(r.pid)
-      assert is_integer(r.value) and r.value >= 0
+      for r <- results do
+        assert is_pid(r.pid)
+        assert is_integer(r.value) and r.value >= 0
+      end
     end
-  end
 
-  test "window/3 returns processes that grew" do
-    # Spawn one process that accumulates a large list
-    pid =
-      spawn(fn ->
-        Enum.reduce(1..1_000_000, [], fn i, acc -> [i | acc] end)
-        Process.sleep(:infinity)
-      end)
+    test "window/3 returns processes that grew" do
+      # Spawn one process that accumulates a large list
+      pid =
+        spawn(fn ->
+          Enum.reduce(1..1_000_000, [], fn i, acc -> [i | acc] end)
+          Process.sleep(:infinity)
+        end)
 
-    on_exit(fn -> Process.exit(pid, :kill) end)
+      on_exit(fn -> Process.exit(pid, :kill) end)
 
-    results = ProcessReport.window(:memory, 5, 150)
-    assert is_list(results)
+      results = ProcessReport.window(:memory, 5, 150)
+      assert is_list(results)
+    end
   end
 end
 ```
 
 ### Step 9: remote-shell usage
+
+**Objective**: Execute node/process/allocator reports in iex sequence (60s latency budget) to correlate :binary_alloc fragmentation with refc binary leak.
 
 ```
 iex> MemoryProfiling.NodeReport.build() |> MemoryProfiling.NodeReport.format() |> IO.puts()
@@ -479,6 +501,46 @@ IO.puts("avg: #{time_us / 10_000} µs/op")
 ```
 
 Target: operation should complete in the low-microsecond range on modern hardware; deviations by >2× indicate a regression worth investigating.
+
+## Deep Dive: BEAM Scheduler Tuning and Memory Profiling in Production
+
+The BEAM scheduler is not "magic" — it's a preemptive work-stealing scheduler that divides CPU time 
+into reductions (bytecode instructions). Understanding scheduler tuning is critical when you suspect 
+latency spikes in production.
+
+**Key concepts**:
+- **Reductions budget**: By default, a process gets ~2000 reductions before yielding to another process.
+  Heavy CPU work (binary matching, list recursion) can exhaust the budget and cause tail latency.
+- **Dirty schedulers**: If a process does CPU-intensive work (crypto, compression, numerical), it blocks 
+  the main scheduler. Use dirty NIFs or `spawn_opt(..., [{:fullsweep_after, 0}])` for GC tuning.
+- **Heap tuning per process**: `Process.flag(:min_heap_size, ...)` reserves heap upfront, reducing GC 
+  pauses. Measure; don't guess.
+
+**Memory profiling workflow**:
+1. Run `recon:memory/0` in iex; identify top 10 memory consumers by type (atoms, binaries, ets).
+2. If binaries dominate, check for refc binary leaks (binary held by process that should have been freed).
+3. Use `eprof` or `fprof` for function-level CPU attribution; `recon:proc_window/3` for process memory trends.
+
+**Production pattern**: Deploy with `+K true` (async IO), `-env ERL_MAX_PORTS 65536` (port limit), 
+`+T 9` (async threads). Measure GC time with `erlang:statistics(garbage_collection)` — if >5% of uptime, 
+tune heap or reduce allocation pressure. Never assume defaults are optimal for YOUR workload.
+
+---
+
+## Advanced Considerations
+
+Understanding BEAM internals at production scale requires deep knowledge of scheduler behavior, memory models, and garbage collection dynamics. The soft real-time guarantees of BEAM only hold under specific conditions — high system load, uneven process distribution across schedulers, or GC pressure can break predictable latency completely. Monitor `erlang:statistics(run_queue)` in production to catch scheduler saturation before it degrades latency significantly. The difference between immediate, offheap, and continuous GC garbage collection strategies can significantly impact tail latencies in systems with millions of messages per second and sustained memory pressure.
+
+Process reductions and the reduction counter affect scheduler fairness fundamentally. A process that runs for extended periods without yielding can starve other processes, even though the scheduler treats it fairly by reduction count per scheduling interval. This is especially critical in pipelines processing large data structures or performing recursive computations where yielding points are infrequent and difficult to predict. The BEAM's preemption model is deterministic per reduction, making performance testing reproducible but sometimes hiding race conditions that only manifest under specific load patterns and GC interactions.
+
+The interaction between ETS, Mnesia, and process message queues creates subtle bottlenecks in distributed systems. ETS reads don't block other processes, but writes require acquiring locks; understanding when your workload transitions from read-heavy to write-heavy is crucial for capacity planning. Port drivers and NIFs bypass the BEAM scheduler entirely, which can lead to unexpected priority inversions if not carefully managed. Always profile with `eprof` and `fprof` in realistic production-like environments before deployment to catch performance surprises.
+
+
+## Deep Dive: Otp Patterns and Production Implications
+
+OTP primitives (GenServer, Supervisor, Application) are tested through their public interfaces, not by inspecting internal state. This discipline forces correct design: if you can't test a behavior without peeking into the server's state, the behavior is not public. Production systems with tight integration tests on GenServer internals are fragile and hard to refactor.
+
+---
 
 ## Trade-offs and production gotchas
 
@@ -546,3 +608,13 @@ seconds.
 - ["The Hitchhiker's Tour of the BEAM"](https://www.youtube.com/watch?v=_Pwlvy3zz9M) — Robert Virding
 - [Dashbit blog — debugging memory](https://dashbit.co/blog) — look for posts by José Valim on profiling
 - [LiveDashboard Memory page source](https://github.com/phoenixframework/phoenix_live_dashboard/blob/main/lib/phoenix/live_dashboard/pages/home_page.ex)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

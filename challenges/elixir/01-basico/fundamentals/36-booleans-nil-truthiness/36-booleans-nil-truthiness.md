@@ -68,6 +68,17 @@ We must never treat `false` as "not set". A user explicitly disabling a feature
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### `lib/feature_flag_evaluator.ex`
 
 ```elixir
@@ -257,6 +268,24 @@ mix test
 
 The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
 
+
+
+---
+## Key Concepts
+
+### 1. Only `false` and `nil` are Falsy
+
+In many languages, `0`, empty strings, and empty lists are falsy. In Elixir, only `false` and `nil` are falsy; everything else is truthy. An empty list `[]` is a valid result, not a failure. You must explicitly check for errors with `{:ok, result}` / `{:error, reason}` or guard clauses, not truthiness.
+
+### 2. `true`, `false`, and `nil` Are Atoms
+
+`is_atom(true)` returns `true`. Booleans are atoms. This is why you can pattern-match them. But it also means you cannot confuse them with other atoms. `:ok` is not a boolean; it's an atom you must handle explicitly.
+
+### 3. Use Explicit Checks for Intent
+
+Instead of trusting truthiness, write guards or explicit conditions. A function returning a user struct looks truthy, but it's not `true`. Write `case user do; {:ok, u} -> ...; _ -> ... end` rather than relying on truthiness.
+
+---
 ## Benchmark
 
 ```elixir

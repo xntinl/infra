@@ -92,18 +92,23 @@ mix.exs) decides whether the whole node comes down with it.
 
 ## Implementation
 
-### Dependencies (`mix.exs`)
+### Dependencies (mix.exs)
 
 ```elixir
 defp deps do
   [
-    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+    # Standard library: no external dependencies required
   ]
 end
 ```
 
 
+
+
 ### Step 1: Create the project with a supervision tree
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
 
 ```bash
 mix new my_service_app --sup
@@ -114,6 +119,9 @@ The `--sup` flag scaffolds `application.ex` for you — we'll rewrite it to
 see every piece explicitly.
 
 ### Step 2: `mix.exs` — declare the callback module
+
+**Objective**: Edit `mix.exs` — declare the callback module, exposing release-time behavior that depends on application env resolution and runtime boot semantics.
+
 
 ```elixir
 defmodule MyServiceApp.MixProject do
@@ -141,6 +149,9 @@ end
 ```
 
 ### Step 3: `lib/my_service_app/application.ex`
+
+**Objective**: Wire `application.ex` to start the OTP application callback so BEAM starts/stops the supervision tree through the proper application controller lifecycle.
+
 
 ```elixir
 defmodule MyServiceApp.Application do
@@ -182,6 +193,9 @@ end
 
 ### Step 4: `lib/my_service_app/worker.ex`
 
+**Objective**: Implement `worker.ex` — release-time behavior that depends on application env resolution and runtime boot semantics.
+
+
 ```elixir
 defmodule MyServiceApp.Worker do
   @moduledoc """
@@ -213,6 +227,9 @@ end
 
 ### Step 5: `test/my_service_app_test.exs`
 
+**Objective**: Write `my_service_app_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+
 ```elixir
 defmodule MyServiceAppTest do
   use ExUnit.Case, async: false
@@ -238,6 +255,9 @@ end
 
 ### Step 6: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -248,6 +268,21 @@ mix test
 
 The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
 
+---
+
+## Key Concepts
+
+Application callbacks encode OTP lifecycle semantics. The `Application` behaviour requires `start/2` (boot) and `stop/1` (graceful shutdown), called by the BEAM application controller. The `start/2` callback must return a supervisor pid—this becomes the root of the supervision tree, the spine of your entire application. Every production Elixir service is an OTP application; `mix new --sup` scaffolds this structure. The key insight: BEAM knows how to start, stop, and depend on applications, enabling coordinated multi-app deployments. Declaring the callback in `mix.exs` with `mod: {MyApp.Application, []}` is what activates the application—without this, the code loads but never boots. Understanding this plumbing is essential for moving from scripts to production systems.
+
+---
+
+## Deep Dive: Compile-Time vs Runtime Configuration Boundaries
+
+A release is a static artifact: code and compile-time config are baked in. Runtime config must be provided at boot via environment variables, config files, or config providers. Simple rule: if a value changes between dev and prod, it goes in `config/runtime.exs`, not `config/config.exs`.
+
+Footgun: putting config in compile-time files and assuming environment variables work at runtime. Releases ignore env vars unless `config/runtime.exs` explicitly reads them. If you need env vars, fetch them in `config/runtime.exs` and store in application state.
+
+For distributed systems, config providers (modules loading config from Consul, S3, etc.) are powerful but complex. Start with environment variables and `config/runtime.exs`; only reach for providers if you need dynamic reloading without downtime or multi-tenant config switching. Premature provider complexity is a mistake.
 
 ## Benchmark
 

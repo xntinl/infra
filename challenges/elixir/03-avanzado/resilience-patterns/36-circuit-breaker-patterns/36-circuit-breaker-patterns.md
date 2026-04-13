@@ -152,6 +152,20 @@ the opposite of what we want.
 
 ### Step 1: mix.exs dependencies
 
+**Objective**: Import telemetry for state-transition events so operators instrument the breaker without modifying code; exclude test libraries from production builds.
+
+```elixir
+defp deps do
+  [
+    {:telemetry, "~> 1.2"},
+    {:jason, "~> 1.4", only: [:dev, :test]}
+  ]
+end
+```
+
+### Dependencies (mix.exs)
+
+```elixir
 ```elixir
 defp deps do
   [
@@ -162,6 +176,8 @@ end
 ```
 
 ### Step 2: `lib/circuit_breaker_patterns/classifier.ex`
+
+**Objective**: Extract failure classification rules so breaker FSM remains pure and per-upstream policies (429 vs 408) are swappable without modifying state machine.
 
 ```elixir
 defmodule CircuitBreakerPatterns.Classifier do
@@ -191,6 +207,8 @@ end
 ```
 
 ### Step 3: `lib/circuit_breaker_patterns/breaker.ex`
+
+**Objective**: Serialize state transitions through GenServer but read current state from ETS so call/2 gate checks scale lock-free across cores without mailbox contention.
 
 ```elixir
 defmodule CircuitBreakerPatterns.Breaker do
@@ -406,6 +424,8 @@ end
 
 ### Step 4: Supervisor & Registry in application.ex
 
+**Objective**: Own the shared ETS table at the application level and supervise breakers dynamically so individual FSM crashes never lose the published gate state.
+
 ```elixir
 defmodule CircuitBreakerPatterns.Application do
   use Application
@@ -442,6 +462,8 @@ end
 ```
 
 ### Step 5: `test/circuit_breaker_patterns/breaker_test.exs`
+
+**Objective**: Drive the FSM across closed→open→half-open→closed transitions with deterministic time control so regressions in trip thresholds surface instantly.
 
 ```elixir
 defmodule CircuitBreakerPatterns.BreakerTest do
@@ -529,6 +551,23 @@ end
 
 The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
 
+## Advanced Considerations: Circuit Breakers and Bulkheads in Production
+
+A circuit breaker monitors downstream service health and rejects new requests when failures exceed a threshold, failing fast instead of queuing indefinitely. States: `:closed` (normal), `:open` (fast-fail), `:half_open` (testing recovery). A timeout-based pattern monitors; once requests succeed again, the circuit closes. Half-open tests with a single request; if it succeeds, all requests resume.
+
+Bulkheads isolate resource pools so one slow endpoint doesn't starve others. A GenServer pool with a bounded queue (e.g., `:queue.len(state) >= 100`) can return `{:error, :overloaded}` immediately, preventing queue buildup. Combined with exponential backoff on the client (caller retries with increasing delays), this creates a natural circuit breaker behavior without explicit state.
+
+Graceful degradation means serving stale data or reduced functionality when a service is slow. A cached value with a 5-minute TTL is acceptable for many reads; serve it if the live source is timing out. Feature flags allow disabling expensive operations at runtime. Cascading timeout windows (outer service times out after 5s, inner calls must complete in 3s) prevent unbounded waiting. The cost is complexity: tracking degradation modes, testing failure scenarios, and ensuring data consistency under partial failures.
+
+---
+
+
+## Deep Dive: Resilience Patterns and Production Implications
+
+Resilience patterns (circuit breakers, timeouts, retries) are easy to implement but hard to test. The insight is that resilience patterns must be tested under failure: timeouts matter only when calls actually take time, retries matter only when transient failures occur. Production systems with untested resilience patterns often fail gracefully in test and catastrophically in production.
+
+---
+
 ## Trade-offs and production gotchas
 
 **1. Generation counter against stale timer fires.** Timers scheduled during one
@@ -558,7 +597,7 @@ most useful SLO input.
 
 **7. When NOT to use this.** For non-idempotent operations where re-trying is
 harmful (financial transfers, emails), the breaker is only half the story —
-you also need idempotency keys (exercise 199). For internal services in the
+you also need idempotency keys. For internal services in the
 same cluster, prefer `:pg` / `:global` patterns and deal with split-brain
 explicitly. For hard real-time systems (< 1ms budget), an ETS lookup per call
 may itself be too expensive — inline the state in process state.

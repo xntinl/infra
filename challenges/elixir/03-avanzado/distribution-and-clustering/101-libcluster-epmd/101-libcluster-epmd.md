@@ -133,12 +133,16 @@ Epmd strategy does nothing magic with cookies. Every node in the topology must b
 
 ### Step 1: Create the project
 
+**Objective**: Bootstrap supervised OTP app so libcluster's topology strategy process starts in supervision tree before distribution initializes.
+
 ```bash
 mix new libcluster_epmd --sup
 cd libcluster_epmd
 ```
 
 ### Step 2: `mix.exs`
+
+**Objective**: Pin libcluster dependency to ensure Epmd strategy modules are available before application supervisor boot sequence.
 
 ```elixir
 defmodule LibclusterEpmd.MixProject do
@@ -159,6 +163,8 @@ end
 ```
 
 ### Step 3: `config/config.exs`
+
+**Objective**: Configure static Epmd strategy with env-injected hosts so polling interval discovers peers without manual Node.connect/1 calls.
 
 ```elixir
 import Config
@@ -185,6 +191,8 @@ config :libcluster,
 
 ### Step 4: `lib/libcluster_epmd/application.ex`
 
+**Objective**: Start Cluster.Supervisor before ClusterProbe so nodeup/nodedown events are captured with monotonic timestamps from strategy."""
+
 ```elixir
 defmodule LibclusterEpmd.Application do
   @moduledoc false
@@ -205,6 +213,8 @@ end
 ```
 
 ### Step 5: `lib/libcluster_epmd/cluster_probe.ex`
+
+**Objective**: Trap :net_kernel monitor_nodes events and maintain per-node status map with System.monotonic_time for drift-free event ordering."""
 
 ```elixir
 defmodule LibclusterEpmd.ClusterProbe do
@@ -251,6 +261,8 @@ end
 
 ### Step 6: `lib/libcluster_epmd/topology.ex`
 
+**Objective**: Diff configured hosts against Node.list/0 to detect partial cluster states without polling overhead."""
+
 ```elixir
 defmodule LibclusterEpmd.Topology do
   @moduledoc "Introspect the configured libcluster topology at runtime."
@@ -278,6 +290,8 @@ end
 
 ### Step 7: Tests
 
+**Objective**: Send synthetic :nodeup/:nodedown to ClusterProbe process and assert state convergence without multi-node overhead."""
+
 ```elixir
 # test/libcluster_epmd/cluster_probe_test.exs
 defmodule LibclusterEpmd.ClusterProbeTest do
@@ -285,36 +299,40 @@ defmodule LibclusterEpmd.ClusterProbeTest do
 
   alias LibclusterEpmd.{ClusterProbe, Topology}
 
-  test "status/0 returns a map" do
-    assert is_map(ClusterProbe.status())
-  end
+  describe "LibclusterEpmd.ClusterProbe" do
+    test "status/0 returns a map" do
+      assert is_map(ClusterProbe.status())
+    end
 
-  test "synthetic nodeup event updates status" do
-    fake = :"synthetic@127.0.0.1"
-    send(Process.whereis(ClusterProbe), {:nodeup, fake})
-    Process.sleep(50)
+    test "synthetic nodeup event updates status" do
+      fake = :"synthetic@127.0.0.1"
+      send(Process.whereis(ClusterProbe), {:nodeup, fake})
+      Process.sleep(50)
 
-    assert %{status: :connected} = ClusterProbe.status()[fake]
-  end
+      assert %{status: :connected} = ClusterProbe.status()[fake]
+    end
 
-  test "synthetic nodedown event updates status" do
-    fake = :"synthetic@127.0.0.1"
-    send(Process.whereis(ClusterProbe), {:nodedown, fake})
-    Process.sleep(50)
+    test "synthetic nodedown event updates status" do
+      fake = :"synthetic@127.0.0.1"
+      send(Process.whereis(ClusterProbe), {:nodedown, fake})
+      Process.sleep(50)
 
-    assert %{status: :disconnected} = ClusterProbe.status()[fake]
-  end
+      assert %{status: :disconnected} = ClusterProbe.status()[fake]
+    end
 
-  test "Topology.coverage/1 returns the split" do
-    # Run this test with `elixir --name test@127.0.0.1 --cookie devcluster -S mix test`
-    # so `node/0` is a real node; otherwise coverage will treat everything as missing.
-    %{connected: _c, missing: _m} = Topology.coverage(:dev_epmd)
-    assert is_list(Topology.hosts(:dev_epmd))
+    test "Topology.coverage/1 returns the split" do
+      # Run this test with `elixir --name test@127.0.0.1 --cookie devcluster -S mix test`
+      # so `node/0` is a real node; otherwise coverage will treat everything as missing.
+      %{connected: _c, missing: _m} = Topology.coverage(:dev_epmd)
+      assert is_list(Topology.hosts(:dev_epmd))
+    end
   end
 end
 ```
 
 ### Step 8: Running three nodes
+
+**Objective**: Observe polling_interval-driven peer discovery and :net_kernel.monitor_nodes transparency across IEx sessions."""
 
 Three terminals, same cookie:
 
@@ -347,6 +365,29 @@ Kill `node2`, wait 2 s, observe `nodedown` in logs, then restart it and observe 
 ### Why this works
 
 The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
+
+
+## Key Concepts: Dynamic Cluster Discovery and Node Management
+
+Libcluster automates the discovery process: you define a topology (e.g., "discover nodes via DNS SRV records" or "read a file"), and libcluster runs a supervisor that periodically probes for new nodes, dropping partitions and adding discovered peers. The key benefit is **elasticity**—new nodes can join without restarting the cluster.
+
+EPMD (Erlang Port Mapper Daemon) is the underlying mechanism: when a node starts, it registers with EPMD on port 4369. Other nodes query EPMD to find peers. In containerized environments (Kubernetes), EPMD can be fragile: if a pod's EPMD process dies, peers can't discover it. Modern deployments use DNS-based discovery (libcluster's `:dns_poll` strategy) instead. The trade-off: DNS is slower than EPMD but more robust in cloud environments.
+
+
+## Deep Dive: Cluster Patterns and Production Implications
+
+Clustering distributes computation across nodes using Erlang's distribution protocol. Testing clusters requires simulating node failures, network partitions, and message delays—challenges that single-node tests don't expose. Production clusters fail in ways that cluster tests reveal: nodes can become isolated (stuck), messages can be reordered, and consensus is expensive.
+
+---
+
+## Advanced Considerations
+
+Distributed Elixir systems require careful consideration of network partitions, consistent hashing for distributed state, and the interaction between clustering libraries and node discovery mechanisms. Network partitions are not rare edge cases; they happen regularly in cloud deployments due to maintenance windows and infrastructure issues. A system that works perfectly during local testing but fails under network partitions indicates insufficient failure handling throughout the codebase. Split-brain scenarios where multiple network partitions lead to different cluster views require explicit recovery mechanisms that are often business-specific and context-dependent.
+
+Horde and distributed registries provide eventual consistency guarantees, but "eventual" can mean minutes during network partitions. Applications must handle the case where the same name is registered on multiple nodes simultaneously without coordination. Consistent hashing for distributed services requires understanding rebalancing costs — a single node failure can cause significant key redistribution and thundering herd problems if not carefully managed. The cost of distributed consensus using algorithms like Raft is high; choose it only when consistency is more important than availability and can afford the performance cost.
+
+Global state replication across nodes creates synchronization challenges at scale. Choosing between replicating everywhere versus replicating to specific nodes affects both consistency latency and network bandwidth utilization fundamentally. Node monitoring and heartbeat mechanisms require careful timeout tuning — too aggressive and you get false positives during network hiccups; too conservative and you don't detect actual failures quickly enough for recovery. The EPMD (Erlang Port Mapper Daemon) is a critical component that can become a bottleneck in large clusters and requires careful capacity planning.
+
 
 ## Trade-offs and production gotchas
 
@@ -413,3 +454,13 @@ Measured memory/CPU overhead of libcluster itself: ~350 KB heap, < 0.1% CPU in s
 - [Discord Engineering — building a distributed system](https://discord.com/blog/how-discord-scaled-elixir-to-5-000-000-concurrent-users) — libcluster in production
 - [Dashbit blog — distributed Elixir with libcluster + Horde](https://dashbit.co/blog/elixir-clustering-with-horde) — full stack
 - [Erlang docs — `epmd`](https://www.erlang.org/doc/man/epmd.html) — protocol details
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

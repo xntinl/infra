@@ -2,9 +2,6 @@
 
 **Project**: `kernel_tools` — a module that puts `Kernel`'s less-obvious macros to work: `defguard` for reusable guards, `defdelegate` for thin wrappers, `then/2` and `tap/2` for pipeline ergonomics.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -39,6 +36,14 @@ kernel_tools/
 
 ---
 
+## Why these four Kernel macros and not a library
+
+Cada uno resuelve un problema recurrente que antes requería
+boilerplate o dependencia. Vienen en stdlib porque ganan en cada
+proyecto — sin version drift, sin gap de dialyzer.
+
+---
+
 ## Core concepts
 
 ### 1. `defguard/1` — reusable guard expressions
@@ -55,9 +60,9 @@ def halve(n) when is_even(n), do: div(n, 2)
 ```
 
 `defguard` is itself a macro — it expands into an ordinary macro that only
-emits AST allowed in guards. That's why exercise 91 pairs it with
-`Macro.Env.in_guard?/1` for guards that behave differently inside vs.
-outside `when`.
+emits AST allowed in guards. It pairs naturally with
+`Macro.Env.in_guard?/1` for guards that need to behave differently
+inside vs. outside `when`.
 
 ### 2. `defdelegate/2` — forward without boilerplate
 
@@ -102,9 +107,37 @@ anonymous function that accidentally changes the value.
 
 ---
 
+## Design decisions
+
+**Option A — Helpers como funciones planas**
+- Pros: Dialyzer-friendly; sin superficie de macro.
+- Cons: `even?/1` no sirve en `when`; pipelines pierden ergonomía.
+
+**Option B — `defguard` + `defdelegate` + `tap` + `then` juntos** (elegida)
+- Pros: Primitivas stdlib que componen.
+- Cons: Cuatro mecánicas distintas.
+
+→ Elegida **B** porque este ejercicio *es* el tour.
+
+---
+
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
 
 ```bash
 mix new kernel_tools
@@ -112,6 +145,9 @@ cd kernel_tools
 ```
 
 ### Step 2: `lib/kernel_tools/math.ex` — the delegate target
+
+**Objective**: Edit `math.ex` — the delegate target, exposing AST manipulation that runs at compile time — making the macro's hygiene and unquoting choices observable.
+
 
 ```elixir
 defmodule KernelTools.Math do
@@ -128,6 +164,9 @@ end
 ```
 
 ### Step 3: `lib/kernel_tools.ex`
+
+**Objective**: Implement `kernel_tools.ex` — AST manipulation that runs at compile time — making the macro's hygiene and unquoting choices observable.
+
 
 ```elixir
 defmodule KernelTools do
@@ -198,6 +237,9 @@ end
 
 ### Step 4: `test/kernel_tools_test.exs`
 
+**Objective**: Write `kernel_tools_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+
 ```elixir
 defmodule KernelToolsTest do
   use ExUnit.Case, async: true
@@ -245,9 +287,38 @@ end
 
 ### Step 5: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
+
+### Why this works
+
+`defguard` expande en compile-time a un macro cuyo body es AST
+guard-legal — así que `is_even(n)` inlinado en `when` es idéntico a
+`is_integer(n) and rem(n, 2) == 0`. `defdelegate` reescribe
+`def foo(x), do: Target.foo(x)` en compile time. `tap/2` devuelve su
+primer argumento intacto. `then/2` aplica una función al valor pipeado
+cuando la forma no encaja con primer-argumento de `|>`. Los cuatro
+expanden a código directo.
+
+---
+
+
+## Deep Dive: State Management and Message Handling Patterns
+
+Understanding state transitions is central to reliable OTP systems. Every `handle_call` or `handle_cast` receives current state and returns new state—immutability forces explicit reasoning. This prevents entire classes of bugs: missing state updates are immediately visible.
+
+Key insight: separate pure logic (state → new state) from side effects (logging, external calls). Move pure logic to private helpers; use handlers for orchestration. This makes servers testable—test pure functions independently.
+
+In production, monitor state size and mutation frequency. Unbounded growth is a memory leak; excessive mutations signal hot spots needing optimization. Always profile before reaching for performance solutions like ETS.
+
+## Benchmark
+
+<!-- benchmark N/A: las cuatro macros expanden a código equivalente al
+manual. Microbenchmarks miden el cuerpo de la función, no la macro. -->
 
 ---
 
@@ -286,6 +357,17 @@ Reach for `defguard` only when a predicate is used in **multiple** `when`
 clauses — otherwise it's overengineering. Reach for `defdelegate` only
 when the wrapper truly adds nothing. And don't use `then/2` for every
 minor pipeline — sometimes a temporary variable is the right answer.
+
+---
+
+## Reflection
+
+- Tu módulo delega 12 funciones con `defdelegate`. Dialyzer se queja
+  porque los `@spec` viven solo en el delegador. ¿Duplicás, movés o
+  abandonás `defdelegate`?
+- Un pipeline tiene tres `tap(&Logger.debug/1)` consecutivos. Un
+  compañero propone un `trace` macro. ¿Cuándo vale la abstracción y
+  cuándo el `tap` explícito sigue mejor?
 
 ---
 

@@ -175,6 +175,8 @@ deviation can be > 50%, signaling non-determinism. Re-run with a longer
 
 ### Step 1: `mix.exs`
 
+**Objective**: Pin :benchee so memory_time and reduction_time passes measure allocation pressure and VM work per iteration.
+
 ```elixir
 defmodule BencheeMemory.MixProject do
   use Mix.Project
@@ -188,6 +190,8 @@ end
 ```
 
 ### Step 2: `lib/benchee_memory/builders.ex`
+
+**Objective**: Implement concat O(N²), iodata O(N), and binary-append compiler-optimized variants so memory/reductions deltas surface.
 
 ```elixir
 defmodule BencheeMemory.Builders do
@@ -222,6 +226,8 @@ end
 ```
 
 ### Step 3: `lib/benchee_memory/reporter.ex`
+
+**Objective**: Write custom CSV formatter capturing scenario name, average wall-time, memory, and reductions for regression tracking.
 
 A minimal custom formatter that appends a CSV row per scenario for
 regression tracking.
@@ -284,6 +290,8 @@ end
 
 ### Step 4: `bench/builders_bench.exs`
 
+**Objective**: Measure wall-time, memory, and reductions across N=100 chunks so O(N²) concat penalty surfaces in all three dimensions.
+
 ```elixir
 alias BencheeMemory.Builders
 
@@ -307,6 +315,8 @@ Benchee.run(
 ```
 
 ### Step 5: `test/benchee_memory/builders_test.exs`
+
+**Objective**: Verify all three builders output identical binary and measure reductions delta so concat O(N²) cost quantifies.
 
 ```elixir
 defmodule BencheeMemory.BuildersTest do
@@ -366,6 +376,8 @@ end
 
 ### Step 6: Run and read the report
 
+**Objective**: Execute benchmark with memory/reduction passes and CSV export, then compare wall-time, memory, and reductions across all three.
+
 ```bash
 mkdir -p priv
 mix run bench/builders_bench.exs
@@ -413,6 +425,46 @@ IO.puts("avg: #{time_us / 10_000} µs/op")
 ```
 
 Target: operation should complete in the low-microsecond range on modern hardware; deviations by >2× indicate a regression worth investigating.
+
+## Deep Dive: BEAM Scheduler Tuning and Memory Profiling in Production
+
+The BEAM scheduler is not "magic" — it's a preemptive work-stealing scheduler that divides CPU time 
+into reductions (bytecode instructions). Understanding scheduler tuning is critical when you suspect 
+latency spikes in production.
+
+**Key concepts**:
+- **Reductions budget**: By default, a process gets ~2000 reductions before yielding to another process.
+  Heavy CPU work (binary matching, list recursion) can exhaust the budget and cause tail latency.
+- **Dirty schedulers**: If a process does CPU-intensive work (crypto, compression, numerical), it blocks 
+  the main scheduler. Use dirty NIFs or `spawn_opt(..., [{:fullsweep_after, 0}])` for GC tuning.
+- **Heap tuning per process**: `Process.flag(:min_heap_size, ...)` reserves heap upfront, reducing GC 
+  pauses. Measure; don't guess.
+
+**Memory profiling workflow**:
+1. Run `recon:memory/0` in iex; identify top 10 memory consumers by type (atoms, binaries, ets).
+2. If binaries dominate, check for refc binary leaks (binary held by process that should have been freed).
+3. Use `eprof` or `fprof` for function-level CPU attribution; `recon:proc_window/3` for process memory trends.
+
+**Production pattern**: Deploy with `+K true` (async IO), `-env ERL_MAX_PORTS 65536` (port limit), 
+`+T 9` (async threads). Measure GC time with `erlang:statistics(garbage_collection)` — if >5% of uptime, 
+tune heap or reduce allocation pressure. Never assume defaults are optimal for YOUR workload.
+
+---
+
+## Advanced Considerations
+
+Understanding BEAM internals at production scale requires deep knowledge of scheduler behavior, memory models, and garbage collection dynamics. The soft real-time guarantees of BEAM only hold under specific conditions — high system load, uneven process distribution across schedulers, or GC pressure can break predictable latency completely. Monitor `erlang:statistics(run_queue)` in production to catch scheduler saturation before it degrades latency significantly. The difference between immediate, offheap, and continuous GC garbage collection strategies can significantly impact tail latencies in systems with millions of messages per second and sustained memory pressure.
+
+Process reductions and the reduction counter affect scheduler fairness fundamentally. A process that runs for extended periods without yielding can starve other processes, even though the scheduler treats it fairly by reduction count per scheduling interval. This is especially critical in pipelines processing large data structures or performing recursive computations where yielding points are infrequent and difficult to predict. The BEAM's preemption model is deterministic per reduction, making performance testing reproducible but sometimes hiding race conditions that only manifest under specific load patterns and GC interactions.
+
+The interaction between ETS, Mnesia, and process message queues creates subtle bottlenecks in distributed systems. ETS reads don't block other processes, but writes require acquiring locks; understanding when your workload transitions from read-heavy to write-heavy is crucial for capacity planning. Port drivers and NIFs bypass the BEAM scheduler entirely, which can lead to unexpected priority inversions if not carefully managed. Always profile with `eprof` and `fprof` in realistic production-like environments before deployment to catch performance surprises.
+
+
+## Deep Dive: Otp Patterns and Production Implications
+
+OTP primitives (GenServer, Supervisor, Application) are tested through their public interfaces, not by inspecting internal state. This discipline forces correct design: if you can't test a behavior without peeking into the server's state, the behavior is not public. Production systems with tight integration tests on GenServer internals are fragile and hard to refactor.
+
+---
 
 ## Trade-offs and production gotchas
 
@@ -487,3 +539,13 @@ Example GitHub Actions step:
 - [José Valim — iolist vs binary](https://elixir-lang.org/blog/) — the canonical write-up on binary concatenation cost
 - [Chris Keathley — benchmarking in Elixir](https://keathley.io/) — practical benchmark-driven optimization
 - [Dashbit — memory and reductions in production](https://dashbit.co/blog/) — real-world stories of reduction-based alerting
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

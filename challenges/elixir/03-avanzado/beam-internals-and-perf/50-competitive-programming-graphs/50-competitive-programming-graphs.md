@@ -86,6 +86,8 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ### Step 1: `lib/api_gateway/graph/graph.ex`
 
+**Objective**: Represent graphs as maps so undirected/weighted edges share immutable contract independent of algorithm.
+
 ```elixir
 defmodule ApiGateway.Graph do
   @moduledoc "Functional graph representation and construction helpers."
@@ -123,6 +125,8 @@ end
 ```
 
 ### Step 2: `lib/api_gateway/graph/bfs.ex`
+
+**Objective**: Use :queue FIFO so layer-by-layer traversal + hop-count distances compute in O(V+E) without list-reversal overhead.
 
 BFS uses Erlang's `:queue` for O(1) enqueue/dequeue. It visits all reachable nodes
 layer by layer, computing hop-count distances from the start node.
@@ -227,6 +231,8 @@ end
 
 ### Step 3: `lib/api_gateway/graph/topological_sort.ex`
 
+**Objective**: Implement Kahn's algorithm tracking in-degrees so service dependency order surfaces and cycles auto-detect.
+
 Kahn's algorithm: BFS-based topological sort. Starts from nodes with no incoming edges
 (in-degree 0) and progressively removes them, adding newly zero-degree nodes to the queue.
 If the result is shorter than the node count, the graph contains a cycle.
@@ -305,6 +311,8 @@ end
 ```
 
 ### Step 4: `lib/api_gateway/graph/cycle_detector.ex`
+
+**Objective**: Run three-color DFS (white/gray/black) so a back edge to a gray ancestor reveals and reconstructs the cycle.
 
 Three-color DFS for cycle detection. White = unvisited, gray = in current DFS path,
 black = fully processed. A back edge (encountering a gray node) proves a cycle exists.
@@ -429,6 +437,8 @@ end
 
 ### Step 5: `lib/api_gateway/graph/dijkstra.ex`
 
+**Objective**: Back Dijkstra's relaxation with `:gb_sets` for O(log n) min extraction on weighted shortest-path queries.
+
 Dijkstra's algorithm finds shortest paths in weighted graphs. Uses `:gb_sets` as a
 min-heap priority queue for O(log n) extraction of the minimum-distance node.
 
@@ -535,6 +545,8 @@ end
 
 ### Step 6: Service dependency resolver
 
+**Objective**: Translate a `%{service => [deps]}` map into topological call order and surface circular dependencies by path.
+
 Wraps the graph algorithms into a domain-specific interface for resolving service
 call order and detecting circular dependencies.
 
@@ -584,6 +596,8 @@ end
 
 ### Step 7: Tests
 
+**Objective**: Cover BFS hop counts, Kahn ordering, cycle detection, and Dijkstra's weighted paths against known expected values.
+
 ```elixir
 # test/api_gateway/graph/bfs_test.exs
 defmodule ApiGateway.Graph.BFSTest do
@@ -592,41 +606,43 @@ defmodule ApiGateway.Graph.BFSTest do
   alias ApiGateway.Graph
   alias ApiGateway.Graph.BFS
 
-  test "visits all reachable nodes" do
-    g = Graph.new()
-    |> Graph.add_edge("a", "b")
-    |> Graph.add_edge("b", "c")
-    |> Graph.add_edge("d", "e")
+  describe "ApiGateway.Graph.BFS" do
+    test "visits all reachable nodes" do
+      g = Graph.new()
+      |> Graph.add_edge("a", "b")
+      |> Graph.add_edge("b", "c")
+      |> Graph.add_edge("d", "e")
 
-    {order, _} = BFS.traverse(g, "a")
-    assert Enum.sort(order) == ["a", "b", "c"]
-  end
+      {order, _} = BFS.traverse(g, "a")
+      assert Enum.sort(order) == ["a", "b", "c"]
+    end
 
-  test "connected_components finds isolated components" do
-    g = Graph.new()
-    |> Graph.add_edge("a", "b")
-    |> Graph.add_edge("c", "d")
-    |> Map.put("e", [])
+    test "connected_components finds isolated components" do
+      g = Graph.new()
+      |> Graph.add_edge("a", "b")
+      |> Graph.add_edge("c", "d")
+      |> Map.put("e", [])
 
-    components = BFS.connected_components(g)
-    assert length(components) == 3
-  end
+      components = BFS.connected_components(g)
+      assert length(components) == 3
+    end
 
-  test "shortest_path returns correct hop count" do
-    g = Graph.new()
-    |> Graph.add_edge("a", "b")
-    |> Graph.add_edge("b", "c")
-    |> Graph.add_edge("a", "c")
+    test "shortest_path returns correct hop count" do
+      g = Graph.new()
+      |> Graph.add_edge("a", "b")
+      |> Graph.add_edge("b", "c")
+      |> Graph.add_edge("a", "c")
 
-    assert {:ok, ["a", "c"], 1} = BFS.shortest_path(g, "a", "c")
-  end
+      assert {:ok, ["a", "c"], 1} = BFS.shortest_path(g, "a", "c")
+    end
 
-  test "returns no_path for disconnected nodes" do
-    g = Graph.new()
-    |> Graph.add_edge("a", "b")
-    |> Map.put("z", [])
+    test "returns no_path for disconnected nodes" do
+      g = Graph.new()
+      |> Graph.add_edge("a", "b")
+      |> Map.put("z", [])
 
-    assert {:error, :no_path} = BFS.shortest_path(g, "a", "z")
+      assert {:error, :no_path} = BFS.shortest_path(g, "a", "z")
+    end
   end
 end
 ```
@@ -639,39 +655,41 @@ defmodule ApiGateway.Graph.TopologicalSortTest do
   alias ApiGateway.Graph
   alias ApiGateway.Graph.TopologicalSort
 
-  test "returns valid topological order for acyclic graph" do
-    g = %{
-      "a" => ["b", "c"],
-      "b" => ["d"],
-      "c" => ["d"],
-      "d" => []
-    }
-    {:ok, order} = TopologicalSort.sort(g)
-    assert Enum.find_index(order, &(&1 == "a")) < Enum.find_index(order, &(&1 == "d"))
-  end
+  describe "ApiGateway.Graph.TopologicalSort" do
+    test "returns valid topological order for acyclic graph" do
+      g = %{
+        "a" => ["b", "c"],
+        "b" => ["d"],
+        "c" => ["d"],
+        "d" => []
+      }
+      {:ok, order} = TopologicalSort.sort(g)
+      assert Enum.find_index(order, &(&1 == "a")) < Enum.find_index(order, &(&1 == "d"))
+    end
 
-  test "detects cycle" do
-    g = %{"a" => ["b"], "b" => ["c"], "c" => ["a"]}
-    assert {:error, :has_cycle} = TopologicalSort.sort(g)
-  end
+    test "detects cycle" do
+      g = %{"a" => ["b"], "b" => ["c"], "c" => ["a"]}
+      assert {:error, :has_cycle} = TopologicalSort.sort(g)
+    end
 
-  test "service dependency resolver returns correct call order" do
-    deps = %{
-      "payments"       => ["auth"],
-      "auth"           => ["users"],
-      "users"          => [],
-      "exchange_rates" => []
-    }
-    {:ok, order} = ApiGateway.ServiceDependencyResolver.resolve(deps)
-    assert Enum.find_index(order, &(&1 == "users")) <
-           Enum.find_index(order, &(&1 == "auth"))
-    assert Enum.find_index(order, &(&1 == "auth")) <
-           Enum.find_index(order, &(&1 == "payments"))
-  end
+    test "service dependency resolver returns correct call order" do
+      deps = %{
+        "payments"       => ["auth"],
+        "auth"           => ["users"],
+        "users"          => [],
+        "exchange_rates" => []
+      }
+      {:ok, order} = ApiGateway.ServiceDependencyResolver.resolve(deps)
+      assert Enum.find_index(order, &(&1 == "users")) <
+             Enum.find_index(order, &(&1 == "auth"))
+      assert Enum.find_index(order, &(&1 == "auth")) <
+             Enum.find_index(order, &(&1 == "payments"))
+    end
 
-  test "resolver detects circular dependency" do
-    deps = %{"a" => ["b"], "b" => ["c"], "c" => ["a"]}
-    assert {:error, {:circular, _}} = ApiGateway.ServiceDependencyResolver.resolve(deps)
+    test "resolver detects circular dependency" do
+      deps = %{"a" => ["b"], "b" => ["c"], "c" => ["a"]}
+      assert {:error, {:circular, _}} = ApiGateway.ServiceDependencyResolver.resolve(deps)
+    end
   end
 end
 ```
@@ -690,18 +708,22 @@ defmodule ApiGateway.Graph.DijkstraTest do
     "d" => []
   }
 
-  test "finds shortest path" do
-    assert {:ok, 6, ["a", "c", "b", "d"]} = Dijkstra.shortest_path(@graph, "a", "d")
-  end
+  describe "ApiGateway.Graph.Dijkstra" do
+    test "finds shortest path" do
+      assert {:ok, 6, ["a", "c", "b", "d"]} = Dijkstra.shortest_path(@graph, "a", "d")
+    end
 
-  test "returns no_path for unreachable node" do
-    g = %{"a" => [{"b", 1}], "b" => [], "z" => []}
-    assert {:error, :no_path} = Dijkstra.shortest_path(g, "a", "z")
+    test "returns no_path for unreachable node" do
+      g = %{"a" => [{"b", 1}], "b" => [], "z" => []}
+      assert {:error, :no_path} = Dijkstra.shortest_path(g, "a", "z")
+    end
   end
 end
 ```
 
 ### Step 8: Benchmark
+
+**Objective**: Bench BFS traversal and connected-component discovery on random 1k and 10k graphs to confirm linear scaling.
 
 ```elixir
 # bench/graph_bench.exs
@@ -744,6 +766,40 @@ mix run bench/graph_bench.exs
 ### Why this works
 
 The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
+
+## Deep Dive: BEAM Scheduler Tuning and Memory Profiling in Production
+
+The BEAM scheduler is not "magic" — it's a preemptive work-stealing scheduler that divides CPU time 
+into reductions (bytecode instructions). Understanding scheduler tuning is critical when you suspect 
+latency spikes in production.
+
+**Key concepts**:
+- **Reductions budget**: By default, a process gets ~2000 reductions before yielding to another process.
+  Heavy CPU work (binary matching, list recursion) can exhaust the budget and cause tail latency.
+- **Dirty schedulers**: If a process does CPU-intensive work (crypto, compression, numerical), it blocks 
+  the main scheduler. Use dirty NIFs or `spawn_opt(..., [{:fullsweep_after, 0}])` for GC tuning.
+- **Heap tuning per process**: `Process.flag(:min_heap_size, ...)` reserves heap upfront, reducing GC 
+  pauses. Measure; don't guess.
+
+**Memory profiling workflow**:
+1. Run `recon:memory/0` in iex; identify top 10 memory consumers by type (atoms, binaries, ets).
+2. If binaries dominate, check for refc binary leaks (binary held by process that should have been freed).
+3. Use `eprof` or `fprof` for function-level CPU attribution; `recon:proc_window/3` for process memory trends.
+
+**Production pattern**: Deploy with `+K true` (async IO), `-env ERL_MAX_PORTS 65536` (port limit), 
+`+T 9` (async threads). Measure GC time with `erlang:statistics(garbage_collection)` — if >5% of uptime, 
+tune heap or reduce allocation pressure. Never assume defaults are optimal for YOUR workload.
+
+---
+
+## Advanced Considerations
+
+Understanding BEAM internals at production scale requires deep knowledge of scheduler behavior, memory models, and garbage collection dynamics. The soft real-time guarantees of BEAM only hold under specific conditions — high system load, uneven process distribution across schedulers, or GC pressure can break predictable latency completely. Monitor `erlang:statistics(run_queue)` in production to catch scheduler saturation before it degrades latency significantly. The difference between immediate, offheap, and continuous GC garbage collection strategies can significantly impact tail latencies in systems with millions of messages per second and sustained memory pressure.
+
+Process reductions and the reduction counter affect scheduler fairness fundamentally. A process that runs for extended periods without yielding can starve other processes, even though the scheduler treats it fairly by reduction count per scheduling interval. This is especially critical in pipelines processing large data structures or performing recursive computations where yielding points are infrequent and difficult to predict. The BEAM's preemption model is deterministic per reduction, making performance testing reproducible but sometimes hiding race conditions that only manifest under specific load patterns and GC interactions.
+
+The interaction between ETS, Mnesia, and process message queues creates subtle bottlenecks in distributed systems. ETS reads don't block other processes, but writes require acquiring locks; understanding when your workload transitions from read-heavy to write-heavy is crucial for capacity planning. Port drivers and NIFs bypass the BEAM scheduler entirely, which can lead to unexpected priority inversions if not carefully managed. Always profile with `eprof` and `fprof` in realistic production-like environments before deployment to catch performance surprises.
+
 
 ## Trade-off analysis
 
@@ -801,3 +857,13 @@ Target: operation should complete in the low-microsecond range on modern hardwar
 - [`:gb_sets` module -- Erlang/OTP](https://www.erlang.org/doc/man/gb_sets.html) -- balanced BST used as priority queue
 - [Introduction to Algorithms -- CLRS](https://mitpress.mit.edu/9780262046305/introduction-to-algorithms/) -- BFS, DFS, Dijkstra (chapters 22-24)
 - [libgraph](https://github.com/bitwalker/libgraph) -- production-grade graph library for Elixir
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

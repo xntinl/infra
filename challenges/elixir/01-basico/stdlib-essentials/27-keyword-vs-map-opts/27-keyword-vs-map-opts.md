@@ -2,9 +2,6 @@
 
 **Project**: `http_opts` — a tiny HTTP client wrapper with validated, typed options
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 2-3 hours
-
 ---
 
 ## Why the options shape matters for a senior developer
@@ -25,6 +22,12 @@ Senior code validates options at the entry of the public function using
 `Keyword.validate!/2` (stdlib, Elixir 1.13+) for small APIs, or the
 `NimbleOptions` pattern for larger specs with types, defaults, and
 documentation generated from a schema.
+
+---
+
+## Why a keyword public API and a map internal state (and not one shape end-to-end)
+
+Picking keyword lists everywhere looks consistent but punishes hot paths: every `Keyword.get/3` walks the list, and a request handler that reads five options repeats that O(n) scan five times per call. Picking maps everywhere breaks the community convention — no one writes `HTTPoison.get("url", %{timeout: 5_000})`; the ecosystem expects keyword lists at API boundaries so `|> Keyword.merge(extra)` and compile-time typo detection via `Keyword.validate!/2` remain available. The senior pattern is to accept the idiomatic keyword list at the boundary, validate and convert to a map once, and then use the map internally — pay the conversion once so every later lookup is O(log n).
 
 ---
 
@@ -67,9 +70,40 @@ http_opts/
 
 ---
 
+## Design decisions
+
+**Option A — accept a keyword list, use `Keyword.get/3` everywhere internally**
+- Pros: one shape end-to-end; no conversion; trivial to destructure with `[{:timeout, t} | _]`.
+- Cons: O(n) lookup repeated in every handler; `Keyword.get` with a default is easy to misuse (`opts[:flag] || true` coerces `false` to `true`); no compile-time type checks.
+
+**Option B — schema-driven validator returning a map; public API is keyword, internals are map** (chosen)
+- Pros: single source of truth drives both validation and doc generation; unknown keys fail at the boundary (`unknown options: [:timout]`); types are enforced (`timeout: 0` rejected as non-positive); internal code sees `opts.timeout` with a guaranteed integer.
+- Cons: extra module; reimplements a subset of `NimbleOptions` (which is the production answer); adds a keyword-to-map conversion per call.
+
+Chose **B** because options are the contract with callers for years; silently ignoring typos (`timout: 5_000`) is the class of bug that destroys trust in a shared library. The validation cost is microseconds — negligible next to any real HTTP call.
+
+---
+
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"ecto", "~> 1.0"},
+    {:"httpoison", "~> 1.0"},
+    {:"plug", "~> 1.0"},
+    {:"poison", "~> 1.0"},
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Keyword API boundary; map internals for O(log n) lookups; convert once, use many times prevents O(n²).
 
 ```bash
 mix new http_opts
@@ -77,6 +111,8 @@ cd http_opts
 ```
 
 ### Step 2: `mix.exs`
+
+**Objective**: Boilerplate; focus on schema-driven validation — Keyword.validate!/2 (1.13+) enforces types at boundary.
 
 ```elixir
 defmodule HttpOpts.MixProject do
@@ -105,6 +141,8 @@ end
 
 ### Step 3: `.formatter.exs`
 
+**Objective**: Formatter is opinionated; configure inputs glob + line length once; format is hermetic (no env deps).
+
 ```elixir
 [
   inputs: ["{mix,.formatter}.exs", "{config,lib,test}/**/*.{ex,exs}"],
@@ -113,6 +151,8 @@ end
 ```
 
 ### Step 4: `lib/http_opts/options.ex`
+
+**Objective**: Keyword.validate!/2 fails fast on unknown keys (typo proof); returns map for internal O(1) lookups.
 
 ```elixir
 defmodule HttpOpts.Options do
@@ -250,6 +290,8 @@ end
 
 ### Step 5: `lib/http_opts/transport.ex`
 
+**Objective**: Stub transport (not real HTTP) — tests don't touch network; protocol contract is testable in isolation.
+
 ```elixir
 defmodule HttpOpts.Transport do
   @moduledoc """
@@ -292,6 +334,8 @@ end
 ```
 
 ### Step 6: `lib/http_opts/client.ex`
+
+**Objective**: Client uses validated map opts; schema is single source of truth for validation + docs generation.
 
 ```elixir
 defmodule HttpOpts.Client do
@@ -417,6 +461,8 @@ end
   map — `opts.backoff_ms` is always a number, never `nil`.
 
 ### Step 7: Tests
+
+**Objective**: Test option validation (unknown keys fail, types enforced); defaults apply; client receives valid map.
 
 ```elixir
 # test/http_opts/options_test.exs
@@ -563,12 +609,55 @@ end
 
 ### Step 8: Run and verify
 
+**Objective**: --warnings-as-errors catches unused option fields; test coverage validates validation rejects bad input.
+
 ```bash
 mix deps.get
 mix compile --warnings-as-errors
 mix test --trace
 mix format
 ```
+
+### Why this works
+
+The schema is plain data (a keyword list of `{name, [type: ..., default: ...]}`). `validate/2` walks it once to reject unknown keys, once to check types, and once to apply defaults — every call produces a fully-populated map so internal handlers never branch on "is this option set?". Because the schema is a module attribute, the same data drives the `@moduledoc` via `Options.docs/1`, so documentation cannot drift from validation. The internal transport is a behaviour, so tests swap the stub in without mocking libraries.
+
+---
+
+
+## Key Concepts
+
+### 1. Keyword Lists for Function Options
+Keyword lists are idiomatic for function options. They preserve order and allow duplicate keys.
+
+### 2. Maps for Nested Data
+For API responses, database records, and unstructured data, use maps.
+
+### 3. Modern Elixir Prefers Maps for Options
+Newer libraries use maps. But keyword lists remain for backward compatibility and tradition. Both are acceptable.
+
+---
+## Benchmark
+
+```elixir
+# bench.exs
+defmodule Bench do
+  def run do
+    opts = [method: :post, timeout: 5_000, retries: 2, user_agent: "bench/1"]
+
+    {us, _} =
+      :timer.tc(fn ->
+        Enum.each(1..100_000, fn _ -> HttpOpts.Client.request("https://example.test", opts) end)
+      end)
+
+    IO.puts("validated request x100k: #{us} µs (#{us / 100_000} µs/call)")
+  end
+end
+
+Bench.run()
+```
+
+Target: under 10 µs per call (validation + stub transport). Validation alone is under 2 µs; anything beyond that is the transport echoing the payload.
 
 ---
 
@@ -641,6 +730,13 @@ a new option. Generate the docs from the schema as shown in `docs/1`.
   maps for dynamic config.
 - **Serialisation to JSON** — keyword lists serialise as lists of
   two-element lists, not objects. Use maps.
+
+---
+
+## Reflection
+
+1. `Options.validate/2` short-circuits on the first bad option. For a CLI that wants to report every error at once, would you switch to `Enum.reduce/3` and accumulate errors, keep short-circuit and document it, or expose a `validate_all/2` variant? What does each cost in implementation and user experience?
+2. The schema lives in a module attribute. If a new feature needs options that depend on the `:method` (e.g. `:body` only valid for POST/PUT/PATCH), does the current shape still fit? Would you nest schemas per method, add a cross-field validator hook, or bite the bullet and migrate to `NimbleOptions` with its `:subsection` support?
 
 ---
 

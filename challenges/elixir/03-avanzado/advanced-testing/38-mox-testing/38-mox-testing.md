@@ -163,6 +163,8 @@ in-memory fake".
 
 ### Step 1: `mix.exs`
 
+**Objective**: Isolate Mox to `:test` scope and add `test/support` to compile paths so mock code never compiles into production binaries.
+
 ```elixir
 defmodule Payments.MixProject do
   use Mix.Project
@@ -196,6 +198,8 @@ end
 
 ### Step 2: Behaviour and dispatcher
 
+**Objective**: Pin behaviour callbacks and dispatch through impl() so Mox enforces signatures at compile-time while runtime config swaps implementations.
+
 ```elixir
 # lib/payments/gateway.ex
 defmodule Payments.Gateway do
@@ -225,6 +229,8 @@ end
 ```
 
 ### Step 3: Production implementation
+
+**Objective**: Map HTTP status codes to semantic errors so callers branch on domain semantics, not transport details.
 
 ```elixir
 # lib/payments/gateway/http_client.ex
@@ -270,6 +276,8 @@ end
 
 ### Step 4: Dev/staging stub (used with `stub_with`)
 
+**Objective**: Embed deterministic failure modes in token prefixes so stub_with provides a reusable fake without per-test expect boilerplate.
+
 ```elixir
 # test/support/in_memory_gateway.ex
 defmodule Payments.Gateway.InMemory do
@@ -289,6 +297,8 @@ end
 ```
 
 ### Step 5: Domain logic
+
+**Objective**: Restrict retries to transient errors so tests prove declined charges fail fast without customer double-charging.
 
 ```elixir
 # lib/payments/charge.ex
@@ -321,6 +331,8 @@ end
 
 ### Step 6: Worker (spawns tasks — triggers allowance concerns)
 
+**Objective**: Parallelize charges via Task.async_stream so test expectations must be explicitly allowed across spawned child processes.
+
 ```elixir
 # lib/payments/worker.ex
 defmodule Payments.Worker do
@@ -340,6 +352,8 @@ end
 
 ### Step 7: Application
 
+**Objective**: Supervise Finch pool so tests reuse one connection pool without socket leaks across test isolation.
+
 ```elixir
 # lib/payments/application.ex
 defmodule Payments.Application do
@@ -354,6 +368,8 @@ end
 ```
 
 ### Step 8: Mocks and test helper
+
+**Objective**: Generate Mox mock from behaviour and inject into Application env so all tests use mocks, never real gateway.
 
 ```elixir
 # test/support/mocks.ex
@@ -374,6 +390,8 @@ config :payments, :api_token, System.get_env("PAYMENTS_API_TOKEN") || "dev"
 ```
 
 ### Step 9: Charge tests (private mode, async)
+
+**Objective**: Assert retry counts and decline semantics with verify_on_exit! in async tests so private mock registry prevents state bleeding.
 
 ```elixir
 # test/payments/charge_test.exs
@@ -421,6 +439,8 @@ end
 ```
 
 ### Step 10: Worker tests (cross-process allowance)
+
+**Objective**: Use Mox.allow/3 to grant Task pids access to expectations, or use stub_with/2 to avoid allowance entirely via $callers.
 
 ```elixir
 # test/payments/worker_test.exs
@@ -475,6 +495,21 @@ IO.puts("avg: #{time_us / 10_000} µs/op")
 ```
 
 Target: operation should complete in the low-microsecond range on modern hardware; deviations by >2× indicate a regression worth investigating.
+
+## Deep Dive: Mox Patterns and Production Implications
+
+Testing through explicit behavior contracts requires careful design of expectations. In production systems with many mocked dependencies, the cost of maintaining contracts grows with each new adapter or integration point. The key insight is that Mox's private-mode isolation prevents test pollution only when all pids involved are accounted for—the moment you spawn unowned processes (Tasks, Oban workers, Broadway pipelines), you must switch to global mode, trading parallelism for simplicity. Understanding when to reach for expect/3 vs stub_with/2 vs global mode separates brittle test suites from maintainable ones. A senior engineer recognizes that mocking boundaries—not implementation details—pays dividends over time.
+
+---
+
+## Advanced Considerations
+
+Production testing strategies require careful attention to resource management and test isolation across multiple concurrent test processes. In large codebases, tests can consume significant memory and CPU resources, especially when using concurrent testing without proper synchronization and cleanup. The BEAM scheduler's preemptive nature means test processes may interfere with each other if shared resources aren't properly isolated at the process boundary. Pay careful attention to how Ecto's sandbox mode interacts with your supervision tree — if you have GenServers that hold state across tests, the sandbox rollback mechanism may leave phantom processes in your monitoring systems that continue consuming resources until forced cleanup occurs.
+
+When scaling tests to production-grade test suites, consider the cost of stub verification and the memory overhead of generated test cases. Each property-based test invocation can create thousands of synthetic test cases, potentially causing garbage collection pressure that's invisible during local testing but becomes critical in CI/CD pipelines running long test suites continuously. The interaction between concurrent tests and ETS tables (often used in caches and registry patterns) requires explicit `inherited: true` options to prevent unexpected sharing between test processes, which can cause mysterious failures when tests run in different orders or under load.
+
+For distributed testing scenarios using tools like `Peer`, network simulation can mask real latency issues and failure modes. Test timeouts that work locally may fail in CI due to scheduler contention and GC pauses. Always include substantial buffers for timeout values and monitor actual execution times under load. The coordination between multiple test nodes requires careful cleanup — a failure in test coordination can leave zombie processes consuming resources indefinitely. Implement proper telemetry hooks within your test helpers to diagnose production-like scenarios and capture performance characteristics.
+
 
 ## Trade-offs and production gotchas
 
@@ -557,3 +592,13 @@ throughput, catastrophic if you were tempted to use Mox in production paths.
 - [Mox `Mox.Server` source](https://github.com/dashbitco/mox/blob/main/lib/mox/server.ex)
 - [Finch docs](https://hexdocs.pm/finch)
 - ["Avoid test pollution" — Saša Jurić](https://www.theerlangelist.com/)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

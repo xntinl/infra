@@ -3,9 +3,6 @@
 **Project**: `evt_pubsub` — a minimal publish/subscribe bus where subscribers
 register themselves under a topic via `Registry` and receive events by message.
 
-**Difficulty**: ★★☆☆☆
-**Time**: 2-3 hours
-
 ---
 
 ## Project structure
@@ -69,9 +66,56 @@ understand `Phoenix.PubSub`.
 
 ---
 
+## Why Registry and not a single GenServer bus
+
+- A GenServer-based bus serialises every publish through one mailbox — that mailbox is the bottleneck and a single point of crash for the whole bus.
+- `:global` gives cluster scope but also locks and a single resolver process; overkill on one node and expensive for dynamic keys.
+- A hand-rolled ETS table gives you the fast lookup but you then implement monitor-based cleanup yourself. `Registry` gives you that cleanup for free.
+
+Registry is the correct primitive precisely because publish is O(subscribers) ETS reads plus direct `send/2` — no central process.
+
+---
+
+## Design decisions
+
+**Option A — `:unique` keys + a separate "subscriber set" data structure per topic**
+- Pros: one Registry entry per topic, lookup is O(1).
+- Cons: you re-implement the subscriber set and its monitoring yourself; cleanup on subscriber crash becomes manual.
+
+**Option B — `:duplicate` keys, one Registry entry per `{topic, subscriber}` pair** (chosen)
+- Pros: Registry's built-in monitor removes the entry on subscriber death; `Registry.dispatch/3` iterates the set in ETS directly; no custom data structure.
+- Cons: `subscribe/1` is not idempotent — a subscriber calling twice gets two entries and two deliveries.
+
+→ Chose **B** because the whole point of using Registry is the automatic cleanup. Building on `:unique` forfeits that. Idempotency is a caller-side concern (dedupe before calling `subscribe/1`).
+
+---
+
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"phoenix", "~> 1.0"},
+  ]
+end
+```
+
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  # Registry ships with Elixir. No external deps for this exercise.
+  []
+end
+```
+
 ### Step 1: Create the project
+
+**Objective**: scaffold a new Mix project and set up the directory layout for the exercise.
 
 ```bash
 mix new evt_pubsub
@@ -79,6 +123,8 @@ cd evt_pubsub
 ```
 
 ### Step 2: `mix.exs`
+
+**Objective**: declare project metadata and dependencies required for the exercise.
 
 ```elixir
 defmodule EvtPubsub.MixProject do
@@ -105,6 +151,8 @@ end
 
 ### Step 3: `.formatter.exs`
 
+**Objective**: configure the formatter inputs and line length for consistent code style.
+
 ```elixir
 [
   inputs: ["{mix,.formatter}.exs", "{config,lib,test}/**/*.{ex,exs}"],
@@ -113,6 +161,8 @@ end
 ```
 
 ### Step 4: `lib/evt_pubsub/application.ex`
+
+**Objective**: implement application — starts the shared registry used as the pub/sub backbone.
 
 ```elixir
 defmodule EvtPubsub.Application do
@@ -147,6 +197,8 @@ end
 ```
 
 ### Step 5: `lib/evt_pubsub/bus.ex`
+
+**Objective**: implement bus — pub/sub api built on `registry` in `:duplicate` mode.
 
 ```elixir
 defmodule EvtPubsub.Bus do
@@ -239,6 +291,8 @@ end
 
 ### Step 6: `lib/evt_pubsub/subscriber.ex`
 
+**Objective**: implement subscriber — a tiny spawn-based subscriber process.
+
 ```elixir
 defmodule EvtPubsub.Subscriber do
   @moduledoc """
@@ -292,8 +346,8 @@ defmodule EvtPubsub.Subscriber do
   @doc """
   Synchronously requests the list of events the subscriber has seen.
 
-  Uses the same ref-correlation pattern from exercise 32 — the only safe way
-  to do request/response over raw message passing.
+  Uses the canonical `make_ref/0` + `^ref` correlation pattern — the only
+  safe way to do request/response over raw message passing.
   """
   @spec dump(pid(), timeout()) :: {:ok, [term()]} | {:error, :timeout}
   def dump(pid, timeout \\ 500) do
@@ -310,6 +364,8 @@ end
 ```
 
 ### Step 7: Tests
+
+**Objective**: write ExUnit tests covering happy paths and edge cases for the module.
 
 ```elixir
 # test/evt_pubsub/bus_test.exs
@@ -444,12 +500,55 @@ end
 
 ### Step 8: Run
 
+**Objective**: compile the project, run the tests, and verify the expected behavior.
+
 ```bash
 mix deps.get
 mix compile --warnings-as-errors
 mix test
 mix format
 ```
+
+### Why this works
+
+`Registry` is a named ETS table plus a monitor process. `register/3` inserts a `{key, pid, value}` row and monitors the pid; when the pid dies, the monitor callback deletes the row. `lookup/2` and `dispatch/3` read from ETS with concurrent-read semantics — no central process in the publish path. `parallel: true` on dispatch fans the callback out across scheduler partitions so subscriber lists don't serialise. The whole publish path is lock-free in the common case.
+
+---
+
+
+## Key Concepts
+
+### 1. The Registry Allows Looking Up Processes by Name
+`Registry.register` registers a process. `Registry.lookup` finds it by key. Without Registry, you'd need a global process dictionary or ETS table.
+
+### 2. Unique Keys vs Duplicate Keys
+Unique — one process per key (singleton resources). Duplicate — multiple processes per key (fan-out).
+
+### 3. Metadata and Monitoring
+Registry includes metadata and monitoring. This makes it powerful for dynamic systems where processes are created and destroyed frequently.
+
+---
+## Benchmark
+
+```elixir
+# bench/pubsub.exs
+for _ <- 1..1_000 do
+  spawn_link(fn ->
+    {:ok, _} = EvtPubsub.Bus.subscribe(:hot)
+    receive do: (_ -> :ok)
+  end)
+end
+
+Process.sleep(50)
+
+{t, _} = :timer.tc(fn ->
+  Enum.each(1..10_000, fn _ -> EvtPubsub.Bus.publish(:hot, :tick) end)
+end)
+
+IO.puts("10k publishes to 1000 subs: #{t} µs — #{t / 10_000} µs/publish")
+```
+
+Target: < 500 µs per publish with 1000 subscribers on modern hardware. The cost scales linearly with subscribers (one `send/2` each); the ETS lookup itself is O(1).
 
 ---
 
@@ -518,6 +617,13 @@ across different destinations is not a guarantee you should lean on.
   Registry or use a full event bus; don't abuse `:duplicate` mode.
 - Keys are dynamically typed user input — validate them before registering,
   otherwise any caller can flood your registry with garbage keys.
+
+---
+
+## Reflection
+
+- A topic has 10k subscribers and the publisher is publishing 1k events/sec. At what point does `parallel: true` stop helping — subscriber count, event rate, or scheduler count? How would you measure it?
+- A slow subscriber turns its mailbox into a memory bomb. Registry offers no backpressure. What do you add — per-subscriber flow control, a buffer GenServer, or drop-on-full — and what does each cost?
 
 ---
 

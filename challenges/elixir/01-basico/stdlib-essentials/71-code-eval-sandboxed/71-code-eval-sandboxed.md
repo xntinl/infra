@@ -2,9 +2,6 @@
 
 **Project**: `formula_eval` — evaluates simple arithmetic formulas from user input using AST whitelisting, NOT `Code.eval_string/1`.
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 1–2 hours
-
 ---
 
 ## Project context
@@ -65,9 +62,46 @@ to allow and reject everything else. Any novel AST node should fail closed.
 
 ---
 
+## Why AST whitelist and not `Code.eval_string/2` with a custom binding
+
+`Code.eval_string/2` with bindings looks like it restricts what the user can do — after all, it only sees the variables you pass in. It doesn't. The BEAM evaluator happily resolves `File`, `System`, `:os`, and every other module in the VM regardless of what bindings you supply. There is no `safe: true` flag and no way to restrict the evaluator. Even removing macro support still leaves you a full-featured shell: `Kernel.apply/3` is reachable, atoms can be constructed at runtime, and `Code.eval_string("File.rm_rf!(~s(/))")` is a valid expression. The only defence is to parse (which doesn't execute), walk the resulting AST yourself, and evaluate only the node shapes you enumerated as safe. Whitelists fail closed: an operator you forgot to list simply doesn't work; blacklists fail open: something you forgot to block simply runs.
+
+---
+
+## Design decisions
+
+**Option A — `Code.eval_string(formula, [])` with an empty binding**
+- Pros: 1 line of code; handles arbitrary arithmetic for free; matches operator precedence.
+- Cons: full RCE primitive; empty bindings do NOT restrict module access; no way to sandbox; any input reaching this line is a security incident.
+
+**Option B — blacklist dangerous tokens with a regex before evaluating**
+- Pros: tempting "just block `File` and `System`" fix; keeps `Code.eval_string` convenience.
+- Cons: inexhaustible bypass surface (atom construction, Unicode lookalikes, hex encoding, macro expansion); every attacker's playground; false sense of security.
+
+**Option C — `Code.string_to_quoted/1` → recursive `safe_eval/1` walking only whitelisted AST nodes (numbers, `+`, `-`, `*`, `/`, unary minus)** (chosen)
+- Pros: no code ever runs through the evaluator; new AST node shapes fail closed at the catch-all clause; adding an operator requires a conscious code change; division-by-zero handled explicitly rather than via `ArithmeticError`.
+- Cons: manual evaluator to maintain; extending to variables/functions needs its own binding store; slightly slower than native eval (irrelevant at formula scale).
+
+Chose **C** because it is the only option that survives a security review. The maintenance cost is 20 lines; the cost of the alternatives is "we got owned because a user typed a formula".
+
+---
+
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Never Code.eval_string(user_input) — it's a full shell. Parse AST, whitelist node shapes only.
 
 ```bash
 mix new formula_eval
@@ -75,6 +109,8 @@ cd formula_eval
 ```
 
 ### Step 2: `lib/formula_eval.ex`
+
+**Objective**: Code.string_to_quoted/1 parses without executing; walk AST, whitelist only {+,-,*,/}, reject all else.
 
 ```elixir
 defmodule FormulaEval do
@@ -158,6 +194,8 @@ end
 
 ### Step 3: `test/formula_eval_test.exs`
 
+**Objective**: Test operator precedence, division by zero (handled explicitly), unary minus, rejection of function calls.
+
 ```elixir
 defmodule FormulaEvalTest do
   use ExUnit.Case, async: true
@@ -227,9 +265,60 @@ end
 
 ### Step 4: Run
 
+**Objective**: --warnings-as-errors finds unused whitelist branches; test coverage validates exploit attempts fail safely.
+
 ```bash
 mix test
 ```
+
+### Why this works
+
+`Code.string_to_quoted/1` parses the input to an AST without executing a single expression — it's a pure transformation from source text to a data structure. `safe_eval/1` then pattern matches on the handful of node shapes we allow (integer/float literals, whitelisted binary operators, unary minus). Every other shape — variables `{name, meta, nil}`, function calls `{fun, meta, args}`, module references `{:__aliases__, _, _}`, atoms, strings, tuples, maps — falls through to the catch-all clause and returns `{:error, :forbidden_expression}`. This is the "fail closed" property: an operator you didn't think of simply doesn't work. Division by zero is handled explicitly in `apply_op/3` so `1/0` becomes a tagged error rather than an uncontrolled `ArithmeticError` bubbling up to the caller.
+
+---
+
+
+## Key Concepts
+
+### 1. `Code.eval_string/1` Executes Elixir Code at Runtime
+This is powerful but dangerous. Never eval untrusted code—it has full access to your system.
+
+### 2. No True Sandboxing in Elixir
+There is no `safe eval` in Elixir. If you eval untrusted code, assume your system is compromised.
+
+### 3. When to Use
+Use `Code.eval_string` for user-defined formulas, configuration that's Elixir code, or trusted plugins. Never for user-supplied input.
+
+---
+## Benchmark
+
+```elixir
+# bench.exs
+defmodule Bench do
+  def run do
+    formulas = [
+      "1 + 2 * 3",
+      "(10 - 2) / 4",
+      "((1 + 2) * (3 + 4)) / 7",
+      "-5 + 3 * -2"
+    ]
+
+    {us, _} =
+      :timer.tc(fn ->
+        Enum.each(1..100_000, fn _ ->
+          Enum.each(formulas, &FormulaEval.eval/1)
+        end)
+      end)
+
+    per = us / (100_000 * length(formulas))
+    IO.puts("eval/1: #{Float.round(per, 2)} µs/call")
+  end
+end
+
+Bench.run()
+```
+
+Target: under 20 µs per call. `Code.string_to_quoted/1` dominates; the AST walk itself is a few hundred nanoseconds. If you expect millions of calls per second, cache the parsed AST keyed by the raw formula string.
 
 ---
 
@@ -268,6 +357,13 @@ limit on input (e.g. reject formulas > 1 KB).
 If users need a real spreadsheet language, use an embedded language designed for
 it (Lua via `:luerl`, a DSL via `NimbleParsec`). Hand-rolling an arithmetic
 evaluator is fine; hand-rolling a full language is a yak too big to shave.
+
+---
+
+## Reflection
+
+1. Product now wants variables (`salary + bonus`) resolved from a context map the caller controls. The obvious extension is adding a `{name, _meta, nil}` clause with a bindings lookup. What new risks does that open (atom exhaustion from unknown names, lookup of a function-like atom, shadowing of allowed operators), and how do you close them before shipping?
+2. A power user asks "can I get `min`, `max`, and `sum` as functions?". You can whitelist specific function names in the AST walker. Where do you draw the line between "safe arithmetic DSL" and "small scripting language"? At what feature set would you stop patching `safe_eval/1` and migrate to a real parser (`NimbleParsec`) or an embedded language (`:luerl`)?
 
 ---
 

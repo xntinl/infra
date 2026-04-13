@@ -119,12 +119,18 @@ end
 
 ### Step 1: Create the project
 
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
+
 ```bash
 mix new timer_gs
 cd timer_gs
 ```
 
 ### Step 2: `lib/timer_gs/send_after.ex`
+
+**Objective**: Implement `send_after.ex` — the GenServer callback shape that determines blocking vs fire-and-forget semantics and state invariants.
+
 
 ```elixir
 defmodule TimerGs.SendAfter do
@@ -199,6 +205,9 @@ end
 
 ### Step 3: `lib/timer_gs/send_interval.ex`
 
+**Objective**: Implement `send_interval.ex` — the GenServer callback shape that determines blocking vs fire-and-forget semantics and state invariants.
+
+
 ```elixir
 defmodule TimerGs.SendInterval do
   @moduledoc """
@@ -264,6 +273,9 @@ end
 
 ### Step 4: `test/timer_gs_send_after_test.exs`
 
+**Objective**: Write `timer_gs_send_after_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+
 ```elixir
 defmodule TimerGs.SendAfterTest do
   use ExUnit.Case, async: true
@@ -302,6 +314,9 @@ end
 
 ### Step 5: `test/timer_gs_send_interval_test.exs`
 
+**Objective**: Write `timer_gs_send_interval_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+
 ```elixir
 defmodule TimerGs.SendIntervalTest do
   # NOTE: async: false — :timer is global VM state; concurrent runs can
@@ -329,6 +344,9 @@ end
 
 ### Step 6: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -338,6 +356,14 @@ mix test
 ### Why this works
 
 The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+
+## Key Concepts: Asynchronous Messages and Timer-Driven State
+
+`handle_info/2` catches messages that don't come from `GenServer.call/cast` —like messages from `send/2`, timers, or external processes. Timers (via `Process.send_after/3`) are a common use case: schedule a message to yourself, handle it in `handle_info`, and update state based on elapsed time.
+
+Example: a rate limiter that resets the token bucket every second via a timer. Every time `handle_info` receives the timer message, it increments the token count and reschedules the next timer. Gotcha: timers are process-local (if the process crashes, the timer is lost). For durable timers or distributed scheduling, use a job queue (Oban) instead.
 
 
 ## Benchmark

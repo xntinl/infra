@@ -133,6 +133,8 @@ laptop, never a public Livebook instance talking to prod.
 
 ### Step 1: Create the supporting project
 
+**Objective**: Boot OTP app and add Kino dependencies for interactive Livebook notebook widgets and visualizations.
+
 ```bash
 mix new livebook_demo --sup
 cd livebook_demo
@@ -151,6 +153,8 @@ end
 ```
 
 ### Step 2: `lib/livebook_demo/gateway.ex`
+
+**Objective**: Build ETS-backed rate limiter that Livebook notebooks query remotely for dashboard inspection.
 
 ```elixir
 defmodule LivebookDemo.Gateway do
@@ -188,6 +192,8 @@ end
 ```
 
 ### Step 3: `lib/livebook_demo/metrics.ex`
+
+**Objective**: Store rolling metric time-series in a bounded memory buffer for Livebook charting and analysis.
 
 ```elixir
 defmodule LivebookDemo.Metrics do
@@ -230,6 +236,8 @@ end
 
 ### Step 4: `lib/livebook_demo/application.ex`
 
+**Objective**: Start Gateway and Metrics under supervision so Livebook attaches to a live system.
+
 ```elixir
 defmodule LivebookDemo.Application do
   @moduledoc false
@@ -248,6 +256,8 @@ end
 ```
 
 ### Step 5: `livebooks/operational/rate_limiter_inspector.livemd`
+
+**Objective**: Create interactive Kino charts and forms that connect via `:rpc` to query live system metrics and state.
 
 Create the notebook file with this content:
 
@@ -328,6 +338,8 @@ Kino.Process.app_tree(:livebook_demo)
 
 ### Step 6: `livebooks/ml/embedding_playground.livemd`
 
+**Objective**: Document the workflow in `embedding_playground.livemd`.
+
 ````markdown
 # Embedding playground
 
@@ -405,6 +417,8 @@ for a <- tensors, b <- tensors, do: cosine.(a, b)
 
 ### Step 7: `livebooks/docs/README.livemd`
 
+**Objective**: Document the workflow in `README.livemd`.
+
 ````markdown
 # LivebookDemo — walking tour
 
@@ -452,6 +466,8 @@ graph TD
 
 ### Step 8: Run it
 
+**Objective**: Verify the implementation by running the test suite.
+
 1. Start the target node:
 
    ```bash
@@ -482,6 +498,24 @@ IO.puts("avg: #{time_us / 10_000} µs/op")
 ```
 
 Target: operation should complete in the low-microsecond range on modern hardware; deviations by >2× indicate a regression worth investigating.
+
+## Deep Dive
+
+Specialized frameworks like Ash (business logic), Commanded (event sourcing), and Nx (numerical computing) abstract away common infrastructure but impose architectural constraints. Ash's declarative resource definitions simplify authorization and querying at the cost of reduced flexibility—deeply nested association policies can degrade query performance. Commanded's event store and aggregate roots enforce event sourcing discipline, making audit trails and temporal queries natural, but require careful snapshot strategy to avoid replaying years of events. Nx brings numerical computing to Elixir, but JIT compilation and lazy evaluation introduce latency; production models benefit from ahead-of-time compilation for inference. For IoT (Nerves), firmware updates must be atomic and resumable—OTA rollback on failure is non-negotiable. Choose frameworks that align with your scaling assumptions: Ash scales horizontally via read replicas; Commanded scales via sharding; Nx scales via distributed training.
+## Advanced Considerations
+
+Framework choices like Ash, Commanded, and Nerves create significant architectural constraints that are difficult to change later. Ash's powerful query builder and declarative approach simplify common patterns but can be opaque when debugging complex permission logic or custom filters at scale. Event sourcing with Commanded is powerful for audit trails but creates a different mental model for state management — replaying events to derive current state has CPU and latency costs that aren't apparent in traditional CRUD systems.
+
+Nerves requires understanding the full embedded system stack — from bootloader configuration to over-the-air update mechanisms. A Nerves system that works on your development board may fail in production due to hardware variations, network conditions, or power supply issues. NX's numerical computing is powerful but requires understanding GPU acceleration trade-offs and memory management for large datasets. Livebook provides interactive development but shouldn't be used for production deployments without careful containerization and resource isolation.
+
+The integration between these frameworks and traditional BEAM patterns (supervisors, processes, GenServers) requires careful design. A Commanded projection that rebuilds state from the event log can consume all available CPU, starving other services. NX autograd computations can create unexpected memory usage if not carefully managed. Nerves systems are memory-constrained; performance assumptions from desktop Elixir don't hold. Always prototype these frameworks in realistic environments before committing to them in production systems to validate assumptions.
+
+
+## Deep Dive: Domain Patterns and Production Implications
+
+Domain-specific frameworks enforce module dependencies and architectural boundaries. Testing domain isolation ensures that constraints are maintained as the codebase grows. Production systems without boundary enforcement often become monolithic and hard to test.
+
+---
 
 ## Trade-offs and production gotchas
 
@@ -534,3 +568,13 @@ middle ground.
 - [Bumblebee notebooks in Livebook](https://hexdocs.pm/bumblebee/examples.html)
 - [VegaLite grammar reference](https://vega.github.io/vega-lite/docs/)
 - [Livebook security model](https://github.com/livebook-dev/livebook/blob/main/SECURITY.md)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

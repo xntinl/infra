@@ -83,11 +83,23 @@ A crash in partition 3 does not affect partitions 0, 1, 2, 4, ..., because each 
 
 ### Dependencies (`mix.exs`)
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
+
 ```elixir
 defp deps, do: [{:benchee, "~> 1.3", only: [:dev, :test]}]
 ```
 
 ### Step 1: The aggregator GenServer
+
+**Objective**: Build one counter GenServer reused both as singleton baseline and as the child spec under `PartitionSupervisor`.
 
 ```elixir
 defmodule MetricsAggregator.Aggregator do
@@ -133,6 +145,8 @@ end
 
 ### Step 2: Naive (single-process) wrapper
 
+**Objective**: Expose the singleton aggregator as the contention baseline, serialising every write through one mailbox.
+
 ```elixir
 defmodule MetricsAggregator.NaiveAggregator do
   @moduledoc "Single-instance aggregator — used as the contention baseline."
@@ -155,6 +169,8 @@ end
 ```
 
 ### Step 3: Partitioned wrapper
+
+**Objective**: Shard the aggregator with `PartitionSupervisor` + `with_arguments`, routing each metric by hash into its own mailbox.
 
 ```elixir
 defmodule MetricsAggregator.PartitionedAggregator do
@@ -204,6 +220,8 @@ end
 ```
 
 ### Step 4: Application
+
+**Objective**: Start both naive and partitioned variants side-by-side so benchmarks compare identical workloads on the same BEAM.
 
 ```elixir
 defmodule MetricsAggregator.Application do
@@ -372,6 +390,23 @@ If the partitioned version is *not* faster, the most common causes are:
 - all writers hitting the same metric name (one-partition collision),
 - `:erlang.phash2/2` being the bottleneck (unlikely at 64 writers),
 - the schedulers being over-subscribed (`System.schedulers_online` set to 1).
+
+## Advanced Considerations: Partitioned Supervisors and Custom Restart Strategies
+
+A standard Supervisor is a single process managing a static tree. For thousands of children, a single supervisor becomes a bottleneck: all supervisor callbacks run on one process, and supervisor restart logic is sequential. PartitionSupervisor (OTP 25+) spawns N independent supervisors, each managing a subset of children. Hashing the child ID determines which partition supervises it, distributing load and enabling horizontal scaling.
+
+Custom restart strategies (via `Supervisor.init/2` callback) allow logic beyond the defaults. A strategy might prioritize restarting dependent services in a specific order, or apply backoff based on restart frequency. The downside is complexity: custom logic is harder to test and reason about, and mistakes cascade. Start with defaults and profile before adding custom behavior.
+
+Selective restart via `:rest_for_one` or `:one_for_all` affects failure isolation. `:one_for_all` restarts all children when one fails (simulating a total system failure), which can be necessary for consistency but is expensive. `:rest_for_one` restarts the failed child and any started after it, balancing isolation and dependencies. Understanding which strategy fits your architecture prevents cascading failures and unnecessary restarts.
+
+---
+
+
+## Deep Dive: Supervisor Patterns and Production Implications
+
+Supervisor trees define fault tolerance at the application level. Testing supervisor restart strategies (one_for_one, rest_for_one, one_for_all) requires reasoning about side effects of crashes across multiple children. The insight is that your test should verify not just that a child restarts, but that dependent state (ETS tables, connections, message queues) is properly initialized after restart. Production incidents often involve restart loops under load—a supervisor that works fine in quiet tests can spin wildly when children fail faster than they recover.
+
+---
 
 ## Trade-offs and production gotchas
 

@@ -2,9 +2,6 @@
 
 **Project**: `telemetry_intro` — a tiny module that emits `:telemetry` events and an attached handler that counts them.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -102,9 +99,37 @@ expects; roll your own at your peril.
 
 ---
 
+## Design decisions
+
+**Option A — log from business code directly (`Logger.info/2`) and aggregate by parsing logs**
+- Pros: zero library surface; works everywhere; log lines carry all context.
+- Cons: structured aggregation requires log parsing; you can't cheaply branch metric reporters; rotation/volume becomes a cost; no standard shape across libraries (Phoenix, Ecto, Finch).
+
+**Option B — emit `:telemetry` events with measurements + metadata + config, attach thin handlers (chosen)**
+- Pros: same shape Phoenix/Ecto/Finch already use; Metrics/OpenTelemetry consume it without code changes; handlers are swappable; handler isolation (a crashing handler detaches itself).
+- Cons: handlers run synchronously in the caller — slow handlers add latency; a raising handler silently detaches; you must remember to put high-cardinality values in metadata, not the event name.
+
+→ Chose **B** because the whole ecosystem assumes `:telemetry`; emitting via Logger forces future metrics work to re-instrument every call site.
+
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"ecto", "~> 1.0"},
+    {:"phoenix", "~> 1.0"},
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
 
 ```bash
 mix new telemetry_intro
@@ -124,6 +149,9 @@ end
 Then `mix deps.get`.
 
 ### Step 2: `lib/telemetry_intro.ex`
+
+**Objective**: Implement `telemetry_intro.ex` — the integration seam where external protocol semantics meet Elixir domain code.
+
 
 ```elixir
 defmodule TelemetryIntro do
@@ -175,6 +203,9 @@ end
 
 ### Step 3: `lib/telemetry_intro/counter_handler.ex`
 
+**Objective**: Implement `counter_handler.ex` — the integration seam where external protocol semantics meet Elixir domain code.
+
+
 ```elixir
 defmodule TelemetryIntro.CounterHandler do
   @moduledoc """
@@ -209,6 +240,9 @@ end
 ```
 
 ### Step 4: `test/telemetry_intro_test.exs`
+
+**Objective**: Write `telemetry_intro_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
 
 ```elixir
 defmodule TelemetryIntroTest do
@@ -285,11 +319,29 @@ end
 
 ### Step 5: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
 
 ---
+
+
+## Key Concepts
+
+Telemetry is Elixir's standard observability infrastructure—a publisher-subscriber pattern for emitting and consuming metrics. Libraries emit telemetry events (`telemetry:execute/3` with span names and measurements); your code attaches handlers to listen and process them. This decouples business code from monitoring: the library doesn't care what consumes its events, enabling flexible monitoring strategies. Standard patterns: `:http_request.stop` events carrying duration and status code; `:database.query.stop` events with query time and rows affected. Handlers can forward to Prometheus, StatsD, log files, or custom analysis. Telemetry is the foundation of modern observability in Elixir—every library worth using emits telemetry events. Building on this standard is how entire ecosystems stay loosely coupled: a database library emits events, monitoring tools consume them, applications route them.
+
+---
+
+## Deep Dive: Instrumentation as a First-Class Concern
+
+Telemetry separates the *production of observability data* from *consumption*. Your code emits events (spans, metrics, logs); handlers subscribe and decide what to do (send to Prometheus, publish to a log aggregator, forward to APM). This decoupling prevents your code from being coupled to specific monitoring backends.
+
+In production, emit events at system boundaries (HTTP ingress/egress, database queries, external API calls) and at decision points (circuit breaker opens, backpressure detected, cascade failure started). Avoid emitting from hot loops unless you've profiled—telemetry handlers run synchronously and can impact latency.
+
+A common mistake: emitting too much (every database query) when you should sample (1 in 100). Sampling must be early—decide at the system boundary, not in the handler. Also, telemetry is *not* structured logging: use telemetry for metrics and distributed tracing, use Logger for operational logs.
 
 ## Trade-offs and production gotchas
 
@@ -326,6 +378,14 @@ handler is great for in-process logic (audit trails, internal counters,
 feature flags) but a poor substitute for the real ecosystem.
 
 ---
+
+## Benchmark
+
+<!-- benchmark N/A: integration/configuration exercise -->
+
+## Reflection
+
+- `:telemetry` handlers run synchronously in the caller's process and a raised exception permanently detaches them. If you were reviewing a PR that added a handler doing `Logger.info/2` plus a `Map.fetch!/2` on metadata keys, which of those two lines is more likely to eventually silently disable your metrics in production, and what changes to the handler would make it safe?
 
 ## Resources
 

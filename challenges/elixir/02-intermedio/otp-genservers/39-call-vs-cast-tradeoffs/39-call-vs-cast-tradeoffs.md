@@ -114,12 +114,18 @@ end
 
 ### Step 1: Create the project
 
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
+
 ```bash
 mix new call_vs_cast_demo
 cd call_vs_cast_demo
 ```
 
 ### Step 2: `lib/call_vs_cast_demo/sync_server.ex`
+
+**Objective**: Implement `sync_server.ex` — the GenServer callback shape that determines blocking vs fire-and-forget semantics and state invariants.
+
 
 ```elixir
 defmodule CallVsCastDemo.SyncServer do
@@ -151,6 +157,9 @@ end
 ```
 
 ### Step 3: `lib/call_vs_cast_demo/async_server.ex`
+
+**Objective**: Implement `async_server.ex` — the GenServer callback shape that determines blocking vs fire-and-forget semantics and state invariants.
+
 
 ```elixir
 defmodule CallVsCastDemo.AsyncServer do
@@ -188,6 +197,9 @@ end
 ```
 
 ### Step 4: `lib/call_vs_cast_demo.ex`
+
+**Objective**: Implement `call_vs_cast_demo.ex` — the GenServer callback shape that determines blocking vs fire-and-forget semantics and state invariants.
+
 
 ```elixir
 defmodule CallVsCastDemo do
@@ -261,6 +273,9 @@ end
 
 ### Step 5: `test/call_vs_cast_demo_test.exs`
 
+**Objective**: Write `call_vs_cast_demo_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+
 ```elixir
 defmodule CallVsCastDemoTest do
   use ExUnit.Case, async: true
@@ -311,6 +326,9 @@ end
 
 ### Step 6: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 # To see actual numbers from your machine:
@@ -323,6 +341,15 @@ mix test
 ### Why this works
 
 The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+## Deep Dive: Flow Control and Mailbox Pressure in Production
+
+The call/cast trade-off is fundamentally about whether you want the process to push back when it can't keep up. A `call` that times out after 5 seconds gives callers a hard signal: "I couldn't process your request." That signal propagates: if you're in an HTTP request handler and your GenServer `call` times out, the HTTP layer sees a timeout and can respond with 503 or retry. A `cast`, by contrast, silently succeeds — it just enqueues — and the server's mailbox grows invisibly until memory is exhausted.
+
+In production systems at scale, the single biggest source of GenServer pain is unbounded mailboxes from casts. The naive metric — "casts are faster" — masks reality: they're fast *for the caller*, but the server pays the cost later, and by then the damage (memory pressure, GC pauses, cascading timeouts in unrelated processes) is done. High-volume producers should default to `call` with timeout tuning, or use techniques like shedding (ignore casts under load) and batching (combine N casts into one aggregate message).
+
+Monitoring mailbox depth is essential. Libraries like `:observer` or integration with Prometheus can emit mailbox size; if you see sustained growth, it's a cast problem. Pattern match: if the operation has a meaningful failure case or the caller benefits from knowing when work completed, use `call`. If it's purely "fire and hope", use `cast` but always have backpressure elsewhere (rate limiting, per-producer quotas, shedding logic).
 
 
 ## Benchmark

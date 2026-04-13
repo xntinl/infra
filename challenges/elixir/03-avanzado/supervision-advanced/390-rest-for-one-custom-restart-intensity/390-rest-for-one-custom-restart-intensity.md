@@ -80,11 +80,23 @@ When the supervisor itself exits (because restart intensity was exceeded), the *
 
 ### Dependencies (`mix.exs`)
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
+
 ```elixir
 defp deps, do: [{:benchee, "~> 1.3", only: [:dev, :test]}]
 ```
 
 ### Step 1: The three stages
+
+**Objective**: Implement The three stages.
 
 ```elixir
 defmodule IngestPipeline.Source do
@@ -165,6 +177,8 @@ end
 
 ### Step 2: The supervisor
 
+**Objective**: Implement The supervisor.
+
 ```elixir
 defmodule IngestPipeline.Supervisor do
   use Supervisor
@@ -192,6 +206,8 @@ end
 ```
 
 ### Step 3: Application
+
+**Objective**: Define the OTP application and wire the supervision tree.
 
 ```elixir
 defmodule IngestPipeline.Application do
@@ -366,6 +382,23 @@ IO.puts("Recovery time: #{time_us}µs (#{Float.round(time_us / 1000, 2)}ms)")
 ```
 
 Expected: 5–30ms for three GenServers with empty `init/1`. If `init/1` opens DB connections, multiply by the connection handshake cost. Long recovery times (> 500ms) are your signal that `init/1` is doing too much — push slow work into `handle_continue/2`.
+
+## Advanced Considerations: Partitioned Supervisors and Custom Restart Strategies
+
+A standard Supervisor is a single process managing a static tree. For thousands of children, a single supervisor becomes a bottleneck: all supervisor callbacks run on one process, and supervisor restart logic is sequential. PartitionSupervisor (OTP 25+) spawns N independent supervisors, each managing a subset of children. Hashing the child ID determines which partition supervises it, distributing load and enabling horizontal scaling.
+
+Custom restart strategies (via `Supervisor.init/2` callback) allow logic beyond the defaults. A strategy might prioritize restarting dependent services in a specific order, or apply backoff based on restart frequency. The downside is complexity: custom logic is harder to test and reason about, and mistakes cascade. Start with defaults and profile before adding custom behavior.
+
+Selective restart via `:rest_for_one` or `:one_for_all` affects failure isolation. `:one_for_all` restarts all children when one fails (simulating a total system failure), which can be necessary for consistency but is expensive. `:rest_for_one` restarts the failed child and any started after it, balancing isolation and dependencies. Understanding which strategy fits your architecture prevents cascading failures and unnecessary restarts.
+
+---
+
+
+## Deep Dive: Property Patterns and Production Implications
+
+Property-based testing inverts the testing mindset: instead of writing examples, you state invariants (properties) and let a generator find counterexamples. StreamData's shrinking capability is its superpower—when a property fails on a 10,000-element list, the framework reduces it to the minimal list that still fails, cutting debugging time from hours to minutes. The trade-off is that properties require rigorous thinking about domain constraints, and not every invariant is worth expressing as a property. Teams that adopt property testing often find bugs in specifications themselves, not just implementations.
+
+---
 
 ## Trade-offs and production gotchas
 

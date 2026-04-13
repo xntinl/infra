@@ -124,6 +124,18 @@ this compound key so a single client's entries never touch another's.
 
 ### Step 1: The behaviour
 
+**Objective**: Define RateLimiter behaviour contract so token/leaky/sliding implementations are swappable and clients don't depend on specific algorithm.
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
+
 ```elixir
 defmodule RateLimitingPatterns.RateLimiter do
   @moduledoc "Contract every limiter implementation must satisfy."
@@ -139,6 +151,8 @@ end
 ```
 
 ### Step 2: Token bucket — `lib/rate_limiting_patterns/token_bucket.ex`
+
+**Objective**: Implement token bucket with lazy refill so tokens replenish on check/2 without background timers; allows bursts up to capacity_ms via fractional arithmetic.
 
 ```elixir
 defmodule RateLimitingPatterns.TokenBucket do
@@ -205,6 +219,8 @@ end
 
 ### Step 3: Leaky bucket — `lib/rate_limiting_patterns/leaky_bucket.ex`
 
+**Objective**: Implement leaky bucket with fixed drain rate so requests queue logically then drain at constant throughput; smooths bursts to protect slow downstreams.
+
 ```elixir
 defmodule RateLimitingPatterns.LeakyBucket do
   @moduledoc """
@@ -258,6 +274,8 @@ end
 
 ### Step 4: Sliding window — `lib/rate_limiting_patterns/sliding_window.ex`
 
+**Objective**: Store request timestamps in :bag ETS table so window pruning counts only recent requests; provides exact billing accuracy without burst tolerance.
+
 ```elixir
 defmodule RateLimitingPatterns.SlidingWindow do
   @moduledoc """
@@ -302,6 +320,8 @@ end
 
 ### Step 5: Tests (token bucket shown; leaky / sliding analogous)
 
+**Objective**: Write tests for (token bucket shown; leaky / sliding analogous).
+
 ```elixir
 defmodule RateLimitingPatterns.TokenBucketTest do
   use ExUnit.Case, async: false
@@ -313,28 +333,32 @@ defmodule RateLimitingPatterns.TokenBucketTest do
     :ok
   end
 
-  test "allows up to capacity in a burst" do
-    for _ <- 1..10 do
-      assert {:allow, _} = TokenBucket.check("c1", capacity: 10, refill_per_sec: 1)
+  describe "RateLimitingPatterns.TokenBucket" do
+    test "allows up to capacity in a burst" do
+      for _ <- 1..10 do
+        assert {:allow, _} = TokenBucket.check("c1", capacity: 10, refill_per_sec: 1)
+      end
+
+      assert {:deny, _} = TokenBucket.check("c1", capacity: 10, refill_per_sec: 1)
     end
 
-    assert {:deny, _} = TokenBucket.check("c1", capacity: 10, refill_per_sec: 1)
-  end
+    test "refills over time" do
+      for _ <- 1..10, do: TokenBucket.check("c2", capacity: 10, refill_per_sec: 100)
+      Process.sleep(30)
+      assert {:allow, _} = TokenBucket.check("c2", capacity: 10, refill_per_sec: 100)
+    end
 
-  test "refills over time" do
-    for _ <- 1..10, do: TokenBucket.check("c2", capacity: 10, refill_per_sec: 100)
-    Process.sleep(30)
-    assert {:allow, _} = TokenBucket.check("c2", capacity: 10, refill_per_sec: 100)
-  end
-
-  test "isolates keys" do
-    for _ <- 1..10, do: TokenBucket.check("c3", capacity: 10, refill_per_sec: 1)
-    assert {:allow, _} = TokenBucket.check("c4", capacity: 10, refill_per_sec: 1)
+    test "isolates keys" do
+      for _ <- 1..10, do: TokenBucket.check("c3", capacity: 10, refill_per_sec: 1)
+      assert {:allow, _} = TokenBucket.check("c4", capacity: 10, refill_per_sec: 1)
+    end
   end
 end
 ```
 
 ### Step 6: Benchmark — `bench/compare_bench.exs`
+
+**Objective**: Benchmark bench/compare_bench.exs to compare approaches.
 
 ```elixir
 alias RateLimitingPatterns.{TokenBucket, LeakyBucket, SlidingWindow}
@@ -381,6 +405,23 @@ IO.puts("avg: #{time_us / 10_000} µs/op")
 ```
 
 Target: operation should complete in the low-microsecond range on modern hardware; deviations by >2× indicate a regression worth investigating.
+
+## Advanced Considerations: Circuit Breakers and Bulkheads in Production
+
+A circuit breaker monitors downstream service health and rejects new requests when failures exceed a threshold, failing fast instead of queuing indefinitely. States: `:closed` (normal), `:open` (fast-fail), `:half_open` (testing recovery). A timeout-based pattern monitors; once requests succeed again, the circuit closes. Half-open tests with a single request; if it succeeds, all requests resume.
+
+Bulkheads isolate resource pools so one slow endpoint doesn't starve others. A GenServer pool with a bounded queue (e.g., `:queue.len(state) >= 100`) can return `{:error, :overloaded}` immediately, preventing queue buildup. Combined with exponential backoff on the client (caller retries with increasing delays), this creates a natural circuit breaker behavior without explicit state.
+
+Graceful degradation means serving stale data or reduced functionality when a service is slow. A cached value with a 5-minute TTL is acceptable for many reads; serve it if the live source is timing out. Feature flags allow disabling expensive operations at runtime. Cascading timeout windows (outer service times out after 5s, inner calls must complete in 3s) prevent unbounded waiting. The cost is complexity: tracking degradation modes, testing failure scenarios, and ensuring data consistency under partial failures.
+
+---
+
+
+## Deep Dive: Resilience Patterns and Production Implications
+
+Resilience patterns (circuit breakers, timeouts, retries) are easy to implement but hard to test. The insight is that resilience patterns must be tested under failure: timeouts matter only when calls actually take time, retries matter only when transient failures occur. Production systems with untested resilience patterns often fail gracefully in test and catastrophically in production.
+
+---
 
 ## Trade-offs and production gotchas
 

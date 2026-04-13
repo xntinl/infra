@@ -70,7 +70,20 @@ all pass. It is a crisp demo of compound guards in a function head, plus `unless
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### Step 1 — Create the project
+
+**Objective**: Build single module so unless vs if trade-off sits next to compound guard examples side-by-side.
 
 ```bash
 mix new feature_gate
@@ -78,6 +91,8 @@ cd feature_gate
 ```
 
 ### Step 2 — `lib/feature_gate/gate.ex`
+
+**Objective**: Use role in @privileged_roles guard clause so admins short-circuit before env/rollout checks run.
 
 ```elixir
 defmodule FeatureGate.Gate do
@@ -135,6 +150,8 @@ end
 > covers this.
 
 ### Step 3 — `test/feature_gate_test.exs`
+
+**Objective**: Assert FunctionClauseError on invalid percent so guard is the contract, not deferred to runtime body check.
 
 ```elixir
 defmodule FeatureGateTest do
@@ -202,6 +219,8 @@ end
 
 ### Step 4 — Run the tests
 
+**Objective**: Verify bucket boundary (id 10 at 20%) uses < not <= so rollout percentage is exclusive, not inclusive.
+
 ```bash
 mix test
 ```
@@ -214,6 +233,19 @@ All 11 tests pass.
 
 The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
 
+
+## Key Concepts
+
+### 1. `unless` is Negated `if`
+`unless admin?, do: deny_access()` is equivalent to `if not admin?, do: deny_access()`. `unless` reads naturally for negation. Prefer `if` when the positive case is primary.
+
+### 2. `else` with `unless` is Confusing
+This reads backwards. Use `if admin?, do: allow(), else: deny()` instead. Guards (`when not admin?`) are preferred in function clauses.
+
+### 3. Guards vs unless
+Guards like `def process(user) when not user.admin` are clearer than nesting `unless` inside the function body.
+
+---
 ## Benchmark
 
 ```elixir

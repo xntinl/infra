@@ -118,6 +118,18 @@ Raising inside `trace/2` aborts the current compilation. Use `CompileError` with
 
 ### Step 1: `lib/compile_tracer/policy.ex`
 
+**Objective**: Declare allowed cross-context call graph as MapSet so tracer checks are O(1) lookup overhead.
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
+
 ```elixir
 defmodule CompileTracer.Policy do
   @moduledoc "Declares the allowed cross-context calls."
@@ -158,6 +170,8 @@ end
 
 ### Step 2: `lib/compile_tracer/graph.ex`
 
+**Objective**: Wire ETS :public :bag table so parallel compiler workers record edges concurrently without locks.
+
 ```elixir
 defmodule CompileTracer.Graph do
   @moduledoc "ETS-backed recorder of inter-module references."
@@ -197,6 +211,8 @@ end
 ```
 
 ### Step 3: `lib/compile_tracer/tracer.ex`
+
+**Objective**: Implement trace/2 callback to intercept :remote_function/:remote_macro calls and CompileError on boundary violations.
 
 ```elixir
 defmodule CompileTracer.Tracer do
@@ -247,6 +263,8 @@ end
 
 ### Step 4: `config/config.exs`
 
+**Objective**: Register tracer via Code.put_compiler_option(:tracers) so boundary checks run during mix compile globally.
+
 ```elixir
 import Config
 
@@ -258,6 +276,8 @@ end
 ```
 
 ### Step 5: Tests — install the tracer, compile in-memory modules
+
+**Objective**: Dynamically install tracer, compile fixture modules in-memory, assert edges recorded and violations raise CompileError.
 
 ```elixir
 defmodule CompileTracer.TracerTest do
@@ -273,47 +293,49 @@ defmodule CompileTracer.TracerTest do
     :ok
   end
 
-  test "records allowed cross-context calls" do
-    Code.compile_string("""
-    defmodule MyApp.Catalog.Product do
-      def hello, do: :ok
-    end
-
-    defmodule MyApp.Ordering.Order do
-      def run, do: MyApp.Catalog.Product.hello()
-    end
-    """)
-
-    edges = Graph.edges()
-
-    assert Enum.any?(edges, fn
-             {MyApp.Ordering.Order, MyApp.Catalog.Product, _} -> true
-             _ -> false
-           end)
-  end
-
-  test "raises CompileError on forbidden direction" do
-    assert_raise CompileError, ~r/boundary violation/, fn ->
+  describe "CompileTracer.Tracer" do
+    test "records allowed cross-context calls" do
       Code.compile_string("""
-      defmodule MyApp.Ordering.Service do
-        def handle, do: :ok
+      defmodule MyApp.Catalog.Product do
+        def hello, do: :ok
       end
 
-      defmodule MyApp.Catalog.Bad do
-        def run, do: MyApp.Ordering.Service.handle()
+      defmodule MyApp.Ordering.Order do
+        def run, do: MyApp.Catalog.Product.hello()
       end
       """)
-    end
-  end
 
-  test "ignores stdlib modules" do
-    Code.compile_string("""
-    defmodule MyApp.Catalog.Uses do
-      def do_it, do: Enum.map([1, 2], &(&1 + 1))
-    end
-    """)
+      edges = Graph.edges()
 
-    refute Enum.any?(Graph.edges(), fn {_, mod, _} -> mod == Enum end)
+      assert Enum.any?(edges, fn
+               {MyApp.Ordering.Order, MyApp.Catalog.Product, _} -> true
+               _ -> false
+             end)
+    end
+
+    test "raises CompileError on forbidden direction" do
+      assert_raise CompileError, ~r/boundary violation/, fn ->
+        Code.compile_string("""
+        defmodule MyApp.Ordering.Service do
+          def handle, do: :ok
+        end
+
+        defmodule MyApp.Catalog.Bad do
+          def run, do: MyApp.Ordering.Service.handle()
+        end
+        """)
+      end
+    end
+
+    test "ignores stdlib modules" do
+      Code.compile_string("""
+      defmodule MyApp.Catalog.Uses do
+        def do_it, do: Enum.map([1, 2], &(&1 + 1))
+      end
+      """)
+
+      refute Enum.any?(Graph.edges(), fn {_, mod, _} -> mod == Enum end)
+    end
   end
 end
 ```
@@ -327,6 +349,23 @@ the reference. Recording into a `:public` ETS table with
 contention. Raising a `CompileError` with `file:` and `line:` makes the build
 fail at the offending source location, turning a policy into a mechanical
 guarantee rather than a convention.
+
+---
+
+## Advanced Considerations: Macro Hygiene and Compile-Time Validation
+
+Macros execute at compile time, walking the AST and returning new AST. That power is easy to abuse: a macro that generates variables can shadow outer scope bindings, or a quote block that references variables directly can fail if the macro is used in a context where those variables don't exist. The `unquote` mechanism is the escape hatch, but misusing it leads to hard-to-debug compile errors.
+
+Macro hygiene is about capturing intent correctly. A `defmacro` that takes `:my_option` and uses it directly might match an unrelated `:my_option` from the caller's scope. The idiomatic pattern is to use `unquote` for values that should be "from the outside" and keep AST nodes quoted for safety. The `quote` block's binding of `var!` and `binding!` provides escape valves for the rare case when shadowing is intentional.
+
+Compile-time validation unlocks errors that would otherwise surface at runtime. A macro can call functions to validate input, generate code conditionally, or fail the build with `IO.warn`. Schema libraries like `Ecto` and `Ash` use macros to define fields at compile time, so runtime queries are guaranteed type-safe. The cost is cognitive load: developers must reason about both the code as written and the code generated.
+
+---
+
+
+## Deep Dive: Metaprogramming Patterns and Production Implications
+
+Metaprogramming (macros, AST manipulation) requires testing at compile time and runtime. The challenge is that macro tests often involve parsing and expanding code, which couples tests to compiler internals. Production bugs in macros can corrupt entire modules; testing macros rigorously is non-negotiable.
 
 ---
 

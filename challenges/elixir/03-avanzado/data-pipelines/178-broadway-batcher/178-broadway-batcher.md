@@ -118,6 +118,8 @@ off-peak. Fix by shortening `batch_timeout` or sizing `batch_size` for
 
 ### Step 1: Deps
 
+**Objective**: Pin `broadway ~> 1.1` and Benchee so batcher timing contracts and sweep benchmarks produce reproducible numbers.
+
 ```elixir
 defp deps do
   [
@@ -128,6 +130,8 @@ end
 ```
 
 ### Step 2: Pipeline with tunable batcher
+
+**Objective**: Expose `batch_size` and `batch_timeout` as opts so the sweep benchmark can explore the latency/throughput frontier.
 
 ```elixir
 defmodule BroadwayBatcher.Pipeline do
@@ -176,6 +180,8 @@ end
 
 ### Step 3: Fake TSDB client
 
+**Objective**: Hold write latency constant regardless of batch size so benchmarks isolate batching gains from backend variance.
+
 ```elixir
 defmodule BroadwayBatcher.TsdbClient do
   @moduledoc "Fake TSDB client. Simulates a 20ms HTTP round-trip regardless of batch size."
@@ -189,6 +195,8 @@ end
 ```
 
 ### Step 4: Application
+
+**Objective**: Supervise the pipeline under `:one_for_one` so a batcher crash restarts cleanly without bouncing the VM.
 
 ```elixir
 defmodule BroadwayBatcher.Application do
@@ -204,6 +212,8 @@ end
 
 ### Step 5: Tests
 
+**Objective**: Assert both size-triggered and timeout-triggered flushes via `test_batch/2` so partial-batch paths never regress silently.
+
 ```elixir
 defmodule BroadwayBatcher.PipelineTest do
   use ExUnit.Case, async: false
@@ -215,24 +225,28 @@ defmodule BroadwayBatcher.PipelineTest do
     :ok
   end
 
-  test "flushes by size" do
-    events = for i <- 1..10, do: %{metric: "cpu", v: i}
-    ref = Broadway.test_batch(Pipeline, events)
-    assert_receive {:ack, ^ref, acks, []}, 2_000
-    assert length(acks) == 10
-  end
+  describe "BroadwayBatcher.Pipeline" do
+    test "flushes by size" do
+      events = for i <- 1..10, do: %{metric: "cpu", v: i}
+      ref = Broadway.test_batch(Pipeline, events)
+      assert_receive {:ack, ^ref, acks, []}, 2_000
+      assert length(acks) == 10
+    end
 
-  test "flushes by timeout with a partial batch" do
-    events = for i <- 1..3, do: %{metric: "cpu", v: i}
-    ref = Broadway.test_batch(Pipeline, events)
-    # batch_timeout 500ms
-    assert_receive {:ack, ^ref, acks, []}, 2_000
-    assert length(acks) == 3
+    test "flushes by timeout with a partial batch" do
+      events = for i <- 1..3, do: %{metric: "cpu", v: i}
+      ref = Broadway.test_batch(Pipeline, events)
+      # batch_timeout 500ms
+      assert_receive {:ack, ^ref, acks, []}, 2_000
+      assert length(acks) == 3
+    end
   end
 end
 ```
 
 ### Step 6: Benchmark — sweep batch configs
+
+**Objective**: Sweep `(batch_size, batch_timeout)` pairs under Benchee so the throughput/latency knee is measured, not guessed.
 
 ```elixir
 # bench/batcher_bench.exs
@@ -281,6 +295,24 @@ dominate and throughput plateaus.
 ### Why this works
 
 The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
+
+## Deep Dive
+
+Data pipelines in Elixir leverage the Actor model to coordinate work across producer, consumer, and batcher stages. GenStage provides the foundation—a demand-driven backpressure mechanism that prevents memory bloat when producers exceed consumer capacity. Broadway abstracts this further, handling subscriptions, acknowledgments, and error propagation automatically. Understanding pipeline topology is critical at scale: a misconfigured batcher can serialize work and kill throughput; conversely, excessive partitioning fragments state and increases GC pressure. In production systems, always measure latency and memory per stage—Broadway's metrics integration with Telemetry makes this traceable. Consider exactly-once delivery semantics early; most pipelines require idempotency keys or deduplication at the consumer boundary. For high-volume Kafka scenarios, partition alignment (matching Broadway partitions to Kafka partitions) is essential to avoid rebalancing storms.
+## Advanced Considerations
+
+Data pipeline implementations at scale require careful consideration of backpressure, memory buffering, and failure recovery semantics. Broadway and Genstage provide demand-driven processing, but understanding the exact flow of backpressure through your pipeline is essential to avoid either starving producers or overwhelming buffers. The interaction between batcher timeouts and consumer demand can create unexpected latencies when tuples are held waiting for either a size threshold or time threshold to be reached. In systems processing millions of events, even a 100ms batch timeout can impact end-to-end latency dramatically.
+
+Idempotency and exactly-once semantics are not automatic — they require architectural decisions about checkpointing and deduplication strategies. Writing checkpoints too frequently becomes a bottleneck; writing them too infrequently means lost progress on failure and potential duplicates. The choice between in-process ETS-based deduplication versus external stores (Redis, database) changes your failure recovery story fundamentally. Broadway's acknowledgment system is flexible but requires explicit design; missing acknowledgments can cause data loss or duplicates in production environments where failures are common.
+
+When handling external systems (databases, message queues, APIs), transient failures and circuit-breaker patterns become essential. A single slow downstream service can cause backpressure to ripple through your entire pipeline catastrophically. Consider implementing bulkhead patterns where certain pipeline stages have isolated pools of workers to prevent cascading failures. For ETL pipelines combining Ecto with streaming, managing database connection pools and transaction contexts requires careful coordination to prevent connection exhaustion.
+
+
+## Deep Dive: Streaming Patterns and Production Implications
+
+Stream-based pipelines in Elixir achieve backpressure and composability by deferring computation until consumption. Unlike eager list operations that allocate all intermediate structures, Streams are lazy chains that produce one element at a time, reducing memory footprint and enabling infinite sequences. The BEAM scheduler yields between Stream operations, allowing multiple concurrent pipelines to interleave fairly. At scale (processing millions of rows or events), the difference between eager and lazy evaluation becomes the difference between consistent latency and garbage collection pauses. Production systems benefit most when Streams are composed at library boundaries, not scattered across the codebase.
+
+---
 
 ## Trade-offs and production gotchas
 
@@ -349,3 +381,13 @@ vs size 10, modest latency cost.
 - [`Broadway.test_batch/3`](https://hexdocs.pm/broadway/Broadway.html#test_batch/3)
 - [Benchee documentation](https://hexdocs.pm/benchee/readme.html)
 - [Concurrent Data Processing in Elixir — Svilen Gospodinov](https://pragprog.com/titles/sgdpelixir/)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

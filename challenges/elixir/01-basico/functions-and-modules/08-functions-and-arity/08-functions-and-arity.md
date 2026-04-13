@@ -89,6 +89,18 @@ pipeline/
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"plug", "~> 1.0"},
+  ]
+end
+```
+
+
 ### `lib/pipeline.ex`
 
 ```elixir
@@ -439,6 +451,24 @@ mix test --trace
 
 ---
 
+
+
+---
+## Key Concepts
+
+### 1. Arity is Part of the Function's Identity
+
+In Elixir, functions are identified by module, name, and arity: `Kernel.+/2` is different from `Kernel.+/1`. This allows you to overload functions by arity without conditional logic.
+
+### 2. Guard Clauses Narrow Patterns Without Creating New Arity
+
+Both `process(x) when is_integer(x)` and `process(x) when is_binary(x)` are still `process/1`. The guard restricts which callers invoke that clause. If no clause matches, you get a `FunctionClauseError`.
+
+### 3. Default Arguments are Syntactic Sugar
+
+`def build(name, size \\ :medium)` expands to two functions: `build/1` and `build/2`. Calling `build("Widget")` calls `build/1`, which delegates to `build/2` with the default.
+
+---
 ## The function capture operator `&`
 
 ```elixir

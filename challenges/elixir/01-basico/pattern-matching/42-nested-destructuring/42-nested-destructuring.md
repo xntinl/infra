@@ -66,6 +66,17 @@ the code.
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### `lib/json_ast_walker.ex`
 
 ```elixir
@@ -337,6 +348,32 @@ mix test
 
 The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
 
+
+
+---
+## Key Concepts
+
+### 1. Destructuring Composes for Deeply Nested Data
+
+```elixir
+{:ok, %{user: %{id: id, email: email}}} = api_response
+```
+
+Pattern matching works arbitrarily deep. You extract exactly what you need in one operation.
+
+### 2. Aliasing in Patterns Captures Sub-structures
+
+```elixir
+{:ok, %{user: user} = data} = response
+```
+
+You capture both the full `data` and the extracted `user`. This prevents re-computing the pattern match later.
+
+### 3. Avoid Over-nesting
+
+While composable, patterns can become brittle if the API changes shape. Consider building helper modules with extraction functions for complex nested structures.
+
+---
 ## Benchmark
 
 ```elixir

@@ -172,6 +172,8 @@ Rule: filter only when rejection rate is low (< 20%). Otherwise bind from a smal
 
 ### Step 1: `mix.exs`
 
+**Objective**: Isolate StreamData to test/dev scopes and add test/support to compile paths so generators stay out of production builds.
+
 ```elixir
 defmodule MoneyCalc.MixProject do
   use Mix.Project
@@ -198,6 +200,8 @@ end
 ```
 
 ### Step 2: Domain — `Money`
+
+**Objective**: Represent monetary amounts as integer minor units and closed currencies to avoid float rounding errors during property shrinking.
 
 ```elixir
 # lib/money_calc/money.ex
@@ -234,6 +238,8 @@ end
 
 ### Step 3: Converter
 
+**Objective**: Implement currency converter that scales amounts by decimal places and applies rates, handling edge cases like identity conversion and rounding.
+
 ```elixir
 # lib/money_calc/converter.ex
 defmodule MoneyCalc.Converter do
@@ -262,6 +268,8 @@ end
 
 ### Step 4: Invoice
 
+**Objective**: Implement invoice total calculator that sums line items, applies discount and tax with rounding at each step.
+
 ```elixir
 # lib/money_calc/invoice.ex
 defmodule MoneyCalc.Invoice do
@@ -282,6 +290,8 @@ end
 ```
 
 ### Step 5: Shared generators
+
+**Objective**: Build reusable StreamData generators with bind/2 to constrain domains and ensure shrinking converges to minimal counterexamples.
 
 ```elixir
 # test/support/generators.ex
@@ -331,6 +341,8 @@ end
 ```
 
 ### Step 6: Money property tests
+
+**Objective**: Assert algebraic properties (commutative, associative, identity, inverse, currency type safety) using StreamData generators.
 
 ```elixir
 # test/money_calc/money_test.exs
@@ -387,6 +399,8 @@ end
 
 ### Step 7: Converter property tests
 
+**Objective**: Test metamorphic relations (identity, round-trip inverse, linear scaling) with tolerance for rounding error across currencies.
+
 ```elixir
 # test/money_calc/converter_property_test.exs
 defmodule MoneyCalc.ConverterPropertyTest do
@@ -438,6 +452,8 @@ end
 
 ### Step 8: Invoice property tests
 
+**Objective**: Assert invoice invariants (identity, discount absorption, partition additive) across dynamic line item counts.
+
 ```elixir
 # test/money_calc/invoice_property_test.exs
 defmodule MoneyCalc.InvoicePropertyTest do
@@ -478,6 +494,8 @@ end
 
 ### Step 9: Running properties with more iterations
 
+**Objective**: Execute property tests with deterministic seeds and increased iteration counts to validate invariants at scale.
+
 ```bash
 mix test
 mix test --seed 0                                           # deterministic
@@ -510,6 +528,21 @@ IO.puts("avg: #{time_us / 10_000} µs/op")
 ```
 
 Target: operation should complete in the low-microsecond range on modern hardware; deviations by >2× indicate a regression worth investigating.
+
+## Deep Dive: Property Patterns and Production Implications
+
+Property-based testing inverts the testing mindset: instead of writing examples, you state invariants (properties) and let a generator find counterexamples. StreamData's shrinking capability is its superpower—when a property fails on a 10,000-element list, the framework reduces it to the minimal list that still fails, cutting debugging time from hours to minutes. The trade-off is that properties require rigorous thinking about domain constraints, and not every invariant is worth expressing as a property. Teams that adopt property testing often find bugs in specifications themselves, not just implementations.
+
+---
+
+## Advanced Considerations
+
+Production testing strategies require careful attention to resource management and test isolation across multiple concurrent test processes. In large codebases, tests can consume significant memory and CPU resources, especially when using concurrent testing without proper synchronization and cleanup. The BEAM scheduler's preemptive nature means test processes may interfere with each other if shared resources aren't properly isolated at the process boundary. Pay careful attention to how Ecto's sandbox mode interacts with your supervision tree — if you have GenServers that hold state across tests, the sandbox rollback mechanism may leave phantom processes in your monitoring systems that continue consuming resources until forced cleanup occurs.
+
+When scaling tests to production-grade test suites, consider the cost of stub verification and the memory overhead of generated test cases. Each property-based test invocation can create thousands of synthetic test cases, potentially causing garbage collection pressure that's invisible during local testing but becomes critical in CI/CD pipelines running long test suites continuously. The interaction between concurrent tests and ETS tables (often used in caches and registry patterns) requires explicit `inherited: true` options to prevent unexpected sharing between test processes, which can cause mysterious failures when tests run in different orders or under load.
+
+For distributed testing scenarios using tools like `Peer`, network simulation can mask real latency issues and failure modes. Test timeouts that work locally may fail in CI due to scheduler contention and GC pauses. Always include substantial buffers for timeout values and monitor actual execution times under load. The coordination between multiple test nodes requires careful cleanup — a failure in test coordination can leave zombie processes consuming resources indefinitely. Implement proper telemetry hooks within your test helpers to diagnose production-like scenarios and capture performance characteristics.
+
 
 ## Trade-offs and production gotchas
 
@@ -563,7 +596,7 @@ This tests determinism. Possibly useful, usually not.
 
 For GenServer / state-machine testing use `StreamData`'s lower-level combinators to generate
 *sequences of commands* and check invariants after each step. This is covered separately in
-exercise 202 — the short version:
+a dedicated section — the short version:
 
 ```elixir
 commands = list_of(one_of([
@@ -596,3 +629,13 @@ end
 - [PropEr TESTing — Fred Hébert](https://propertesting.com/) — the definitive text (Erlang but applies)
 - ["Metamorphic testing" — ACM paper](https://dl.acm.org/doi/10.1145/2934466) — foundational reference
 - [QuickCheck papers — John Hughes](https://www.cse.chalmers.se/~rjmh/QuickCheck/) — the original
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

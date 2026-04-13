@@ -89,7 +89,20 @@ when you are responsible for the child's lifecycle.
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Build raw spawn_link + trap_exit mechanism so exit signal handling stays visible before abstracting to GenServer.
 
 ```bash
 mix new worker_wrapper
@@ -97,6 +110,8 @@ cd worker_wrapper
 ```
 
 ### Step 2: `lib/worker_wrapper.ex`
+
+**Objective**: Set trap_exit before spawn_link to avoid race where child crash propagates before flag conversion to messages.
 
 ```elixir
 defmodule WorkerWrapper do
@@ -172,6 +187,8 @@ end
 
 ### Step 3: `test/worker_wrapper_test.exs`
 
+**Objective**: Test all exit paths (raise, throw, exit, timeout) so {:EXIT, pid, reason} shape is proved pattern-matchable for each case.
+
 ```elixir
 defmodule WorkerWrapperTest do
   use ExUnit.Case, async: true
@@ -205,6 +222,8 @@ end
 
 ### Step 4: Run tests
 
+**Objective**: Verify trap_exit flag is reset via after clause so caller's default crash semantics are never modified.
+
 ```bash
 mix test
 ```
@@ -215,6 +234,19 @@ mix test
 
 ---
 
+
+## Key Concepts
+
+### 1. Process Links Create Bidirectional Exit Notifications
+When you call `spawn_link`, the spawned process is linked to the current process. If either exits, the other gets an exit signal.
+
+### 2. `trap_exit` Converts Exit Signals to Messages
+By default, an exit signal terminates the process. With `Process.flag(:trap_exit, true)`, exit signals are converted to messages.
+
+### 3. Unlinked Processes Don't Get Exit Signals
+If you `spawn` without `spawn_link`, the spawned process is independent. Use `spawn` for fire-and-forget tasks, `spawn_link` for monitored tasks.
+
+---
 ## Benchmark
 
 Measure the cost of a link+trap round-trip so you know the overhead budget for a wrapper that spawns one child per request:

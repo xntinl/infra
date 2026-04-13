@@ -2,9 +2,6 @@
 
 **Project**: `ets_sharding` — a sharded ETS layer that scales writes by splitting one logical table across N physical tables chosen by `:erlang.phash2(key, N)`.
 
-**Difficulty**: ★★★★☆
-**Estimated time**: 3–6 hours
-
 ---
 
 ## Project context
@@ -34,6 +31,12 @@ ets_sharding/
 │   └── sharded_store_test.exs
 └── mix.exs
 ```
+
+---
+
+## Why sharded tables and not one big table
+
+A single ETS table serializes writes at the lock level even with `:write_concurrency`. Sharding partitions the lock domain across N independent tables, so contention drops with N.
 
 ---
 
@@ -85,9 +88,35 @@ per scheduler. More shards just increase the per-op dispatch cost. Measure.
 
 ---
 
+## Design decisions
+
+**Option A — single ETS table with `:write_concurrency`**
+- Pros: simpler; one table to back up, introspect, and clean.
+- Cons: write contention rises past ~16 cores; one hot key stalls the whole table.
+
+**Option B — sharded ETS tables (N tables, key-hash dispatch)** (chosen)
+- Pros: scales writes with core count; one hot key stalls only one shard.
+- Cons: iteration requires fan-out; operations that need atomicity across keys become awkward.
+
+→ Chose **B** because write contention is the dominant bottleneck at target scale; the operational cost is tolerable.
+
+---
+
 ## Implementation
 
 ### Step 1: `mix.exs`
+
+**Objective**: Pin `:benchee` as a dev-only dep so the sharded-vs-single-table bench never ships in release artifacts.
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
 
 ```elixir
 defmodule EtsSharding.MixProject do
@@ -104,6 +133,8 @@ end
 ```
 
 ### Step 2: `lib/ets_sharding/application.ex`
+
+**Objective**: Size the shard count to the next power of two above `schedulers_online` so `phash2` routing distributes evenly.
 
 ```elixir
 defmodule EtsSharding.Application do
@@ -127,6 +158,8 @@ end
 ```
 
 ### Step 3: `lib/ets_sharding/sharded_store.ex`
+
+**Objective**: Route keys to N ETS shards via `phash2`, cache the table list in `:persistent_term` so reads skip the GenServer.
 
 ```elixir
 defmodule EtsSharding.ShardedStore do
@@ -221,6 +254,8 @@ end
 
 ### Step 4: `bench/run.exs`
 
+**Objective**: Pit a maxed-out single table against the sharded store under parallel writers to expose the lock-contention cliff.
+
 ```elixir
 alias EtsSharding.ShardedStore
 
@@ -248,6 +283,8 @@ Benchee.run(
 ```
 
 ### Step 5: `test/sharded_store_test.exs`
+
+**Objective**: Prove `phash2` spreads uniform keys across every shard and that 8 concurrent writers lose zero updates.
 
 ```elixir
 defmodule EtsSharding.ShardedStoreTest do
@@ -329,11 +366,17 @@ end
 
 ### Step 6: Run it
 
+**Objective**: Run the Benchee script end-to-end and confirm sharded writes scale linearly while the single table plateaus.
+
 ```bash
 mix deps.get
 mix test
 mix run bench/run.exs
 ```
+
+### Why this works
+
+A stable hash of the key picks one of N tables. Reads and writes go directly to that table; there is no cross-shard coordination on the hot path. Iteration is the only operation that degrades, and it is acceptably O(N * shard-size).
 
 ---
 
@@ -351,6 +394,24 @@ mix run bench/run.exs
 
 Diminishing returns past `~= schedulers_online`, and a small regression beyond that due to
 dispatch overhead.
+
+---
+
+## Deep Dive
+
+ETS (Erlang Term Storage) is RAM-only and process-linked; table destruction triggers if the owner crashes, causing silent data loss in careless designs. Match specifications (match_specs) are micro-programs that filter/transform data at the C layer, orders of magnitude faster than fetching all records and filtering in Elixir. Mnesia adds disk persistence and replication but introduces transaction overhead and deadlock potential; dirty operations bypass locks for speed but sacrifice consistency guarantees. For caching, named tables (public by design) are globally visible but require careful name management; consider ETS sharding (multiple small tables) to reduce lock contention on hot keys. DETS (Disk ETS) persists to disk but is single-process bottleneck and slower than a real database. At scale, prefer ETS for in-process state and Mnesia/PostgreSQL for shared, persistent data.
+## Advanced Considerations
+
+ETS and DETS performance characteristics change dramatically based on access patterns and table types. Ordered sets provide range queries but slower access than hash tables; set types don't support duplicate keys while bags do. The `heir` option for ETS tables is essential for fault tolerance — when a table owner crashes, the heir process can take ownership and prevent data loss. Without it, the table is lost immediately. Mnesia replicates entire tables across nodes; choosing which nodes should have replicas and whether they're RAM or disk replicas affects both consistency guarantees and network traffic during cluster operations.
+
+DETS persistence comes with significant performance implications — writes are synchronous to disk by default, creating latency spikes. Using `sync: false` improves throughput but risks data loss on crashes. The maximum DETS table size is limited by available memory and the file system; planning capacity requires understanding your growth patterns. Mnesia's transaction system provides ACID guarantees, but dirty operations bypass these guarantees for performance. Understanding when to use dirty reads versus transactional reads significantly impacts both correctness and latency.
+
+Debugging ETS and DETS issues is challenging because problems often emerge under load when many processes contend for the same table. Table memory fragmentation is invisible to code but can exhaust memory. Using match specs instead of iteration over large tables can dramatically improve performance but requires careful construction. The interaction between ETS, replication, and distributed systems creates subtle consistency issues — a node with a stale ETS replica can serve incorrect data during network partitions. Always monitor table sizes and replication status with structured logging.
+
+
+## Deep Dive: Etsdets Patterns and Production Implications
+
+ETS tables are in-memory, non-distributed key-value stores with tunable semantics (ordered_set, duplicate_bag). Under concurrent read/write load, ETS table semantics matter: bag semantics allow fast appends but slow deletes; ordered_set allows range queries but slower inserts. Testing ETS behavior under concurrent load is non-trivial; single-threaded tests miss lock contention. Production ETS tables often fail under load due to concurrency assumptions that quiet tests don't exercise.
 
 ---
 
@@ -377,6 +438,13 @@ shard index. This helps diagnose "one shard is hot" scenarios.
 
 **7. When NOT to use this.** Small caches (< 100k ops/s), tables that need full scans, or tables
 with cross-key transactions. Sharding is an optimization for known contention — not a default.
+
+---
+
+## Reflection
+
+- If 5% of keys take 95% of the traffic, does sharding still help, and what do you do about the hot shard?
+- You need a consistent snapshot across all shards. Can you still do it, and at what cost to writers?
 
 ---
 

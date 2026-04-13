@@ -94,18 +94,23 @@ want a `GenServer`. Mixing "holds state" and "reacts to things" in an
 
 ## Implementation
 
-### Dependencies (`mix.exs`)
+### Dependencies (mix.exs)
 
 ```elixir
 defp deps do
   [
-    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+    # Standard library: no external dependencies required
   ]
 end
 ```
 
 
+
+
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
 
 ```bash
 mix new config_agent
@@ -113,6 +118,9 @@ cd config_agent
 ```
 
 ### Step 2: `lib/config_agent.ex`
+
+**Objective**: Implement `config_agent.ex` — the concurrency primitive whose back-pressure, linking, and timeout semantics we are isolating.
+
 
 ```elixir
 defmodule ConfigAgent do
@@ -183,6 +191,9 @@ end
 
 ### Step 3: `test/config_agent_test.exs`
 
+**Objective**: Write `config_agent_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+
 ```elixir
 defmodule ConfigAgentTest do
   use ExUnit.Case, async: true
@@ -250,6 +261,9 @@ end
 
 ### Step 4: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -260,6 +274,15 @@ mix test
 
 The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
 
+
+
+## Deep Dive: Task Spawn vs GenServer for Ephemeral Work
+
+A Task is lightweight `spawn/1` for bounded, self-contained work: compute, return, exit. Unlike GenServer (which receives messages indefinitely), Task is inherently ephemeral. This shapes everything: no callbacks, no state management, no back-pressure.
+
+Advantages: simplicity (few lines vs GenServer boilerplate). Disadvantages: no explicit state or message handling—Tasks assume pure computation or simple I/O. If you need a long-lived process responding to external events, you've outgrown Task.
+
+For CPU-bound work (calculations, parsing), Task.Supervisor with `:temporary` is ideal: spawn tasks, let them exit, don't restart. For coordinated async work (multiple tasks handing off results), GenServer + worker tasks often clarifies intent despite more boilerplate. Measure first: if code clarity improves with GenServer, the overhead is justified.
 
 ## Benchmark
 
@@ -289,7 +312,7 @@ linked to it may die too. Validate inputs **before** calling `update`.
 **4. `Agent` cannot receive timers, monitors, or arbitrary messages**
 There's no `handle_info` hook. If you need periodic cleanup, a TTL, or
 reactions to external events, you've outgrown `Agent` — switch to
-`GenServer`. Exercise 49 (`agent_vs_gs`) walks through that trade-off.
+`GenServer`. The `agent_vs_gs` comparison walks through that trade-off.
 
 **5. Named agents break `async: true` test isolation**
 A named agent (`name: __MODULE__`) is global. Two tests running in parallel

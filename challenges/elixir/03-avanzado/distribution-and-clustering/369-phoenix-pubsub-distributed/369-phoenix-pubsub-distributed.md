@@ -106,6 +106,8 @@ end
 
 ### Step 1: Application tree
 
+**Objective**: Start `Phoenix.PubSub` with the PG2 adapter so topic fan-out rides `:pg` without introducing a Redis or NATS dependency.
+
 ```elixir
 # lib/chat_fanout/application.ex
 defmodule ChatFanout.Application do
@@ -123,6 +125,8 @@ end
 ```
 
 ### Step 2: Domain API
+
+**Objective**: Hide topic naming and payload shape behind a `Rooms` module so callers never touch `Phoenix.PubSub` directly.
 
 ```elixir
 # lib/chat_fanout/rooms.ex
@@ -152,6 +156,8 @@ end
 ```
 
 ### Step 3: Minimal channel-style consumer
+
+**Objective**: Wrap subscription in a GenServer so the consumer's lifetime ties `:pg` membership to supervision, not ad-hoc `self()` calls.
 
 ```elixir
 # lib/chat_fanout/channel.ex
@@ -296,6 +302,24 @@ Benchee.run(
 
 Target: < 200 µs per broadcast for 1000 local subscribers (single node). Add 0.5–1 ms per additional remote node due to distribution serialization.
 
+## Deep Dive
+
+Distributed Erlang relies on a heartbeat mechanism (net_kernel tick) to detect node failure, but the network is fundamentally asynchronous—split-brain scenarios are inevitable. A partitioned cluster may have two sets of nodes, each believing the other is dead. Libraries like Horde and Phoenix.PubSub solve this with quorum-aware consensus, but they add latency and complexity. At scale, choose your consistency model explicitly: eventual consistency (via Redis PubSub) is faster but allows temporary divergence; strong consistency (via Horde DLM or distributed transactions) is slower but guarantees atomicity. For global registries, the order of operations matters—registering a process before its monitor is live creates race conditions. In multi-region setups, latency between nodes compounds these issues; consider regional clusters with a lightweight coordinator rather than a fully meshed topology.
+## Advanced Considerations
+
+Distributed Elixir systems require careful consideration of network partitions, consistent hashing for distributed state, and the interaction between clustering libraries and node discovery mechanisms. Network partitions are not rare edge cases; they happen regularly in cloud deployments due to maintenance windows and infrastructure issues. A system that works perfectly during local testing but fails under network partitions indicates insufficient failure handling throughout the codebase. Split-brain scenarios where multiple network partitions lead to different cluster views require explicit recovery mechanisms that are often business-specific and context-dependent.
+
+Horde and distributed registries provide eventual consistency guarantees, but "eventual" can mean minutes during network partitions. Applications must handle the case where the same name is registered on multiple nodes simultaneously without coordination. Consistent hashing for distributed services requires understanding rebalancing costs — a single node failure can cause significant key redistribution and thundering herd problems if not carefully managed. The cost of distributed consensus using algorithms like Raft is high; choose it only when consistency is more important than availability and can afford the performance cost.
+
+Global state replication across nodes creates synchronization challenges at scale. Choosing between replicating everywhere versus replicating to specific nodes affects both consistency latency and network bandwidth utilization fundamentally. Node monitoring and heartbeat mechanisms require careful timeout tuning — too aggressive and you get false positives during network hiccups; too conservative and you don't detect actual failures quickly enough for recovery. The EPMD (Erlang Port Mapper Daemon) is a critical component that can become a bottleneck in large clusters and requires careful capacity planning.
+
+
+## Deep Dive: Phoenix Patterns and Production Implications
+
+Phoenix's conn struct represents an HTTP request/response in flight, accumulating transformations through middleware and handler code. Testing a Phoenix endpoint end-to-end (not just the controller) catches middleware order bugs, header mismatches, and plug composition issues. The trade-off is that full integration tests are slower and harder to parallelize than unit tests. Production bugs in auth, CORS, or session handling are often due to middleware assumptions that live tests reveal.
+
+---
+
 ## Trade-offs and production gotchas
 
 1. **Slow subscribers drag down the broadcaster**: `send/2` is fire-and-forget but the subscriber's mailbox grows. A slow LiveView can accumulate thousands of messages, eventually OOM. Monitor mailbox sizes with `:erlang.process_info(pid, :message_queue_len)` and drop or kill slow consumers.
@@ -316,3 +340,13 @@ If two nodes broadcast to the same topic at the same nanosecond, do all subscrib
 - [`:pg` Erlang docs](https://www.erlang.org/doc/man/pg.html)
 - [The state of `:pg` — Maxim Fedorov](https://www.youtube.com/watch?v=8DNUZlz6mAk)
 - [Phoenix.Channel fastlane source](https://github.com/phoenixframework/phoenix/blob/main/lib/phoenix/channel/server.ex)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

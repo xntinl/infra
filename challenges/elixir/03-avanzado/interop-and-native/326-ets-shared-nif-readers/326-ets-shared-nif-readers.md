@@ -96,6 +96,16 @@ GenServer involvement, serialization, or mailbox hop.
 
 ### Dependencies (`mix.exs`)
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
+
 ```elixir
 defmodule FeatureFlagsFastPath.MixProject do
   use Mix.Project
@@ -122,6 +132,8 @@ end
 ```
 
 ### Step 1: ETS owner GenServer
+
+**Objective**: Serialize writes so read_concurrency readers never see torn updates while scaling lock-free across schedulers.
 
 ```elixir
 defmodule FeatureFlagsFastPath.Store do
@@ -180,6 +192,8 @@ end
 
 ### Step 2: NIF fast path (`lib/feature_flags_fast_path/nif.ex`)
 
+**Objective**: Provide typed stubs so Dialyzer validates NIF calls before dylib is loaded.
+
 ```elixir
 defmodule FeatureFlagsFastPath.NIF do
   use Rustler, otp_app: :feature_flags_fast_path, crate: :ff_nif
@@ -197,6 +211,8 @@ end
 
 ### Step 3: Cargo manifest
 
+**Objective**: Declare cdylib crate so `mix compile` produces dylib that BEAM can load at module startup.
+
 ```toml
 # native/ff_nif/Cargo.toml
 [package]
@@ -213,6 +229,8 @@ rustler = "0.34"
 ```
 
 ### Step 4: Rust NIF (`native/ff_nif/src/lib.rs`)
+
+**Objective**: Call :ets.lookup via env.apply so the NIF stays BEAM-version-portable without linking ETS internals.
 
 ```rust
 use rustler::{Atom, Encoder, Env, NifResult, Term};
@@ -291,6 +309,8 @@ rustler::init!("Elixir.FeatureFlagsFastPath.NIF", [get, get_many]);
 ```
 
 ### Step 5: Application
+
+**Objective**: Boot Store supervisor so ETS table lifecycle is tied to its owner process.
 
 ```elixir
 defmodule FeatureFlagsFastPath.Application do
@@ -430,6 +450,23 @@ Benchee.run(
 
 The insight: for ETS reads, pure Elixir is often faster than individual NIF calls due to
 NIF transition cost. The NIF wins when you amortize with a batch API.
+
+## Advanced Considerations: NIF Isolation and Scheduler Integration
+
+NIF calls run atomically on a scheduler thread, blocking all other processes on that scheduler until the function returns. For operations exceeding ~1 millisecond, this starvation becomes visible: heartbeat processes delay, ETS owner replies hang, supervision timeouts fire. The BEAM's dirty scheduler pool (8 CPU + 10 IO by default) isolates long NIFs from the main scheduler ring, but they're still a finite resource.
+
+Understanding scheduler capacity is critical. Each dirty CPU scheduler can run ~1,000 100-microsecond operations per second, or ~5 100-millisecond operations. Beyond that, callers queue. A GenServer pool capping concurrency and applying backpressure prevents cascade failures: if the dirty pool saturates, reject new work immediately instead of queuing unboundedly.
+
+Resource management inside NIFs differs from pure Elixir. A `Binary<'a>` is a borrow tied to the NIF call; it cannot escape to threads or be stored in resources. An `OwnedBinary` allocation isn't visible to BEAM's garbage collector, so memory limits must be enforced in the Elixir layer. Hybrid architectures (Port processes for I/O, NIFs for CPU work) offer better observability and failure isolation than trying to do everything in a single NIF crate.
+
+---
+
+
+## Deep Dive: Etsdets Patterns and Production Implications
+
+ETS tables are in-memory, non-distributed key-value stores with tunable semantics (ordered_set, duplicate_bag). Under concurrent read/write load, ETS table semantics matter: bag semantics allow fast appends but slow deletes; ordered_set allows range queries but slower inserts. Testing ETS behavior under concurrent load is non-trivial; single-threaded tests miss lock contention. Production ETS tables often fail under load due to concurrency assumptions that quiet tests don't exercise.
+
+---
 
 ## Trade-offs and production gotchas
 

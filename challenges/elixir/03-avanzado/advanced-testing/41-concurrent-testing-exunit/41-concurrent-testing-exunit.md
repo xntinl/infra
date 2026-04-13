@@ -142,6 +142,8 @@ end)
 
 ### Step 1: `mix.exs`
 
+**Objective**: Add Ecto + Postgres deps and alias test task to auto-create/migrate schema so CI always starts with clean database state.
+
 ```elixir
 defmodule Shortener.MixProject do
   use Mix.Project
@@ -181,6 +183,8 @@ end
 
 ### Step 2: Repo and application
 
+**Objective**: Start Repo under app supervisor so tests share Postgres pool via Sandbox while each test gets isolated sandboxed connection.
+
 ```elixir
 # lib/shortener/repo.ex
 defmodule Shortener.Repo do
@@ -205,6 +209,8 @@ end
 ```
 
 ### Step 3: ETS Counter — async-safe design
+
+**Objective**: Accept table name via opts and enable read/write concurrency so async: true tests create isolated tables without collisions.
 
 ```elixir
 # lib/shortener/counter.ex
@@ -248,6 +254,8 @@ end
 
 ### Step 4: Generator
 
+**Objective**: Implement base-32 encoding with unambiguous alphabet so tests verify uniqueness-by-hash across parallel insert races.
+
 ```elixir
 # lib/shortener/generator.ex
 defmodule Shortener.Generator do
@@ -268,6 +276,8 @@ end
 ```
 
 ### Step 5: Link schema and context
+
+**Objective**: Add unique_constraint at Changeset layer so concurrent inserts return :error tuples instead of crashing on DB constraint violation.
 
 ```elixir
 # lib/shortener/link.ex
@@ -318,6 +328,8 @@ end
 
 ### Step 6: Migration
 
+**Objective**: Create unique_index on :code so changesets detect concurrent duplicate inserts via UNIQUE CONSTRAINT instead of silent collision.
+
 ```elixir
 # priv/repo/migrations/20260101000000_create_links.exs
 defmodule Shortener.Repo.Migrations.CreateLinks do
@@ -336,6 +348,8 @@ end
 ```
 
 ### Step 7: DataCase with sandbox
+
+**Objective**: Implement per-test sandbox checkout with optional {:shared, self()} mode so async tests isolate DB rows without seeing concurrency artifacts.
 
 ```elixir
 # test/support/data_case.ex
@@ -370,6 +384,8 @@ end
 
 ### Step 8: Counter test — per-test table for async safety
 
+**Objective**: Create unique ETS table per test via unique_integer so async: true tests prove counter isolation under concurrent parallel execution.
+
 ```elixir
 # test/shortener/counter_test.exs
 defmodule Shortener.CounterTest do
@@ -390,27 +406,31 @@ defmodule Shortener.CounterTest do
       {:ok, table: table}
   end
 
-  test "incr/3 initialises from zero and increments", %{table: t} do
-    assert Counter.incr(t, :a) == 1
-    assert Counter.incr(t, :a) == 2
-    assert Counter.incr(t, :a, 10) == 12
-  end
+  describe "Shortener.Counter" do
+    test "incr/3 initialises from zero and increments", %{table: t} do
+      assert Counter.incr(t, :a) == 1
+      assert Counter.incr(t, :a) == 2
+      assert Counter.incr(t, :a, 10) == 12
+    end
 
-  test "get/2 reflects the latest value", %{table: t} do
-    Counter.incr(t, :b, 5)
-    assert Counter.get(t, :b) == 5
-  end
+    test "get/2 reflects the latest value", %{table: t} do
+      Counter.incr(t, :b, 5)
+      assert Counter.get(t, :b) == 5
+    end
 
-  test "different keys are independent", %{table: t} do
-    Counter.incr(t, :x)
-    Counter.incr(t, :y, 3)
-    assert Counter.get(t, :x) == 1
-    assert Counter.get(t, :y) == 3
+    test "different keys are independent", %{table: t} do
+      Counter.incr(t, :x)
+      Counter.incr(t, :y, 3)
+      assert Counter.get(t, :x) == 1
+      assert Counter.get(t, :y) == 3
+    end
   end
 end
 ```
 
 ### Step 9: Generator test — pure, trivially async
+
+**Objective**: Stress `encode/1` across 10k ids in an `async: true` module so the pure function's determinism doubles as a property-style invariant check.
 
 ```elixir
 # test/shortener/generator_test.exs
@@ -419,25 +439,29 @@ defmodule Shortener.GeneratorTest do
 
   alias Shortener.Generator
 
-  test "encodes zero" do
-    assert Generator.encode(0) == "a"
-  end
+  describe "Shortener.Generator" do
+    test "encodes zero" do
+      assert Generator.encode(0) == "a"
+    end
 
-  test "produces unique codes for unique ids" do
-    codes = for i <- 0..999, do: Generator.encode(i)
-    assert length(Enum.uniq(codes)) == 1000
-  end
+    test "produces unique codes for unique ids" do
+      codes = for i <- 0..999, do: Generator.encode(i)
+      assert length(Enum.uniq(codes)) == 1000
+    end
 
-  test "avoids visually confusing characters (no l, o, 0, 1)" do
-    for i <- 0..10_000 do
-      code = Generator.encode(i)
-      refute code =~ ~r/[lo01]/
+    test "avoids visually confusing characters (no l, o, 0, 1)" do
+      for i <- 0..10_000 do
+        code = Generator.encode(i)
+        refute code =~ ~r/[lo01]/
+      end
     end
   end
 end
 ```
 
 ### Step 10: Links test — Ecto sandbox with async
+
+**Objective**: Combine `DataCase` checkout with `@tag :shared_db` so async DB tests run in transactions while `Task.async` cases opt into shared mode only when they spawn.
 
 ```elixir
 # test/shortener/links_test.exs
@@ -447,40 +471,45 @@ defmodule Shortener.LinksTest do
   alias Shortener.Links
 
   # Each test runs in its own transaction — other async tests never see this row.
-  test "create/1 inserts a link" do
-    assert {:ok, link} = Links.create("https://example.com")
-    assert is_binary(link.code)
-    assert link.url == "https://example.com"
-  end
 
-  test "create/1 produces unique codes across many calls" do
-    urls = for i <- 1..50, do: "https://ex#{i}.com"
-    results = Enum.map(urls, &Links.create/1)
-    codes = Enum.map(results, fn {:ok, l} -> l.code end)
-    assert length(Enum.uniq(codes)) == 50
-  end
+  describe "Shortener.Links" do
+    test "create/1 inserts a link" do
+      assert {:ok, link} = Links.create("https://example.com")
+      assert is_binary(link.code)
+      assert link.url == "https://example.com"
+    end
 
-  test "resolve/1 returns a link by code" do
-    {:ok, link} = Links.create("https://target.com")
-    assert {:ok, found} = Links.resolve(link.code)
-    assert found.id == link.id
-  end
+    test "create/1 produces unique codes across many calls" do
+      urls = for i <- 1..50, do: "https://ex#{i}.com"
+      results = Enum.map(urls, &Links.create/1)
+      codes = Enum.map(results, fn {:ok, l} -> l.code end)
+      assert length(Enum.uniq(codes)) == 50
+    end
 
-  test "resolve/1 returns :not_found for unknown codes" do
-    assert Links.resolve("nope") == :not_found
-  end
+    test "resolve/1 returns a link by code" do
+      {:ok, link} = Links.create("https://target.com")
+      assert {:ok, found} = Links.resolve(link.code)
+      assert found.id == link.id
+    end
 
-  @tag :shared_db
-  test "shared mode allows spawned processes to see the sandbox connection" do
-    {:ok, link} = Links.create("https://spawned.com")
+    test "resolve/1 returns :not_found for unknown codes" do
+      assert Links.resolve("nope") == :not_found
+    end
 
-    task = Task.async(fn -> Links.resolve(link.code) end)
-    assert {:ok, _} = Task.await(task)
+    @tag :shared_db
+    test "shared mode allows spawned processes to see the sandbox connection" do
+      {:ok, link} = Links.create("https://spawned.com")
+
+      task = Task.async(fn -> Links.resolve(link.code) end)
+      assert {:ok, _} = Task.await(task)
+    end
   end
 end
 ```
 
 ### Step 11: `test_helper.exs`
+
+**Objective**: Call `Sandbox.mode(Repo, :manual)` in `test_helper.exs` so every module must explicitly check out a connection — no silent shared-mode defaults.
 
 ```elixir
 ExUnit.start()
@@ -488,6 +517,8 @@ Ecto.Adapters.SQL.Sandbox.mode(Shortener.Repo, :manual)
 ```
 
 ### Step 12: Run
+
+**Objective**: Run `mix test --trace` so interleaved output proves async modules coexist without `:already_started` or sandbox ownership errors.
 
 ```bash
 mix test --trace
@@ -500,6 +531,21 @@ mix test --trace
 ### Why this works
 
 The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
+
+## Deep Dive: Property Patterns and Production Implications
+
+Property-based testing inverts the testing mindset: instead of writing examples, you state invariants (properties) and let a generator find counterexamples. StreamData's shrinking capability is its superpower—when a property fails on a 10,000-element list, the framework reduces it to the minimal list that still fails, cutting debugging time from hours to minutes. The trade-off is that properties require rigorous thinking about domain constraints, and not every invariant is worth expressing as a property. Teams that adopt property testing often find bugs in specifications themselves, not just implementations.
+
+---
+
+## Advanced Considerations
+
+Production testing strategies require careful attention to resource management and test isolation across multiple concurrent test processes. In large codebases, tests can consume significant memory and CPU resources, especially when using concurrent testing without proper synchronization and cleanup. The BEAM scheduler's preemptive nature means test processes may interfere with each other if shared resources aren't properly isolated at the process boundary. Pay careful attention to how Ecto's sandbox mode interacts with your supervision tree — if you have GenServers that hold state across tests, the sandbox rollback mechanism may leave phantom processes in your monitoring systems that continue consuming resources until forced cleanup occurs.
+
+When scaling tests to production-grade test suites, consider the cost of stub verification and the memory overhead of generated test cases. Each property-based test invocation can create thousands of synthetic test cases, potentially causing garbage collection pressure that's invisible during local testing but becomes critical in CI/CD pipelines running long test suites continuously. The interaction between concurrent tests and ETS tables (often used in caches and registry patterns) requires explicit `inherited: true` options to prevent unexpected sharing between test processes, which can cause mysterious failures when tests run in different orders or under load.
+
+For distributed testing scenarios using tools like `Peer`, network simulation can mask real latency issues and failure modes. Test timeouts that work locally may fail in CI due to scheduler contention and GC pauses. Always include substantial buffers for timeout values and monitor actual execution times under load. The coordination between multiple test nodes requires careful cleanup — a failure in test coordination can leave zombie processes consuming resources indefinitely. Implement proper telemetry hooks within your test helpers to diagnose production-like scenarios and capture performance characteristics.
+
 
 ## Trade-offs and production gotchas
 
@@ -575,3 +621,13 @@ busy on each test.
 - ["Faster tests in Elixir" — Chris Keathley](https://keathley.io/) — practical migration guide
 - [start_supervised! docs](https://hexdocs.pm/ex_unit/ExUnit.Callbacks.html#start_supervised!/2)
 - [`$callers` internals](https://hexdocs.pm/elixir/Process.html#get/0) — Process.get(:"$callers")
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

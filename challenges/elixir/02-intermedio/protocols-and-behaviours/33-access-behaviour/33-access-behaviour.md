@@ -95,9 +95,22 @@ See `Access.key/2` and `Access.all/0` for built-in accessors.
 
 ---
 
+### Dependencies (`mix.exs`)
+
+```elixir
+def deps do
+  [
+    {exunit},
+    {ok},
+  ]
+end
+```
 ## Implementation
 
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
 
 ```bash
 mix new user_access
@@ -105,6 +118,9 @@ cd user_access
 ```
 
 ### Step 2: `lib/user.ex`
+
+**Objective**: Implement `user.ex` — polymorphism via dispatch on the data's type (protocol) or via an explicit contract (behaviour).
+
 
 ```elixir
 defmodule User do
@@ -162,6 +178,9 @@ end
 
 ### Step 3: `test/user_test.exs`
 
+**Objective**: Write `user_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+
 ```elixir
 defmodule UserTest do
   use ExUnit.Case, async: true
@@ -215,6 +234,9 @@ end
 
 ### Step 4: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -224,6 +246,14 @@ mix test
 `fetch/2` restricts bracket access to the declared struct fields — unknown keys return `:error`, which `Access.get/2` turns into `nil`, matching map semantics without bypassing struct strictness. `get_and_update/3` routes a `:pop` return into an explicit `ArgumentError`, so `pop_in` on required fields fails loudly instead of silently corrupting state. Because `profile` is a plain map, `user[:profile][:name]` chains through two `Access` impls (yours + `Map`'s) without extra code.
 
 ---
+
+
+## Key Concepts: The Access Behaviour and Bracket Notation
+
+The `Access` behaviour lets custom data structures support bracket notation (`struct[key]`, `struct[key] = value`). Normally only maps and keyword lists support this. Implement `get/3` and `get_and_update/4` to enable bracket access on your struct.
+
+Example: a custom `Spreadsheet` struct can implement `Access` to support `sheet["A1"]` and `sheet["A1"] = value`, making it transparent in code that expects map-like behavior. The gotcha: `Access` requires explicit opt-in; naive bracket access on a custom struct raises an error.
+
 
 ## Benchmark
 
@@ -273,3 +303,17 @@ objects, not for stateful or invariant-heavy types.
 - [`Kernel.get_in/2`, `put_in/3`, `update_in/3`](https://hexdocs.pm/elixir/Kernel.html#get_in/2)
 - [`Access.key/2` — accessor for missing-or-present fields](https://hexdocs.pm/elixir/Access.html#key/2)
 - ["The Access behaviour and you" — ElixirSchool](https://elixirschool.com/en/lessons/advanced/protocols/)
+
+
+## Key Concepts
+
+Protocols and behaviors are Elixir's mechanism for ad-hoc and static polymorphism. They solve different problems and are often confused.
+
+**Protocols:**
+Dispatch based on the type/struct of the first argument at runtime. A protocol defines a contract (e.g., `Enumerable`); any type can implement it by adding a corresponding implementation block. Protocols excel when you control neither the type nor the caller — e.g., a library that needs to iterate any collection. The fallback is `:any` — if no specific implementation exists, the `:any` handler is tried. This enables "optional" protocol implementations.
+
+**Behaviours:**
+Static polymorphism enforced at compile time. A module implements a behavior by defining callbacks (functions). Behaviors are about contracts between modules, not types. Use when you need multiple implementations of the same interface and the caller chooses which to use (e.g., different database adapters, different strategies). Callbacks are checked at compile time — missing a required callback is a compiler error.
+
+**Architectural patterns:**
+Behaviors excel in plugin systems (user defines modules conforming to the behavior). Protocols excel in type-driven dispatch (any type can conform). Mix both: a behavior can require that its callbacks operate on types that implement a protocol. Example: `MyAdapter` behavior requiring callbacks that work with `Enumerable` types.

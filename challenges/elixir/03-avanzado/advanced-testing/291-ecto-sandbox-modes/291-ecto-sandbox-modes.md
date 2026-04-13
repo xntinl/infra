@@ -95,6 +95,8 @@ defp elixirc_paths(_),     do: ["lib"]
 
 ### Step 1: config
 
+**Objective**: Size the pool to `schedulers_online * 2` so async tests never stall waiting for a sandboxed connection.
+
 ```elixir
 # config/test.exs
 import Config
@@ -110,6 +112,8 @@ config :billing_api, BillingApi.Repo,
 ```
 
 ### Step 2: `DataCase` helper
+
+**Objective**: Centralize `start_owner!` with `shared: not tags[:async]` so every test opts into the correct sandbox mode via a single tag.
 
 ```elixir
 # test/support/data_case.ex
@@ -143,6 +147,8 @@ end
 
 ### Step 3: async isolation — happy path
 
+**Objective**: Prove that parallel tests inserting rows see zero cross-contamination because each owns a rolled-back transaction.
+
 ```elixir
 # test/billing_api/invoices_test.exs
 defmodule BillingApi.InvoicesTest do
@@ -166,6 +172,8 @@ end
 ```
 
 ### Step 4: helper process — `allow/4`
+
+**Objective**: Grant a supervisor-started GenServer access to the test's sandboxed connection so cross-process work avoids `DBConnection.OwnershipError`.
 
 When the test triggers work in a named GenServer that was started by the application
 supervisor, the GenServer lives outside the test process and cannot see the sandboxed
@@ -198,6 +206,8 @@ end
 
 ### Step 5: integration test — `:shared` mode
 
+**Objective**: Trade parallelism for reach: switch to `:shared` when a pipeline spawns too many processes to enumerate with `allow/4`.
+
 When many helper processes (e.g. a Plug endpoint that spawns its own async stages) each
 need access, enumerating them with `allow/4` is impractical. Switch to `:shared` mode and
 disable async for the test.
@@ -222,6 +232,8 @@ end
 ```
 
 ### Step 6: tagged mode overrides
+
+**Objective**: Drive sandbox mode from `@moduletag` so individual tests escalate to `:shared` without forking the `DataCase` hierarchy.
 
 ```elixir
 # For targeted cases: opt into shared without using integration_test file
@@ -262,6 +274,21 @@ IO.puts("full suite #{t / 1_000_000}s")
 Target: an 800-test suite with `async: true` everywhere should finish in well under
 20% of the sequential time. Rule of thumb: one CPU core per 10–15 concurrent tests.
 
+## Deep Dive: Sandbox Patterns and Production Implications
+
+Ecto.Sandbox enforces database transaction isolation per test process, allowing async tests without race conditions. The 'shared' mode wraps each test in a transaction that rolls back after completion; the 'manual' mode gives you fine-grained control. Understanding which mode to use requires knowing your database's isolation levels (Postgres default is READ COMMITTED, not SERIALIZABLE) and whether your tests actually exercise transactions. Misconfiguring Sandbox is a common source of production bugs that don't reproduce in test—concurrent writes that work in-test may deadlock in production with different isolation settings.
+
+---
+
+## Advanced Considerations
+
+Production testing strategies require careful attention to resource management and test isolation across multiple concurrent test processes. In large codebases, tests can consume significant memory and CPU resources, especially when using concurrent testing without proper synchronization and cleanup. The BEAM scheduler's preemptive nature means test processes may interfere with each other if shared resources aren't properly isolated at the process boundary. Pay careful attention to how Ecto's sandbox mode interacts with your supervision tree — if you have GenServers that hold state across tests, the sandbox rollback mechanism may leave phantom processes in your monitoring systems that continue consuming resources until forced cleanup occurs.
+
+When scaling tests to production-grade test suites, consider the cost of stub verification and the memory overhead of generated test cases. Each property-based test invocation can create thousands of synthetic test cases, potentially causing garbage collection pressure that's invisible during local testing but becomes critical in CI/CD pipelines running long test suites continuously. The interaction between concurrent tests and ETS tables (often used in caches and registry patterns) requires explicit `inherited: true` options to prevent unexpected sharing between test processes, which can cause mysterious failures when tests run in different orders or under load.
+
+For distributed testing scenarios using tools like `Peer`, network simulation can mask real latency issues and failure modes. Test timeouts that work locally may fail in CI due to scheduler contention and GC pauses. Always include substantial buffers for timeout values and monitor actual execution times under load. The coordination between multiple test nodes requires careful cleanup — a failure in test coordination can leave zombie processes consuming resources indefinitely. Implement proper telemetry hooks within your test helpers to diagnose production-like scenarios and capture performance characteristics.
+
+
 ## Trade-offs and production gotchas
 
 **1. Running a connection-dependent operation in a `Task.async` without `allow/4`**
@@ -301,3 +328,13 @@ real cost of `:shared`?
 - [José Valim — Concurrent transactional tests](https://dashbit.co/blog/ecto-sql-3-changesets-are-data)
 - [Phoenix test guide](https://hexdocs.pm/phoenix/testing.html)
 - [`Oban.Testing`](https://hexdocs.pm/oban/Oban.Testing.html)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

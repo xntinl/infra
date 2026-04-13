@@ -114,12 +114,18 @@ end
 
 ### Step 1: Create the project
 
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
+
 ```bash
 mix new process_dict_lab
 cd process_dict_lab
 ```
 
 ### Step 2: `lib/process_dict_lab/implicit.ex`
+
+**Objective**: Implement `implicit.ex` — the GenServer callback shape that determines blocking vs fire-and-forget semantics and state invariants.
+
 
 ```elixir
 defmodule ProcessDictLab.Implicit do
@@ -162,6 +168,9 @@ end
 
 ### Step 3: `lib/process_dict_lab/explicit.ex`
 
+**Objective**: Implement `explicit.ex` — the GenServer callback shape that determines blocking vs fire-and-forget semantics and state invariants.
+
+
 ```elixir
 defmodule ProcessDictLab.Explicit do
   @moduledoc """
@@ -192,6 +201,9 @@ end
 
 ### Step 4: `lib/process_dict_lab.ex`
 
+**Objective**: Implement `process_dict_lab.ex` — the GenServer callback shape that determines blocking vs fire-and-forget semantics and state invariants.
+
+
 ```elixir
 defmodule ProcessDictLab do
   @moduledoc """
@@ -216,6 +228,9 @@ end
 ```
 
 ### Step 5: `test/process_dict_lab_test.exs`
+
+**Objective**: Write `process_dict_lab_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
 
 ```elixir
 defmodule ProcessDictLabTest do
@@ -280,6 +295,9 @@ end
 
 ### Step 6: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -290,6 +308,15 @@ mix test
 
 The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
 
+
+
+## Deep Dive: Process-Local Storage vs GenServer State Management
+
+The process dictionary (via `Process.put/2`, `Process.get/2`) feels like mutable state within a single process, but it's unsuitable for inter-process sharing—that's GenServer's job. Use the process dictionary sparingly: temporary caches, performance-critical per-process context, or tracing state where you must avoid passing large state through function calls.
+
+GenServer state is idiomatic because it enforces explicitness: every state change is visible in handler return values, making state flow obvious to future maintainers. The process dictionary hides mutations as side effects, creating subtle bugs when code assumes an entry exists but error paths prevented its creation.
+
+In production, the process dictionary is an optimization target, not a design pattern. Ask: Is this truly temporary? Is it inherently per-process? If the answer is 'maybe', use GenServer. The slight overhead of explicit state passing pays enormous dividends in debugging time, testability, and code clarity.
 
 ## Benchmark
 

@@ -2,9 +2,6 @@
 
 **Project**: `live_components` — a composable cart UI with per-item state, reusable buttons, and a shared checkout summary.
 
-**Difficulty**: ★★★★☆
-**Estimated time**: 4–6 hours
-
 ---
 
 ## Project context
@@ -59,6 +56,12 @@ live_components/
 
 ---
 
+## Why LiveComponents and not parent-only state
+
+A LiveView with 20 nested widgets is a maintenance nightmare. LiveComponents let each widget own its own update cycle while sharing the parent process.
+
+---
+
 ## Core concepts
 
 ### 1. Three flavors compared
@@ -90,6 +93,16 @@ renders) and `update/2` (called every time the parent passes new assigns). The d
 `update/2` just merges assigns. You override it when you need to react to external
 changes — for example, resetting a local "draft" state when the parent swaps the
 underlying record:
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
 
 ```elixir
 def update(%{line_item: new_item} = assigns, socket) do
@@ -153,9 +166,25 @@ from the domain (`item.id`).
 
 ---
 
+## Design decisions
+
+**Option A — everything in the parent LiveView**
+- Pros: one process, one state; simple flow.
+- Cons: parent becomes a god object; every sub-area forces the full tree to re-render logic.
+
+**Option B — LiveComponents for bounded sub-areas** (chosen)
+- Pros: isolated state updates; smaller diffs; testable independently.
+- Cons: lifecycle adds concepts (update/2, handle_event within component); inter-component communication needs discipline.
+
+→ Chose **B** because past a certain complexity LiveComponents are the only way to keep the parent readable.
+
+---
+
 ## Implementation
 
 ### Step 1: Create the project
+
+**Objective**: Scaffold a Phoenix app without Ecto since the cart is an in-memory demo owned by the LiveView process.
 
 ```bash
 mix phx.new live_components --no-ecto --no-mailer
@@ -163,6 +192,8 @@ cd live_components
 ```
 
 ### Step 2: The cart domain — `lib/live_components/cart.ex`
+
+**Objective**: Keep cart logic pure functions over `Decimal` so totals stay exact and components stay rendering-only.
 
 ```elixir
 defmodule LiveComponents.Cart do
@@ -201,6 +232,8 @@ end
 
 ### Step 3: Function components — `lib/live_components_web/components/core_components.ex`
 
+**Objective**: Define design-system atoms as stateless `Phoenix.Component`s with typed `attr`/`slot` contracts so misuse fails at compile time.
+
 ```elixir
 defmodule LiveComponentsWeb.CoreComponents do
   @moduledoc "Design-system atoms. Pure render helpers, no LiveView state."
@@ -233,6 +266,8 @@ end
 ```
 
 ### Step 4: Stateful LiveComponent — `lib/live_components_web/live_components/line_item_component.ex`
+
+**Objective**: Isolate modal and draft-qty state in the component so `phx-target={@myself}` events never touch the parent.
 
 ```elixir
 defmodule LiveComponentsWeb.LineItemComponent do
@@ -326,6 +361,8 @@ end
 
 ### Step 5: Stateless LiveComponent — `lib/live_components_web/live_components/summary_component.ex`
 
+**Objective**: Derive total on every render from parent-passed items so the summary has zero state to keep in sync.
+
 ```elixir
 defmodule LiveComponentsWeb.SummaryComponent do
   @moduledoc """
@@ -351,6 +388,8 @@ end
 ```
 
 ### Step 6: Parent LiveView — `lib/live_components_web/live/cart_live.ex`
+
+**Objective**: Own the authoritative items list and react to `send/2` messages from components so child events bubble explicitly.
 
 ```elixir
 defmodule LiveComponentsWeb.CartLive do
@@ -393,6 +432,8 @@ end
 ```
 
 ### Step 7: Tests — `test/live_components_web/live/cart_live_test.exs`
+
+**Objective**: Drive `element/3` and `render_click/1` against component targets so tests hit the exact `phx-target` dispatch path.
 
 ```elixir
 defmodule LiveComponentsWeb.CartLiveTest do
@@ -438,6 +479,27 @@ end
 mix test
 ```
 
+### Why this works
+
+A stateful LiveComponent has its own `mount/1`, `update/2`, and `handle_event/3`. Phoenix only re-renders the components whose assigns changed, sending just their portion of the diff. The components live inside the parent LiveView process, so no extra processes are allocated.
+
+---
+
+## Advanced Considerations: LiveView Real-Time Patterns and Pubsub Scale
+
+LiveView bridges the browser and BEAM via WebSocket, allowing server-side renders to push incremental DOM diffs to the client. A LiveView process is long-lived, receiving events (clicks, form submissions) and broadcasting updates. For real-time features (collaborative editing, live notifications), LiveView processes subscribe to PubSub topics and receive broadcast messages.
+
+Phoenix.PubSub partitions topics across a pool of processes, allowing horizontal scaling. By default, `:local` mode uses in-memory ETS; `:redis` mode distributes across nodes via Redis. At scale (thousands of concurrent LiveViews), topic fanout can bottleneck: broadcasting to a million subscribers means delivering one million messages. The BEAM handles this, but the network cost matters on multi-node deployments.
+
+`Presence` module tracks which users are viewing which pages, syncing state via PubSub. A presence join/leave is broadcast to all nodes, allowing real-time "who's online" updates. Under partition, presence state can diverge; the library uses unique presence keys to detect and reconcile. Operationally, watching presence on every page load can amplify server load if users are flaky (mobile networks, browser reloads). Consider presence only for features where it's user-facing (collaborative editors, live sports scoreboards).
+
+---
+
+
+## Deep Dive: Phoenix Patterns and Production Implications
+
+Phoenix's conn struct represents an HTTP request/response in flight, accumulating transformations through middleware and handler code. Testing a Phoenix endpoint end-to-end (not just the controller) catches middleware order bugs, header mismatches, and plug composition issues. The trade-off is that full integration tests are slower and harder to parallelize than unit tests. Production bugs in auth, CORS, or session handling are often due to middleware assumptions that live tests reveal.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -445,7 +507,7 @@ mix test
 **1. Stateful LCs share the parent's process**
 They are not GenServers. A long computation in `handle_event/3` blocks the
 entire LiveView (and every other component on the page). Offload with
-`Task.async/1` or `assign_async/3` (exercise 216), never with blocking work.
+`Task.async/1` or `assign_async/3`, never with blocking work.
 
 **2. The `:id` must be stable and unique**
 Reusing the same id for two different renders merges the state; generating
@@ -486,6 +548,25 @@ For a design system published across products, function components are the
 right boundary — they have no runtime dependency on LiveView. If your consumers
 include a regular Phoenix controller view, stateless LCs won't work there.
 Keep the atoms (buttons, inputs) as `Phoenix.Component`s, not LCs.
+
+---
+
+## Benchmark
+
+```elixir
+# :timer.tc / Benchee measurement sketch
+{time_us, _} = :timer.tc(fn -> :ok end)
+IO.puts("elapsed: #{time_us} us")
+```
+
+Target: component update diff under 500 bytes; re-render time scales with touched components, not tree size.
+
+---
+
+## Reflection
+
+- Your component needs to trigger a parent state change. You have `send/3` and `send_update/2` and event propagation. Which one and when?
+- Every component has its own mount. At 50 components per page, is that a problem? How would you measure?
 
 ---
 

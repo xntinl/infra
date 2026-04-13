@@ -2,9 +2,6 @@
 
 **Project**: `my_unless` — re-implement Elixir's `unless` control structure using `defmacro`, `quote`, and `unquote`. The "hello world" of metaprogramming.
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 1–2 hours
-
 ---
 
 ## Project context
@@ -30,6 +27,16 @@ my_unless/
 │   └── my_unless_test.exs
 └── mix.exs
 ```
+
+---
+
+## Why a macro and not a function
+
+A function evaluates **both** arguments before running — its body and its
+else-branch would always execute, defeating the "only run one branch"
+contract. A macro receives the *unevaluated AST* of each branch and
+emits code that evaluates the right one only when the condition demands
+it. That lazy dispatch is what makes control structures possible.
 
 ---
 
@@ -78,9 +85,38 @@ variable called `do_block`*, not the code the caller wrote. You must
 
 ---
 
+## Design decisions
+
+**Option A — Build `unless` with explicit `case not cond`**
+- Pros: No dependency on `if/2`; entirely self-contained.
+- Cons: Duplicates the `if` optimizer logic; slightly larger AST.
+
+**Option B — Expand to `if not cond` and let the compiler optimize** (chosen)
+- Pros: Inherits every compiler optimization that applies to `if`.
+- Cons: Relies on `if/2` being stable (it is — it's a special form).
+
+→ Chose **B** because `unless` is semantically "if with an inverted
+condition"; reusing `if` is idiomatic and produces identical bytecode.
+
+---
+
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
 
 ```bash
 mix new my_unless
@@ -88,6 +124,9 @@ cd my_unless
 ```
 
 ### Step 2: `lib/my_unless.ex`
+
+**Objective**: Implement `my_unless.ex` — AST manipulation that runs at compile time — making the macro's hygiene and unquoting choices observable.
+
 
 ```elixir
 defmodule MyUnless do
@@ -127,6 +166,9 @@ end
 ```
 
 ### Step 3: `test/my_unless_test.exs`
+
+**Objective**: Write `my_unless_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
 
 ```elixir
 defmodule MyUnlessTest do
@@ -190,6 +232,9 @@ end
 
 ### Step 4: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -204,6 +249,33 @@ iex> Macro.expand(ast, __ENV__) |> Macro.to_string() |> IO.puts
 
 You should see a plain `if` expression — no trace of `my_unless` remains
 after expansion.
+
+### Why this works
+
+Each `defmacro` clause receives the caller's code as AST, wraps it in a
+fresh `quote` whose body is `if unquote(condition) do ... else ... end`,
+and returns that AST. Because the do/else blocks are spliced with
+`unquote`, they run only when their branch is selected — lazy
+evaluation preserved. The compiler then inlines the macro output at the
+call site, leaving zero runtime overhead versus `Kernel.unless/2`.
+
+---
+
+
+## Deep Dive: State Management and Message Handling Patterns
+
+Understanding state transitions is central to reliable OTP systems. Every `handle_call` or `handle_cast` receives current state and returns new state—immutability forces explicit reasoning. This prevents entire classes of bugs: missing state updates are immediately visible.
+
+Key insight: separate pure logic (state → new state) from side effects (logging, external calls). Move pure logic to private helpers; use handlers for orchestration. This makes servers testable—test pure functions independently.
+
+In production, monitor state size and mutation frequency. Unbounded growth is a memory leak; excessive mutations signal hot spots needing optimization. Always profile before reaching for performance solutions like ETS.
+
+## Benchmark
+
+<!-- benchmark N/A: `my_unless` expands to the same AST as `if`; any
+benchmark is effectively measuring `Kernel.if/2`, not the macro. La
+comparación significativa es `Macro.expand/2` mostrando igualdad con la
+forma `if`. -->
 
 ---
 
@@ -235,6 +307,18 @@ Implementing it is educational; using it is usually bad style.
 In production, `Kernel.unless/2` is the correct answer — it's already
 imported, documented, tooled, and battle-tested. This exercise exists
 purely so you understand what's happening when you read Elixir source.
+
+---
+
+## Reflection
+
+- Estás leyendo un codebase que usa `unless user.admin? && !feature_flag`
+  anidado tres niveles. Antes de refactorizar, reformulá la condición en
+  positivo y justificá si `unless` era la elección correcta aquí, o si
+  `if` con un predicado nombrado habría sido más claro desde el inicio.
+- Supongamos que Elixir elimina `if/2` mañana y solo queda `case/2`.
+  ¿Cómo reescribís `my_unless` para que siga compilando? ¿Qué te enseña
+  esa expansión sobre qué es realmente `unless`?
 
 ---
 

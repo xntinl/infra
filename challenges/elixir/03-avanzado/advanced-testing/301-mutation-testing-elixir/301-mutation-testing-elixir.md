@@ -96,6 +96,8 @@ end
 
 ### Step 1: the module under test
 
+**Objective**: Express discount tiers as guarded clauses with integer-cent arithmetic so each branch becomes a distinct mutation target with an exact expected value.
+
 ```elixir
 # lib/discount_engine/rules.ex
 defmodule DiscountEngine.Rules do
@@ -127,6 +129,8 @@ end
 
 ### Step 2: weak tests (the "before")
 
+**Objective**: Write coverage-only assertions like `result > 0` so mutants at boundaries and boolean flips visibly survive — evidence that line coverage lies.
+
 These are tests written with coverage in mind but not mutation resilience. Each passes
 on the original code but survives at least one common mutant.
 
@@ -154,6 +158,8 @@ end
 ```
 
 ### Step 3: strong tests that kill mutants
+
+**Objective**: Assert exact values at 499/500/999/1000 boundaries and both member flags so ROR, COR, AOR, and SDL mutants all die.
 
 ```elixir
 # test/discount_engine/rules_test.exs
@@ -228,6 +234,8 @@ end
 
 ### Step 4: the manual mutation workflow
 
+**Objective**: Codify a one-operator-at-a-time edit-test-revert loop so mutation discipline becomes a repeatable PR ritual, not an ad-hoc intuition.
+
 ```
 1. Pick a critical module (`lib/discount_engine/rules.ex`).
 2. Pick an operator from the catalogue (e.g., ROR).
@@ -261,6 +269,21 @@ See Step 3.
 The cost is human time, not wall-clock. One mutation + test run = ~5 seconds of CPU,
 but ~1 minute of reading and editing. Target: review 5 mutations per module per PR
 that touches the module.
+
+## Deep Dive: Mutation Patterns and Production Implications
+
+Mutation testing modifies your code and re-runs tests; if a test still passes, you've found a gap in your assertions. It's a powerful way to find weak tests that don't actually verify behavior. The cost is execution time—mutation testing can take 10–100× longer than normal tests. Production bugs from insufficient test coverage are real; mutation testing forces rigor by exposing dead assertions.
+
+---
+
+## Advanced Considerations
+
+Production testing strategies require careful attention to resource management and test isolation across multiple concurrent test processes. In large codebases, tests can consume significant memory and CPU resources, especially when using concurrent testing without proper synchronization and cleanup. The BEAM scheduler's preemptive nature means test processes may interfere with each other if shared resources aren't properly isolated at the process boundary. Pay careful attention to how Ecto's sandbox mode interacts with your supervision tree — if you have GenServers that hold state across tests, the sandbox rollback mechanism may leave phantom processes in your monitoring systems that continue consuming resources until forced cleanup occurs.
+
+When scaling tests to production-grade test suites, consider the cost of stub verification and the memory overhead of generated test cases. Each property-based test invocation can create thousands of synthetic test cases, potentially causing garbage collection pressure that's invisible during local testing but becomes critical in CI/CD pipelines running long test suites continuously. The interaction between concurrent tests and ETS tables (often used in caches and registry patterns) requires explicit `inherited: true` options to prevent unexpected sharing between test processes, which can cause mysterious failures when tests run in different orders or under load.
+
+For distributed testing scenarios using tools like `Peer`, network simulation can mask real latency issues and failure modes. Test timeouts that work locally may fail in CI due to scheduler contention and GC pauses. Always include substantial buffers for timeout values and monitor actual execution times under load. The coordination between multiple test nodes requires careful cleanup — a failure in test coordination can leave zombie processes consuming resources indefinitely. Implement proper telemetry hooks within your test helpers to diagnose production-like scenarios and capture performance characteristics.
+
 
 ## Trade-offs and production gotchas
 
@@ -302,3 +325,13 @@ cost of classifying it higher than the value of the answer?
 - [Stryker (JS)](https://stryker-mutator.io/) — comparable concepts
 - [Offutt & Untch — "Mutation 2000" survey](https://cs.gmu.edu/~offutt/rsrch/papers/mut-survey.pdf)
 - [Excoveralls](https://github.com/parroty/excoveralls) — pair coverage with this discipline
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

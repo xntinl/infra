@@ -88,7 +88,57 @@ defmodule UiKit.MixProject do
 end
 ```
 
+### Dependencies (mix.exs)
+
+```elixir
+```elixir
+JS.push("save", value: %{form_id: "signup"}) |> JS.hide(to: "#modal")
+```
+
+The client executes: (1) send `save` event with the value, (2) hide the modal. The hide is optimistic — it happens before the server replies. If the server crashes the event, the UI is already closed.
+
+### 4. `JS.transition`
+
+Adds a class for the duration of the animation, then removes it. Pairs with Tailwind classes like `transition-all duration-200`.
+
+### 5. `JS.exec`
+
+Fires another element's `data-show`, `data-hide`, etc. Useful for "clicking outside closes modal" — register `phx-click-away={JS.exec("data-cancel", to: "#modal")}`.
+
+## Design decisions
+
+- **Option A — all round trips to the server**: simplest, works offline. Cost: UI lag on every click.
+- **Option B — custom Alpine components**: fast, but dual state model.
+- **Option C — `Phoenix.LiveView.JS` for purely-client ops**: client-only for show/hide/toggle, server round trip only when state changes. One language, one mental model.
+
+Chosen: Option C. Reserve round trips for operations that need server authority (save, delete, mutation of `:assign`).
+
+## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defmodule UiKit.MixProject do
+  use Mix.Project
+  def project, do: [app: :ui_kit, version: "0.1.0", elixir: "~> 1.16", deps: deps()]
+  def application, do: [extra_applications: [:logger]]
+
+  defp deps do
+    [
+      {:phoenix, "~> 1.7.14"},
+      {:phoenix_live_view, "~> 1.0"},
+      {:phoenix_html, "~> 4.1"},
+      {:jason, "~> 1.4"},
+      {:plug_cowboy, "~> 2.7"},
+      {:floki, "~> 0.36", only: :test}
+    ]
+  end
+end
+```
+
 ### Step 1: The LiveView — `lib/ui_kit_web/live/gallery_live.ex`
+
+**Objective**: Compose `Phoenix.LiveView.JS` commands server-side so modal, tab, and focus transitions run on the client without a socket round-trip.
 
 ```elixir
 defmodule UiKitWeb.GalleryLive do
@@ -235,6 +285,23 @@ IO.puts("render time: #{us}µs, iodata bytes: #{bytes}")
 ```
 
 **Expected**: render < 200µs, iodata < 4 KB. If you see > 20 KB, you are probably embedding the same `JS` command in a loop — extract it to a partial.
+
+## Advanced Considerations: LiveView Real-Time Patterns and Pubsub Scale
+
+LiveView bridges the browser and BEAM via WebSocket, allowing server-side renders to push incremental DOM diffs to the client. A LiveView process is long-lived, receiving events (clicks, form submissions) and broadcasting updates. For real-time features (collaborative editing, live notifications), LiveView processes subscribe to PubSub topics and receive broadcast messages.
+
+Phoenix.PubSub partitions topics across a pool of processes, allowing horizontal scaling. By default, `:local` mode uses in-memory ETS; `:redis` mode distributes across nodes via Redis. At scale (thousands of concurrent LiveViews), topic fanout can bottleneck: broadcasting to a million subscribers means delivering one million messages. The BEAM handles this, but the network cost matters on multi-node deployments.
+
+`Presence` module tracks which users are viewing which pages, syncing state via PubSub. A presence join/leave is broadcast to all nodes, allowing real-time "who's online" updates. Under partition, presence state can diverge; the library uses unique presence keys to detect and reconcile. Operationally, watching presence on every page load can amplify server load if users are flaky (mobile networks, browser reloads). Consider presence only for features where it's user-facing (collaborative editors, live sports scoreboards).
+
+---
+
+
+## Deep Dive: Phoenix Patterns and Production Implications
+
+Phoenix's conn struct represents an HTTP request/response in flight, accumulating transformations through middleware and handler code. Testing a Phoenix endpoint end-to-end (not just the controller) catches middleware order bugs, header mismatches, and plug composition issues. The trade-off is that full integration tests are slower and harder to parallelize than unit tests. Production bugs in auth, CORS, or session handling are often due to middleware assumptions that live tests reveal.
+
+---
 
 ## Trade-offs and production gotchas
 

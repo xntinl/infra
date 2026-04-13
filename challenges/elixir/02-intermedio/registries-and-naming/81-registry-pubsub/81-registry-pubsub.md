@@ -99,9 +99,28 @@ transforms applied before `send/2`. For a starter pubsub, pass `nil`.
 
 ---
 
+### Dependencies (`mix.exs`)
+
+```elixir
+def deps do
+  [
+    {DOWN},
+    {broadcast},
+    {exunit},
+    {got},
+    {ok},
+    {pubsub},
+    {rabbitmq},
+    {ready},
+  ]
+end
+```
 ## Implementation
 
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
 
 ```bash
 mix new local_pubsub --sup
@@ -109,6 +128,9 @@ cd local_pubsub
 ```
 
 ### Step 2: `lib/local_pubsub/application.ex`
+
+**Objective**: Wire `application.ex` to start the supervision tree that starts the Registry before any via-tuple lookup can happen.
+
 
 ```elixir
 defmodule LocalPubsub.Application do
@@ -129,6 +151,9 @@ end
 ```
 
 ### Step 3: `lib/local_pubsub.ex`
+
+**Objective**: Implement `local_pubsub.ex` — the naming/lookup strategy that decides how processes are addressed under concurrency and failure.
+
 
 ```elixir
 defmodule LocalPubsub do
@@ -202,6 +227,9 @@ end
 ```
 
 ### Step 4: `test/local_pubsub_test.exs`
+
+**Objective**: Write `local_pubsub_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
 
 ```elixir
 defmodule LocalPubsubTest do
@@ -287,6 +315,9 @@ end
 
 ### Step 5: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -296,6 +327,14 @@ mix test
 `Registry` in `:duplicate` mode is a multi-map keyed by topic, stored in read-concurrent ETS and maintained by a monitor on every subscriber pid. `dispatch/3` walks the partition's entries and runs the fan-out callback without holding a lock on the registry, so the publisher never blocks registrations or other publishes. Because the subscriber pid is the unit of identity, dead subscribers are reaped without any bookkeeping on your part.
 
 ---
+
+
+## Key Concepts: Pub-Sub via Registry
+
+`Registry` supports pub-sub patterns: processes can subscribe to topics, and senders broadcast messages to all subscribers without knowing who they are. This decouples producers from consumers.
+
+Example: a cache can publish `:cache_invalidated` events, and any interested process subscribes. When the cache is cleared, all subscribers receive a message. The gotcha: `Registry` is local to a node; for distributed pub-sub, use `Phoenix.PubSub` or external brokers (Redis, RabbitMQ).
+
 
 ## Benchmark
 
@@ -370,3 +409,15 @@ node, wrong for anything else.
 - [`Registry.dispatch/3`](https://hexdocs.pm/elixir/Registry.html#dispatch/4)
 - [`Phoenix.PubSub`](https://hexdocs.pm/phoenix_pubsub/Phoenix.PubSub.html) — what you want when local is not enough
 - [José Valim — "Announcing Registry" (blog)](https://dashbit.co/blog/whats-new-in-elixir-1-4)
+
+
+## Key Concepts
+
+Registry patterns in Elixir provide distributed name resolution through a central registry process. Unlike traditional naming services, Elixir registries are per-node by default but can be partitioned globally. Process name resolution follows a lookup chain: local registry → distributed registry (if configured) → `:global` → fallback mechanisms.
+
+**Critical concepts:**
+- **Via tuple pattern** `{:via, module, name}`: Enables pluggable naming backends. The registry module intercepts `:whereis`, `:register`, `:unregister` calls, allowing both local and distributed strategies.
+- **Partitioned registries** (`Registry.start_link(partitions: 8)`): Reduce contention by sharding the registry across multiple ETS tables. Each partition handles independent name lookups, improving throughput under high concurrency.
+- **Clustering implications**: Global registries across nodes require consensus. Elixir's registry design favors availability (CAP theorem) — a node can register locally and replicate asynchronously. This is why `:global` exists separately from local registries.
+
+**Senior-level gotcha**: Mixing local and global registration without explicit sync logic can cause "phantom" processes — a process registered locally appears available to local callers but fails remote calls. Always make registry scope explicit in your architecture.

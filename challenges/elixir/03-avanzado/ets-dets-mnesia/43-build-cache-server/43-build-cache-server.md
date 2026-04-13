@@ -2,15 +2,12 @@
 
 **Project**: `cache_server_full` — a production-grade in-memory cache with TTL, approximate LRU eviction, telemetry hooks, and optional sharding across N tables.
 
-**Difficulty**: ★★★★☆
-**Estimated time**: 3–6 hours
-
 ---
 
 ## Project context
 
-Across the previous ETS exercises you've seen each technique in isolation: concurrent flags (16),
-counter primitives (20), cache patterns (19). This is the capstone where you assemble them into
+This is the capstone ETS exercise where you assemble multiple cache techniques (concurrent flags,
+counter primitives, LRU eviction patterns) into
 a single component that a real service could depend on.
 
 The goal: a `CacheServer.start_link/1` that accepts `max_size`, `ttl_ms`, `shards`, and a
@@ -35,6 +32,12 @@ cache_server_full/
 │   └── cache_test.exs
 └── mix.exs
 ```
+
+---
+
+## Why building a cache and not importing one
+
+Cache semantics are where correctness bugs hide. Building one end-to-end forces engagement with each subtlety — TTL precision, stampede, negative caching — that a library would hide.
 
 ---
 
@@ -86,9 +89,78 @@ You can, and usually should. Building it yourself is valuable for:
 
 ---
 
+## Design decisions
+
+**Option A — library (Cachex, Nebulex)**
+- Pros: solved problem; battle-tested; feature-complete.
+- Cons: learning by using, not by understanding.
+
+**Option B — build your own on ETS + Supervisor** (chosen)
+- Pros: full understanding of every trade-off; tailored to the exact use case.
+- Cons: all the subtleties (TTL, stampede, eviction) are now yours.
+
+→ Chose **B** because for learning, building is the point; in production pick the library unless you have a measured reason.
+
+---
+
 ## Implementation
 
 ### Step 1: `mix.exs`
+
+**Objective**: Pin `:telemetry` for hit/miss/eviction events and `:benchee` dev-only to measure shard scaling.
+
+```elixir
+defmodule CacheServerFull.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :cache_server_full, version: "0.1.0", elixir: "~> 1.16", deps: deps()]
+  end
+
+  def application, do: [extra_applications: [:logger], mod: {CacheServerFull.Application, []}]
+
+  defp deps do
+    [{:telemetry, "~> 1.2"}, {:benchee, "~> 1.3", only: [:dev, :test]}]
+  end
+end
+```
+
+### Dependencies (mix.exs)
+
+```elixir
+```elixir
+:telemetry.attach("my-cache", [:cache_server_full, :get], &handler/4, nil)
+```
+
+### 5. Why not just use Cachex or Nebulex?
+
+You can, and usually should. Building it yourself is valuable for:
+
+- Pedagogy: understanding what those libraries actually do.
+- Smaller dependency surface when the requirements are narrow.
+- Custom telemetry or event schemas those libraries don't expose.
+
+---
+
+## Design decisions
+
+**Option A — library (Cachex, Nebulex)**
+- Pros: solved problem; battle-tested; feature-complete.
+- Cons: learning by using, not by understanding.
+
+**Option B — build your own on ETS + Supervisor** (chosen)
+- Pros: full understanding of every trade-off; tailored to the exact use case.
+- Cons: all the subtleties (TTL, stampede, eviction) are now yours.
+
+→ Chose **B** because for learning, building is the point; in production pick the library unless you have a measured reason.
+
+---
+
+## Implementation
+
+### Step 1: `mix.exs`
+
+**Objective**: Pin `:telemetry` for hit/miss/eviction events and `:benchee` dev-only to measure shard scaling.
 
 ```elixir
 defmodule CacheServerFull.MixProject do
@@ -107,6 +179,8 @@ end
 ```
 
 ### Step 2: `lib/cache_server_full/application.ex`
+
+**Objective**: Size shards to `schedulers_online` and wire TTL + max_size via child args so the cache is tuneable per release.
 
 ```elixir
 defmodule CacheServerFull.Application do
@@ -127,6 +201,8 @@ end
 ```
 
 ### Step 3: `lib/cache_server_full/shard.ex`
+
+**Objective**: Create one `:public` ETS shard with `write_concurrency: :auto` so direct readers/writers bypass the GenServer owner.
 
 ```elixir
 defmodule CacheServerFull.Shard do
@@ -150,6 +226,8 @@ end
 
 ### Step 4: `lib/cache_server_full/telemetry.ex`
 
+**Objective**: Implement the module in `lib/cache_server_full/telemetry.ex`.
+
 ```elixir
 defmodule CacheServerFull.Telemetry do
   @moduledoc false
@@ -162,6 +240,8 @@ end
 ```
 
 ### Step 5: `lib/cache_server_full/cache.ex`
+
+**Objective**: Implement the module in `lib/cache_server_full/cache.ex`.
 
 ```elixir
 defmodule CacheServerFull.Cache do
@@ -280,6 +360,8 @@ end
 
 ### Step 6: `lib/cache_server_full/janitor.ex`
 
+**Objective**: Implement the module in `lib/cache_server_full/janitor.ex`.
+
 ```elixir
 defmodule CacheServerFull.Janitor do
   @moduledoc """
@@ -376,6 +458,8 @@ end
 
 ### Step 7: `test/cache_test.exs`
 
+**Objective**: Write tests in `test/cache_test.exs` covering behavior and edge cases.
+
 ```elixir
 defmodule CacheServerFull.CacheTest do
   use ExUnit.Case, async: false
@@ -462,10 +546,16 @@ end
 
 ### Step 8: Run it
 
+**Objective**: Exercise the implementation end-to-end in IEx or the shell.
+
 ```bash
 mix deps.get
 mix test --trace
 ```
+
+### Why this works
+
+A cache server is an ETS table, a supervisor that owns it, a TTL sweeper, and a stampede protection strategy. Each piece is small; the interaction between them is what matters.
 
 ---
 
@@ -488,6 +578,24 @@ Benchee.run(
 ```
 
 Expected: with `shards: 12` on a 12-core box, sustained put throughput ≈ 8–12 M ops/s.
+
+---
+
+## Deep Dive
+
+ETS (Erlang Term Storage) is RAM-only and process-linked; table destruction triggers if the owner crashes, causing silent data loss in careless designs. Match specifications (match_specs) are micro-programs that filter/transform data at the C layer, orders of magnitude faster than fetching all records and filtering in Elixir. Mnesia adds disk persistence and replication but introduces transaction overhead and deadlock potential; dirty operations bypass locks for speed but sacrifice consistency guarantees. For caching, named tables (public by design) are globally visible but require careful name management; consider ETS sharding (multiple small tables) to reduce lock contention on hot keys. DETS (Disk ETS) persists to disk but is single-process bottleneck and slower than a real database. At scale, prefer ETS for in-process state and Mnesia/PostgreSQL for shared, persistent data.
+## Advanced Considerations
+
+ETS and DETS performance characteristics change dramatically based on access patterns and table types. Ordered sets provide range queries but slower access than hash tables; set types don't support duplicate keys while bags do. The `heir` option for ETS tables is essential for fault tolerance — when a table owner crashes, the heir process can take ownership and prevent data loss. Without it, the table is lost immediately. Mnesia replicates entire tables across nodes; choosing which nodes should have replicas and whether they're RAM or disk replicas affects both consistency guarantees and network traffic during cluster operations.
+
+DETS persistence comes with significant performance implications — writes are synchronous to disk by default, creating latency spikes. Using `sync: false` improves throughput but risks data loss on crashes. The maximum DETS table size is limited by available memory and the file system; planning capacity requires understanding your growth patterns. Mnesia's transaction system provides ACID guarantees, but dirty operations bypass these guarantees for performance. Understanding when to use dirty reads versus transactional reads significantly impacts both correctness and latency.
+
+Debugging ETS and DETS issues is challenging because problems often emerge under load when many processes contend for the same table. Table memory fragmentation is invisible to code but can exhaust memory. Using match specs instead of iteration over large tables can dramatically improve performance but requires careful construction. The interaction between ETS, replication, and distributed systems creates subtle consistency issues — a node with a stale ETS replica can serve incorrect data during network partitions. Always monitor table sizes and replication status with structured logging.
+
+
+## Deep Dive: Etsdets Patterns and Production Implications
+
+ETS tables are in-memory, non-distributed key-value stores with tunable semantics (ordered_set, duplicate_bag). Under concurrent read/write load, ETS table semantics matter: bag semantics allow fast appends but slow deletes; ordered_set allows range queries but slower inserts. Testing ETS behavior under concurrent load is non-trivial; single-threaded tests miss lock contention. Production ETS tables often fail under load due to concurrency assumptions that quiet tests don't exercise.
 
 ---
 
@@ -517,6 +625,13 @@ for anything that mutates.
 **7. When NOT to use this.** If you need distributed caching across a cluster, this is the wrong
 shape. Use `:pg`/`Phoenix.PubSub` for invalidation, Cachex's distributed mode, or an external
 Redis.
+
+---
+
+## Reflection
+
+- At 100k QPS, does your hand-built cache beat a library, or have you accidentally rebuilt a worse version? How would you measure?
+- Which feature of a real production cache did you skip, and how would you notice in production that you needed it?
 
 ---
 

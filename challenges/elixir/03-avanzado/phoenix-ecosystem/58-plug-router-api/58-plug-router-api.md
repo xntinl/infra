@@ -56,9 +56,78 @@ If you declare the dynamic route first, `GET /services/health` will be captured 
 
 ---
 
+## Why Plug.Router and not Phoenix
+
+Phoenix is a framework; Plug.Router is a routing macro. For a service whose entire surface is a dozen endpoints, Phoenix adds concepts you do not use.
+
+---
+
+## Design decisions
+
+**Option A — full Phoenix**
+- Pros: batteries included; controllers, views, templates, channels.
+- Cons: overkill for a small JSON API; bigger supervision tree and compile surface.
+
+**Option B — Plug.Router directly** (chosen)
+- Pros: minimal; a few hundred lines runs a real API; faster to boot.
+- Cons: you rebuild any Phoenix convenience you need; less familiar to Phoenix developers.
+
+→ Chose **B** because for a genuinely small API — webhooks, health checks, internal services — Plug.Router is right-sized.
+
+---
+
 ## Implementation
 
 ### Step 1: `mix.exs` — dependencies
+
+**Objective**: Build the mix.exs layer: dependencies.
+
+```elixir
+defp deps do
+  [
+    {:plug_cowboy, "~> 2.7"},
+    {:jason, "~> 1.4"}
+  ]
+end
+```
+
+### Dependencies (mix.exs)
+
+```elixir
+```elixir
+get "/services/health"  # specific — must come before the dynamic route
+get "/services/:name"   # matches anything, including "health"
+```
+
+If you declare the dynamic route first, `GET /services/health` will be captured by `get "/services/:name"` with `conn.path_params["name"] == "health"`.
+
+---
+
+## Why Plug.Router and not Phoenix
+
+Phoenix is a framework; Plug.Router is a routing macro. For a service whose entire surface is a dozen endpoints, Phoenix adds concepts you do not use.
+
+---
+
+## Design decisions
+
+**Option A — full Phoenix**
+- Pros: batteries included; controllers, views, templates, channels.
+- Cons: overkill for a small JSON API; bigger supervision tree and compile surface.
+
+**Option B — Plug.Router directly** (chosen)
+- Pros: minimal; a few hundred lines runs a real API; faster to boot.
+- Cons: you rebuild any Phoenix convenience you need; less familiar to Phoenix developers.
+
+→ Chose **B** because for a genuinely small API — webhooks, health checks, internal services — Plug.Router is right-sized.
+
+---
+
+## Implementation
+
+### Step 1: `mix.exs` — dependencies
+
+**Objective**: Build the mix.exs layer: dependencies.
 
 ```elixir
 defp deps do
@@ -70,6 +139,8 @@ end
 ```
 
 ### Step 2: `lib/api_gateway/service_store.ex`
+
+**Objective**: Implement the module in `lib/api_gateway/service_store.ex`.
 
 ```elixir
 defmodule ApiGateway.ServiceStore do
@@ -111,6 +182,8 @@ end
 ```
 
 ### Step 3: `lib/api_gateway/router.ex`
+
+**Objective**: Implement the module in `lib/api_gateway/router.ex`.
 
 ```elixir
 defmodule ApiGateway.Router do
@@ -218,6 +291,8 @@ The `get "/logs/stream"` route demonstrates chunked transfer encoding. `send_chu
 
 ### Step 4: Given tests — must pass without modification
 
+**Objective**: Build the given tests layer: must pass without modification.
+
 ```elixir
 # test/api_gateway/router_test.exs
 defmodule ApiGateway.RouterTest do
@@ -305,9 +380,15 @@ end
 
 ### Step 5: Run tests
 
+**Objective**: Run tests.
+
 ```bash
 mix test test/api_gateway/router_test.exs --trace
 ```
+
+### Why this works
+
+`Plug.Router` is itself a plug. It pattern-matches on method and path, binds params, and dispatches to a handler function. Plug pipelines, JSON serialization, and auth all compose the same way they do in Phoenix.
 
 ---
 
@@ -342,6 +423,46 @@ Without `match _`, Plug.Router raises `Plug.Router.NoRouteError` for unmatched p
 
 **5. Not handling `{:error, :closed}` in chunked responses**
 If the client disconnects mid-stream, `chunk/2` returns `{:error, :closed}`. Ignoring this causes a crash in the process handling that request. Use `Enum.reduce_while/3` to stop cleanly on the first `:closed` error.
+
+---
+
+## Benchmark
+
+```elixir
+# :timer.tc / Benchee measurement sketch
+{time_us, _} = :timer.tc(fn -> :ok end)
+IO.puts("elapsed: #{time_us} us")
+```
+
+Target: Plug.Router dispatch overhead under 20 us; boot time under 1 s for a simple API.
+
+---
+
+## Deep Dive: Plug Pipeline Architecture and Composition
+
+The power of Plug comes from its pipeline model: each request flows through a chain of plugs, where each plug is a function receiving and returning a `Conn`. This model scales from simple routers to complex middleware stacks. Understanding the implicit contract — that a plug must always return a conn, whether modified or not — is key to debugging pipeline issues. When a request vanishes midway (no response sent, no error raised), the culprit is usually a plug that doesn't explicitly return the conn or halts the pipeline without being responsible for sending the response.
+
+The `Plug.Router.match/1` and `Plug.Router.dispatch/1` plugs are themselves composed into a pipeline. Match runs first, pattern-matching the request against declared routes and binding path parameters into `conn.path_params`. If no route matches, the `NoRouteError` is raised (unless caught by a catch-all route). Dispatch runs after body parsing and calls the matched handler. This separation means you can insert plugs between match and dispatch (like authentication or rate limiting) that run for all routes, or conditionally based on the matched route.
+
+The route-ordering gotcha — specific routes must come before dynamic routes — becomes clear once you understand that Plug.Router compiles routes into a single function with pattern-matched clauses. The first matching clause wins; Plug.Router cannot reorder for you. This is a blessing for performance (route matching is O(1) at runtime, compile-time ordered dispatch) but a curse for maintainability if you're not careful with declaration order.
+
+---
+
+## Advanced Considerations: LiveView Real-Time Patterns and Pubsub Scale
+
+LiveView bridges the browser and BEAM via WebSocket, allowing server-side renders to push incremental DOM diffs to the client. A LiveView process is long-lived, receiving events (clicks, form submissions) and broadcasting updates. For real-time features (collaborative editing, live notifications), LiveView processes subscribe to PubSub topics and receive broadcast messages.
+
+Phoenix.PubSub partitions topics across a pool of processes, allowing horizontal scaling. By default, `:local` mode uses in-memory ETS; `:redis` mode distributes across nodes via Redis. At scale (thousands of concurrent LiveViews), topic fanout can bottleneck: broadcasting to a million subscribers means delivering one million messages. The BEAM handles this, but the network cost matters on multi-node deployments.
+
+`Presence` module tracks which users are viewing which pages, syncing state via PubSub. A presence join/leave is broadcast to all nodes, allowing real-time "who's online" updates. Under partition, presence state can diverge; the library uses unique presence keys to detect and reconcile. Operationally, watching presence on every page load can amplify server load if users are flaky (mobile networks, browser reloads). Consider presence only for features where it's user-facing (collaborative editors, live sports scoreboards).
+
+---
+
+
+## Reflection
+
+- Your Plug.Router app accidentally grows to 40 endpoints and needs LiveView. Is migrating to Phoenix cheaper now or when it reaches 80 endpoints? What is the migration path?
+- If you need channels, have you rebuilt Phoenix poorly, or is there a Plug-only real-time story that fits?
 
 ---
 

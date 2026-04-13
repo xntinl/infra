@@ -2,15 +2,22 @@
 
 **Project**: `defdelegate_custom` — write your own `defproxy/2` macro that emits a proxy function identical to `defdelegate`, plus automatic `:telemetry` spans and optional circuit-breaker hooks.
 
-**Difficulty**: ★★★★☆
-**Estimated time**: 3–5 hours
-
 ---
 
 ## Project context
 
 Your team relies heavily on `defdelegate/2` — a clean way to re-export functions from
 another module:
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
 
 ```elixir
 defmodule MyApp.API do
@@ -46,6 +53,12 @@ defdelegate_custom/
 │   └── proxy_macro_test.exs
 └── mix.exs
 ```
+
+---
+
+## Why a macro and not hand-written wrappers
+
+Hand wrappers work for five functions; past that they rot. A macro emits identical `def` clauses with the target's `@spec` interpolated, so adding a delegate is one line and there is no wrapper-vs-target skew to chase.
 
 ---
 
@@ -88,9 +101,25 @@ lets you avoid writing this yourself.
 
 ---
 
+## Design decisions
+
+**Option A — hand-written wrapper functions**
+- Pros: explicit, trivially debuggable stacktraces; easy to add logging or arg transformation.
+- Cons: repetitive; drift between wrapper and target; no introspection.
+
+**Option B — custom `defdelegate`-style macro** (chosen)
+- Pros: single source of truth, compile-time spec propagation, metadata available for docs.
+- Cons: opaque stacktraces if unwrapped; macro machinery to maintain.
+
+→ Chose **B** because the delegation table is long and mechanical; the macro keeps signatures and specs in lockstep.
+
+---
+
 ## Implementation
 
 ### Step 1: `lib/defdelegate_custom/telemetry_helpers.ex`
+
+**Objective**: Expose event_name/2 and span/3 so defproxy macro dispatches telemetry spans with normalized names.
 
 ```elixir
 defmodule DefdelegateCustom.TelemetryHelpers do
@@ -120,6 +149,8 @@ end
 ```
 
 ### Step 2: `lib/defdelegate_custom/proxy_macro.ex`
+
+**Objective**: Emit defproxy/2 macro that wraps target calls in telemetry.span for transparent start/stop/exception events.
 
 ```elixir
 defmodule DefdelegateCustom.ProxyMacro do
@@ -181,6 +212,8 @@ end
 
 ### Step 3: Example usage
 
+**Objective**: Define sample target module and proxied API so users can trace forwarded function calls ergonomically.
+
 ```elixir
 defmodule DefdelegateCustom.Sample.Users do
   @moduledoc false
@@ -199,6 +232,8 @@ end
 ```
 
 ### Step 4: Tests
+
+**Objective**: Assert start/stop telemetry events fire, result tags match outcomes, and exceptions propagate with :exception events.
 
 ```elixir
 defmodule DefdelegateCustom.ProxyMacroTest do
@@ -270,6 +305,27 @@ defmodule DefdelegateCustom.ProxyMacroTest do
 end
 ```
 
+### Why this works
+
+The macro captures the target `{mod, fun, arity}` at compile time and emits a `def` clause whose body is a direct remote call. The clause is a normal Elixir function — it appears in stacktraces, supports `@doc` and `@spec`, and is optimized like any other function.
+
+---
+
+## Advanced Considerations: Macro Hygiene and Compile-Time Validation
+
+Macros execute at compile time, walking the AST and returning new AST. That power is easy to abuse: a macro that generates variables can shadow outer scope bindings, or a quote block that references variables directly can fail if the macro is used in a context where those variables don't exist. The `unquote` mechanism is the escape hatch, but misusing it leads to hard-to-debug compile errors.
+
+Macro hygiene is about capturing intent correctly. A `defmacro` that takes `:my_option` and uses it directly might match an unrelated `:my_option` from the caller's scope. The idiomatic pattern is to use `unquote` for values that should be "from the outside" and keep AST nodes quoted for safety. The `quote` block's binding of `var!` and `binding!` provides escape valves for the rare case when shadowing is intentional.
+
+Compile-time validation unlocks errors that would otherwise surface at runtime. A macro can call functions to validate input, generate code conditionally, or fail the build with `IO.warn`. Schema libraries like `Ecto` and `Ash` use macros to define fields at compile time, so runtime queries are guaranteed type-safe. The cost is cognitive load: developers must reason about both the code as written and the code generated.
+
+---
+
+
+## Deep Dive: Metaprogramming Patterns and Production Implications
+
+Metaprogramming (macros, AST manipulation) requires testing at compile time and runtime. The challenge is that macro tests often involve parsing and expanding code, which couples tests to compiler internals. Production bugs in macros can corrupt entire modules; testing macros rigorously is non-negotiable.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -319,6 +375,13 @@ Benchee.run(%{
 ```
 
 Expect ~100–200 ns overhead for the proxy when no handlers are attached.
+
+---
+
+## Reflection
+
+- If your delegate needs to log every call or translate error shapes, do you still keep the macro form, or fall back to explicit wrappers? Where is the line?
+- A teammate argues that `defdelegate` hides the real implementation and makes code harder to read. How do you answer with evidence from your benchmark and stacktraces?
 
 ---
 

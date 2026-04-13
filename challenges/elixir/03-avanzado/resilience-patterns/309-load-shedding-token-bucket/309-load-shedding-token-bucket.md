@@ -75,6 +75,16 @@ Each tier is an independent token bucket. If the low bucket is empty but high is
 
 ### Dependencies (`mix.exs`)
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
+
 ```elixir
 defmodule EdgeShedder.MixProject do
   use Mix.Project
@@ -85,6 +95,8 @@ end
 ```
 
 ### Step 1: Bucket (`lib/edge_shedder/bucket.ex`)
+
+**Objective**: Use :atomics + compare_exchange for lock-free lazy refill so 50k req/s admission checks never serialize on GenServer mailbox or mutex.
 
 ```elixir
 defmodule EdgeShedder.Bucket do
@@ -162,6 +174,8 @@ end
 
 ### Step 2: Shedder (`lib/edge_shedder/shedder.ex`)
 
+**Objective**: Store per-priority buckets in :persistent_term so admit?/1 reads zero-copy and low-priority class sheds before medium/high during congestion.
+
 ```elixir
 defmodule EdgeShedder.Shedder do
   alias EdgeShedder.Bucket
@@ -198,6 +212,8 @@ end
 ```
 
 ### Step 3: Application wiring
+
+**Objective**: Parameterize capacity and refill_per_second per priority tier so operators adjust shedding thresholds via config without recompilation.
 
 ```elixir
 defmodule EdgeShedder.Application do
@@ -300,6 +316,23 @@ Benchee.run(
 ```
 
 Expected: p99 < 500ns, parallel scaling close to linear. If > 2µs you are hitting a lock — verify `:persistent_term` hasn't been rewritten at runtime (triggers global GC which stalls readers).
+
+## Advanced Considerations: Circuit Breakers and Bulkheads in Production
+
+A circuit breaker monitors downstream service health and rejects new requests when failures exceed a threshold, failing fast instead of queuing indefinitely. States: `:closed` (normal), `:open` (fast-fail), `:half_open` (testing recovery). A timeout-based pattern monitors; once requests succeed again, the circuit closes. Half-open tests with a single request; if it succeeds, all requests resume.
+
+Bulkheads isolate resource pools so one slow endpoint doesn't starve others. A GenServer pool with a bounded queue (e.g., `:queue.len(state) >= 100`) can return `{:error, :overloaded}` immediately, preventing queue buildup. Combined with exponential backoff on the client (caller retries with increasing delays), this creates a natural circuit breaker behavior without explicit state.
+
+Graceful degradation means serving stale data or reduced functionality when a service is slow. A cached value with a 5-minute TTL is acceptable for many reads; serve it if the live source is timing out. Feature flags allow disabling expensive operations at runtime. Cascading timeout windows (outer service times out after 5s, inner calls must complete in 3s) prevent unbounded waiting. The cost is complexity: tracking degradation modes, testing failure scenarios, and ensuring data consistency under partial failures.
+
+---
+
+
+## Deep Dive: Resilience Patterns and Production Implications
+
+Resilience patterns (circuit breakers, timeouts, retries) are easy to implement but hard to test. The insight is that resilience patterns must be tested under failure: timeouts matter only when calls actually take time, retries matter only when transient failures occur. Production systems with untested resilience patterns often fail gracefully in test and catastrophically in production.
+
+---
 
 ## Trade-offs and production gotchas
 

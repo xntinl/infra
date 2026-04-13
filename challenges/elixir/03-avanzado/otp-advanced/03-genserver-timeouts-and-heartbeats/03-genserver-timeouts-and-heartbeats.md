@@ -125,8 +125,101 @@ defp deps do
 end
 ```
 
+### Dependencies (mix.exs)
+
+```elixir
+```elixir
+def handle_cast(:touch, state) do
+  {:noreply, state, @idle_ms}       # arm
+end
+
+def handle_info(:timeout, state) do  # fires if mailbox is silent for @idle_ms
+  {:stop, :idle, state}
+end
+```
+
+OTP stores the timeout internally; it is not a `Process.send_after` call. Every subsequent callback either re-arms it (by including a timeout in the return) or disables it (by omitting it). No refs, no leaks.
+
+### 2. Why the 5th-element timeout is not a heartbeat
+
+If *any* message arrives — a telemetry probe, a debug ping, a spurious `:DOWN` from an unrelated monitor — the timeout resets. The process thinks it is "active" even though no real work has occurred. You need a separate mechanism that measures peer liveness, not mailbox activity.
+
+```
+mailbox:  [:noise, :noise, :noise, :noise, :noise, ...]
+           ↑ resets timeout every time, even though the peer is dead
+```
+
+### 3. Heartbeat pattern
+
+```
+ t0   ──send(:ping, peer)──▶ peer
+       schedule_after(:pong_deadline, @pong_ms)
+ t1                          ◀── pong(t0)
+       cancel :pong_deadline
+       schedule_after(:send_ping, @ping_ms)
+ ...
+```
+
+A separate `:pong_deadline` timer fires only if the peer does not respond within `@pong_ms`. The `:send_ping` timer triggers the next ping after `@ping_ms`. Two timers; `Process.cancel_timer/2` cleans up the deadline when a pong arrives.
+
+### 4. Interaction with the 5th-element timeout
+
+This is where most implementations break. If you return `{:noreply, state, @idle_ms}` after every heartbeat-related callback, the heartbeat traffic itself resets the inactivity timer and the process never dies from client inactivity. The fix is to separate concerns: use the heartbeat to kill on peer silence, and use the 5th-element timeout only for a truly orthogonal condition (e.g. "no client-initiated action in 30 min" vs. "no pong in 10 s").
+
+### 5. `Process.cancel_timer/2` semantics
+
+`Process.cancel_timer/2` returns the milliseconds remaining or `false` if the timer already fired. If it already fired, the message is sitting in the mailbox. You must consume it:
+
+```elixir
+case Process.cancel_timer(ref) do
+  false ->
+    receive do
+      :pong_deadline -> :ok
+    after
+      0 -> :ok
+    end
+  _remaining -> :ok
+end
+```
+
+Without the flush, a stale `:pong_deadline` fires after you thought you had cancelled it and the session dies for the wrong reason.
+
+---
+
+## Why heartbeats and not TCP keepalive
+
+Linux TCP keepalive defaults to 2 h idle + 75 s interval × 9 probes — detection lag exceeds two hours. Tuning keepalive per-socket is possible but requires NIF access and is ignored by many NAT middleboxes that recycle idle flows after 60 s of silence. An application-layer ping/pong runs in user space, respects business-level liveness (the peer's scheduler might be alive while its handler loop is deadlocked), and is tunable per-session. The 5th-element timeout handles orthogonal "no business activity" detection.
+
+---
+
+## Design decisions
+
+**Option A — single inactivity timer (5th-element only)**
+- Pros: zero timer refs, single `:timeout` message, trivial state.
+- Cons: any mailbox noise (telemetry probes, monitor DOWNs) resets the timer; cannot distinguish "peer alive" from "process alive".
+
+**Option B — heartbeat + independent inactivity timer** (chosen)
+- Pros: two orthogonal questions get two orthogonal answers; heartbeat catches half-open sockets, inactivity catches abandoned sessions; each can tune its own threshold.
+- Cons: two timer refs plus a `Process.cancel_timer` flush pattern; you must compute `idle_remaining/1` by hand so heartbeat traffic doesn't reset inactivity.
+
+→ Chose **B** because the failure modes are genuinely different (frozen peer vs. idle user) and the SLO demands sub-10 s peer detection while tolerating 30 min of legitimate user idleness.
+
+---
+
+## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  []
+end
+```
+
 
 ### Step 1: `mix.exs`
+
+**Objective**: Empty deps so heartbeat vs idle timeout patterns rely only on Process.send_after/3 and GenServer timeout mechanics.
 
 ```elixir
 defmodule HeartbeatGs.MixProject do
@@ -141,6 +234,8 @@ end
 ```
 
 ### Step 2: `lib/heartbeat_gs/session_tracker.ex`
+
+**Objective**: Decouple peer-liveness check (heartbeat) from inactivity timeout so each timeout fires independently without masking the other.
 
 ```elixir
 defmodule HeartbeatGs.SessionTracker do
@@ -274,6 +369,8 @@ end
 
 ### Step 3: `lib/heartbeat_gs/application.ex` and fake peer
 
+**Objective**: Wire Registry for :via naming and FakePeer stub so tests can block pongs deterministically without wall-clock delays.
+
 ```elixir
 defmodule HeartbeatGs.Application do
   use Application
@@ -314,6 +411,8 @@ end
 
 ### Step 4: `test/heartbeat_gs/session_tracker_test.exs`
 
+**Objective**: Stub peer silence via :go_silent to assert :peer_unreachable fires, proving heartbeat detects freeze without racing inactivity timeout.
+
 ```elixir
 defmodule HeartbeatGs.SessionTrackerTest do
   use ExUnit.Case, async: false
@@ -328,25 +427,27 @@ defmodule HeartbeatGs.SessionTrackerTest do
     %{id: id, peer: peer, pid: pid, ref: ref}
   end
 
-  test "session survives while peer answers pings", %{ref: ref} do
-    # Wait longer than ping+pong window; peer answers, so we should stay alive.
-    refute_receive {:DOWN, ^ref, :process, _, _}, 8_000
-  end
-
-  test "session dies on peer silence", %{ref: ref, peer: peer} do
-    send(peer, :go_silent)
-    # next ping goes out ~5s after boot, pong deadline 2s later -> ~7s max
-    assert_receive {:DOWN, ^ref, :process, _, :peer_unreachable}, 10_000
-  end
-
-  test "touch resets only the inactivity timer, not the heartbeat", %{id: id, ref: ref} do
-    for _ <- 1..5 do
-      SessionTracker.touch(id)
-      Process.sleep(500)
+  describe "HeartbeatGs.SessionTracker" do
+    test "session survives while peer answers pings", %{ref: ref} do
+      # Wait longer than ping+pong window; peer answers, so we should stay alive.
+      refute_receive {:DOWN, ^ref, :process, _, _}, 8_000
     end
 
-    # Touching kept us alive; heartbeat is still independent and healthy.
-    refute_receive {:DOWN, ^ref, :process, _, _}, 100
+    test "session dies on peer silence", %{ref: ref, peer: peer} do
+      send(peer, :go_silent)
+      # next ping goes out ~5s after boot, pong deadline 2s later -> ~7s max
+      assert_receive {:DOWN, ^ref, :process, _, :peer_unreachable}, 10_000
+    end
+
+    test "touch resets only the inactivity timer, not the heartbeat", %{id: id, ref: ref} do
+      for _ <- 1..5 do
+        SessionTracker.touch(id)
+        Process.sleep(500)
+      end
+
+      # Touching kept us alive; heartbeat is still independent and healthy.
+      refute_receive {:DOWN, ^ref, :process, _, _}, 100
+    end
   end
 end
 ```
@@ -354,6 +455,23 @@ end
 ### Why this works
 
 `last_ping_id` (a `make_ref()`) guarantees stale pongs cannot extend a dead session. `idle_remaining/1` subtracts elapsed time from the inactivity budget so heartbeat messages never reset the business timer — the two liveness checks stay orthogonal. The `Process.cancel_timer` + `receive after 0` pattern drains fired-but-late deadline messages so they can't masquerade as genuine timeouts in the next cycle.
+
+---
+
+## Advanced Considerations: Supervision and Hot Code Upgrade Patterns
+
+The OTP supervision tree is the backbone of Elixir's fault tolerance. A DynamicSupervisor can spawn workers on demand and track them, but if a worker crashes before it's supervised, messages to it drop silently. Equally, a `:temporary` worker that crashes is restarted zero times — useful for one-off tasks, but requires the caller to handle crashes. `:transient` restarts on non-normal exits; `:permanent` always restarts.
+
+`handle_continue` callbacks and `:hibernate` reduce memory overhead in long-lived processes. After initializing, a GenServer can return `{:noreply, state, {:continue, :do_work}}` to defer expensive work past the `init/1` call, keeping the supervisor's synchronous startup fast. Hibernation moves a process's heap to disk, freeing RAM at the cost of latency when the process receives its next message.
+
+Hot code upgrades via `sys:replace_state/2` or `:sys.replace_state/3` allow changing code without restarting the VM, but only if state structure is forward- and backward-compatible. In practice, code changes that alter state shape (adding or removing fields) require a migration function. The `:code.purge/1` and `:code.load_file/1` cycle reloads the module, but old pids still run old code until they return to the scheduler. Design for graceful degradation: code that cannot upgrade hot should acknowledge that in docs and operational runbooks.
+
+---
+
+
+## Deep Dive: Otp Patterns and Production Implications
+
+OTP primitives (GenServer, Supervisor, Application) are tested through their public interfaces, not by inspecting internal state. This discipline forces correct design: if you can't test a behavior without peeking into the server's state, the behavior is not public. Production systems with tight integration tests on GenServer internals are fragile and hard to refactor.
 
 ---
 

@@ -123,7 +123,7 @@ end
 
 ### Step 1: Node naming helper
 
-Derives a deterministic node name from the pod's IP and release name.
+**Objective**: Derive stable node names from POD_IP to survive restarts without `:nodedown` flapping across Kubernetes pods.
 
 ```elixir
 # lib/cluster_bootstrap/node_namer.ex
@@ -145,6 +145,8 @@ end
 ```
 
 ### Step 2: Topology module resolved at runtime
+
+**Objective**: Select EPMD or DNSPoll strategy at runtime from environment variables for single-codebase multi-environment deployments.
 
 ```elixir
 # lib/cluster_bootstrap/topology.ex
@@ -187,6 +189,8 @@ end
 
 ### Step 3: Application supervision tree
 
+**Objective**: Boot libcluster Supervisor to poll and initiate Node.connect/1 calls at startup and on topology changes.
+
 ```elixir
 # lib/cluster_bootstrap/application.ex
 defmodule ClusterBootstrap.Application do
@@ -206,6 +210,8 @@ end
 ```
 
 ### Step 4: Runtime config
+
+**Objective**: Inject topology configuration at release boot from environment variables for prod EPMD-less DNS resolution.
 
 ```elixir
 # config/runtime.exs
@@ -232,6 +238,8 @@ config :libcluster,
 
 ### Step 5: Release vm.args for EPMD-less mode
 
+**Objective**: Pin distribution port to 9100 and replace :erl_epmd with Cluster.EpmdCache to bypass EPMD port resolution.
+
 ```
 # rel/vm.args.eex
 -name <%= System.get_env("RELEASE_NODE") %>
@@ -250,6 +258,8 @@ export RELEASE_NODE="cluster_bootstrap@${POD_IP}"
 ```
 
 ### Step 6: Data flow diagram
+
+**Objective**: Visualize multi-pod DNS resolution and libcluster polling loop to understand latency of convergence.
 
 ```
                     ┌───────────────────────────────────┐
@@ -345,6 +355,24 @@ end)
 
 Target: < 6 seconds with `polling_interval: 5_000`. On a LAN EPMD strategy converges under 500 ms; DNSPoll is bounded by the polling interval plus DNS TTL.
 
+## Deep Dive
+
+Distributed Erlang relies on a heartbeat mechanism (net_kernel tick) to detect node failure, but the network is fundamentally asynchronous—split-brain scenarios are inevitable. A partitioned cluster may have two sets of nodes, each believing the other is dead. Libraries like Horde and Phoenix.PubSub solve this with quorum-aware consensus, but they add latency and complexity. At scale, choose your consistency model explicitly: eventual consistency (via Redis PubSub) is faster but allows temporary divergence; strong consistency (via Horde DLM or distributed transactions) is slower but guarantees atomicity. For global registries, the order of operations matters—registering a process before its monitor is live creates race conditions. In multi-region setups, latency between nodes compounds these issues; consider regional clusters with a lightweight coordinator rather than a fully meshed topology.
+## Advanced Considerations
+
+Distributed Elixir systems require careful consideration of network partitions, consistent hashing for distributed state, and the interaction between clustering libraries and node discovery mechanisms. Network partitions are not rare edge cases; they happen regularly in cloud deployments due to maintenance windows and infrastructure issues. A system that works perfectly during local testing but fails under network partitions indicates insufficient failure handling throughout the codebase. Split-brain scenarios where multiple network partitions lead to different cluster views require explicit recovery mechanisms that are often business-specific and context-dependent.
+
+Horde and distributed registries provide eventual consistency guarantees, but "eventual" can mean minutes during network partitions. Applications must handle the case where the same name is registered on multiple nodes simultaneously without coordination. Consistent hashing for distributed services requires understanding rebalancing costs — a single node failure can cause significant key redistribution and thundering herd problems if not carefully managed. The cost of distributed consensus using algorithms like Raft is high; choose it only when consistency is more important than availability and can afford the performance cost.
+
+Global state replication across nodes creates synchronization challenges at scale. Choosing between replicating everywhere versus replicating to specific nodes affects both consistency latency and network bandwidth utilization fundamentally. Node monitoring and heartbeat mechanisms require careful timeout tuning — too aggressive and you get false positives during network hiccups; too conservative and you don't detect actual failures quickly enough for recovery. The EPMD (Erlang Port Mapper Daemon) is a critical component that can become a bottleneck in large clusters and requires careful capacity planning.
+
+
+## Deep Dive: Cluster Patterns and Production Implications
+
+Clustering distributes computation across nodes using Erlang's distribution protocol. Testing clusters requires simulating node failures, network partitions, and message delays—challenges that single-node tests don't expose. Production clusters fail in ways that cluster tests reveal: nodes can become isolated (stuck), messages can be reordered, and consensus is expensive.
+
+---
+
 ## Trade-offs and production gotchas
 
 1. **Polling interval vs convergence**: lower interval = faster recovery, higher DNS pressure. 5 s is the sweet spot for most teams. Under 1 s you risk rate-limiting your DNS resolver.
@@ -365,3 +393,13 @@ If your cluster needs to span two Kubernetes clusters in different regions with 
 - [Fly.io — Running Elixir Clusters](https://fly.io/docs/elixir/the-basics/clustering/)
 - [Erlang distribution protocol](https://www.erlang.org/doc/apps/erts/erl_dist_protocol.html)
 - [EPMD-less release guide](https://github.com/bitwalker/libcluster#epmdless)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

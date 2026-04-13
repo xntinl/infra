@@ -114,12 +114,18 @@ end
 
 ### Step 1: Create the project
 
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
+
 ```bash
 mix new stop_reasons_gs --sup
 cd stop_reasons_gs
 ```
 
 ### Step 2: `lib/stop_reasons_gs.ex`
+
+**Objective**: Implement `stop_reasons_gs.ex` — the GenServer callback shape that determines blocking vs fire-and-forget semantics and state invariants.
+
 
 ```elixir
 defmodule StopReasonsGs do
@@ -196,6 +202,9 @@ end
 
 ### Step 3: `lib/stop_reasons_gs/supervisor.ex`
 
+**Objective**: Encode the restart policy in `supervisor.ex` — the supervisor strategy is the lesson; the children exist to make it observable.
+
+
 ```elixir
 defmodule StopReasonsGs.Supervisor do
   @moduledoc """
@@ -224,6 +233,9 @@ end
 ```
 
 ### Step 4: `test/stop_reasons_gs_test.exs`
+
+**Objective**: Write `stop_reasons_gs_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
 
 ```elixir
 defmodule StopReasonsGsTest do
@@ -295,6 +307,9 @@ end
 
 ### Step 5: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -305,6 +320,15 @@ mix test
 
 The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
 
+
+
+## Deep Dive: State Management and Message Handling Patterns
+
+Understanding state transitions is central to reliable OTP systems. Every `handle_call` or `handle_cast` receives current state and returns new state—immutability forces explicit reasoning. This prevents entire classes of bugs: missing state updates are immediately visible.
+
+Key insight: separate pure logic (state → new state) from side effects (logging, external calls). Move pure logic to private helpers; use handlers for orchestration. This makes servers testable—test pure functions independently.
+
+In production, monitor state size and mutation frequency. Unbounded growth is a memory leak; excessive mutations signal hot spots needing optimization. Always profile before reaching for performance solutions like ETS.
 
 ## Benchmark
 

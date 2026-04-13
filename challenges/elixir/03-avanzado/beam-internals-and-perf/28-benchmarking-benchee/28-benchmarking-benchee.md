@@ -139,6 +139,8 @@ load-test the whole request path.
 
 ### Step 1: project
 
+**Objective**: Scaffold app with `bench/` so benchmark scripts isolate from compiled code paths and avoid release pollution.
+
 ```bash
 mix new benchee_deep
 cd benchee_deep
@@ -146,6 +148,8 @@ mkdir -p bench
 ```
 
 ### Step 2: `mix.exs`
+
+**Objective**: Pin `:benchee` so HTML reports + statistical significance (confidence intervals, deviation%) guide architecture decisions confidently.
 
 ```elixir
 defmodule BencheeDeep.MixProject do
@@ -169,6 +173,8 @@ end
 
 ### Step 3: `lib/benchee_deep/sum.ex`
 
+**Objective**: Implement 4 sum-of-squares variants so Enum protocol dispatch + Stream overhead costs surface against reduction-counted recursion.
+
 ```elixir
 defmodule BencheeDeep.Sum do
   @moduledoc "Four implementations of sum-of-squares over a list."
@@ -191,6 +197,8 @@ end
 ```
 
 ### Step 4: `lib/benchee_deep/parse.ex`
+
+**Objective**: Benchmark String.split vs binary_scan so allocating intermediate lists vs zero-copy pattern matching overhead quantifies.
 
 ```elixir
 defmodule BencheeDeep.Parse do
@@ -218,6 +226,8 @@ end
 ```
 
 ### Step 5: `lib/benchee_deep/runner.ex`
+
+**Objective**: Enforce 2s warmup + memory+reduction measurements so JIT warm-up and GC pause variance don't skew comparison.
 
 ```elixir
 defmodule BencheeDeep.Runner do
@@ -257,6 +267,8 @@ end
 ```
 
 ### Step 6: benchmarks
+
+**Objective**: Benchmark small/medium/large inputs + parallel=8 so O(n²) hiding, GC pressure, and contention surface.
 
 ```elixir
 # bench/sum_bench.exs
@@ -325,6 +337,8 @@ BencheeDeep.Runner.run(
 
 ### Step 7: tests
 
+**Objective**: Lock down correctness so benchmark speedups never mask silent off-by-one bugs or overflow regressions.
+
 ```elixir
 # test/benchee_deep/sum_test.exs
 defmodule BencheeDeep.SumTest do
@@ -334,16 +348,18 @@ defmodule BencheeDeep.SumTest do
   @list Enum.to_list(1..100)
   @expected Enum.reduce(1..100, 0, fn x, a -> x * x + a end)
 
-  test "all implementations agree on small input" do
-    assert Sum.enum_map_sum(@list) == @expected
-    assert Sum.enum_reduce(@list) == @expected
-    assert Sum.stream_sum(@list) == @expected
-    assert Sum.recursive(@list) == @expected
-  end
+  describe "BencheeDeep.Sum" do
+    test "all implementations agree on small input" do
+      assert Sum.enum_map_sum(@list) == @expected
+      assert Sum.enum_reduce(@list) == @expected
+      assert Sum.stream_sum(@list) == @expected
+      assert Sum.recursive(@list) == @expected
+    end
 
-  test "empty list returns 0" do
-    for fun <- [&Sum.enum_map_sum/1, &Sum.enum_reduce/1, &Sum.stream_sum/1, &Sum.recursive/1] do
-      assert fun.([]) == 0
+    test "empty list returns 0" do
+      for fun <- [&Sum.enum_map_sum/1, &Sum.enum_reduce/1, &Sum.stream_sum/1, &Sum.recursive/1] do
+        assert fun.([]) == 0
+      end
     end
   end
 end
@@ -357,20 +373,24 @@ defmodule BencheeDeep.ParseTest do
 
   @blob "a\nbb\nccc\n"
 
-  test "all implementations agree on line count" do
-    assert Parse.enum_split(@blob) == 3
-    assert Parse.stream_split(@blob) == 3
-    assert Parse.binary_scan(@blob) == 3
-  end
+  describe "BencheeDeep.Parse" do
+    test "all implementations agree on line count" do
+      assert Parse.enum_split(@blob) == 3
+      assert Parse.stream_split(@blob) == 3
+      assert Parse.binary_scan(@blob) == 3
+    end
 
-  test "empty blob returns 0" do
-    assert Parse.binary_scan("") == 0
-    assert Parse.stream_split("") == 0
+    test "empty blob returns 0" do
+      assert Parse.binary_scan("") == 0
+      assert Parse.stream_split("") == 0
+    end
   end
 end
 ```
 
 ### Step 8: run
+
+**Objective**: Measure all variants (warmup 2s, time 5s, memory+reductions on) so Enum dispatch, Stream overhead, and scheduler contention surface quantitatively.
 
 ```bash
 mix deps.get
@@ -411,6 +431,46 @@ IO.puts("avg: #{time_us / 10_000} µs/op")
 ```
 
 Target: operation should complete in the low-microsecond range on modern hardware; deviations by >2× indicate a regression worth investigating.
+
+## Deep Dive: BEAM Scheduler Tuning and Memory Profiling in Production
+
+The BEAM scheduler is not "magic" — it's a preemptive work-stealing scheduler that divides CPU time 
+into reductions (bytecode instructions). Understanding scheduler tuning is critical when you suspect 
+latency spikes in production.
+
+**Key concepts**:
+- **Reductions budget**: By default, a process gets ~2000 reductions before yielding to another process.
+  Heavy CPU work (binary matching, list recursion) can exhaust the budget and cause tail latency.
+- **Dirty schedulers**: If a process does CPU-intensive work (crypto, compression, numerical), it blocks 
+  the main scheduler. Use dirty NIFs or `spawn_opt(..., [{:fullsweep_after, 0}])` for GC tuning.
+- **Heap tuning per process**: `Process.flag(:min_heap_size, ...)` reserves heap upfront, reducing GC 
+  pauses. Measure; don't guess.
+
+**Memory profiling workflow**:
+1. Run `recon:memory/0` in iex; identify top 10 memory consumers by type (atoms, binaries, ets).
+2. If binaries dominate, check for refc binary leaks (binary held by process that should have been freed).
+3. Use `eprof` or `fprof` for function-level CPU attribution; `recon:proc_window/3` for process memory trends.
+
+**Production pattern**: Deploy with `+K true` (async IO), `-env ERL_MAX_PORTS 65536` (port limit), 
+`+T 9` (async threads). Measure GC time with `erlang:statistics(garbage_collection)` — if >5% of uptime, 
+tune heap or reduce allocation pressure. Never assume defaults are optimal for YOUR workload.
+
+---
+
+## Advanced Considerations
+
+Understanding BEAM internals at production scale requires deep knowledge of scheduler behavior, memory models, and garbage collection dynamics. The soft real-time guarantees of BEAM only hold under specific conditions — high system load, uneven process distribution across schedulers, or GC pressure can break predictable latency completely. Monitor `erlang:statistics(run_queue)` in production to catch scheduler saturation before it degrades latency significantly. The difference between immediate, offheap, and continuous GC garbage collection strategies can significantly impact tail latencies in systems with millions of messages per second and sustained memory pressure.
+
+Process reductions and the reduction counter affect scheduler fairness fundamentally. A process that runs for extended periods without yielding can starve other processes, even though the scheduler treats it fairly by reduction count per scheduling interval. This is especially critical in pipelines processing large data structures or performing recursive computations where yielding points are infrequent and difficult to predict. The BEAM's preemption model is deterministic per reduction, making performance testing reproducible but sometimes hiding race conditions that only manifest under specific load patterns and GC interactions.
+
+The interaction between ETS, Mnesia, and process message queues creates subtle bottlenecks in distributed systems. ETS reads don't block other processes, but writes require acquiring locks; understanding when your workload transitions from read-heavy to write-heavy is crucial for capacity planning. Port drivers and NIFs bypass the BEAM scheduler entirely, which can lead to unexpected priority inversions if not carefully managed. Always profile with `eprof` and `fprof` in realistic production-like environments before deployment to catch performance surprises.
+
+
+## Deep Dive: Benchmark Patterns and Production Implications
+
+Benchmarking in Elixir requires statistical rigor: a single run means nothing. Tools like Benchee measure distribution, not just mean time. The mistake most engineers make is benchmarking in isolation (single process) and then deploying to a system under concurrent load where cache hits, scheduler contention, and garbage collection behave differently. Production performance tuning must account for these realities.
+
+---
 
 ## Trade-offs and production gotchas
 
@@ -498,3 +558,13 @@ Take-aways:
 - ["Benchmarking correctly is hard" — Aleksandar Prokopec](https://aleksandar-prokopec.com/resources/docs/lcpc-beyond-benchmarking.pdf)
 - [`mix profile.fprof`](https://hexdocs.pm/mix/Mix.Tasks.Profile.Fprof.html) — complement Benchee with flamegraphs
 - [eprof for function-level profiling](https://www.erlang.org/doc/man/eprof.html)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

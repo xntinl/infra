@@ -1,8 +1,6 @@
 # Mnesia RAM-Only Tables with Cluster Replication
 
 **Project**: `mnesia_ram_demo` — in-memory distributed state for a real-time session/presence system.
-**Difficulty**: ★★★★☆
-**Estimated time**: 3–6 hours
 
 ---
 
@@ -43,6 +41,12 @@ mnesia_ram_demo/
 │       └── session_store_test.exs
 └── mix.exs
 ```
+
+---
+
+## Why Mnesia RAM and not ETS
+
+ETS is a hash table. Mnesia gives the same storage plus transactions and replication. For anything that cares about multi-key atomicity or cluster state, starting with ETS is starting from minus one.
 
 ---
 
@@ -114,9 +118,107 @@ somewhere. A common pattern is: `ram_copies` on application nodes for speed,
 
 ---
 
+## Design decisions
+
+**Option A — ETS + custom replication**
+- Pros: fast, well-understood data structure; full control.
+- Cons: reimplementing transactions, replication, and recovery is a multi-year project.
+
+**Option B — Mnesia RAM tables** (chosen)
+- Pros: transactions, multi-node replication, and QLC queries for free.
+- Cons: Mnesia's quirks (netsplits, schema management, tooling gaps) are real.
+
+→ Chose **B** because building ACID on ETS from scratch is never justified when Mnesia exists.
+
+---
+
 ## Implementation
 
 ### Step 1: `mix.exs`
+
+**Objective**: Pin `:libcluster` for node discovery and list `:mnesia` under `extra_applications` so it starts before replication kicks in.
+
+```elixir
+defmodule MnesiaRamDemo.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :mnesia_ram_demo,
+      version: "0.1.0",
+      elixir: "~> 1.16",
+      start_permanent: Mix.env() == :prod,
+      deps: deps()
+    ]
+  end
+
+  def application do
+    [
+      extra_applications: [:logger, :mnesia],
+      mod: {MnesiaRamDemo.Application, []}
+    ]
+  end
+
+  defp deps do
+    [
+      {:libcluster, "~> 3.3"},
+      {:benchee, "~> 1.3", only: :dev}
+    ]
+  end
+end
+```
+
+### Dependencies (mix.exs)
+
+```elixir
+```elixir
+:mnesia.add_table_copy(Session, node(), :ram_copies)
+```
+
+from a node that already holds the table. Mnesia streams the current contents
+to the new node and keeps it in sync from that point forward.
+
+### 4. Netsplit detection — `:inconsistent_database`
+
+When a cluster heals after a partition, Mnesia emits a system event:
+
+```elixir
+{:mnesia_system_event, {:inconsistent_database, :running_partitioned_network, node}}
+```
+
+Mnesia does NOT heal automatically. You must pick a node to "win", stop Mnesia
+on the losing node, delete its schema, and let it rejoin. This is the part
+every Mnesia tutorial skips and every production system has to solve.
+
+### 5. `ram_copies` and the "last node" problem
+
+If you have a table with replicas on nodes A, B, C, and all three die, the
+data is gone. There is no disk backup. If you need *at least one* replica to
+survive a full cluster restart, you need at least one `disc_copies` replica
+somewhere. A common pattern is: `ram_copies` on application nodes for speed,
+`disc_copies` on a dedicated "persistence node" for durability.
+
+---
+
+## Design decisions
+
+**Option A — ETS + custom replication**
+- Pros: fast, well-understood data structure; full control.
+- Cons: reimplementing transactions, replication, and recovery is a multi-year project.
+
+**Option B — Mnesia RAM tables** (chosen)
+- Pros: transactions, multi-node replication, and QLC queries for free.
+- Cons: Mnesia's quirks (netsplits, schema management, tooling gaps) are real.
+
+→ Chose **B** because building ACID on ETS from scratch is never justified when Mnesia exists.
+
+---
+
+## Implementation
+
+### Step 1: `mix.exs`
+
+**Objective**: Pin `:libcluster` for node discovery and list `:mnesia` under `extra_applications` so it starts before replication kicks in.
 
 ```elixir
 defmodule MnesiaRamDemo.MixProject do
@@ -150,6 +252,8 @@ end
 
 ### Step 2: `lib/mnesia_ram_demo/application.ex`
 
+**Objective**: Start `Cluster.Supervisor` with gossip topology before the schema and partition handler so node discovery precedes replication.
+
 ```elixir
 defmodule MnesiaRamDemo.Application do
   @moduledoc false
@@ -181,6 +285,8 @@ end
 ```
 
 ### Step 3: `lib/mnesia_ram_demo/schema.ex`
+
+**Objective**: Bootstrap `:ram_copies` tables idempotently and monitor `:nodeup` events to replicate new peers on the fly.
 
 ```elixir
 defmodule MnesiaRamDemo.Schema do
@@ -287,6 +393,8 @@ end
 
 ### Step 4: `lib/mnesia_ram_demo/session_store.ex`
 
+**Objective**: Expose a typed session API: dirty reads for hot lookups, transactional writes so replication stays atomic cluster-wide.
+
 ```elixir
 defmodule MnesiaRamDemo.SessionStore do
   @moduledoc """
@@ -346,6 +454,8 @@ end
 
 ### Step 5: `lib/mnesia_ram_demo/partition_handler.ex`
 
+**Objective**: Subscribe to `:mnesia_system_event` and resolve `:inconsistent_database` netsplits by letting the lowest-named node win.
+
 ```elixir
 defmodule MnesiaRamDemo.PartitionHandler do
   @moduledoc """
@@ -401,6 +511,8 @@ end
 
 ### Step 6: `test/mnesia_ram_demo/session_store_test.exs`
 
+**Objective**: Verify `invalidate_user/1` atomically deletes every session per user via `match_object` inside a single transaction.
+
 ```elixir
 defmodule MnesiaRamDemo.SessionStoreTest do
   use ExUnit.Case, async: false
@@ -453,6 +565,8 @@ end
 
 ### Step 7: Exercise the cluster
 
+**Objective**: Boot two named nodes so gossip discovery triggers `add_table_copy/3` and proves live replication across the cluster.
+
 Start two nodes on the same host:
 
 ```bash
@@ -486,6 +600,28 @@ Node.disconnect(:"b@127.0.0.1")
 Node.connect(:"b@127.0.0.1")
 # watch the :inconsistent_database event fire in the logs
 ```
+
+### Why this works
+
+Mnesia RAM tables store data in ETS under the hood, then layer a transaction log and a replication protocol on top. Reads avoid the transaction manager unless you wrap them in `:transaction/1`. Writes within a transaction lock the involved keys and replicate on commit.
+
+---
+
+## Deep Dive
+
+ETS (Erlang Term Storage) is RAM-only and process-linked; table destruction triggers if the owner crashes, causing silent data loss in careless designs. Match specifications (match_specs) are micro-programs that filter/transform data at the C layer, orders of magnitude faster than fetching all records and filtering in Elixir. Mnesia adds disk persistence and replication but introduces transaction overhead and deadlock potential; dirty operations bypass locks for speed but sacrifice consistency guarantees. For caching, named tables (public by design) are globally visible but require careful name management; consider ETS sharding (multiple small tables) to reduce lock contention on hot keys. DETS (Disk ETS) persists to disk but is single-process bottleneck and slower than a real database. At scale, prefer ETS for in-process state and Mnesia/PostgreSQL for shared, persistent data.
+## Advanced Considerations
+
+ETS and DETS performance characteristics change dramatically based on access patterns and table types. Ordered sets provide range queries but slower access than hash tables; set types don't support duplicate keys while bags do. The `heir` option for ETS tables is essential for fault tolerance — when a table owner crashes, the heir process can take ownership and prevent data loss. Without it, the table is lost immediately. Mnesia replicates entire tables across nodes; choosing which nodes should have replicas and whether they're RAM or disk replicas affects both consistency guarantees and network traffic during cluster operations.
+
+DETS persistence comes with significant performance implications — writes are synchronous to disk by default, creating latency spikes. Using `sync: false` improves throughput but risks data loss on crashes. The maximum DETS table size is limited by available memory and the file system; planning capacity requires understanding your growth patterns. Mnesia's transaction system provides ACID guarantees, but dirty operations bypass these guarantees for performance. Understanding when to use dirty reads versus transactional reads significantly impacts both correctness and latency.
+
+Debugging ETS and DETS issues is challenging because problems often emerge under load when many processes contend for the same table. Table memory fragmentation is invisible to code but can exhaust memory. Using match specs instead of iteration over large tables can dramatically improve performance but requires careful construction. The interaction between ETS, replication, and distributed systems creates subtle consistency issues — a node with a stale ETS replica can serve incorrect data during network partitions. Always monitor table sizes and replication status with structured logging.
+
+
+## Deep Dive: Etsdets Patterns and Production Implications
+
+ETS tables are in-memory, non-distributed key-value stores with tunable semantics (ordered_set, duplicate_bag). Under concurrent read/write load, ETS table semantics matter: bag semantics allow fast appends but slow deletes; ordered_set allows range queries but slower inserts. Testing ETS behavior under concurrent load is non-trivial; single-threaded tests miss lock contention. Production ETS tables often fail under load due to concurrency assumptions that quiet tests don't exercise.
 
 ---
 
@@ -582,6 +718,13 @@ Expected ballpark on a 2-node local cluster (M1, Elixir 1.16, OTP 26):
 
 The 100x gap between `dirty_read` and `transaction_write` is the cost of the
 two-phase commit and lock acquisition across replicas.
+
+---
+
+## Reflection
+
+- You need durability across a single-node crash. Does RAM-only still fit, or do you switch to disc_copies? Why not disc_only?
+- Your cluster split-brain recovers with divergent writes. What does Mnesia do, and what do you wish it did instead?
 
 ---
 

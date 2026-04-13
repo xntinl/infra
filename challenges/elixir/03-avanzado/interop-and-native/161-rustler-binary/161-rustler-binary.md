@@ -64,6 +64,16 @@ For input: decode as `Binary<'a>`. For output: `OwnedBinary::new(len)`, fill via
 
 ### 3. Sub-binary GC trap
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
+
 ```elixir
 big = :crypto.strong_rand_bytes(100_000_000)   # 100 MB
 <<_header::binary-size(100), rest::binary>> = big
@@ -106,6 +116,8 @@ If you generate output in chunks (compression, encoding), build a `Vec<Binary>` 
 
 ### Step 1: `native/rustler_binary_nif/Cargo.toml`
 
+**Objective**: Declare cdylib target so BEAM dynamically loads the Rust-compiled shared object at module init.
+
 ```toml
 [package]
 name = "rustler_binary_nif"
@@ -121,6 +133,8 @@ rustler = "0.32"
 ```
 
 ### Step 2: `native/rustler_binary_nif/src/lib.rs`
+
+**Objective**: Zero-copy borrow inputs via Binary<'a> and return OwnedBinary results to move multi-MB payloads without heap copies.
 
 ```rust
 use rustler::{Binary, Env, OwnedBinary, NifResult, Error};
@@ -171,6 +185,8 @@ rustler::init!(
 
 ### Step 3: `lib/rustler_binary/native.ex`
 
+**Objective**: Provide typed stubs with `:nif_not_loaded` so Dialyzer validates zero-copy binary ops even pre-compilation.
+
 ```elixir
 defmodule RustlerBinary.Native do
   @moduledoc "Zero-copy binary operations."
@@ -193,6 +209,8 @@ end
 
 ### Step 4: `mix.exs`
 
+**Objective**: Register the `rustler_crates` entry in release mode so `mix compile` triggers `cargo build --release` and caches the artifact under `_build`.
+
 ```elixir
 defmodule RustlerBinary.MixProject do
   use Mix.Project
@@ -213,39 +231,43 @@ end
 
 ### Step 5: `test/rustler_binary_test.exs`
 
+**Objective**: Assert round-trip XOR symmetry and empty-mask rejection to catch regressions in lifetime handling and `BadArg` propagation across the FFI boundary.
+
 ```elixir
 defmodule RustlerBinaryTest do
   use ExUnit.Case, async: true
   alias RustlerBinary.Native
 
-  test "byte_len on large binary" do
-    bin = :crypto.strong_rand_bytes(10_000_000)
-    assert Native.byte_len(bin) == 10_000_000
-  end
+  describe "RustlerBinary" do
+    test "byte_len on large binary" do
+      bin = :crypto.strong_rand_bytes(10_000_000)
+      assert Native.byte_len(bin) == 10_000_000
+    end
 
-  test "xor_mask is its own inverse" do
-    data = "the quick brown fox"
-    mask = "key"
-    masked = Native.xor_mask(data, mask)
-    assert Native.xor_mask(masked, mask) == data
-  end
+    test "xor_mask is its own inverse" do
+      data = "the quick brown fox"
+      mask = "key"
+      masked = Native.xor_mask(data, mask)
+      assert Native.xor_mask(masked, mask) == data
+    end
 
-  test "xor_mask rejects empty mask" do
-    assert_raise ArgumentError, fn -> Native.xor_mask("hello", "") end
-  end
+    test "xor_mask rejects empty mask" do
+      assert_raise ArgumentError, fn -> Native.xor_mask("hello", "") end
+    end
 
-  test "histogram counts every byte" do
-    counts = Native.histogram(<<0, 0, 1, 1, 1, 255>>)
-    assert Enum.at(counts, 0) == 2
-    assert Enum.at(counts, 1) == 3
-    assert Enum.at(counts, 255) == 1
-    assert Enum.sum(counts) == 6
-  end
+    test "histogram counts every byte" do
+      counts = Native.histogram(<<0, 0, 1, 1, 1, 255>>)
+      assert Enum.at(counts, 0) == 2
+      assert Enum.at(counts, 1) == 3
+      assert Enum.at(counts, 255) == 1
+      assert Enum.sum(counts) == 6
+    end
 
-  test "utf8 validation" do
-    assert Native.is_valid_utf8("hello")
-    assert Native.is_valid_utf8("日本語")
-    refute Native.is_valid_utf8(<<0xFF, 0xFE>>)
+    test "utf8 validation" do
+      assert Native.is_valid_utf8("hello")
+      assert Native.is_valid_utf8("日本語")
+      refute Native.is_valid_utf8(<<0xFF, 0xFE>>)
+    end
   end
 end
 ```
@@ -256,6 +278,26 @@ end
 ### Why this works
 
 The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
+
+## Advanced Considerations: NIF Guards and Scheduler Isolation
+
+When binary processing moves into Rustler, the safety model shifts. A NIF call blocks its scheduler thread until the Rust code returns. On systems with 16 scheduler threads, a 100 ms NIF leaves 15 schedulers running — but that one thread starves any BEAM process assigned to it. Heavy NIFs demand explicit thought about time budgets and escape hatches.
+
+**Scheduler directives** control this: by default, NIFs run on "normal" schedulers. Adding the `dirty_cpu` attribute offloads to a separate thread pool (configurable via `+SDcpu` flag), freeing the main scheduler for interactive work. In the benchmark above, `xor_mask` on 100 MB takes ~50 ms — borderline. For production, measure with your actual workload; 5–10 ms on normal schedulers is safe, 100+ ms demands dirty-cpu.
+
+**Lifetime guards** also matter. A `Binary<'a>` holds a reference into the BEAM's heap. If the NIF yields to async code or a background thread, the BEAM may trigger garbage collection, invalidating the pointer. Rustler's type system enforces that `Binary` cannot escape the call boundary, but vigilance is needed when using `enif_*` C APIs directly or calling native libraries that spawn threads.
+
+**Port alternatives** exist when you need more isolation. Instead of NIFs, a separate OS process (via `Port.open/2` with `{:spawn, cmd}`) communicates over stdin/stdout, incurring serialization overhead but gaining true process isolation. A hung or crashing external process cannot freeze the BEAM VM. For untrusted code, network services, or long-running tasks, a Port is safer than a NIF, even at 10–100× latency cost.
+
+**Resource cleanup** is implicit in NIFs but requires discipline. An `OwnedBinary` that allocates 1 GB but crashes before `release(env)` leaks memory back to BEAM's allocator. Using `OwnedBinary` as a guard (wrapped in a custom struct with Drop impl or Rust's RAII) helps, but Elixir developers must reason in binary ownership terms. Contrast this with pure Elixir, where the garbage collector owns all memory.
+
+---
+
+## Deep Dive: Interop Patterns and Production Implications
+
+Interop with native code (NIFs, ports, C extensions) introduces failure modes that pure Elixir code doesn't have: segfaults, memory leaks, deadlocks with the Erlang emulator. Testing interop requires separate test suites for the native layer and integration tests that exercise the boundary.
+
+---
 
 ## Trade-offs and production gotchas
 

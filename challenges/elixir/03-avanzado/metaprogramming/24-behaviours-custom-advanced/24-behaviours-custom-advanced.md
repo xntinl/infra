@@ -2,9 +2,6 @@
 
 **Project**: `behaviours_advanced` — a plugin system that defines a behaviour with required, optional, and versioned callbacks, enforces them at compile time, and performs runtime `ensure_loaded?` checks for hot-reloaded plugins.
 
-**Difficulty**: ★★★★☆
-**Estimated time**: 4–6 hours
-
 ---
 
 ## Project context
@@ -42,9 +39,25 @@ behaviours_advanced/
 
 ---
 
+## Why behaviours and not duck typing
+
+Duck typing works until someone forgets a callback and the error appears in production. `@callback` plus `@behaviour` lets the compiler warn at the implementer's module, at compile time, before anyone runs a test.
+
+---
+
 ## Core concepts
 
 ### 1. `@callback` vs `@optional_callbacks`
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
 
 ```elixir
 @callback send_notification(user :: map(), msg :: String.t()) :: :ok | {:error, term()}
@@ -90,9 +103,25 @@ A behaviour can evolve. Having impls declare `version/0` and the host compare ag
 
 ---
 
+## Design decisions
+
+**Option A — define a module that callers duck-type against**
+- Pros: no ceremony; callers just implement the right functions.
+- Cons: no compile-time check, no documentation, no Dialyzer help.
+
+**Option B — explicit `@callback` + optional callbacks** (chosen)
+- Pros: compile-time warnings, introspection via `behaviour_info/1`, Dialyzer coverage.
+- Cons: one more module to maintain; requires discipline to keep `@spec`s accurate.
+
+→ Chose **B** because contracts deserve names; duck typing loses the compiler's help for nothing.
+
+---
+
 ## Implementation
 
 ### Step 1: `lib/behaviours_advanced/notifier.ex`
+
+**Objective**: Define @callback + @optional_callbacks contracts; @after_compile enforces version/0 floor at compile time.
 
 ```elixir
 defmodule BehavioursAdvanced.Notifier do
@@ -160,6 +189,8 @@ end
 
 ### Step 2: `lib/behaviours_advanced/plugins/slack.ex`
 
+**Objective**: Implement all required and optional callbacks with @impl true annotations to define conformance baseline.
+
 ```elixir
 defmodule BehavioursAdvanced.Plugins.Slack do
   use BehavioursAdvanced.Notifier
@@ -183,6 +214,8 @@ end
 ```
 
 ### Step 3: `lib/behaviours_advanced/plugins/sms.ex`
+
+**Objective**: Omit format_preview/1 optional callback; enforce 160-byte message length guard on send_notification/2.
 
 ```elixir
 defmodule BehavioursAdvanced.Plugins.SMS do
@@ -209,6 +242,8 @@ end
 
 ### Step 4: `lib/behaviours_advanced/plugins/partial.ex`
 
+**Objective**: Implement only required callbacks; prove optional ones are truly optional without compile error.
+
 ```elixir
 defmodule BehavioursAdvanced.Plugins.Partial do
   @moduledoc "Minimal plugin — only implements required callbacks."
@@ -223,6 +258,8 @@ end
 ```
 
 ### Step 5: `lib/behaviours_advanced/registry.ex`
+
+**Objective**: Fan out to plugins via required send_notification/2; gate optional calls with function_exported?/3.
 
 ```elixir
 defmodule BehavioursAdvanced.Registry do
@@ -269,6 +306,8 @@ end
 ```
 
 ### Step 6: Tests
+
+**Objective**: Assert required callbacks work, optional ones return :not_implemented safely, and version floor blocks old impls.
 
 ```elixir
 defmodule BehavioursAdvanced.NotifierTest do
@@ -340,6 +379,35 @@ defmodule BehavioursAdvanced.NotifierTest do
 end
 ```
 
+### Why this works
+
+`@behaviour Mod` triggers the compiler to check that every `@callback` in `Mod` has a matching `def` in the implementer. `@optional_callbacks` relaxes that check per callback. The behaviour module itself carries `@callback` attributes that `behaviour_info/1` exposes at runtime.
+
+---
+
+
+## Key Concepts: Custom Behaviour Definition and Enforcement
+
+You can define your own custom behaviour (not just using OTP's built-in ones). Define callbacks with `@callback` and optionally `@optional_callbacks`. Then modules can `@behaviour` your custom behaviour.
+
+Example: `@callback perform(args :: any()) :: :ok | {:error, reason :: any()}` defines a callback that all implementations must provide. At compile time, Elixir checks that implementing modules provide all non-optional callbacks. This is powerful for plugin systems: define the interface, let plugins implement it, and compose them at runtime.
+
+
+## Advanced Considerations: Macro Hygiene and Compile-Time Validation
+
+Macros execute at compile time, walking the AST and returning new AST. That power is easy to abuse: a macro that generates variables can shadow outer scope bindings, or a quote block that references variables directly can fail if the macro is used in a context where those variables don't exist. The `unquote` mechanism is the escape hatch, but misusing it leads to hard-to-debug compile errors.
+
+Macro hygiene is about capturing intent correctly. A `defmacro` that takes `:my_option` and uses it directly might match an unrelated `:my_option` from the caller's scope. The idiomatic pattern is to use `unquote` for values that should be "from the outside" and keep AST nodes quoted for safety. The `quote` block's binding of `var!` and `binding!` provides escape valves for the rare case when shadowing is intentional.
+
+Compile-time validation unlocks errors that would otherwise surface at runtime. A macro can call functions to validate input, generate code conditionally, or fail the build with `IO.warn`. Schema libraries like `Ecto` and `Ash` use macros to define fields at compile time, so runtime queries are guaranteed type-safe. The cost is cognitive load: developers must reason about both the code as written and the code generated.
+
+---
+
+
+## Deep Dive: Metaprogramming Patterns and Production Implications
+
+Metaprogramming (macros, AST manipulation) requires testing at compile time and runtime. The challenge is that macro tests often involve parsing and expanding code, which couples tests to compiler internals. Production bugs in macros can corrupt entire modules; testing macros rigorously is non-negotiable.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -389,6 +457,13 @@ Benchee.run(%{
 
 Expect ~1–3 µs for `dispatch/3` per plugin and ~0.2 µs for the optional check (which
 is mostly `function_exported?` lookup, cached in the VM after first call).
+
+---
+
+## Reflection
+
+- Your behaviour has grown to 15 callbacks. Is that a signal that the contract is too big, or that the domain is irreducibly complex? How do you decide?
+- If you had to version a behaviour without breaking existing implementers, what does that look like? What is the migration story?
 
 ---
 

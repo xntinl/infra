@@ -81,7 +81,21 @@ Same as ordinary structs: `@enforce_keys [:address]` makes the struct's construc
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"ecto", "~> 1.0"},
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: scaffold a new Mix project and set up the directory layout for the exercise.
 
 ```bash
 mix new domain_errors
@@ -89,6 +103,8 @@ cd domain_errors
 ```
 
 ### Step 2: `lib/domain_errors.ex`
+
+**Objective**: implement domain_errors — domain-specific exceptions for a payments module.
 
 ```elixir
 defmodule DomainErrors do
@@ -173,6 +189,8 @@ end
 
 ### Step 3: `test/domain_errors_test.exs`
 
+**Objective**: cover domain_errors_test with ExUnit tests for the public API and representative edge cases.
+
 ```elixir
 defmodule DomainErrorsTest do
   use ExUnit.Case, async: true
@@ -236,6 +254,8 @@ end
 
 ### Step 4: Run tests
 
+**Objective**: run the test suite and confirm all tests pass.
+
 ```bash
 mix test
 ```
@@ -246,6 +266,19 @@ mix test
 
 ---
 
+
+## Key Concepts
+
+### 1. Define Custom Exceptions as Modules Implementing `Exception` Protocol
+Custom exceptions let you encode domain-specific information (error code, amount, user_id) in the exception itself.
+
+### 2. Rescue Pattern-Matches on Exception Type
+You can handle specific exception types and access their fields. This is cleaner than error codes or tuples.
+
+### 3. Exceptions Are Heavy; Use Sparingly
+Creating and catching exceptions involves stack unwinding and is slower than returning error tuples. For frequent failures, use tuples.
+
+---
 ## Benchmark
 
 Measure the cost of raising a custom exception vs. returning a tagged tuple so you know which to pick per call volume:

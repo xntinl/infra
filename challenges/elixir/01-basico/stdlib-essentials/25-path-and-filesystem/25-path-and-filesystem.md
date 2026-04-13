@@ -2,9 +2,6 @@
 
 **Project**: `scaffold_gen` — generates a project directory tree with template files from a blueprint
 
-**Difficulty**: ★☆☆☆☆
-**Estimated time**: 1-2 hours
-
 ---
 
 ## Why Path and File matter for a senior developer
@@ -22,6 +19,12 @@ Elixir provides two complementary modules:
   non-bang variant that returns `{:ok, _} | {:error, reason}`.
 
 Knowing which belongs where prevents both bugs and unnecessary IO.
+
+---
+
+## Why `Path` + `File` and not hardcoded strings + `:file`
+
+Hardcoding `"/"` as a separator works on BEAM (it normalises internally) until you hand the string to an external tool — shell, Dockerfile generator, Git — that expects native separators and silently corrupts on Windows CI. Relative paths without `Path.expand/1` are interpreted against the cwd at call time, so a test that passes `./tmp` under the project root succeeds locally and fails when the same code runs from a systemd unit with a different cwd. `Path` handles both concerns with pure string ops and no syscalls; `File` layers the actual IO on top. Reaching directly for `:file` (Erlang) skips the cross-platform normalisation and returns charlists instead of binaries, which then leak into your logs and assertions.
 
 ---
 
@@ -62,9 +65,36 @@ scaffold_gen/
 
 ---
 
+## Design decisions
+
+**Option A — imperative generator: one function per file, `File.write!/2` inline**
+- Pros: zero indirection; each file is visible at a glance; no template engine to learn.
+- Cons: every new stack forks the generator; paths and templates are tangled; testing a path rendering requires a filesystem; easy to stomp on existing files.
+
+**Option B — data-driven blueprint (`%{directories: [...], files: [...]}`) rendered by a pure renderer, materialised by a separate generator** (chosen)
+- Pros: blueprints are testable in memory (no IO); new stacks = new blueprint functions, no generator changes; placeholder rendering has its own module and unit tests; validation happens before any write so partial scaffolds are impossible.
+- Cons: three layers instead of one; plain `String.replace/3` templates can't express conditionals (EEx would) — fine for the current scope.
+
+Chose **B** because the generator lives forever and new stacks arrive unpredictably. Separating "what the blueprint says" from "how we render it" from "how we write it" pays off the first time two devs add stacks in parallel.
+
+---
+
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Path is pure string ops (OS-agnostic separators); File is actual IO — never hardcode "/" for portable code.
 
 ```bash
 mix new scaffold_gen
@@ -72,6 +102,8 @@ cd scaffold_gen
 ```
 
 ### Step 2: `mix.exs`
+
+**Objective**: Boilerplate; focus on Path.expand/1 resolving relative paths against project root, not cwd.
 
 ```elixir
 defmodule ScaffoldGen.MixProject do
@@ -97,6 +129,8 @@ end
 
 ### Step 3: `.formatter.exs`
 
+**Objective**: Formatter is opinionated; configure inputs glob + line length once; format is hermetic (no env deps).
+
 ```elixir
 [
   inputs: ["{mix,.formatter}.exs", "{config,lib,test}/**/*.{ex,exs}"],
@@ -105,6 +139,8 @@ end
 ```
 
 ### Step 4: `lib/scaffold_gen/blueprint.ex`
+
+**Objective**: Data-driven blueprints (maps) are testable without IO; pure description separates intent from side effects.
 
 ```elixir
 defmodule ScaffoldGen.Blueprint do
@@ -239,6 +275,8 @@ end
 
 ### Step 5: `lib/scaffold_gen/renderer.ex`
 
+**Objective**: Renderer is pure (String.replace); testing templates never touches disk — fast, repeatable, isolated.
+
 ```elixir
 defmodule ScaffoldGen.Renderer do
   @moduledoc """
@@ -295,6 +333,8 @@ end
 ```
 
 ### Step 6: `lib/scaffold_gen/generator.ex`
+
+**Objective**: File.mkdir_p validates target doesn't exist; File.write! only after validation — never partial scaffolds.
 
 ```elixir
 defmodule ScaffoldGen.Generator do
@@ -416,6 +456,8 @@ end
   scaffold — we fail fast.
 
 ### Step 7: Tests
+
+**Objective**: Test path rendering and blueprint validation in memory; only test generator integration with temp dirs.
 
 ```elixir
 # test/scaffold_gen/renderer_test.exs
@@ -539,12 +581,37 @@ end
 
 ### Step 8: Run and verify
 
+**Objective**: --warnings-as-errors catches unused blueprint keys; test coverage validates all template placeholders expand.
+
 ```bash
 mix deps.get
 mix compile --warnings-as-errors
 mix test --trace
 mix format
 ```
+
+### Why this works
+
+`Path.expand/1` canonicalises the target once so every subsequent operation — mkdir, write, error logging — references the same absolute path. `Path.join/2` consults the host OS for the correct separator, which keeps the same blueprint correct on macOS, Linux, and Windows CI. Validation (`validate_service_name`, `validate_target`) runs before any IO, so a failed scaffold leaves the filesystem untouched; a half-written project is worse than none. `File.mkdir_p/1` is idempotent and recursive, so blueprints can list only the leaf directories and still work.
+
+---
+
+
+## Key Concepts
+
+### 1. `Path` Functions Work with Strings, Not Actual Paths
+`Path.join` does string manipulation on paths without validation. `Path` does not check if paths exist or are accessible.
+
+### 2. Cross-Platform Paths
+`Path.join/2` uses the OS-specific separator. Always use `join` instead of string concatenation for portable code.
+
+### 3. Path Components
+`Path.dirname`, `Path.basename`, `Path.extname` parse paths into components without touching the filesystem.
+
+---
+## Benchmark
+
+<!-- benchmark N/A: IO-bound scaffolder, dominated by filesystem latency, not Elixir code paths -->
 
 ---
 
@@ -601,6 +668,13 @@ files.
 - When your templates are user-supplied — beware of injection. A plain
   `String.replace/3` here is safe because blueprints ship with the app, not
   from external input.
+
+---
+
+## Reflection
+
+1. Your scaffolder refuses to write into a non-empty directory. A platform team now wants an "update" mode that patches existing scaffolds in place (add a new config file, refresh a gitignore). Would you add an `:overwrite` flag, split `generate/3` into `generate_new/3` and `apply_diff/3`, or move to a git-based workflow (clone template, merge changes)? What invariant does each approach preserve?
+2. Blueprints today are plain Elixir functions compiled into the generator. A product manager wants users to upload their own blueprints as YAML. What changes in the trust model of `Renderer.render/2` and in the validator? At what point do you stop fighting and embed a real template engine (EEx with restricted bindings, Mustache)?
 
 ---
 

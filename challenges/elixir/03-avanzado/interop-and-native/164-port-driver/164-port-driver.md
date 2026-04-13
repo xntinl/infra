@@ -93,6 +93,16 @@ For 99% of new native code — use a NIF.
 
 ### 5. Loading a port driver
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
+
 ```elixir
 :ok = :erl_ddll.load_driver(~c"./priv", ~c"upcase_drv")
 port = Port.open({:spawn_driver, ~c"upcase_drv"}, [:binary])
@@ -124,6 +134,8 @@ Both NIFs and Port Drivers run in-process — a segfault in either crashes the B
 
 ### Step 1: `Makefile`
 
+**Objective**: Query running BEAM for ERTS paths so compiled driver/NIF matches the actual OTP release ABI, avoiding link-time failures.
+
 ```make
 ERTS_INCLUDE := $(shell erl -eval 'io:format("~s", [code:root_dir() ++ "/erts-" ++ erlang:system_info(version) ++ "/include"])' -s init stop -noshell)
 ERL_INTERFACE_DIR := $(shell erl -eval 'io:format("~s", [filename:join([code:root_dir(), "lib", "erl_interface-"] ++ [element(1, string:to_integer(erlang:system_info(version)))])])' -s init stop -noshell)
@@ -142,6 +154,8 @@ all: priv/upcase_drv.so priv/upcase_nif.so
 ```
 
 ### Step 2: `c_src/upcase_drv.c` — minimal port driver
+
+**Objective**: Implement driver callbacks so linked-in code shares scheduler threads with BEAM while maintaining per-port state isolation.
 
 ```c
 #include <string.h>
@@ -184,6 +198,8 @@ DRIVER_INIT(upcase_drv) { return &upcase_driver_entry; }
 
 ### Step 3: `c_src/upcase_nif.c` — C NIF for comparison
 
+**Objective**: Zero-copy inspect input and return output binary so NIF latency becomes the baseline for driver vs NIF cost comparison.
+
 ```c
 #include <string.h>
 #include <ctype.h>
@@ -207,6 +223,8 @@ ERL_NIF_INIT(Elixir.PortDriverDemo.ViaNif, funcs, NULL, NULL, NULL, NULL)
 ```
 
 ### Step 4: `lib/port_driver_demo/via_port.ex`
+
+**Objective**: Isolate to external process so buggy code cannot crash BEAM, trading isolation safety for fork/exec spawn overhead.
 
 ```elixir
 defmodule PortDriverDemo.ViaPort do
@@ -233,6 +251,8 @@ end
 ```
 
 ### Step 5: `lib/port_driver_demo/via_driver.ex`
+
+**Objective**: Idempotent driver loading via erl_ddll so repeated port opens reuse the linked-in driver without reload failure.
 
 ```elixir
 defmodule PortDriverDemo.ViaDriver do
@@ -269,6 +289,8 @@ end
 
 ### Step 6: `lib/port_driver_demo/via_nif.ex`
 
+**Objective**: Load dylib at module init time so NIF symbols resolve once, with stubs raising until startup completes.
+
 ```elixir
 defmodule PortDriverDemo.ViaNif do
   @on_load :load_nif
@@ -284,6 +306,8 @@ end
 ```
 
 ### Step 7: `mix.exs`
+
+**Objective**: Wire elixir_make compiler so `mix compile` auto-runs Makefile and keeps .so/.dylib synchronized with C sources.
 
 ```elixir
 defmodule PortDriverDemo.MixProject do
@@ -307,6 +331,8 @@ end
 
 ### Step 8: `test/port_driver_demo_test.exs`
 
+**Objective**: Assert all three strategies (Port, Driver, NIF) produce identical outputs so correctness is decoupled from performance choice.
+
 ```elixir
 defmodule PortDriverDemoTest do
   use ExUnit.Case, async: false
@@ -315,21 +341,23 @@ defmodule PortDriverDemoTest do
 
   @data "hello world"
 
-  test "all three produce the same output" do
-    assert ViaPort.upcase(@data)   == "HELLO WORLD"
-    assert ViaDriver.upcase(@data) == "HELLO WORLD"
-    assert ViaNif.upcase(@data)    == "HELLO WORLD"
-  end
+  describe "PortDriverDemo" do
+    test "all three produce the same output" do
+      assert ViaPort.upcase(@data)   == "HELLO WORLD"
+      assert ViaDriver.upcase(@data) == "HELLO WORLD"
+      assert ViaNif.upcase(@data)    == "HELLO WORLD"
+    end
 
-  test "empty input" do
-    assert ViaNif.upcase("") == ""
-    assert ViaDriver.upcase("") == ""
-  end
+    test "empty input" do
+      assert ViaNif.upcase("") == ""
+      assert ViaDriver.upcase("") == ""
+    end
 
-  test "unicode bytes untouched by ASCII-only upcase" do
-    # We upcase ASCII only — multibyte UTF-8 bytes stay identical.
-    bin = "héllo"
-    assert byte_size(ViaNif.upcase(bin)) == byte_size(bin)
+    test "unicode bytes untouched by ASCII-only upcase" do
+      # We upcase ASCII only — multibyte UTF-8 bytes stay identical.
+      bin = "héllo"
+      assert byte_size(ViaNif.upcase(bin)) == byte_size(bin)
+    end
   end
 end
 ```
@@ -340,6 +368,32 @@ end
 ### Why this works
 
 The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
+
+
+## Key Concepts: Port Drivers and Low-Level System Integration
+
+Port drivers are dynamic libraries (C/Rust) loaded directly into the Erlang VM, unlike NIFs which are linked. They run in separate scheduler threads and are pre-OTP1.25 the way to do heavy lifting without blocking the VM.
+
+Port drivers are rarely used now (NIFs are more flexible, and Ports are simpler for most cases). But for very old systems or extreme performance needs, port drivers remain an option. The complexity is higher: you're writing C/Rust that must be thread-safe and signal-safe.
+
+
+## Advanced Considerations: Port Isolation Tradeoffs and Latency Tuning
+
+The three strategies form a spectrum: **Port (OS process) vs Linked-in Driver vs NIF**. Each trades isolation for speed. A Port spawns a full subprocess, incurring ~0.3–1 ms per round-trip (fork + exec + serialization overhead); but if the subprocess crashes or hangs, the BEAM VM is unaffected. A Linked-in Driver loads a shared library, cutting latency to ~10–50 μs, but a SIGSEGV in the driver code kills the entire BEAM process. A NIF is even faster (~1–5 μs call overhead) yet has no additional isolation layer.
+
+**Serialization cost** dominates over the wire. Sending a 1 MB binary to a Port requires encoding it (often base64 or framing), writing to stdin/pipe, reading from stdout, and decoding. That's typically 5–10 ms. For frequent small messages, the call overhead compounds: 10,000 simple operations via Port takes ~3 seconds; the same 10,000 NIF calls takes ~10 ms. But if the workload is rare (one Port call per request in a web server), the speed difference is immaterial.
+
+**Backpressure and buffering** matter. A Port maintaining a queue of pending work is explicit in Elixir; you see the queue depth and can apply backpressure. A NIF workload that exceeds dirty scheduler capacity is invisible until you monitor scheduler metrics. In microservice architectures, Port-based external services often scale better because you can spawn multiple worker processes and load-balance, whereas NIF dirty-cpu schedulers are a fixed global resource.
+
+**Hybrid deployment** is common. I/O-heavy operations (database queries, HTTP requests) → Port or async Task. CPU-heavy operations (image resizing, compression) → NIF on DirtyCpu. Parsing and validation → pure Elixir. A well-layered system uses each tool where it fits best, avoiding the temptation to push everything into a single fast NIF.
+
+---
+
+## Deep Dive: Interop Patterns and Production Implications
+
+Interop with native code (NIFs, ports, C extensions) introduces failure modes that pure Elixir code doesn't have: segfaults, memory leaks, deadlocks with the Erlang emulator. Testing interop requires separate test suites for the native layer and integration tests that exercise the boundary.
+
+---
 
 ## Trade-offs and production gotchas
 

@@ -75,6 +75,8 @@ end
 
 ### Step 1: Schema with per-field complexity
 
+**Objective**: Attach static and `fn args, child -> n + n*child end` costs per field so the analyzer can score any AST before resolvers wake.
+
 ```elixir
 defmodule GraphqlGuardrailsWeb.Graphql.Schema do
   use Absinthe.Schema
@@ -111,6 +113,8 @@ end
 
 ### Step 2: Enforce complexity at execution
 
+**Objective**: Flip `analyze_complexity: true, max_complexity: 200` on `Absinthe.Plug` so abusive documents die in validation, never in the DB.
+
 Absinthe provides `Absinthe.Phase.Document.Complexity.Result`. Enable it via pipeline options:
 
 ```elixir
@@ -127,6 +131,8 @@ forward "/api",
 A document exceeding `max_complexity` is rejected before any resolver runs; the client gets a standard GraphQL error.
 
 ### Step 3: Persisted query store
+
+**Objective**: Map sha256 → query text in ETS and verify hashes with `Plug.Crypto.secure_compare/2` so timing attacks cannot probe the registry.
 
 ```elixir
 defmodule GraphqlGuardrails.PersistedStore do
@@ -159,6 +165,8 @@ end
 `secure_compare` prevents timing attacks on hash comparison.
 
 ### Step 4: APQ plug that rewrites the request body
+
+**Objective**: Implement the Apollo APQ protocol: lookup hash, rewrite `conn.params["query"]` on hit, emit `PersistedQueryNotFound` on miss so clients register on second shot.
 
 ```elixir
 defmodule GraphqlGuardrailsWeb.Graphql.Plugs.APQ do
@@ -302,6 +310,50 @@ Benchee.run(%{
 
 **Expected**: complexity phase adds < 50 µs on a medium document; negligible vs. any DB work.
 
+## Deep Dive: Query Complexity and N+1 Prevention Patterns
+
+GraphQL's flexibility is a double-edged sword. A query like `{ users { posts { comments { author { email } } } } }`
+becomes a DDoS vector if unchecked: a resolver that loads each post's comments naively yields 1000 database 
+queries for a 100-user query.
+
+**Three strategies to prevent N+1**:
+1. **Dataloader batching** (Absinthe-native): Queue fields in phase 1 (`load/3`), flush in phase 2 (`run/1`).
+   Single database call per level. Works across HTTP boundaries via custom sources.
+2. **Ecto select/5 eager loading** (preload): Best when schema relationships are known at resolver definition time.
+   Fine-grained control; requires discipline in your types.
+3. **Complexity analysis** (persisted queries): Assign a "weight" to each field (users=2, posts=5, comments=10).
+   Reject queries exceeding a threshold BEFORE execution. Prevents runaway queries entirely.
+
+**Production gotcha**: Complexity analysis doesn't prevent slow queries — it prevents expensive queries.
+A query that hits 50,000 database rows but under the complexity limit still runs. Combine with database 
+query timeouts and active monitoring.
+
+**Subscription patterns** (real-time): Subscriptions over PubSub break traditional Dataloader batching 
+because events arrive asynchronously. Use a separate resolver that doesn't call the loader; instead, 
+publish (source) and subscribe (sink) directly. This keeps subscriptions cheap and doesn't starve 
+the dataloader queue.
+
+**Field-level authorization**: Dataloader sources can enforce per-user visibility rules at load time, 
+not in the resolver. This is cleaner than filtering after the fact and reduces unnecessary database 
+queries for unauthorized fields.
+
+---
+
+## Advanced Considerations
+
+API implementations at scale require careful consideration of request handling, error responses, and the interaction between multiple clients with different performance expectations. The distinction between public APIs and internal APIs affects error reporting granularity, versioning strategies, and backwards compatibility guarantees fundamentally. Versioning APIs through headers, paths, or query parameters each have trade-offs in terms of maintenance burden, client complexity, and developer experience across multiple client versions. When deprecating API endpoints, the migration window and support period must balance client migration costs with infrastructure maintenance costs and team capacity constraints.
+
+GraphQL adds complexity around query costs, depth limits, and the interaction between nested resolvers and N+1 query problems. A deeply nested GraphQL query can trigger hundreds of database queries if not carefully managed with proper preloading and query analysis. Implementing query cost analysis prevents malicious or poorly-written queries from starving resources and degrading service for other clients. The caching layer becomes more complex with GraphQL because the same data may be accessed through multiple query paths, each with different caching semantics and TTL requirements that must be carefully coordinated at the application level.
+
+Error handling and status codes require careful design to balance information disclosure with security concerns. Too much detail in error messages helps attackers; too little detail frustrates legitimate users. Implement structured error responses with specific error codes that clients can use to handle different failure scenarios intelligently and retry appropriately. Rate limiting, circuit breakers, and backpressure mechanisms prevent API overload but require careful configuration based on expected traffic patterns and SLA requirements.
+
+
+## Deep Dive: Apis Patterns and Production Implications
+
+API testing requires testing schema validation, error messages, pagination, and rate limiting—not just happy paths. The mistake is testing only the happy path and assuming error handling works. Production APIs with weak error handling become support nightmares.
+
+---
+
 ## Trade-offs and production gotchas
 
 **1. Complexity scoring drifts from reality**
@@ -332,3 +384,13 @@ Your API has two tiers of clients: first-party (mobile app) and third-party (pub
 - [Apollo APQ protocol](https://www.apollographql.com/docs/apollo-server/performance/apq/)
 - [`Absinthe.Phase.Document.Complexity.Result` source](https://github.com/absinthe-graphql/absinthe/blob/main/lib/absinthe/phase/document/complexity/result.ex)
 - [Plug.Crypto.secure_compare](https://hexdocs.pm/plug_crypto/Plug.Crypto.html#secure_compare/2)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

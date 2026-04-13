@@ -144,6 +144,91 @@ without modification.
 
 ### Step 1: mix.exs
 
+**Objective**: Declare Finch (pool), Telemetry (instrumentation), Jason (codec) so middleware pipeline is built on production foundations from the start.
+
+```elixir
+defp deps do
+  [
+    {:finch, "~> 0.18"},
+    {:jason, "~> 1.4"},
+    {:telemetry, "~> 1.2"}
+  ]
+end
+```
+
+### Dependencies (mix.exs)
+
+```elixir
+```elixir
+adapter_fn = fn req -> HTTPAdapter.request(req) end
+
+pipeline_fn =
+  middlewares
+  |> Enum.reverse()
+  |> Enum.reduce(adapter_fn, fn {mod, opts}, inner ->
+    fn req -> mod.call(req, inner, opts) end
+  end)
+
+pipeline_fn.(request)
+```
+
+Order matters: Telemetry outermost (captures everything including breaker
+rejections); CircuitBreaker before RateLimit (don't waste rate-limit tokens on
+a known-dead upstream); Retry inside both so retries are counted against the
+breaker and the rate limiter.
+
+### 3. Structured error taxonomy
+
+Returning `{:error, :something}` loses causal chain. We use a struct:
+
+```elixir
+%ClientError{
+  kind: :timeout | :circuit_open | :rate_limited | :http_error | :transport,
+  status: integer() | nil,
+  retriable: boolean(),
+  meta: map(),
+  original: term()
+}
+```
+
+Downstream can pattern-match on `kind` and inspect `retriable` to decide
+whether to bubble up or degrade gracefully.
+
+### 4. Determinism under retry
+
+A naive retry loop that retries every failure amplifies outages (one request
+became four). Our retry middleware retries only when `retriable: true` AND the
+request is idempotent (GET, PUT, DELETE — NOT POST unless an Idempotency-Key
+header is present;
+
+### 5. Telemetry events shape
+
+Every request emits three events: `[:api_client, :request, :start]`,
+`[:api_client, :request, :stop]`, `[:api_client, :request, :exception]`, all
+with consistent metadata (`client`, `method`, `url_host`, `status`). Match the
+`:telemetry.span/3` convention so you can plug in `TelemetryMetricsPrometheus`
+without modification.
+
+---
+
+## Design decisions
+
+**Option A — naive/simple approach**
+- Pros: minimal code, easy to reason about.
+- Cons: breaks under load, lacks observability, hard to evolve.
+
+**Option B — the approach used here** (chosen)
+- Pros: production-grade, handles edge cases, testable boundaries.
+- Cons: more moving parts, requires understanding of the BEAM primitives involved.
+
+→ Chose **B** because correctness under concurrency and failure modes outweighs the extra surface area.
+
+## Implementation
+
+### Step 1: mix.exs
+
+**Objective**: Declare Finch (pool), Telemetry (instrumentation), Jason (codec) so middleware pipeline is built on production foundations from the start.
+
 ```elixir
 defp deps do
   [
@@ -155,6 +240,8 @@ end
 ```
 
 ### Step 2: `lib/api_client_wrapper/middleware.ex` and the error struct
+
+**Objective**: Define Middleware behaviour and ClientError struct so middlewares are composable and errors carry retriable flag for smart retry logic.
 
 ```elixir
 defmodule ApiClientWrapper.Middleware do
@@ -188,6 +275,8 @@ end
 
 ### Step 3: Timeout middleware
 
+**Objective**: Wrap next/1 call in Task.yield + Task.shutdown so timeouts abort downstream work cleanly without leaking stuck processes into caller's hierarchy.
+
 ```elixir
 defmodule ApiClientWrapper.Middlewares.Timeout do
   @behaviour ApiClientWrapper.Middleware
@@ -217,6 +306,8 @@ end
 ```
 
 ### Step 4: Retry middleware (exponential + full jitter)
+
+**Objective**: Retry only retriable errors with full-jitter backoff so thundering herd during recovery decorrelates into independent retry waves.
 
 ```elixir
 defmodule ApiClientWrapper.Middlewares.Retry do
@@ -255,7 +346,9 @@ defmodule ApiClientWrapper.Middlewares.Retry do
 end
 ```
 
-### Step 5: Circuit-breaker middleware (thin wrapper over exercise 36)
+### Step 5: Circuit-breaker middleware (thin wrapper over a breaker)
+
+**Objective**: Short-circuit calls when the ETS-published breaker state is `:open` so a tripped dependency rejects in microseconds instead of burning timeout budget.
 
 ```elixir
 defmodule ApiClientWrapper.Middlewares.CircuitBreaker do
@@ -298,6 +391,8 @@ end
 
 ### Step 6: Rate-limit middleware
 
+**Objective**: Consult a token bucket keyed per tenant/route so local shaping absorbs bursts before the upstream's 429 does it for you.
+
 ```elixir
 defmodule ApiClientWrapper.Middlewares.RateLimit do
   @behaviour ApiClientWrapper.Middleware
@@ -327,6 +422,8 @@ end
 
 ### Step 7: Telemetry middleware
 
+**Objective**: Wrap every call in `:telemetry.span` so latency, outcome and error-kind flow to handlers without threading loggers through the pipeline.
+
 ```elixir
 defmodule ApiClientWrapper.Middlewares.Telemetry do
   @behaviour ApiClientWrapper.Middleware
@@ -355,6 +452,8 @@ end
 ```
 
 ### Step 8: Client pipeline runner — `lib/api_client_wrapper/client.ex`
+
+**Objective**: Fold the middleware list right-to-left over the adapter so composition is a plain closure chain with zero runtime dispatch overhead.
 
 ```elixir
 defmodule ApiClientWrapper.Client do
@@ -405,62 +504,66 @@ end
 
 ### Step 9: Tests — pipeline composition
 
+**Objective**: Exercise retry/non-retry branches with a scripted adapter agent so composition invariants are verified without touching the network.
+
 ```elixir
 defmodule ApiClientWrapper.ClientTest do
   use ExUnit.Case, async: true
   alias ApiClientWrapper.{Client, ClientError}
   alias ApiClientWrapper.Middlewares.{Retry, Timeout}
 
-  test "retries on retriable error and eventually succeeds" do
-    agent =
-      start_agent([
-        {:error, %ClientError{kind: :transport, retriable: true}},
-        {:error, %ClientError{kind: :transport, retriable: true}},
-        {:ok, %{status: 200, body: "ok"}}
-      ])
+  describe "ApiClientWrapper.Client" do
+    test "retries on retriable error and eventually succeeds" do
+      agent =
+        start_agent([
+          {:error, %ClientError{kind: :transport, retriable: true}},
+          {:error, %ClientError{kind: :transport, retriable: true}},
+          {:ok, %{status: 200, body: "ok"}}
+        ])
 
-    client =
-      Client.new(
-        adapter: fn _req -> next_response(agent) end,
-        pipeline: [
-          {Retry, max_attempts: 3, base_ms: 1, cap_ms: 5}
-        ]
-      )
+      client =
+        Client.new(
+          adapter: fn _req -> next_response(agent) end,
+          pipeline: [
+            {Retry, max_attempts: 3, base_ms: 1, cap_ms: 5}
+          ]
+        )
 
-    assert {:ok, %{status: 200}} =
-             Client.request(client, %{method: :get, url: "http://x"})
-  end
+      assert {:ok, %{status: 200}} =
+               Client.request(client, %{method: :get, url: "http://x"})
+    end
 
-  test "non-retriable error is not retried" do
-    counter = :counters.new(1, [])
+    test "non-retriable error is not retried" do
+      counter = :counters.new(1, [])
 
-    client =
-      Client.new(
-        adapter: fn _req ->
-          :counters.add(counter, 1, 1)
-          {:error, %ClientError{kind: :http_error, retriable: false, status: 400}}
-        end,
-        pipeline: [{Retry, max_attempts: 3, base_ms: 1, cap_ms: 5}]
-      )
+      client =
+        Client.new(
+          adapter: fn _req ->
+            :counters.add(counter, 1, 1)
+            {:error, %ClientError{kind: :http_error, retriable: false, status: 400}}
+          end,
+          pipeline: [{Retry, max_attempts: 3, base_ms: 1, cap_ms: 5}]
+        )
 
-    assert {:error, %ClientError{}} =
-             Client.request(client, %{method: :get, url: "http://x"})
+      assert {:error, %ClientError{}} =
+               Client.request(client, %{method: :get, url: "http://x"})
 
-    assert :counters.get(counter, 1) == 1
-  end
+      assert :counters.get(counter, 1) == 1
+    end
 
-  test "timeout wraps slow adapter" do
-    client =
-      Client.new(
-        adapter: fn _req ->
-          Process.sleep(200)
-          {:ok, %{status: 200}}
-        end,
-        pipeline: [{Timeout, timeout: 50}]
-      )
+    test "timeout wraps slow adapter" do
+      client =
+        Client.new(
+          adapter: fn _req ->
+            Process.sleep(200)
+            {:ok, %{status: 200}}
+          end,
+          pipeline: [{Timeout, timeout: 50}]
+        )
 
-    assert {:error, %ClientError{kind: :timeout}} =
-             Client.request(client, %{method: :get, url: "http://x"})
+      assert {:error, %ClientError{kind: :timeout}} =
+               Client.request(client, %{method: :get, url: "http://x"})
+    end
   end
 
   defp start_agent(responses) do
@@ -492,6 +595,23 @@ IO.puts("avg: #{time_us / 10_000} µs/op")
 ```
 
 Target: operation should complete in the low-microsecond range on modern hardware; deviations by >2× indicate a regression worth investigating.
+
+## Advanced Considerations: Circuit Breakers and Bulkheads in Production
+
+A circuit breaker monitors downstream service health and rejects new requests when failures exceed a threshold, failing fast instead of queuing indefinitely. States: `:closed` (normal), `:open` (fast-fail), `:half_open` (testing recovery). A timeout-based pattern monitors; once requests succeed again, the circuit closes. Half-open tests with a single request; if it succeeds, all requests resume.
+
+Bulkheads isolate resource pools so one slow endpoint doesn't starve others. A GenServer pool with a bounded queue (e.g., `:queue.len(state) >= 100`) can return `{:error, :overloaded}` immediately, preventing queue buildup. Combined with exponential backoff on the client (caller retries with increasing delays), this creates a natural circuit breaker behavior without explicit state.
+
+Graceful degradation means serving stale data or reduced functionality when a service is slow. A cached value with a 5-minute TTL is acceptable for many reads; serve it if the live source is timing out. Feature flags allow disabling expensive operations at runtime. Cascading timeout windows (outer service times out after 5s, inner calls must complete in 3s) prevent unbounded waiting. The cost is complexity: tracking degradation modes, testing failure scenarios, and ensuring data consistency under partial failures.
+
+---
+
+
+## Deep Dive: Resilience Patterns and Production Implications
+
+Resilience patterns (circuit breakers, timeouts, retries) are easy to implement but hard to test. The insight is that resilience patterns must be tested under failure: timeouts matter only when calls actually take time, retries matter only when transient failures occur. Production systems with untested resilience patterns often fail gracefully in test and catastrophically in production.
+
+---
 
 ## Trade-offs and production gotchas
 

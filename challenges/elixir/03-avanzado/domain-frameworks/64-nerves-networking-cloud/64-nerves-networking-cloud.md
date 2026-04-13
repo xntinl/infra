@@ -65,6 +65,8 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ### Step 1: `mix.exs` additions
 
+**Objective**: Add VintageNet, WiFi, and Tortoise (MQTT) for embedded network and cloud connectivity.
+
 ```elixir
 defp deps do
   [
@@ -77,6 +79,8 @@ end
 ```
 
 ### Step 2: `lib/api_gateway/fleet/identity.ex`
+
+**Objective**: Derive stable device ID from eth0 MAC address to identify devices across reboots and updates.
 
 ```elixir
 defmodule ApiGateway.Fleet.Identity do
@@ -123,6 +127,8 @@ end
 ```
 
 ### Step 3: `lib/api_gateway/network/wifi_manager.ex`
+
+**Objective**: Subscribe to VintageNet status changes and apply exponential backoff + jitter on disconnects.
 
 ```elixir
 defmodule ApiGateway.Network.WiFiManager do
@@ -227,6 +233,8 @@ end
 
 ### Step 4: `lib/api_gateway/network/telemetry_publisher.ex`
 
+**Objective**: Implement the `telemetry_publisher.ex` module.
+
 ```elixir
 defmodule ApiGateway.Network.TelemetryPublisher do
   @moduledoc """
@@ -305,6 +313,8 @@ The buffer uses Erlang's `:queue` module which provides O(1) amortized enqueue a
 
 ### Step 5: Given tests — must pass without modification
 
+**Objective**: Implement: Given tests — must pass without modification.
+
 ```elixir
 # test/api_gateway/telemetry_publisher_test.exs
 defmodule ApiGateway.Network.TelemetryPublisherTest do
@@ -321,58 +331,62 @@ defmodule ApiGateway.Network.TelemetryPublisherTest do
     :ok
   end
 
-  test "buffers messages when not connected" do
-    {:ok, pid} = start_supervised({
-      TelemetryPublisher,
-      [host: "localhost", device_id: "test-001"]
-    })
+  describe "ApiGateway.Network.TelemetryPublisher" do
+    test "buffers messages when not connected" do
+      {:ok, pid} = start_supervised({
+        TelemetryPublisher,
+        [host: "localhost", device_id: "test-001"]
+      })
 
-    TelemetryPublisher.publish(%{temperature: 22.5})
-    TelemetryPublisher.publish(%{temperature: 23.0})
+      TelemetryPublisher.publish(%{temperature: 22.5})
+      TelemetryPublisher.publish(%{temperature: 23.0})
 
-    Process.sleep(50)
-    state = :sys.get_state(pid)
-    assert state.buffer_count == 2
-    refute_received {:published, _}
-  end
+      Process.sleep(50)
+      state = :sys.get_state(pid)
+      assert state.buffer_count == 2
+      refute_received {:published, _}
+    end
 
-  test "buffer does not exceed max_buffer" do
-    {:ok, pid} = start_supervised({
-      TelemetryPublisher,
-      [host: "localhost", device_id: "test-002"]
-    })
+    test "buffer does not exceed max_buffer" do
+      {:ok, pid} = start_supervised({
+        TelemetryPublisher,
+        [host: "localhost", device_id: "test-002"]
+      })
 
-    for i <- 1..510, do: TelemetryPublisher.publish(%{seq: i})
+      for i <- 1..510, do: TelemetryPublisher.publish(%{seq: i})
 
-    Process.sleep(100)
-    state = :sys.get_state(pid)
-    assert state.buffer_count <= 500
-  end
+      Process.sleep(100)
+      state = :sys.get_state(pid)
+      assert state.buffer_count <= 500
+    end
 
-  test "dropping oldest when full — newest entry survives" do
-    {:ok, pid} = start_supervised({
-      TelemetryPublisher,
-      [host: "localhost", device_id: "test-003"]
-    })
+    test "dropping oldest when full — newest entry survives" do
+      {:ok, pid} = start_supervised({
+        TelemetryPublisher,
+        [host: "localhost", device_id: "test-003"]
+      })
 
-    for i <- 1..500, do: TelemetryPublisher.publish(%{seq: i})
-    Process.sleep(50)
+      for i <- 1..500, do: TelemetryPublisher.publish(%{seq: i})
+      Process.sleep(50)
 
-    TelemetryPublisher.publish(%{seq: :last})
-    Process.sleep(50)
+      TelemetryPublisher.publish(%{seq: :last})
+      Process.sleep(50)
 
-    state = :sys.get_state(pid)
-    messages =
-      state.buffer
-      |> :queue.to_list()
-      |> Enum.map(&Jason.decode!/1)
+      state = :sys.get_state(pid)
+      messages =
+        state.buffer
+        |> :queue.to_list()
+        |> Enum.map(&Jason.decode!/1)
 
-    assert Enum.any?(messages, fn m -> get_in(m, ["payload", "seq"]) == "last" end)
+      assert Enum.any?(messages, fn m -> get_in(m, ["payload", "seq"]) == "last" end)
+    end
   end
 end
 ```
 
 ### Step 6: Run tests on host
+
+**Objective**: Run the code to validate the full workflow end-to-end.
 
 ```bash
 MIX_TARGET=host mix test test/api_gateway/telemetry_publisher_test.exs --trace
@@ -385,6 +399,26 @@ MIX_TARGET=host mix test test/api_gateway/telemetry_publisher_test.exs --trace
 
 The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
 
+## Deep Dive
+
+Specialized frameworks like Ash (business logic), Commanded (event sourcing), and Nx (numerical computing) abstract away common infrastructure but impose architectural constraints. Ash's declarative resource definitions simplify authorization and querying at the cost of reduced flexibility—deeply nested association policies can degrade query performance. Commanded's event store and aggregate roots enforce event sourcing discipline, making audit trails and temporal queries natural, but require careful snapshot strategy to avoid replaying years of events. Nx brings numerical computing to Elixir, but JIT compilation and lazy evaluation introduce latency; production models benefit from ahead-of-time compilation for inference. For IoT (Nerves), firmware updates must be atomic and resumable—OTA rollback on failure is non-negotiable. Choose frameworks that align with your scaling assumptions: Ash scales horizontally via read replicas; Commanded scales via sharding; Nx scales via distributed training.
+
+---
+
+## Advanced Considerations
+
+Framework choices like Ash, Commanded, and Nerves create significant architectural constraints that are difficult to change later. Ash's powerful query builder and declarative approach simplify common patterns but can be opaque when debugging complex permission logic or custom filters at scale. Event sourcing with Commanded is powerful for audit trails but creates a different mental model for state management — replaying events to derive current state has CPU and latency costs that aren't apparent in traditional CRUD systems.
+
+Nerves requires understanding the full embedded system stack — from bootloader configuration to over-the-air update mechanisms. A Nerves system that works on your development board may fail in production due to hardware variations, network conditions, or power supply issues. NX's numerical computing is powerful but requires understanding GPU acceleration trade-offs and memory management for large datasets. Livebook provides interactive development but shouldn't be used for production deployments without careful containerization and resource isolation.
+
+The integration between these frameworks and traditional BEAM patterns (supervisors, processes, GenServers) requires careful design. A Commanded projection that rebuilds state from the event log can consume all available CPU, starving other services. NX autograd computations can create unexpected memory usage if not carefully managed. Nerves systems are memory-constrained; performance assumptions from desktop Elixir don't hold. Always prototype these frameworks in realistic environments before committing to them in production systems to validate assumptions.
+
+
+## Deep Dive: Domain Patterns and Production Implications
+
+Domain-specific frameworks enforce module dependencies and architectural boundaries. Testing domain isolation ensures that constraints are maintained as the codebase grows. Production systems without boundary enforcement often become monolithic and hard to test.
+
+---
 ## Trade-off analysis
 
 | Aspect | VintageNet + Tortoise311 | Raw `wpa_supplicant` + `paho-mqtt` | Cloud-only (no edge) |
@@ -437,3 +471,13 @@ Target: operation should complete in the low-microsecond range on modern hardwar
 - [Tortoise311](https://hexdocs.pm/tortoise311) — MQTT client: QoS, subscriptions, handlers
 - [VintageNetWiFi](https://hexdocs.pm/vintage_net_wifi) — WiFi-specific configuration
 - [MQTT spec — QoS levels](https://docs.oasis-open.org/mqtt/mqtt/v5.0/os/mqtt-v5.0-os.html#_Toc3901103) — why QoS 1 vs 0 matters for IoT
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

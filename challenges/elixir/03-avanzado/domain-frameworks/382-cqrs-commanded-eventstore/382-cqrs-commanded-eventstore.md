@@ -92,6 +92,8 @@ end
 
 ### Step 1: Commands and events
 
+**Objective**: Implement: Commands and events.
+
 ```elixir
 defmodule LedgerCqrs.Write.Commands do
   defmodule OpenAccount do
@@ -144,6 +146,8 @@ end
 ```
 
 ### Step 2: Account aggregate
+
+**Objective**: Code execute/2 for debit-credit invariants and apply/2 to fold events into account balance.
 
 ```elixir
 defmodule LedgerCqrs.Write.Account do
@@ -201,6 +205,8 @@ end
 
 ### Step 3: Transfer process manager
 
+**Objective**: Route multi-aggregate sagas: TransferRequested → Debit source → Credit target with failure compensation.
+
 ```elixir
 defmodule LedgerCqrs.Write.ProcessManagers.Transfer do
   use Commanded.ProcessManagers.ProcessManager,
@@ -253,6 +259,8 @@ end
 
 ### Step 4: Router
 
+**Objective**: Wire HTTP routes for: Router.
+
 ```elixir
 defmodule LedgerCqrs.Router do
   use Commanded.Commands.Router
@@ -274,6 +282,8 @@ end
 ```
 
 ### Step 5: Balance projection
+
+**Objective**: Implement: Balance projection.
 
 ```elixir
 defmodule LedgerCqrs.Read.BalanceProjector do
@@ -320,6 +330,8 @@ end
 
 ### Step 6: Read queries
 
+**Objective**: Implement: Read queries.
+
 ```elixir
 defmodule LedgerCqrs.Read.Queries do
   import Ecto.Query
@@ -341,6 +353,8 @@ end
 ```
 
 ### Step 7: Migration
+
+**Objective**: Define the database migration: Migration.
 
 ```elixir
 defmodule LedgerCqrs.Repo.Migrations.CreateBalances do
@@ -454,6 +468,24 @@ Benchee.run(
 
 Expected on a single-node, warm pool: read p50 < 400µs, write p50 1–3ms. The asymmetry is the point: reads are free of the event-store round trip.
 
+## Deep Dive
+
+Specialized frameworks like Ash (business logic), Commanded (event sourcing), and Nx (numerical computing) abstract away common infrastructure but impose architectural constraints. Ash's declarative resource definitions simplify authorization and querying at the cost of reduced flexibility—deeply nested association policies can degrade query performance. Commanded's event store and aggregate roots enforce event sourcing discipline, making audit trails and temporal queries natural, but require careful snapshot strategy to avoid replaying years of events. Nx brings numerical computing to Elixir, but JIT compilation and lazy evaluation introduce latency; production models benefit from ahead-of-time compilation for inference. For IoT (Nerves), firmware updates must be atomic and resumable—OTA rollback on failure is non-negotiable. Choose frameworks that align with your scaling assumptions: Ash scales horizontally via read replicas; Commanded scales via sharding; Nx scales via distributed training.
+## Advanced Considerations
+
+Framework choices like Ash, Commanded, and Nerves create significant architectural constraints that are difficult to change later. Ash's powerful query builder and declarative approach simplify common patterns but can be opaque when debugging complex permission logic or custom filters at scale. Event sourcing with Commanded is powerful for audit trails but creates a different mental model for state management — replaying events to derive current state has CPU and latency costs that aren't apparent in traditional CRUD systems.
+
+Nerves requires understanding the full embedded system stack — from bootloader configuration to over-the-air update mechanisms. A Nerves system that works on your development board may fail in production due to hardware variations, network conditions, or power supply issues. NX's numerical computing is powerful but requires understanding GPU acceleration trade-offs and memory management for large datasets. Livebook provides interactive development but shouldn't be used for production deployments without careful containerization and resource isolation.
+
+The integration between these frameworks and traditional BEAM patterns (supervisors, processes, GenServers) requires careful design. A Commanded projection that rebuilds state from the event log can consume all available CPU, starving other services. NX autograd computations can create unexpected memory usage if not carefully managed. Nerves systems are memory-constrained; performance assumptions from desktop Elixir don't hold. Always prototype these frameworks in realistic environments before committing to them in production systems to validate assumptions.
+
+
+## Deep Dive: Domain Patterns and Production Implications
+
+Domain-specific frameworks enforce module dependencies and architectural boundaries. Testing domain isolation ensures that constraints are maintained as the codebase grows. Production systems without boundary enforcement often become monolithic and hard to test.
+
+---
+
 ## Trade-offs and production gotchas
 
 **1. Read lag is not a bug**
@@ -481,3 +513,13 @@ The `Transfer` process manager is driven by events; if the BEAM restarts between
 - [Martin Fowler — CQRS](https://martinfowler.com/bliki/CQRS.html)
 - [Greg Young — CQRS and event sourcing (YouTube)](https://www.youtube.com/watch?v=JHGkaShoyNs)
 - [EventStore (Elixir) docs](https://hexdocs.pm/eventstore/)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

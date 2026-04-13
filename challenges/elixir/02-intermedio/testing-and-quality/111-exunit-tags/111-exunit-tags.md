@@ -94,9 +94,21 @@ the safety net. Pair it with a pre-push hook or a required CI job.
 
 ---
 
+### Dependencies (`mix.exs`)
+
+```elixir
+def deps do
+  [
+    {exunit},
+  ]
+end
+```
 ## Implementation
 
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
 
 ```bash
 mix new exunit_tags
@@ -104,6 +116,9 @@ cd exunit_tags
 ```
 
 ### Step 2: `lib/feature_flags.ex`
+
+**Objective**: Implement `feature_flags.ex` — the subject under test — shaped specifically to make the testing technique of this lab observable.
+
 
 ```elixir
 defmodule FeatureFlags do
@@ -134,6 +149,9 @@ end
 
 ### Step 3: `test/test_helper.exs`
 
+**Objective**: Implement `test_helper.exs` — the subject under test — shaped specifically to make the testing technique of this lab observable.
+
+
 ```elixir
 # Skip `:integration`, `:external`, and `:skip` by default.
 # Include them explicitly with: `mix test --include integration`
@@ -141,6 +159,9 @@ ExUnit.start(exclude: [:integration, :external, :skip])
 ```
 
 ### Step 4: `test/feature_flags_test.exs`
+
+**Objective**: Write `feature_flags_test.exs` exercising the exact ExUnit feature under study — assertions should fail loudly if the technique is misused.
+
 
 ```elixir
 defmodule FeatureFlagsTest do
@@ -197,6 +218,9 @@ end
 ```
 
 ### Step 5: Run
+
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
 
 ```bash
 # Fast lane: excludes :integration, :external, :skip by default.
@@ -278,3 +302,17 @@ concerns (speed, externality), not organization.
 - [`ExUnit.Case` — tags and filtering](https://hexdocs.pm/ex_unit/ExUnit.Case.html#module-tags)
 - [`ExUnit.configure/1`](https://hexdocs.pm/ex_unit/ExUnit.html#configure/1)
 - [`mix test` task — CLI flags](https://hexdocs.pm/mix/Mix.Tasks.Test.html)
+
+
+## Key Concepts
+
+ExUnit testing in Elixir balances speed, isolation, and readability. The framework provides fixtures, setup hooks, and async mode to achieve both performance and determinism.
+
+**ExUnit patterns and fixtures:**
+`setup_all` runs once per module (module-scoped state); `setup` runs before each test. Returning `{:ok, map}` injects variables into the test context. For side-effectful setup (e.g., starting supervised processes), use `start_supervised` — it automatically stops the process when the test ends, ensuring cleanup.
+
+**Async safety and isolation:**
+Tests with `async: true` run in parallel, but they must be isolated. Shared resources (database, ETS tables, Registry) require careful locking. A common pattern: `setup :set_myflag` — a private setup that configures a unique state for that test. Avoid global state unless protected by locks.
+
+**Mocking trade-offs:**
+Libraries like `Mox` provide compile-time mock modules that behave like real modules but with controlled behavior. The benefit: you catch missing function implementations at test time. The trade-off: mocks don't catch runtime errors (e.g., a real function that crashes). For critical paths, complement mocks with integration tests against real dependencies. Dependency injection (passing modules as arguments) is more testable than direct calls.

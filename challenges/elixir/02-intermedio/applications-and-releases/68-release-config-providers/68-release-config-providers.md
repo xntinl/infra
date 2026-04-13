@@ -103,18 +103,24 @@ the JSON inside `load/2` where the release environment is live.
 
 ## Implementation
 
-### Dependencies (`mix.exs`)
+### Dependencies (mix.exs)
 
 ```elixir
 defp deps do
   [
-    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+    # Standard library: no external dependencies required
+    {:"jason", "~> 1.0"},
   ]
 end
 ```
 
 
+
+
 ### Step 1: Create the project and add Jason
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
 
 ```bash
 mix new config_providers_demo --sup
@@ -145,6 +151,9 @@ end
 
 ### Step 2: `priv/sample_config.json`
 
+**Objective**: Implement `sample_config.json` — release-time behavior that depends on application env resolution and runtime boot semantics.
+
+
 ```json
 {
   "config_providers_demo": {
@@ -156,6 +165,9 @@ end
 ```
 
 ### Step 3: `lib/config_providers_demo/json_config_provider.ex`
+
+**Objective**: Implement `json_config_provider.ex` — release-time behavior that depends on application env resolution and runtime boot semantics.
+
 
 ```elixir
 defmodule ConfigProvidersDemo.JsonConfigProvider do
@@ -224,6 +236,9 @@ end
 
 ### Step 4: `lib/config_providers_demo/application.ex` and `lib/config_providers_demo.ex`
 
+**Objective**: Provide `lib/config_providers_demo/application.ex` and `lib/config_providers_demo.ex` — these are the supporting fixtures the main module depends on to make its concept demonstrable.
+
+
 ```elixir
 defmodule ConfigProvidersDemo.Application do
   @moduledoc false
@@ -246,6 +261,9 @@ end
 ```
 
 ### Step 5: `test/json_config_provider_test.exs`
+
+**Objective**: Write `json_config_provider_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
 
 ```elixir
 defmodule ConfigProvidersDemo.JsonConfigProviderTest do
@@ -292,6 +310,9 @@ end
 
 ### Step 6: Build and run the release
 
+**Objective**: Build and run the release.
+
+
 ```bash
 MIX_ENV=prod mix release
 APP_CONFIG_JSON=$PWD/priv/sample_config.json \
@@ -305,6 +326,21 @@ APP_CONFIG_JSON=$PWD/priv/sample_config.json \
 
 The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
 
+
+
+## Key Concepts
+
+Config providers execute during application startup, before supervised processes come up, to load configuration from external sources. A config provider is a module with an `init/1` callback that reads from disk files, HTTP APIs, or environment and calls `Config.Reader.read!/1` to merge into OTP app env. Config providers run once at boot, before any application code, ensuring supervised processes see fully-initialized configuration. This prevents races where a process starts before its config is loaded. Config providers are how vaults, secret managers, and external config services integrate with Elixir releases—the standard pattern in Elixir 1.14+.
+
+---
+
+## Deep Dive: Compile-Time vs Runtime Configuration Boundaries
+
+A release is a static artifact: code and compile-time config are baked in. Runtime config must be provided at boot via environment variables, config files, or config providers. Simple rule: if a value changes between dev and prod, it goes in `config/runtime.exs`, not `config/config.exs`.
+
+Footgun: putting config in compile-time files and assuming environment variables work at runtime. Releases ignore env vars unless `config/runtime.exs` explicitly reads them. If you need env vars, fetch them in `config/runtime.exs` and store in application state.
+
+For distributed systems, config providers (modules loading config from Consul, S3, etc.) are powerful but complex. Start with environment variables and `config/runtime.exs`; only reach for providers if you need dynamic reloading without downtime or multi-tenant config switching. Premature provider complexity is a mistake.
 
 ## Benchmark
 

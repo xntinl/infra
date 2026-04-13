@@ -75,6 +75,16 @@ Same semantics, single jump table instead of a reflection-style lookup.
 
 `mix.exs` controls when consolidation runs:
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
+
 ```elixir
 def project do
   [
@@ -119,6 +129,8 @@ In production you almost never call this directly — Mix handles it.
 
 ### Step 1: `mix.exs`
 
+**Objective**: Declare consolidate_protocols: true in prod/test to collapse dispatcher into jump table without searching.
+
 ```elixir
 defmodule ProtoConsolidation.MixProject do
   use Mix.Project
@@ -139,6 +151,8 @@ end
 
 ### Step 2: `lib/proto_consolidation/encoder.ex`
 
+**Objective**: Define protocol with @fallback_to_any true so unseen types delegate to Any impl safely.
+
 ```elixir
 defprotocol ProtoConsolidation.Encoder do
   @moduledoc """
@@ -154,6 +168,8 @@ end
 ```
 
 ### Step 3: `lib/proto_consolidation/impls.ex`
+
+**Objective**: Write defimpl for each hot type (Integer, BitString, List, Map, Atom, Any) so consolidation emits type-specific clause guards.
 
 ```elixir
 defimpl ProtoConsolidation.Encoder, for: Integer do
@@ -202,6 +218,8 @@ end
 
 ### Step 4: `lib/proto_consolidation/runner.ex`
 
+**Objective**: Expose encode_many/1 and is_consolidated?/1 so benchmarks isolate dispatch cost separately.
+
 ```elixir
 defmodule ProtoConsolidation.Runner do
   @moduledoc "Driver used by the bench and tests to exercise dispatch."
@@ -220,6 +238,8 @@ end
 
 ### Step 5: Tests
 
+**Objective**: Assert each type encodes correctly, Any fallback catches unknown structs, and protocol is consolidated in test env.
+
 ```elixir
 defmodule ProtoConsolidation.EncoderTest do
   use ExUnit.Case, async: true
@@ -227,36 +247,40 @@ defmodule ProtoConsolidation.EncoderTest do
   alias ProtoConsolidation.Encoder
   alias ProtoConsolidation.Runner
 
-  test "encodes integers" do
-    assert IO.iodata_to_binary(Encoder.encode(42)) == "42"
-  end
+  describe "ProtoConsolidation.Encoder" do
+    test "encodes integers" do
+      assert IO.iodata_to_binary(Encoder.encode(42)) == "42"
+    end
 
-  test "encodes strings with quotes" do
-    assert IO.iodata_to_binary(Encoder.encode("hello")) == ~s("hello")
-  end
+    test "encodes strings with quotes" do
+      assert IO.iodata_to_binary(Encoder.encode("hello")) == ~s("hello")
+    end
 
-  test "encodes lists recursively" do
-    assert IO.iodata_to_binary(Encoder.encode([1, "a"])) == ~s([1,"a"])
-  end
+    test "encodes lists recursively" do
+      assert IO.iodata_to_binary(Encoder.encode([1, "a"])) == ~s([1,"a"])
+    end
 
-  test "encodes maps with string keys" do
-    out = IO.iodata_to_binary(Encoder.encode(%{"id" => 1}))
-    assert out =~ ~s("id")
-    assert out =~ ~s(1)
-  end
+    test "encodes maps with string keys" do
+      out = IO.iodata_to_binary(Encoder.encode(%{"id" => 1}))
+      assert out =~ ~s("id")
+      assert out =~ ~s(1)
+    end
 
-  test "falls back to Any for unknown struct" do
-    defmodule Weird, do: defstruct(x: 1)
-    assert IO.iodata_to_binary(Encoder.encode(%Weird{})) =~ "Weird"
-  end
+    test "falls back to Any for unknown struct" do
+      defmodule Weird, do: defstruct(x: 1)
+      assert IO.iodata_to_binary(Encoder.encode(%Weird{})) =~ "Weird"
+    end
 
-  test "protocol is consolidated under :test env" do
-    assert Runner.is_consolidated?(Encoder)
+    test "protocol is consolidated under :test env" do
+      assert Runner.is_consolidated?(Encoder)
+    end
   end
 end
 ```
 
 ### Step 6: Benchmark — measured consolidation gain
+
+**Objective**: Compare consolidated dispatch latency against manual case/2 baseline to quantify consolidation throughput gain.
 
 ```elixir
 # bench/dispatch_bench.exs
@@ -293,6 +317,34 @@ manual case cost to ~3–5× slower. The overhead exists but it is predictable.
 
 ---
 
+## Benchmark
+
+```elixir
+{us, _} = :timer.tc(fn ->
+  for _ <- 1..10_000, do: ProtoConsolidation.Encoder.encode(42)
+end)
+IO.puts("Avg: #{us / 10_000} µs per op")
+```
+
+Target: **<1 µs per op** on modern hardware with consolidated protocols (`MIX_ENV=prod`).
+
+## Advanced Considerations: Macro Hygiene and Compile-Time Validation
+
+Macros execute at compile time, walking the AST and returning new AST. That power is easy to abuse: a macro that generates variables can shadow outer scope bindings, or a quote block that references variables directly can fail if the macro is used in a context where those variables don't exist. The `unquote` mechanism is the escape hatch, but misusing it leads to hard-to-debug compile errors.
+
+Macro hygiene is about capturing intent correctly. A `defmacro` that takes `:my_option` and uses it directly might match an unrelated `:my_option` from the caller's scope. The idiomatic pattern is to use `unquote` for values that should be "from the outside" and keep AST nodes quoted for safety. The `quote` block's binding of `var!` and `binding!` provides escape valves for the rare case when shadowing is intentional.
+
+Compile-time validation unlocks errors that would otherwise surface at runtime. A macro can call functions to validate input, generate code conditionally, or fail the build with `IO.warn`. Schema libraries like `Ecto` and `Ash` use macros to define fields at compile time, so runtime queries are guaranteed type-safe. The cost is cognitive load: developers must reason about both the code as written and the code generated.
+
+---
+
+
+## Deep Dive: Metaprogramming Patterns and Production Implications
+
+Metaprogramming (macros, AST manipulation) requires testing at compile time and runtime. The challenge is that macro tests often involve parsing and expanding code, which couples tests to compiler internals. Production bugs in macros can corrupt entire modules; testing macros rigorously is non-negotiable.
+
+---
+
 ## Trade-offs and production gotchas
 
 **1. Dev mode is slower by design.** Do not panic when a flame graph shows
@@ -315,7 +367,7 @@ types plus the `Any` fallback.
 Tighten with `@type t :: integer() | binary() | list() | map() | atom()` inside the
 `defprotocol` block using `@type t`.
 
-**6. Struct derivation.** `@derive` (exercise 137) is how `Inspect` and `Jason.Encoder`
+**6. Struct derivation.** `@derive` is how `Inspect` and `Jason.Encoder`
 reach structs without forcing users to write `defimpl`. Understand it alongside
 consolidation.
 

@@ -2,9 +2,6 @@
 
 **Project**: `significant_child` — use `significant: true` + `auto_shutdown:` so a supervisor exits when a critical child exits normally.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 3–4 hours
-
 ---
 
 ## Project context
@@ -93,9 +90,35 @@ Correct pattern: a `BatchSupervisor` added dynamically via `DynamicSupervisor.st
 
 ---
 
+## Design decisions
+
+**Option A — coordinator sends `:stop` to every sibling before exiting**
+- Pros: uses only classic primitives.
+- Cons: the coordinator now owns lifecycle of unrelated processes; easy to leak siblings if the coordinator crashes instead of exiting normally.
+
+**Option B — `significant: true` + `auto_shutdown: :any_significant`** (chosen)
+- Pros: supervisor itself exits when the coordinator finishes normally; no manual teardown code; classical OTP semantics for the error path.
+- Cons: requires Elixir 1.15+ / OTP 25+; emits SASL reports on every completion.
+
+→ Chose **B** because lifecycle coupling belongs in the supervision tree, not in sibling code.
+
+---
+
 ## Implementation
 
 ### Step 1: Application
+
+**Objective**: Host a `DynamicSupervisor` as the parent of batch subtrees — each batch becomes a `:temporary` child so completion does not re-spawn.
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
 
 ```elixir
 # lib/significant_child/application.ex
@@ -118,6 +141,8 @@ end
 ```
 
 ### Step 2: Per-batch supervisor with `auto_shutdown: :any_significant`
+
+**Objective**: Encode batch lifecycle in child specs: coordinator is `significant: true`, so its `:normal` exit tears down siblings declaratively.
 
 ```elixir
 # lib/significant_child/batch_supervisor.ex
@@ -169,6 +194,8 @@ end
 
 ### Step 3: The coordinator (exits normally when done)
 
+**Objective**: Exit `:normal` on completion so `auto_shutdown` fires; raise on bugs so `:transient` restarts without collapsing the batch.
+
 ```elixir
 # lib/significant_child/job_coordinator.ex
 defmodule SignificantChild.JobCoordinator do
@@ -205,6 +232,8 @@ end
 
 ### Step 4: The workers
 
+**Objective**: Keep workers anonymous and side-effect free; they participate in shutdown via their `shutdown:` budget, not lifecycle logic.
+
 ```elixir
 # lib/significant_child/worker.ex
 defmodule SignificantChild.Worker do
@@ -225,6 +254,8 @@ end
 ```
 
 ### Step 5: Registry for coordinator lookup
+
+**Objective**: Add a unique `Registry` so callers address coordinators by `batch_id` without holding pids across restarts.
 
 Add to the application supervisor:
 
@@ -250,6 +281,8 @@ end
 ```
 
 ### Step 6: Public API to spawn and track batches
+
+**Objective**: Expose `start_batch/2` that injects a `:temporary` child spec into the `DynamicSupervisor`, closing the auto-shutdown restart loop.
 
 ```elixir
 # lib/significant_child/batches.ex
@@ -281,6 +314,8 @@ end
 
 ### Step 7: Tests
 
+**Objective**: Distinguish `:normal` (auto_shutdown fires) from crash (`:transient` restarts), and prove batch subtrees remain independent.
+
 ```elixir
 # test/significant_child/auto_shutdown_test.exs
 defmodule SignificantChild.AutoShutdownTest do
@@ -288,60 +323,79 @@ defmodule SignificantChild.AutoShutdownTest do
 
   alias SignificantChild.{Batches, JobCoordinator}
 
-  test "normal coordinator exit auto-shuts-down the batch subtree" do
-    {:ok, batch_sup} = Batches.start_batch("batch-normal", 3)
-    before = Batches.active_batches()
-    assert before >= 1
+  describe "SignificantChild.AutoShutdown" do
+    test "normal coordinator exit auto-shuts-down the batch subtree" do
+      {:ok, batch_sup} = Batches.start_batch("batch-normal", 3)
+      before = Batches.active_batches()
+      assert before >= 1
 
-    # Verify all children alive
-    children = Supervisor.which_children(batch_sup)
-    assert length(children) == 4  # 1 coordinator + 3 workers
+      # Verify all children alive
+      children = Supervisor.which_children(batch_sup)
+      assert length(children) == 4  # 1 coordinator + 3 workers
 
-    ref = Process.monitor(batch_sup)
-    JobCoordinator.complete("batch-normal")
+      ref = Process.monitor(batch_sup)
+      JobCoordinator.complete("batch-normal")
 
-    # BatchSupervisor should die with :shutdown (auto_shutdown).
-    assert_receive {:DOWN, ^ref, :process, ^batch_sup, :shutdown}, 2_000
+      # BatchSupervisor should die with :shutdown (auto_shutdown).
+      assert_receive {:DOWN, ^ref, :process, ^batch_sup, :shutdown}, 2_000
 
-    # DynamicSupervisor has one fewer child.
-    assert Batches.active_batches() == before - 1
-  end
+      # DynamicSupervisor has one fewer child.
+      assert Batches.active_batches() == before - 1
+    end
 
-  test "abnormal coordinator crash restarts (does NOT auto-shutdown)" do
-    {:ok, batch_sup} = Batches.start_batch("batch-crash", 2)
+    test "abnormal coordinator crash restarts (does NOT auto-shutdown)" do
+      {:ok, batch_sup} = Batches.start_batch("batch-crash", 2)
 
-    coordinator =
-      Registry.lookup(SignificantChild.Registry, {:coordinator, "batch-crash"})
-      |> hd()
-      |> elem(0)
+      coordinator =
+        Registry.lookup(SignificantChild.Registry, {:coordinator, "batch-crash"})
+        |> hd()
+        |> elem(0)
 
-    ref_coord = Process.monitor(coordinator)
-    JobCoordinator.crash("batch-crash")
-    assert_receive {:DOWN, ^ref_coord, :process, _, _}, 500
+      ref_coord = Process.monitor(coordinator)
+      JobCoordinator.crash("batch-crash")
+      assert_receive {:DOWN, ^ref_coord, :process, _, _}, 500
 
-    # Supervisor is still alive; coordinator is restarted.
-    assert Process.alive?(batch_sup)
+      # Supervisor is still alive; coordinator is restarted.
+      assert Process.alive?(batch_sup)
 
-    # Clean up
-    :ok = DynamicSupervisor.terminate_child(SignificantChild.BatchRegistry, batch_sup)
-  end
+      # Clean up
+      :ok = DynamicSupervisor.terminate_child(SignificantChild.BatchRegistry, batch_sup)
+    end
 
-  test "multiple batches are independent" do
-    {:ok, b1} = Batches.start_batch("batch-a", 1)
-    {:ok, b2} = Batches.start_batch("batch-b", 1)
+    test "multiple batches are independent" do
+      {:ok, b1} = Batches.start_batch("batch-a", 1)
+      {:ok, b2} = Batches.start_batch("batch-b", 1)
 
-    ref1 = Process.monitor(b1)
-    JobCoordinator.complete("batch-a")
-    assert_receive {:DOWN, ^ref1, :process, ^b1, :shutdown}, 2_000
+      ref1 = Process.monitor(b1)
+      JobCoordinator.complete("batch-a")
+      assert_receive {:DOWN, ^ref1, :process, ^b1, :shutdown}, 2_000
 
-    assert Process.alive?(b2)
+      assert Process.alive?(b2)
 
-    ref2 = Process.monitor(b2)
-    JobCoordinator.complete("batch-b")
-    assert_receive {:DOWN, ^ref2, :process, ^b2, :shutdown}, 2_000
+      ref2 = Process.monitor(b2)
+      JobCoordinator.complete("batch-b")
+      assert_receive {:DOWN, ^ref2, :process, ^b2, :shutdown}, 2_000
+    end
   end
 end
 ```
+
+---
+
+## Advanced Considerations: Partitioned Supervisors and Custom Restart Strategies
+
+A standard Supervisor is a single process managing a static tree. For thousands of children, a single supervisor becomes a bottleneck: all supervisor callbacks run on one process, and supervisor restart logic is sequential. PartitionSupervisor (OTP 25+) spawns N independent supervisors, each managing a subset of children. Hashing the child ID determines which partition supervises it, distributing load and enabling horizontal scaling.
+
+Custom restart strategies (via `Supervisor.init/2` callback) allow logic beyond the defaults. A strategy might prioritize restarting dependent services in a specific order, or apply backoff based on restart frequency. The downside is complexity: custom logic is harder to test and reason about, and mistakes cascade. Start with defaults and profile before adding custom behavior.
+
+Selective restart via `:rest_for_one` or `:one_for_all` affects failure isolation. `:one_for_all` restarts all children when one fails (simulating a total system failure), which can be necessary for consistency but is expensive. `:rest_for_one` restarts the failed child and any started after it, balancing isolation and dependencies. Understanding which strategy fits your architecture prevents cascading failures and unnecessary restarts.
+
+---
+
+
+## Deep Dive: Interop Patterns and Production Implications
+
+Interop with native code (NIFs, ports, C extensions) introduces failure modes that pure Elixir code doesn't have: segfaults, memory leaks, deadlocks with the Erlang emulator. Testing interop requires separate test suites for the native layer and integration tests that exercise the boundary.
 
 ---
 
@@ -363,13 +417,26 @@ end
 
 **8. When NOT to use this.** If your "coordinator" is not really time-bounded (it runs for the life of the app), you don't want auto_shutdown — you want classic `:permanent`. Auto_shutdown fits batch / job / session subtrees, NOT long-lived services.
 
+### Why this works
+
+`significant: true` marks a child whose normal exit is meaningful to the supervisor, not just a passive termination. Combined with `auto_shutdown: :any_significant`, the supervisor propagates the normal exit as its own shutdown, which cleans up the entire subtree in one action. Because this is expressed declaratively in child specs, reviewers can see the lifecycle contract at the point of tree definition instead of having to trace sibling code.
+
 ---
 
-## Performance notes
+## Benchmark
 
 `auto_shutdown` adds zero cost at steady state — it's a check on child exit, which is already an event the supervisor processes. Teardown cost is O(children × average shutdown time).
 
 The pattern scales well: you can run thousands of BatchSupervisors under one DynamicSupervisor. Each batch subtree is ~1 KB overhead (PCB for supervisor + PCB for each child). For 10 000 concurrent batches × 5 processes each = 50 000 processes, well within BEAM limits (default 262 144).
+
+Target: 10k concurrent batch subtrees with ≤ 50 MB total supervisor-layer overhead; teardown latency dominated by `shutdown:` budgets, not bookkeeping.
+
+---
+
+## Reflection
+
+1. Your batch tree uses `auto_shutdown: :any_significant`. Under what failure mode does this silently mask an error you would have wanted to escalate? What child-spec change surfaces the error without giving up the clean-exit behaviour?
+2. At 10k batches/hour, SASL supervisor reports dominate your log volume. Would you filter at the logger, tag the supervisor to skip reporting, or switch to telemetry-only tracking? Argue from an incident-response perspective.
 
 ---
 

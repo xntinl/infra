@@ -128,8 +128,72 @@ defp deps do
 end
 ```
 
+### Dependencies (mix.exs)
+
+```elixir
+```elixir
+def closed({:call, from}, :open, data), do: ...
+def closed(:cast, {:recv, _segment}, data), do: ...
+def closed(:info, {:timeout, ...}, data), do: ...
+```
+
+The first argument is the **event type**: `{:call, from}`, `:cast`, `:info`, `:state_timeout`, `:timeout`, `:internal`. The second is the event payload. The third is your data (analogous to GenServer state).
+
+### 4. Returning actions
+
+```
+{:next_state, new_state, new_data, actions}
+{:keep_state, new_data, actions}
+{:stop, reason, new_data}
+```
+
+Actions are a list of effects OTP executes on your behalf: `{:reply, from, response}`, `{:state_timeout, ms, term}`, `{:timeout, ms, term}`, `{:postpone, true}`, and several more. This is the feature that makes `:gen_statem` worth learning.
+
+### 5. `:state_timeout` vs. `:timeout`
+
+- `:state_timeout` is cancelled automatically on state transition. Perfect for "if we stay in SYN_SENT for more than 3 s, give up".
+- `:timeout` (event timeout) is generic, named, and persists across state changes until it fires or is cancelled.
+
+### 6. Postponing events
+
+Postpone is the `:gen_statem` superpower. If an event arrives in a state that shouldn't handle it yet but *will* in a future state, return `{:postpone, true}`. OTP re-delivers it after the next successful state transition. This is how `:gen_statem` elegantly handles the "out-of-order event" problem: the event is kept in an internal queue and automatically re-played against the new state's callbacks, with no explicit buffer on your side.
+
+---
+
+## Why `:gen_statem` and not GenServer with a status field
+
+A GenServer implementing the same FSM requires every `handle_call`/`handle_cast` to branch on `state.status`, scattering the invariants across every callback. When you add a new state, you must update N callbacks. `:gen_statem` collapses each state to its own function (in `:state_functions` mode), so a new state is one new function, and the dispatcher is OTP. Add `postpone`, `state_timeout`, and named generic timeouts — which require ref-juggling in GenServer — and the organizational delta compounds. GenServer stays right for 1–2 status modes; `:gen_statem` is right above that.
+
+---
+
+## Design decisions
+
+**Option A — `:handle_event_function` (single callback)**
+- Pros: one entry point; states can be structured terms `{:waiting, n}`; supports nested/hierarchical sub-states via pattern matching.
+- Cons: every event passes through one function; pattern-matching on (state, event) grows combinatorially; harder to grep for "what handles event X in state Y".
+
+**Option B — `:state_functions` (one function per state)** (chosen)
+- Pros: each state is a named function; adding a state is a local change; callbacks are easy to locate; test names read naturally.
+- Cons: states must be atoms; no structured-state sugar; hierarchical FSMs require manual encoding.
+
+→ Chose **B** because the TCP handshake is flat, atomic, and standard-reference — states map 1:1 to atoms. `:handle_event_function` pays for flexibility we don't need.
+
+---
+
+## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  []
+end
+```
+
 
 ### Step 1: `mix.exs`
+
+**Objective**: Configure project with OTP application bootstrap so :gen_statem connection FSM starts under supervision.
 
 ```elixir
 defmodule TcpConnectionFsm.MixProject do
@@ -144,6 +208,8 @@ end
 ```
 
 ### Step 2: `lib/tcp_connection_fsm/connection.ex`
+
+**Objective**: Model TCP lifecycle (CLOSED → SYN_SENT → ESTABLISHED → FIN_WAIT → CLOSED) as state_functions so state invariants are enforced structurally.
 
 ```elixir
 defmodule TcpConnectionFsm.Connection do
@@ -285,6 +351,8 @@ end
 
 ### Step 3: `lib/tcp_connection_fsm/application.ex`
 
+**Objective**: Bootstrap OTP application so connection FSM instances start supervised under DynamicSupervisor.
+
 ```elixir
 defmodule TcpConnectionFsm.Application do
   use Application
@@ -299,6 +367,8 @@ end
 
 ### Step 4: `test/tcp_connection_fsm/connection_test.exs`
 
+**Objective**: Test happy path (SYN→ACK→FIN) and error transitions (timeout, RST) so state invariants hold under all inputs.
+
 ```elixir
 defmodule TcpConnectionFsm.ConnectionTest do
   use ExUnit.Case, async: false
@@ -311,67 +381,69 @@ defmodule TcpConnectionFsm.ConnectionTest do
     %{peer: peer, pid: pid}
   end
 
-  test "closed -> syn_sent -> established", %{peer: peer} do
-    assert Connection.current_state(peer) == :closed
-    assert Connection.open(peer) == :ok
-    assert Connection.current_state(peer) == :syn_sent
+  describe "TcpConnectionFsm.Connection" do
+    test "closed -> syn_sent -> established", %{peer: peer} do
+      assert Connection.current_state(peer) == :closed
+      assert Connection.open(peer) == :ok
+      assert Connection.current_state(peer) == :syn_sent
 
-    Connection.recv(peer, :syn_ack)
-    Process.sleep(20)
-    assert Connection.current_state(peer) == :established
-  end
+      Connection.recv(peer, :syn_ack)
+      Process.sleep(20)
+      assert Connection.current_state(peer) == :established
+    end
 
-  test "syn_ack timeout stops the FSM", %{peer: peer, pid: pid} do
-    ref = Process.monitor(pid)
-    Connection.open(peer)
-    assert_receive {:DOWN, ^ref, :process, _, :syn_ack_timeout}, 5_000
-  end
+    test "syn_ack timeout stops the FSM", %{peer: peer, pid: pid} do
+      ref = Process.monitor(pid)
+      Connection.open(peer)
+      assert_receive {:DOWN, ^ref, :process, _, :syn_ack_timeout}, 5_000
+    end
 
-  test "rst in syn_sent returns to closed", %{peer: peer} do
-    Connection.open(peer)
-    Connection.recv(peer, :rst)
-    Process.sleep(20)
-    assert Connection.current_state(peer) == :closed
-  end
+    test "rst in syn_sent returns to closed", %{peer: peer} do
+      Connection.open(peer)
+      Connection.recv(peer, :rst)
+      Process.sleep(20)
+      assert Connection.current_state(peer) == :closed
+    end
 
-  test "established -> fin_wait -> closed on fin_ack", %{peer: peer} do
-    Connection.open(peer)
-    Connection.recv(peer, :syn_ack)
-    Process.sleep(10)
-    assert Connection.current_state(peer) == :established
+    test "established -> fin_wait -> closed on fin_ack", %{peer: peer} do
+      Connection.open(peer)
+      Connection.recv(peer, :syn_ack)
+      Process.sleep(10)
+      assert Connection.current_state(peer) == :established
 
-    assert Connection.close(peer) == :ok
-    assert Connection.current_state(peer) == :fin_wait
+      assert Connection.close(peer) == :ok
+      assert Connection.current_state(peer) == :fin_wait
 
-    Connection.recv(peer, :fin_ack)
-    Process.sleep(10)
-    assert Connection.current_state(peer) == :closed
-  end
+      Connection.recv(peer, :fin_ack)
+      Process.sleep(10)
+      assert Connection.current_state(peer) == :closed
+    end
 
-  test "fin_wait times out to closed", %{peer: peer} do
-    Connection.open(peer)
-    Connection.recv(peer, :syn_ack)
-    Process.sleep(10)
-    Connection.close(peer)
+    test "fin_wait times out to closed", %{peer: peer} do
+      Connection.open(peer)
+      Connection.recv(peer, :syn_ack)
+      Process.sleep(10)
+      Connection.close(peer)
 
-    # wait slightly longer than @fin_timeout
-    Process.sleep(3_200)
-    assert Connection.current_state(peer) == :closed
-  end
+      # wait slightly longer than @fin_timeout
+      Process.sleep(3_200)
+      assert Connection.current_state(peer) == :closed
+    end
 
-  test "calls during syn_sent are postponed and replied on transition", %{peer: peer} do
-    Connection.open(peer)
-    assert Connection.current_state(peer) == :syn_sent
+    test "calls during syn_sent are postponed and replied on transition", %{peer: peer} do
+      Connection.open(peer)
+      assert Connection.current_state(peer) == :syn_sent
 
-    task = Task.async(fn -> Connection.close(peer) end)
-    Process.sleep(50)
-    refute Task.yield(task, 50)
+      task = Task.async(fn -> Connection.close(peer) end)
+      Process.sleep(50)
+      refute Task.yield(task, 50)
 
-    Connection.recv(peer, :syn_ack)
-    # Once established, the postponed :close is re-delivered and handled.
-    result = Task.await(task, 1_000)
-    assert result == :ok
-    assert Connection.current_state(peer) == :fin_wait
+      Connection.recv(peer, :syn_ack)
+      # Once established, the postponed :close is re-delivered and handled.
+      result = Task.await(task, 1_000)
+      assert result == :ok
+      assert Connection.current_state(peer) == :fin_wait
+    end
   end
 end
 ```
@@ -379,6 +451,23 @@ end
 ### Why this works
 
 Each state's function pattern-matches on event type (`:call`, `:cast`, `:state_timeout`) and payload, so invalid transitions fall through to a catch-all that replies with a domain-specific error instead of crashing. `{:state_timeout, 3000, :syn_ack}` is cancelled automatically on state change, so there are no dangling timer refs. `{:postpone, true}` moves the `:close` call into an internal queue where OTP re-delivers it after `:established` arrives — the caller blocks on `:gen_statem.call` until the handshake completes, exactly matching real TCP behaviour.
+
+---
+
+## Advanced Considerations: Supervision and Hot Code Upgrade Patterns
+
+The OTP supervision tree is the backbone of Elixir's fault tolerance. A DynamicSupervisor can spawn workers on demand and track them, but if a worker crashes before it's supervised, messages to it drop silently. Equally, a `:temporary` worker that crashes is restarted zero times — useful for one-off tasks, but requires the caller to handle crashes. `:transient` restarts on non-normal exits; `:permanent` always restarts.
+
+`handle_continue` callbacks and `:hibernate` reduce memory overhead in long-lived processes. After initializing, a GenServer can return `{:noreply, state, {:continue, :do_work}}` to defer expensive work past the `init/1` call, keeping the supervisor's synchronous startup fast. Hibernation moves a process's heap to disk, freeing RAM at the cost of latency when the process receives its next message.
+
+Hot code upgrades via `sys:replace_state/2` or `:sys.replace_state/3` allow changing code without restarting the VM, but only if state structure is forward- and backward-compatible. In practice, code changes that alter state shape (adding or removing fields) require a migration function. The `:code.purge/1` and `:code.load_file/1` cycle reloads the module, but old pids still run old code until they return to the scheduler. Design for graceful degradation: code that cannot upgrade hot should acknowledge that in docs and operational runbooks.
+
+---
+
+
+## Deep Dive: Otp Patterns and Production Implications
+
+OTP primitives (GenServer, Supervisor, Application) are tested through their public interfaces, not by inspecting internal state. This discipline forces correct design: if you can't test a behavior without peeking into the server's state, the behavior is not public. Production systems with tight integration tests on GenServer internals are fragile and hard to refactor.
 
 ---
 

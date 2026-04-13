@@ -31,6 +31,15 @@ stream_resource_file/
 
 ---
 
+### Dependencies (`mix.exs`)
+
+```elixir
+def deps do
+  {error},
+  {exunit},
+  {halt},
+end
+```
 ## Core concepts
 
 ### 1. The three functions of `Stream.resource/3`
@@ -91,12 +100,18 @@ mode.
 
 ### Step 1: Create the project
 
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
+
 ```bash
 mix new stream_resource_file
 cd stream_resource_file
 ```
 
 ### Step 2: `lib/stream_resource_file.ex`
+
+**Objective**: Implement `stream_resource_file.ex` — the lazy operator whose resource and memory profile only becomes visible when the stream is actually run.
+
 
 ```elixir
 defmodule StreamResourceFile do
@@ -156,6 +171,9 @@ end
 
 ### Step 3: `test/stream_resource_file_test.exs`
 
+**Objective**: Write `stream_resource_file_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+
 ```elixir
 defmodule StreamResourceFileTest do
   use ExUnit.Case, async: true
@@ -210,6 +228,9 @@ end
 
 ### Step 4: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -219,6 +240,14 @@ mix test
 `Stream.resource/3` guarantees that `after_fun` runs exactly once — on natural halt, early `Enum.take`, or exception — so the file descriptor is always closed. `next_fun` is invoked one line at a time, so peak memory is O(one line) regardless of file size. `:halt` signals end-of-stream, and `Enum.count/1` just increments a counter without retaining lines.
 
 ---
+
+
+## Key Concepts: Resource Management and Lazy Streaming
+
+`Stream.resource/3` is the building block for streams over external resources (files, sockets, connections). You provide three functions: (1) open the resource, (2) yield elements from it, (3) close the resource. Stream.resource ensures the resource is properly closed even if the consumer exits early or crashes.
+
+Example: `Stream.resource(fn -> File.stream!("large.txt") end, fn stream -> case IO.read(stream, :line) do {:ok, line} -> {[line], stream}; :eof -> {:halt, stream} end end, fn stream -> File.close(stream) end)` streams lines without loading the entire file. The key: cleanup happens via the third function, so you don't leak file handles. For non-resource streams, `Stream.unfold/2` or `Stream.iterate/2` are simpler.
+
 
 ## Benchmark
 
@@ -291,3 +320,20 @@ consider `File.open/2` with `:delayed_write` for better throughput.
 - [`IO.read/2` — hexdocs](https://hexdocs.pm/elixir/IO.html#read/2)
 - [José Valim — "Building a new MacBook Pro provisioning pipeline with Elixir"](https://dashbit.co/blog) — Dashbit blog has multiple posts on streaming I/O patterns
 - Saša Jurić — *Elixir in Action*, chapter on working with the outside world (file I/O patterns)
+
+
+## Deep Dive
+
+Streams are lazy, composable data pipelines that process one element at a time without materializing intermediate collections. This is fundamentally different from Enum, which materializes the entire dataset before the next operation.
+
+**Lazy evaluation semantics:**
+Stream operations return a `%Stream{}` struct containing a function. The actual computation is deferred until consumed by a terminal operation (`.run()`, `Enum.to_list()`, etc.). This allows streams to:
+- Chain indefinite sequences (e.g., `Stream.iterate(0, &(&1 + 1))`)
+- Transform without memory bloat (e.g., processing multi-gigabyte files)
+- Compose reusable pipelines as first-class values
+
+**Resource lifecycle in streams:**
+Streams wrapping resources (`Stream.resource/3`) must define cleanup functions. A stream created from a file remains "open" (in terms of the lambda) until the consumer finishes or errors. If the consumer crashes or stops early, the cleanup function still runs — critical for proper file/socket/port management.
+
+**Backpressure and demand:**
+Unlike streams in other languages, Elixir's synchronous streams don't inherently implement backpressure. Backpressure is demand-based: the consumer pulls data at its own pace. `GenStage` and `Flow` add explicit backpressure — the producer waits for the consumer to request more elements. This is why benchmarking matters: a naive stream consumer can overwhelm memory if the pipeline produces faster than it consumes.

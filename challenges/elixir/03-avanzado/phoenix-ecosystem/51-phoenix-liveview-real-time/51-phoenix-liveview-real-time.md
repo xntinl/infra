@@ -2,9 +2,6 @@
 
 **Project**: `liveview_realtime` — a live trading dashboard that pushes price ticks to every connected browser without polling.
 
-**Difficulty**: ★★★★☆
-**Estimated time**: 4–6 hours
-
 ---
 
 ## Project context
@@ -51,6 +48,12 @@ liveview_realtime/
 │           └── dashboard_live_test.exs
 └── mix.exs
 ```
+
+---
+
+## Why LiveView and not SPA
+
+An SPA duplicates state between client and server, with a JSON API as the bridge. LiveView keeps state on the server and sends minimal DOM diffs, removing the duplication and the hydration dance.
 
 ---
 
@@ -147,13 +150,37 @@ If you render a 500-item price list, Phoenix keeps the full list in socket memor
 so it can compute future diffs. For append-only feeds where you only care about
 the last N items, declare the assign as temporary:
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
+
 ```elixir
 {:ok, assign(socket, :ticks, []), temporary_assigns: [ticks: []]}
 ```
 
 After each render, Phoenix resets `:ticks` to `[]` on the server side. The client
 still has the HTML; the server frees the memory. This is the foundation that the
-LiveView Streams API (exercise 213) generalizes.
+LiveView Streams API generalizes.
+
+---
+
+## Design decisions
+
+**Option A — SPA + JSON API + WebSocket for updates**
+- Pros: familiar frontend stack; separation of frontend and backend concerns.
+- Cons: duplicate state between client and server; JS complexity; hydration bugs.
+
+**Option B — LiveView (server-rendered with diffs)** (chosen)
+- Pros: one state, one language; small payloads; built-in reconnection.
+- Cons: server state per connection; client interactivity limited without hooks.
+
+→ Chose **B** because for data-heavy dashboards and forms, LiveView removes a whole class of SPA problems.
 
 ---
 
@@ -161,12 +188,16 @@ LiveView Streams API (exercise 213) generalizes.
 
 ### Step 1: Create the project
 
+**Objective**: Bootstrap Phoenix with --no-ecto so PubSub, not database, drives live dashboard state.
+
 ```bash
 mix phx.new liveview_realtime --no-ecto --no-mailer
 cd liveview_realtime
 ```
 
 ### Step 2: The domain — `lib/liveview_realtime/ticker.ex`
+
+**Objective**: Model ticks as immutable struct via System.monotonic_time/1 so ordering survives clock drift.
 
 ```elixir
 defmodule LiveviewRealtime.Ticker do
@@ -198,6 +229,8 @@ end
 ```
 
 ### Step 3: The feed simulator — `lib/liveview_realtime/price_feed.ex`
+
+**Objective**: Simulate exchange via GenServer broadcasting on Phoenix.PubSub so subscribers fan out decoupled.
 
 ```elixir
 defmodule LiveviewRealtime.PriceFeed do
@@ -245,6 +278,8 @@ end
 ```
 
 ### Step 4: The LiveView — `lib/liveview_realtime_web/live/dashboard_live.ex`
+
+**Objective**: Buffer ticks and flush on timer so 50ms bursts render as one diff, not N re-renders.
 
 ```elixir
 defmodule LiveviewRealtimeWeb.DashboardLive do
@@ -322,6 +357,8 @@ end
 
 ### Step 5: Router and supervision
 
+**Objective**: Mount LiveView via live/3 and boot PriceFeed under supervisor so feed restarts independently.
+
 ```elixir
 # lib/liveview_realtime_web/router.ex
 scope "/", LiveviewRealtimeWeb do
@@ -341,6 +378,8 @@ children = [
 ```
 
 ### Step 6: Tests — `test/liveview_realtime_web/live/dashboard_live_test.exs`
+
+**Objective**: Use Phoenix.LiveViewTest.live/2 to assert disconnected HTML, PubSub gating, and tick coalescing.
 
 ```elixir
 defmodule LiveviewRealtimeWeb.DashboardLiveTest do
@@ -390,6 +429,27 @@ end
 mix test
 ```
 
+### Why this works
+
+LiveView mounts a stateful process per connection, renders HTML server-side, and sends diffs over a WebSocket. Client events travel back, the process updates state, and the next diff goes out. The client runs a small JS runtime that applies diffs to the DOM.
+
+---
+
+## Advanced Considerations: LiveView Real-Time Patterns and Pubsub Scale
+
+LiveView bridges the browser and BEAM via WebSocket, allowing server-side renders to push incremental DOM diffs to the client. A LiveView process is long-lived, receiving events (clicks, form submissions) and broadcasting updates. For real-time features (collaborative editing, live notifications), LiveView processes subscribe to PubSub topics and receive broadcast messages.
+
+Phoenix.PubSub partitions topics across a pool of processes, allowing horizontal scaling. By default, `:local` mode uses in-memory ETS; `:redis` mode distributes across nodes via Redis. At scale (thousands of concurrent LiveViews), topic fanout can bottleneck: broadcasting to a million subscribers means delivering one million messages. The BEAM handles this, but the network cost matters on multi-node deployments.
+
+`Presence` module tracks which users are viewing which pages, syncing state via PubSub. A presence join/leave is broadcast to all nodes, allowing real-time "who's online" updates. Under partition, presence state can diverge; the library uses unique presence keys to detect and reconcile. Operationally, watching presence on every page load can amplify server load if users are flaky (mobile networks, browser reloads). Consider presence only for features where it's user-facing (collaborative editors, live sports scoreboards).
+
+---
+
+
+## Deep Dive: Phoenix Patterns and Production Implications
+
+Phoenix's conn struct represents an HTTP request/response in flight, accumulating transformations through middleware and handler code. Testing a Phoenix endpoint end-to-end (not just the controller) catches middleware order bugs, header mismatches, and plug composition issues. The trade-off is that full integration tests are slower and harder to parallelize than unit tests. Production bugs in auth, CORS, or session handling are often due to middleware assumptions that live tests reveal.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -426,7 +486,7 @@ ensure `libcluster` or equivalent is forming the cluster — otherwise subscribe
 on B will never hear broadcasts from A.
 
 **6. Temporary assigns vs. streams**
-For append-only feeds, prefer the LiveView Streams API (exercise 213) over
+For append-only feeds, prefer the LiveView Streams API over
 temporary assigns. Streams manage client-side DOM identity; temporary assigns
 only free server memory. Streams are the current recommendation from the
 Phoenix team.
@@ -455,6 +515,25 @@ The browser render is an additional 1–5ms depending on diff size.
 Drop the flush interval to `0` (disable buffering) and observe scheduler load
 in `:observer.start()`. You'll see utilization jump sharply above ~200 ticks/s
 per client — that's the argument for buffering.
+
+---
+
+## Benchmark
+
+```elixir
+# :timer.tc / Benchee measurement sketch
+{time_us, _} = :timer.tc(fn -> :ok end)
+IO.puts("elapsed: #{time_us} us")
+```
+
+Target: diff payload under 1 KB for typical updates; update round-trip under 100 ms over typical networks.
+
+---
+
+## Reflection
+
+- Your LiveView has 5k concurrent users. What is the BEAM cost per connection, and at what point do you shard connections across nodes?
+- A flow needs offline-friendly behavior. Does LiveView still fit, or do you switch models for that flow? How do you keep the rest of the app consistent?
 
 ---
 

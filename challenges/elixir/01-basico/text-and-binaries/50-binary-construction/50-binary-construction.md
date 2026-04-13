@@ -84,7 +84,23 @@ value of a public API that advertises `String.t()`).
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"jason", "~> 1.0"},
+    {:"phoenix", "~> 1.0"},
+    {:"plug", "~> 1.0"},
+  ]
+end
+```
+
+
 ### Step 1 — Create the project
+
+**Objective**: JWTs are built with string concatenation + Base64; iodata [parts] avoid copying on each << >> append.
 
 ```bash
 mix new mini_token
@@ -92,6 +108,8 @@ cd mini_token
 ```
 
 ### Step 2 — `lib/mini_token.ex`
+
+**Objective**: Iodata lists defer concatenation until IO.iodata_to_binary/1; 100x faster than loop concat in hot paths.
 
 ```elixir
 defmodule MiniToken do
@@ -232,6 +250,8 @@ end
 
 ### Step 3 — `test/mini_token_test.exs`
 
+**Objective**: Test HMAC verification: typo in secret fails verification; base64url is rfc-compliant (- _ no padding).
+
 ```elixir
 defmodule MiniTokenTest do
   use ExUnit.Case, async: true
@@ -277,6 +297,8 @@ end
 
 ### Step 4 — Run the tests
 
+**Objective**: --warnings-as-errors catches incorrect HMAC calls; test coverage validates signature doesn't leak key material.
+
 ```bash
 mix test
 ```
@@ -285,6 +307,19 @@ All 5 tests should pass.
 
 ---
 
+
+## Key Concepts
+
+### 1. Build Binaries with Bit Syntax
+The same syntax works for matching (destructuring) and constructing (building). This symmetry is powerful for protocols.
+
+### 2. Concatenation is Efficient
+`<< binary1::binary, binary2::binary >>` is more efficient than `string1 <> string2` for large strings because it avoids creating intermediate strings.
+
+### 3. Variable Integers in Binaries
+For construction, the size must be a compile-time constant or a variable. For pattern matching, use the pin operator to match against variables.
+
+---
 ## Trade-offs
 
 | Technique | When to pick it |

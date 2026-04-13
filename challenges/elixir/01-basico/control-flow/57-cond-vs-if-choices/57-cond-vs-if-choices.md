@@ -68,7 +68,20 @@ rule wins. Inside each branch, `if` shines for a final yes/no (taxable or not).
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### Step 1 — Create the project
+
+**Objective**: Create a minimal library so the pricing logic can be compared as a flat `cond` versus nested `if` without infrastructure noise.
 
 ```bash
 mix new pricing_rule_engine
@@ -76,6 +89,8 @@ cd pricing_rule_engine
 ```
 
 ### Step 2 — `lib/pricing_rule_engine/pricing.ex`
+
+**Objective**: Use `cond` to express ordered mutually exclusive pricing rules flatly, avoiding the nested-`if` arrow that hides business-rule priority.
 
 ```elixir
 defmodule PricingRuleEngine.Pricing do
@@ -138,6 +153,8 @@ end
 
 ### Step 3 — `test/pricing_rule_engine_test.exs`
 
+**Objective**: Test each rule's boundary values so the clause ordering — the critical invariant of any `cond` — is locked against accidental reshuffling.
+
 ```elixir
 defmodule PricingRuleEngineTest do
   use ExUnit.Case, async: true
@@ -189,6 +206,8 @@ end
 
 ### Step 4 — Run the tests
 
+**Objective**: Run the suite to confirm no `cond` clause falls through, which would raise `CondClauseError` at runtime rather than fail the build.
+
 ```bash
 mix test
 ```
@@ -201,6 +220,19 @@ All 7 tests pass.
 
 The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
 
+
+## Key Concepts
+
+### 1. `cond` is for Multiple Boolean Conditions
+`cond` tries each condition in order. The first truthy condition executes. The final `true` is a catch-all.
+
+### 2. `if` vs `cond`
+`if` is for a single boolean condition. `cond` is for multiple conditions. Use `case` if you're pattern-matching.
+
+### 3. Prefer `case` When Possible
+Pattern matching with `case` is more powerful and compile-time checkable. `cond` is a fallback when conditions don't fit a pattern.
+
+---
 ## Benchmark
 
 ```elixir

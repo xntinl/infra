@@ -100,7 +100,72 @@ defmodule SessionStore.MixProject do
 end
 ```
 
+### Dependencies (mix.exs)
+
+```elixir
+```elixir
+:ets.fun2ms(fn {_id, _user, exp, _meta} when exp < 1_700_000_000 -> true end)
+```
+
+Identical behaviour, readable, type-checked by the compiler.
+
+## Core concepts
+
+### 1. Match spec structure
+
+```
+[ {MatchHead, [Guard1, Guard2, ...], [Result1, ...]} ]
+```
+
+- **MatchHead**: a tuple with literals and `'$N'` variables (bound positionally).
+- **Guards**: a list of BIF-like tuples (`{:<, :"$3", some_val}`) that filter matches.
+- **Result**: what to return per match. `:"$_"` = the whole object, `:"$$"` = all variables as a list, or a constructed term.
+
+### 2. `:ets.select/2` vs `:ets.select/3`
+
+`select/2` returns all matches at once. `select/3` with a limit and a continuation enables streaming — essential for tables too big to fit in a single result.
+
+### 3. `:ets.select_delete/2` and `:ets.select_count/2`
+
+These run the match spec inside ETS without returning the rows at all — only a count (or the number of deletions). Zero copy. Use them whenever you do not need the rows.
+
+### 4. `fun2ms` limitations
+
+- Must be called at compile time (`require Ex2ms` or `:ets.fun2ms/1` with `use`; at the very least it must appear literally in source).
+- Fun body is restricted: only a subset of guards, no user function calls.
+- Variable capture from outer scope works only for bound constants (`^var`).
+
+## Design decisions
+
+- **Option A — `tab2list + Enum.filter`**: readable but O(n) heap pressure. Unacceptable at our scale.
+- **Option B — `select/2` with literal match specs**: fastest but unreadable.
+- **Option C — `fun2ms`** (chosen): same performance as B, readability of A.
+
+## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defmodule SessionStore.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :session_store, version: "0.1.0", elixir: "~> 1.16", deps: deps()]
+  end
+
+  def application do
+    [extra_applications: [:logger], mod: {SessionStore.Application, []}]
+  end
+
+  defp deps do
+    [{:benchee, "~> 1.3", only: :dev}]
+  end
+end
+```
+
 ### Step 1: The store
+
+**Objective**: Own the session table and expose `select_delete/2` so expired rows vanish inside the ETS driver, never copied to heap.
 
 ```elixir
 # lib/session_store/store.ex
@@ -159,6 +224,8 @@ end
 
 ### Step 2: Analytics — count-without-copy and range queries
 
+**Objective**: Run `select_count/2` for per-user totals and stream expirations via `select/3` continuations so heap stays flat at any scale.
+
 ```elixir
 # lib/session_store/analytics.ex
 defmodule SessionStore.Analytics do
@@ -194,6 +261,8 @@ end
 ```
 
 ### Step 3: Application
+
+**Objective**: Supervise the Store so a crash recreates `:sessions` before analytics callers observe `:badarg`.
 
 ```elixir
 # lib/session_store/application.ex
@@ -333,6 +402,24 @@ Benchee.run(
 ```
 
 Target: `select_delete` 10–50× faster than the `tab2list` variant, with < 1 MB of heap growth per run vs tens of MB.
+
+## Deep Dive
+
+ETS (Erlang Term Storage) is RAM-only and process-linked; table destruction triggers if the owner crashes, causing silent data loss in careless designs. Match specifications (match_specs) are micro-programs that filter/transform data at the C layer, orders of magnitude faster than fetching all records and filtering in Elixir. Mnesia adds disk persistence and replication but introduces transaction overhead and deadlock potential; dirty operations bypass locks for speed but sacrifice consistency guarantees. For caching, named tables (public by design) are globally visible but require careful name management; consider ETS sharding (multiple small tables) to reduce lock contention on hot keys. DETS (Disk ETS) persists to disk but is single-process bottleneck and slower than a real database. At scale, prefer ETS for in-process state and Mnesia/PostgreSQL for shared, persistent data.
+## Advanced Considerations
+
+ETS and DETS performance characteristics change dramatically based on access patterns and table types. Ordered sets provide range queries but slower access than hash tables; set types don't support duplicate keys while bags do. The `heir` option for ETS tables is essential for fault tolerance — when a table owner crashes, the heir process can take ownership and prevent data loss. Without it, the table is lost immediately. Mnesia replicates entire tables across nodes; choosing which nodes should have replicas and whether they're RAM or disk replicas affects both consistency guarantees and network traffic during cluster operations.
+
+DETS persistence comes with significant performance implications — writes are synchronous to disk by default, creating latency spikes. Using `sync: false` improves throughput but risks data loss on crashes. The maximum DETS table size is limited by available memory and the file system; planning capacity requires understanding your growth patterns. Mnesia's transaction system provides ACID guarantees, but dirty operations bypass these guarantees for performance. Understanding when to use dirty reads versus transactional reads significantly impacts both correctness and latency.
+
+Debugging ETS and DETS issues is challenging because problems often emerge under load when many processes contend for the same table. Table memory fragmentation is invisible to code but can exhaust memory. Using match specs instead of iteration over large tables can dramatically improve performance but requires careful construction. The interaction between ETS, replication, and distributed systems creates subtle consistency issues — a node with a stale ETS replica can serve incorrect data during network partitions. Always monitor table sizes and replication status with structured logging.
+
+
+## Deep Dive: Etsdets Patterns and Production Implications
+
+ETS tables are in-memory, non-distributed key-value stores with tunable semantics (ordered_set, duplicate_bag). Under concurrent read/write load, ETS table semantics matter: bag semantics allow fast appends but slow deletes; ordered_set allows range queries but slower inserts. Testing ETS behavior under concurrent load is non-trivial; single-threaded tests miss lock contention. Production ETS tables often fail under load due to concurrency assumptions that quiet tests don't exercise.
+
+---
 
 ## Trade-offs and production gotchas
 

@@ -2,9 +2,6 @@
 
 **Project**: `fallback_any` — build a protocol both with and without `@fallback_to_any`, benchmark dispatch in each mode with consolidated vs unconsolidated compilation, and understand where the performance cost comes from.
 
-**Difficulty**: ★★★★☆
-**Estimated time**: 3–5 hours
-
 ---
 
 ## Project context
@@ -32,6 +29,12 @@ fallback_any/
 │   └── dispatch_bench.exs
 └── mix.exs
 ```
+
+---
+
+## Why fallback_to_any and not exhaustive impls
+
+Requiring `defimpl` for every type means every new struct in every consumer is a potential production crash. `@fallback_to_any` routes unknown types to a single `defimpl Protocol, for: Any` implementation, which can raise cleanly, log, or return a typed error.
 
 ---
 
@@ -96,9 +99,35 @@ to no fallback. The annotation by itself does nothing without an `Any` impl.
 
 ---
 
+## Design decisions
+
+**Option A — require `defimpl` for every type in the system**
+- Pros: exhaustiveness; no surprise silent fallback; clearest stacktraces.
+- Cons: impossible for open-world types; breaks for any user-defined struct not known at library time.
+
+**Option B — `@fallback_to_any` with a sane default** (chosen)
+- Pros: works on types the library has never seen; avoids `Protocol.UndefinedError` cascades.
+- Cons: the default may be wrong for specific types and fail late; harder to notice missing impls.
+
+→ Chose **B** because the library ships to callers with structs we cannot enumerate; a safe default plus opt-in consolidation gives the ergonomics without giving up correctness.
+
+---
+
 ## Implementation
 
 ### Step 1: `lib/fallback_any/with_fallback.ex`
+
+**Objective**: Define protocol with @fallback_to_any true and defimpl for: Any so unknown types route to term_to_binary safely.
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
 
 ```elixir
 defprotocol FallbackAny.WithFallback do
@@ -136,6 +165,8 @@ end
 
 ### Step 2: `lib/fallback_any/without_fallback.ex`
 
+**Objective**: Mirror protocol without @fallback_to_any so baseline raises Protocol.UndefinedError on unknown types.
+
 ```elixir
 defprotocol FallbackAny.WithoutFallback do
   @moduledoc "Same protocol without Any — raises on unknown values."
@@ -167,6 +198,8 @@ end
 
 ### Step 3: `lib/fallback_any/bench_driver.ex`
 
+**Objective**: Drive both protocols on known/unknown inputs so benchmarks isolate fallback dispatch cost from specific-impl cost.
+
 ```elixir
 defmodule FallbackAny.BenchDriver do
   @moduledoc "Drives many dispatches for benchmarking."
@@ -191,6 +224,8 @@ end
 ```
 
 ### Step 4: Tests
+
+**Objective**: Assert fallback routes unknown structs, no-fallback raises UndefinedError, impl_for returns appropriate values, consolidation confirmed.
 
 ```elixir
 defmodule FallbackAnyTest do
@@ -248,6 +283,8 @@ end
 
 ### Step 5: Benchmark
 
+**Objective**: Quantify dispatch overhead so the Any fallback's real cost on hot and cold paths is not assumed.
+
 ```elixir
 # bench/dispatch_bench.exs
 alias FallbackAny.BenchDriver
@@ -273,6 +310,27 @@ Benchee.run(
 
 The fallback's presence itself is essentially free; the `Any` impl's *work* is what
 you pay for when unknown types arrive.
+
+### Why this works
+
+When the compiler emits dispatch for a protocol, `@fallback_to_any` adds a final clause that matches `Any`. At runtime, when no matching impl exists for a given type, the VM falls through to the `Any` clause. Protocol consolidation still works and elides the dispatch in release mode.
+
+---
+
+## Advanced Considerations: Macro Hygiene and Compile-Time Validation
+
+Macros execute at compile time, walking the AST and returning new AST. That power is easy to abuse: a macro that generates variables can shadow outer scope bindings, or a quote block that references variables directly can fail if the macro is used in a context where those variables don't exist. The `unquote` mechanism is the escape hatch, but misusing it leads to hard-to-debug compile errors.
+
+Macro hygiene is about capturing intent correctly. A `defmacro` that takes `:my_option` and uses it directly might match an unrelated `:my_option` from the caller's scope. The idiomatic pattern is to use `unquote` for values that should be "from the outside" and keep AST nodes quoted for safety. The `quote` block's binding of `var!` and `binding!` provides escape valves for the rare case when shadowing is intentional.
+
+Compile-time validation unlocks errors that would otherwise surface at runtime. A macro can call functions to validate input, generate code conditionally, or fail the build with `IO.warn`. Schema libraries like `Ecto` and `Ash` use macros to define fields at compile time, so runtime queries are guaranteed type-safe. The cost is cognitive load: developers must reason about both the code as written and the code generated.
+
+---
+
+
+## Deep Dive: Metaprogramming Patterns and Production Implications
+
+Metaprogramming (macros, AST manipulation) requires testing at compile time and runtime. The challenge is that macro tests often involve parsing and expanding code, which couples tests to compiler internals. Production bugs in macros can corrupt entire modules; testing macros rigorously is non-negotiable.
 
 ---
 
@@ -304,11 +362,30 @@ Document clearly which protocols your structs are expected to cover.
 is weaker than claimed.
 
 **7. Hot code reload.** Adding a new `defimpl` at runtime in a consolidated release
-requires re-consolidation. See `Protocol.consolidate/2` (exercise 23).
+requires re-consolidation. See `Protocol.consolidate/2`.
 
 **8. When NOT to use `@fallback_to_any`.** If every expected type has an impl, turn
 it OFF — you'll get clearer error messages for the 1% "surprise" type you didn't
 anticipate, rather than silent mis-serialization.
+
+---
+
+## Benchmark
+
+```elixir
+# :timer.tc / Benchee measurement sketch
+{time_us, _} = :timer.tc(fn -> :ok end)
+IO.puts("elapsed: #{time_us} us")
+```
+
+Target: fallback path within 10 ns of direct impl; no measurable overhead after consolidation.
+
+---
+
+## Reflection
+
+- A library you depend on uses `@fallback_to_any` and silently returns `nil` for your struct. How would you detect this in CI without reading every dependency?
+- If you had to design a protocol where silent fallback is dangerous (e.g. serialization), would you enable `@fallback_to_any` at all? What would you do instead?
 
 ---
 

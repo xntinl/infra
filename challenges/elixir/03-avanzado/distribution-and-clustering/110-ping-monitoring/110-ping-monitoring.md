@@ -181,6 +181,8 @@ exponential backoff with jitter: 100ms, 200ms, 400ms, 800ms, capped at 5-10s.
 
 ### Step 1: Mix project
 
+**Objective**: Scaffold supervised app to implement backpressure-aware remote process monitoring with exponential backoff."""
+
 ```elixir
 defmodule NodePingMonitor.MixProject do
   use Mix.Project
@@ -199,6 +201,8 @@ end
 ```
 
 ### Step 2: TenantCoordinator (the target)
+
+**Objective**: Create domain GenServer with :ping handler so DashboardClient can test responsiveness via remote call."""
 
 ```elixir
 defmodule NodePingMonitor.TenantCoordinator do
@@ -230,6 +234,8 @@ end
 ```
 
 ### Step 3: PingTracker — the watcher logic in isolation
+
+**Objective**: Classify :DOWN reasons into retry/wait/alert buckets and compute exponential backoff with jitter deterministically."""
 
 ```elixir
 defmodule NodePingMonitor.PingTracker do
@@ -276,6 +282,8 @@ end
 ```
 
 ### Step 4: DashboardClient — the watcher process
+
+**Objective**: Monitor remote GenServer with backoff logic; trap nodeup to fast-path reconnect when peer revives."""
 
 ```elixir
 defmodule NodePingMonitor.DashboardClient do
@@ -389,6 +397,8 @@ end
 
 ### Step 5: Application
 
+**Objective**: Start DashboardClient under supervision so monitor state survives individual :DOWN events."""
+
 ```elixir
 defmodule NodePingMonitor.Application do
   @moduledoc false
@@ -405,43 +415,47 @@ end
 
 ### Step 6: Tests
 
+**Objective**: Assert backoff classifier and delay computation are deterministic so refactors preserve retry semantics."""
+
 ```elixir
 defmodule NodePingMonitor.PingTrackerTest do
   use ExUnit.Case, async: true
 
   alias NodePingMonitor.PingTracker
 
-  test "classify produces distinct classes for distinct reasons" do
-    assert PingTracker.classify(:normal) == :retry_fast
-    assert PingTracker.classify(:shutdown) == :retry_fast
-    assert PingTracker.classify(:noproc) == :retry_fast
-    assert PingTracker.classify(:noconnection) == :wait_for_nodeup
-    assert PingTracker.classify(:killed) == :alert_and_slow
-    assert PingTracker.classify({:shutdown, :deliberate}) == :retry_fast
-    assert PingTracker.classify(:custom_error) == :alert_and_slow
-  end
+  describe "NodePingMonitor.PingTracker" do
+    test "classify produces distinct classes for distinct reasons" do
+      assert PingTracker.classify(:normal) == :retry_fast
+      assert PingTracker.classify(:shutdown) == :retry_fast
+      assert PingTracker.classify(:noproc) == :retry_fast
+      assert PingTracker.classify(:noconnection) == :wait_for_nodeup
+      assert PingTracker.classify(:killed) == :alert_and_slow
+      assert PingTracker.classify({:shutdown, :deliberate}) == :retry_fast
+      assert PingTracker.classify(:custom_error) == :alert_and_slow
+    end
 
-  test "next_delay_ms grows exponentially for fast retries" do
-    deterministic_rand = fn _ -> 0 end
+    test "next_delay_ms grows exponentially for fast retries" do
+      deterministic_rand = fn _ -> 0 end
 
-    d0 = PingTracker.next_delay_ms(0, :retry_fast, deterministic_rand)
-    d1 = PingTracker.next_delay_ms(1, :retry_fast, deterministic_rand)
-    d2 = PingTracker.next_delay_ms(2, :retry_fast, deterministic_rand)
+      d0 = PingTracker.next_delay_ms(0, :retry_fast, deterministic_rand)
+      d1 = PingTracker.next_delay_ms(1, :retry_fast, deterministic_rand)
+      d2 = PingTracker.next_delay_ms(2, :retry_fast, deterministic_rand)
 
-    assert d0 < d1
-    assert d1 < d2
-  end
+      assert d0 < d1
+      assert d1 < d2
+    end
 
-  test "next_delay_ms caps fast retries at 2s" do
-    deterministic_rand = fn _ -> 0 end
-    d = PingTracker.next_delay_ms(100, :retry_fast, deterministic_rand)
-    # cap is 2000, jitter adds a bit, but the base is clamped
-    assert d <= 2_100
-  end
+    test "next_delay_ms caps fast retries at 2s" do
+      deterministic_rand = fn _ -> 0 end
+      d = PingTracker.next_delay_ms(100, :retry_fast, deterministic_rand)
+      # cap is 2000, jitter adds a bit, but the base is clamped
+      assert d <= 2_100
+    end
 
-  test "wait_for_nodeup uses a long fixed delay" do
-    d = PingTracker.next_delay_ms(0, :wait_for_nodeup, fn _ -> 0 end)
-    assert d >= 20_000
+    test "wait_for_nodeup uses a long fixed delay" do
+      d = PingTracker.next_delay_ms(0, :wait_for_nodeup, fn _ -> 0 end)
+      assert d >= 20_000
+    end
   end
 end
 ```
@@ -464,43 +478,45 @@ defmodule NodePingMonitor.ClusterMonitorTest do
     %{peer: peer, node: node}
   end
 
-  test "receives :DOWN with :noproc when target is not started", %{node: node} do
-    start_supervised!(
-      {DashboardClient,
-       target_name: :absent_coord, target_node: node, listener: self()}
-    )
+  describe "NodePingMonitor.ClusterMonitor" do
+    test "receives :DOWN with :noproc when target is not started", %{node: node} do
+      start_supervised!(
+        {DashboardClient,
+         target_name: :absent_coord, target_node: node, listener: self()}
+      )
 
-    assert_receive {:monitoring, ^node}, 2_000
-    assert_receive {:target_down, ^node, :noproc, :retry_fast}, 2_000
-  end
+      assert_receive {:monitoring, ^node}, 2_000
+      assert_receive {:target_down, ^node, :noproc, :retry_fast}, 2_000
+    end
 
-  test "receives :DOWN with target exit reason", %{node: node} do
-    {:ok, _pid} =
-      :rpc.call(node, TenantCoordinator, :start_link, [[name: :live_coord]])
+    test "receives :DOWN with target exit reason", %{node: node} do
+      {:ok, _pid} =
+        :rpc.call(node, TenantCoordinator, :start_link, [[name: :live_coord]])
 
-    start_supervised!(
-      {DashboardClient,
-       target_name: :live_coord, target_node: node, listener: self()}
-    )
+      start_supervised!(
+        {DashboardClient,
+         target_name: :live_coord, target_node: node, listener: self()}
+      )
 
-    assert_receive {:monitoring, ^node}, 2_000
+      assert_receive {:monitoring, ^node}, 2_000
 
-    # Trigger a remote crash
-    catch_exit(:rpc.call(node, GenServer, :call, [:live_coord, :crash, 200]))
+      # Trigger a remote crash
+      catch_exit(:rpc.call(node, GenServer, :call, [:live_coord, :crash, 200]))
 
-    assert_receive {:target_down, ^node, _reason, _class}, 2_000
-  end
+      assert_receive {:target_down, ^node, _reason, _class}, 2_000
+    end
 
-  test "nodedown is delivered when peer stops", %{peer: peer, node: node} do
-    start_supervised!(
-      {DashboardClient,
-       target_name: :any_name, target_node: node, listener: self()}
-    )
+    test "nodedown is delivered when peer stops", %{peer: peer, node: node} do
+      start_supervised!(
+        {DashboardClient,
+         target_name: :any_name, target_node: node, listener: self()}
+      )
 
-    assert_receive {:monitoring, ^node}, 2_000
-    :peer.stop(peer)
+      assert_receive {:monitoring, ^node}, 2_000
+      :peer.stop(peer)
 
-    assert_receive {:nodedown, ^node}, 5_000
+      assert_receive {:nodedown, ^node}, 5_000
+    end
   end
 end
 ```
@@ -511,6 +527,24 @@ end
 ### Why this works
 
 The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
+
+## Deep Dive
+
+Distributed Erlang relies on a heartbeat mechanism (net_kernel tick) to detect node failure, but the network is fundamentally asynchronous—split-brain scenarios are inevitable. A partitioned cluster may have two sets of nodes, each believing the other is dead. Libraries like Horde and Phoenix.PubSub solve this with quorum-aware consensus, but they add latency and complexity. At scale, choose your consistency model explicitly: eventual consistency (via Redis PubSub) is faster but allows temporary divergence; strong consistency (via Horde DLM or distributed transactions) is slower but guarantees atomicity. For global registries, the order of operations matters—registering a process before its monitor is live creates race conditions. In multi-region setups, latency between nodes compounds these issues; consider regional clusters with a lightweight coordinator rather than a fully meshed topology.
+## Advanced Considerations
+
+Distributed Elixir systems require careful consideration of network partitions, consistent hashing for distributed state, and the interaction between clustering libraries and node discovery mechanisms. Network partitions are not rare edge cases; they happen regularly in cloud deployments due to maintenance windows and infrastructure issues. A system that works perfectly during local testing but fails under network partitions indicates insufficient failure handling throughout the codebase. Split-brain scenarios where multiple network partitions lead to different cluster views require explicit recovery mechanisms that are often business-specific and context-dependent.
+
+Horde and distributed registries provide eventual consistency guarantees, but "eventual" can mean minutes during network partitions. Applications must handle the case where the same name is registered on multiple nodes simultaneously without coordination. Consistent hashing for distributed services requires understanding rebalancing costs — a single node failure can cause significant key redistribution and thundering herd problems if not carefully managed. The cost of distributed consensus using algorithms like Raft is high; choose it only when consistency is more important than availability and can afford the performance cost.
+
+Global state replication across nodes creates synchronization challenges at scale. Choosing between replicating everywhere versus replicating to specific nodes affects both consistency latency and network bandwidth utilization fundamentally. Node monitoring and heartbeat mechanisms require careful timeout tuning — too aggressive and you get false positives during network hiccups; too conservative and you don't detect actual failures quickly enough for recovery. The EPMD (Erlang Port Mapper Daemon) is a critical component that can become a bottleneck in large clusters and requires careful capacity planning.
+
+
+## Deep Dive: Cluster Patterns and Production Implications
+
+Clustering distributes computation across nodes using Erlang's distribution protocol. Testing clusters requires simulating node failures, network partitions, and message delays—challenges that single-node tests don't expose. Production clusters fail in ways that cluster tests reveal: nodes can become isolated (stuck), messages can be reordered, and consensus is expensive.
+
+---
 
 ## Trade-offs and production gotchas
 
@@ -597,3 +631,13 @@ the remote.
 - [Saša Jurić — "Beyond GenServer" (ElixirConf talk)](https://www.theerlangelist.com/) — when to monitor vs link
 - [Phoenix.Tracker source](https://github.com/phoenixframework/phoenix_pubsub/blob/main/lib/phoenix/tracker.ex) — real-world remote-monitoring at scale
 - [Horde's node-watcher implementation](https://github.com/derekkraan/horde/blob/master/lib/horde/node_listener.ex) — production-grade remote-node tracking
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

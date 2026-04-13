@@ -2,9 +2,6 @@
 
 **Project**: `csv_stream` — a CSV transformer that processes multi-GB files without loading them into RAM
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 2-3 hours
-
 ---
 
 ## Why streams matter for a senior developer
@@ -25,6 +22,12 @@ Two concepts power this module:
    through. Each pulled chunk is processed and released before the next is read.
 
 This is the same model used internally by Broadway, Flow, and GenStage.
+
+---
+
+## Why streams and not `File.read!/1` + `Enum`
+
+Reading the full file into memory is simplest and fastest for small inputs, but it scales catastrophically: a 10 GB file needs 10 GB of heap (plus binary refcount copies for every transformation). The VM either OOMs or triggers multi-second GC pauses that freeze request-handling processes on the same node. Streams trade a fixed per-chunk overhead for bounded memory regardless of input size — the only viable option once files outgrow RAM or share a node with latency-sensitive work.
 
 ---
 
@@ -63,9 +66,36 @@ csv_stream/
 
 ---
 
+## Design decisions
+
+**Option A — `File.read!/1` + `String.split/2` + `Enum.*`**
+- Pros: single pass over a plain string; trivial to debug; fastest on small inputs; no laziness surprises.
+- Cons: holds the entire file in memory; dies on GB-scale input; every `Enum.map` allocates a fresh list.
+
+**Option B — `File.stream!/3` + `Stream.*` pipeline + `Stream.into(File.stream!/1)`** (chosen)
+- Pros: memory bounded by chunk size; composes via `Stream.*`; interleaves reads and writes so the VM never buffers the output; identical code works on MB and GB files.
+- Cons: slightly slower on tiny files (constant-factor overhead); easy to accidentally materialise with `Enum.to_list/1` and defeat the laziness; debugging laziness requires mental modelling.
+
+Chose **B** because the product requirement IS multi-GB input; any solution that holds the file in RAM is wrong by definition. The laziness cost is paid in the test suite once and never again.
+
+---
+
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Streams via File.stream! process N-GB files with O(chunk) memory; File.read! scales as O(file size).
 
 ```bash
 mix new csv_stream
@@ -73,6 +103,8 @@ cd csv_stream
 ```
 
 ### Step 2: `mix.exs`
+
+**Objective**: Boilerplate; focus on how Streams are lazily composed — Enum.to_list defeats laziness.
 
 ```elixir
 defmodule CsvStream.MixProject do
@@ -100,6 +132,8 @@ No external dependencies — the standard library is enough.
 
 ### Step 3: `.formatter.exs`
 
+**Objective**: Formatter is opinionated; configure inputs glob + line length once; format is hermetic (no env deps).
+
 ```elixir
 [
   inputs: ["{mix,.formatter}.exs", "{config,lib,test}/**/*.{ex,exs}"],
@@ -108,6 +142,8 @@ No external dependencies — the standard library is enough.
 ```
 
 ### Step 4: `lib/csv_stream/parser.ex`
+
+**Objective**: Minimal CSV parser (split on comma); RFC 4180 (quotes, escapes) requires a real parser, not a toy.
 
 ```elixir
 defmodule CsvStream.Parser do
@@ -189,6 +225,8 @@ end
 
 ### Step 5: `lib/csv_stream/progress.ex`
 
+**Objective**: Callbacks every N lines report progress without tight coupling; Stream.each is the hook for side effects.
+
 ```elixir
 defmodule CsvStream.Progress do
   @moduledoc """
@@ -217,6 +255,8 @@ end
 ```
 
 ### Step 6: `lib/csv_stream/pipeline.ex`
+
+**Objective**: Stream.into(output, mapper) writes lazily; never buffers output; input and write are interleaved.
 
 ```elixir
 defmodule CsvStream.Pipeline do
@@ -319,6 +359,8 @@ end
   interleaved with reads — we never buffer the output.
 
 ### Step 7: Tests
+
+**Objective**: Test both small/large files; test that Stream.into doesn't load file into memory via memory monitoring.
 
 ```elixir
 # test/csv_stream/parser_test.exs
@@ -463,12 +505,70 @@ end
 
 ### Step 8: Run and verify
 
+**Objective**: --warnings-as-errors finds dead progress callbacks; test coverage validates output matches input semantics.
+
 ```bash
 mix deps.get
 mix compile --warnings-as-errors
 mix test --trace
 mix format
 ```
+
+### Why this works
+
+Every stage of the pipeline returns a `Stream` — a description of work, not the work itself. Nothing executes until `Enum.reduce/3` pulls values through at the terminal step, which means memory stays bounded by the `read_ahead` buffer (64 KB here) regardless of file size. `Stream.transform/3` threads the row counter through the pipeline so progress reporting inherits the same laziness. `Stream.into(File.stream!/1)` keeps the output file open for the whole run and interleaves writes with reads — the VM never buffers more than one chunk's worth of output.
+
+---
+
+
+
+---
+## Key Concepts
+
+### 1. `File.read/1` Loads Entire Files Into Memory
+
+For small files, this is fine. For gigabyte-scale files, it's a memory bomb. Use `File.stream!/2` to read lazily in chunks.
+
+### 2. `File.stream!/2` Returns a Stream
+
+```elixir
+File.stream!("large.txt") |> Stream.map(&String.trim/1) |> Enum.to_list()
+```
+
+Each line is read on demand, not preloaded. This is essential for processing large files or piping to external processes.
+
+### 3. Ensure Cleanup with `File.open/2` or Streams
+
+If you use `File.open/2`, ensure the file descriptor is closed (use `File.close/1` or `File.read/2`). Streams auto-close when garbage-collected, but explicit is better. Never leave file descriptors open.
+
+---
+## Benchmark
+
+```elixir
+# bench.exs
+defmodule Bench do
+  def run do
+    path = Path.join(System.tmp_dir!(), "csv_stream_bench.csv")
+    rows = for i <- 1..500_000, into: "id,val\n", do: "#{i},x\n"
+    File.write!(path, rows)
+
+    out = Path.join(System.tmp_dir!(), "csv_stream_bench_out.csv")
+
+    {us, _} =
+      :timer.tc(fn ->
+        CsvStream.Pipeline.run(path, out, has_header: true)
+      end)
+
+    IO.puts("500k rows streamed: #{us} µs (#{us / 500_000} µs/row)")
+    File.rm(path)
+    File.rm(out)
+  end
+end
+
+Bench.run()
+```
+
+Target: under 3 seconds for 500k rows (~6 µs per row) on modern SSDs. Memory high-water should stay under 50 MB — verify with `:erlang.memory(:total)` before and after, or use `:observer.start()` for a GB-scale run.
 
 ---
 
@@ -526,6 +626,13 @@ skip, log every skipped row with its byte offset so ops can audit.
   use `:file.pread/3` for positioned reads.
 - **Parallelism is the bottleneck**. A single `Stream` is sequential. Reach
   for `Flow` or `Broadway` when CPU-bound transforms need multiple cores.
+
+---
+
+## Reflection
+
+1. The pipeline is strictly sequential. If the per-row transform becomes CPU-bound (e.g. decrypting each row), your single-core throughput caps hard. Would you reach for `Flow.from_enumerable/2` with partitioning, spawn a pool of Task workers reading disjoint byte ranges, or push the work to Broadway with a file-chunk producer? What breaks first as the transform grows more expensive?
+2. A malformed row currently crashes the whole run. Product now wants "skip bad rows, write them to a quarantine file, keep going". Would you wrap each row in `try/rescue` inside the `Stream.map`, split the stream into `{:ok, row} | {:error, raw}` tags and fan out via `Stream.transform`, or introduce a second pipeline stage downstream? What's the memory and readability cost of each?
 
 ---
 

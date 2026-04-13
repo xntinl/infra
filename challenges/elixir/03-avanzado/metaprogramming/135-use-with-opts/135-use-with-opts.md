@@ -2,15 +2,22 @@
 
 **Project**: `use_patterns` — catalogue the canonical shapes of `use Module, opts` found in Phoenix, Ecto, and Plug, and build one that combines compile-time options with module attributes for a typed-config DSL.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 3–4 hours
-
 ---
 
 ## Project context
 
 You maintain a shared "base module" that 40+ services in the company `use`. Each one
 passes different options:
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
 
 ```elixir
 defmodule PaymentWorker do
@@ -38,6 +45,12 @@ use_patterns/
 │   └── worker_test.exs
 └── mix.exs
 ```
+
+---
+
+## Why compile-time options and not runtime config
+
+Runtime config needs a lookup on every call and cannot validate required keys until production hits them. Compile-time options let `__using__` raise at compile when a required key is missing, and the generated functions have the value inlined.
 
 ---
 
@@ -111,9 +124,25 @@ end
 
 ---
 
+## Design decisions
+
+**Option A — runtime configuration via `Application.get_env/2`**
+- Pros: changeable without recompile; single place to override for tests.
+- Cons: one level of indirection per call; no compile-time guarantee the option exists.
+
+**Option B — `use Mod, opts` with compile-time validation** (chosen)
+- Pros: options baked into emitted code; failures surface at compile time.
+- Cons: recompile needed to change; each `use` site hardens a copy of the code.
+
+→ Chose **B** because the options affect emitted AST; picking them at runtime would force branching on every call for no reason.
+
+---
+
 ## Implementation
 
 ### Step 1: `lib/use_patterns/worker.ex`
+
+**Objective**: Define @behaviour, validate unknown opts at compile time, and emit run/1 with telemetry.execute calls inlined.
 
 ```elixir
 defmodule UsePatterns.Worker do
@@ -211,6 +240,8 @@ end
 
 ### Step 2: Sample consumers
 
+**Objective**: Use macro with full and partial opts to demonstrate default fallback behaviour side-by-side.
+
 ```elixir
 defmodule UsePatterns.Sample.PaymentWorker do
   use UsePatterns.Worker,
@@ -233,6 +264,8 @@ end
 ```
 
 ### Step 3: Tests
+
+**Objective**: Assert generated accessors, telemetry event firing, and CompileError on unknown opts or invalid prefixes.
 
 ```elixir
 defmodule UsePatterns.WorkerTest do
@@ -304,6 +337,27 @@ defmodule UsePatterns.WorkerTest do
 end
 ```
 
+### Why this works
+
+`__using__(opts)` receives the keyword list at compile time in the caller's module context. Validating keys there fails the compile with a clear `CompileError`. The emitted `quote do ... end` interpolates each option via `unquote(opt)`, so the final module has a literal baked in, not a lookup.
+
+---
+
+## Advanced Considerations: Macro Hygiene and Compile-Time Validation
+
+Macros execute at compile time, walking the AST and returning new AST. That power is easy to abuse: a macro that generates variables can shadow outer scope bindings, or a quote block that references variables directly can fail if the macro is used in a context where those variables don't exist. The `unquote` mechanism is the escape hatch, but misusing it leads to hard-to-debug compile errors.
+
+Macro hygiene is about capturing intent correctly. A `defmacro` that takes `:my_option` and uses it directly might match an unrelated `:my_option` from the caller's scope. The idiomatic pattern is to use `unquote` for values that should be "from the outside" and keep AST nodes quoted for safety. The `quote` block's binding of `var!` and `binding!` provides escape valves for the rare case when shadowing is intentional.
+
+Compile-time validation unlocks errors that would otherwise surface at runtime. A macro can call functions to validate input, generate code conditionally, or fail the build with `IO.warn`. Schema libraries like `Ecto` and `Ash` use macros to define fields at compile time, so runtime queries are guaranteed type-safe. The cost is cognitive load: developers must reason about both the code as written and the code generated.
+
+---
+
+
+## Deep Dive: Metaprogramming Patterns and Production Implications
+
+Metaprogramming (macros, AST manipulation) requires testing at compile time and runtime. The challenge is that macro tests often involve parsing and expanding code, which couples tests to compiler internals. Production bugs in macros can corrupt entire modules; testing macros rigorously is non-negotiable.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -344,6 +398,13 @@ needed.
 
 `use` runs at compile time only; there is nothing to bench at runtime. Any generated
 functions (`queue/0`, `run/1`) are plain functions with normal BEAM performance.
+
+---
+
+## Reflection
+
+- A setting used to be compile-time but now needs to change per-tenant at runtime. Do you keep `use` and add a runtime override, or pivot the whole API? What breaks for existing callers?
+- How do you defend requiring a key at compile time when a library author might want sane defaults? Where does that line live?
 
 ---
 

@@ -110,12 +110,18 @@ end
 
 ### Step 1: Create the project
 
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
+
 ```bash
 mix new process_primitives
 cd process_primitives
 ```
 
 ### Step 2: `lib/process_primitives.ex`
+
+**Objective**: Implement `process_primitives.ex` — the GenServer callback shape that determines blocking vs fire-and-forget semantics and state invariants.
+
 
 ```elixir
 defmodule ProcessPrimitives do
@@ -204,6 +210,9 @@ end
 
 ### Step 3: `test/process_primitives_test.exs`
 
+**Objective**: Write `process_primitives_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+
 ```elixir
 defmodule ProcessPrimitivesTest do
   use ExUnit.Case, async: true
@@ -283,6 +292,9 @@ end
 
 ### Step 4: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -293,6 +305,15 @@ mix test
 
 The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
 
+
+
+## Deep Dive: Message Ordering and Process Linking Semantics
+
+Raw process communication via `send/2` guarantees FIFO message ordering per sender-receiver pair: if A sends M1 then M2 to B, they arrive in order. But if multiple senders target B, messages interleave—this forces explicit reasoning about message ordering rather than assuming global sequencing.
+
+Process linking (`Process.link/1`) creates bidirectional fault coupling: if either linked process crashes, the other receives an exit signal. This is how supervision hierarchies propagate failures upward. Without linking, a child dies silently, orphaning any work it held. Trapping exits (`Process.flag(:trap_exit, true)`) converts exit signals into messages, allowing graceful handling as events rather than fatal crashes.
+
+The distinction matters in production: a supervised process linked to a supervisor will trigger the restart strategy on crash, while an unlinked process just dies. Always link processes managed as a unit; deliberately avoid linking independent processes.
 
 ## Benchmark
 

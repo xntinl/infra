@@ -142,7 +142,22 @@ DDL variants across three dialects.
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"ecto", "~> 1.0"},
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
 
 ```bash
 mix new migrations_lab --sup
@@ -150,6 +165,9 @@ cd migrations_lab
 ```
 
 ### Step 2: `mix.exs`
+
+**Objective**: Declare dependencies and project config in `mix.exs`.
+
 
 ```elixir
 defmodule MigrationsLab.MixProject do
@@ -187,6 +205,9 @@ end
 
 ### Step 3: `config/config.exs`
 
+**Objective**: Implement `config.exs` — the integration seam where external protocol semantics meet Elixir domain code.
+
+
 ```elixir
 import Config
 
@@ -199,6 +220,9 @@ config :migrations_lab, MigrationsLab.Repo,
 ```
 
 ### Step 4: `lib/migrations_lab/repo.ex`, `application.ex`
+
+**Objective**: Provide `lib/migrations_lab/repo.ex`, `application.ex` — these are the supporting fixtures the main module depends on to make its concept demonstrable.
+
 
 ```elixir
 defmodule MigrationsLab.Repo do
@@ -220,6 +244,9 @@ end
 ```
 
 ### Step 5: Migration 1 — `priv/repo/migrations/20260101000001_create_users_and_posts.exs`
+
+**Objective**: Migration 1 — `priv/repo/migrations/20260101000001_create_users_and_posts.exs`.
+
 
 ```elixir
 defmodule MigrationsLab.Repo.Migrations.CreateUsersAndPosts do
@@ -249,6 +276,9 @@ end
 
 ### Step 6: Migration 2 — `priv/repo/migrations/20260101000002_add_published_at_to_posts.exs`
 
+**Objective**: Migration 2 — `priv/repo/migrations/20260101000002_add_published_at_to_posts.exs`.
+
+
 ```elixir
 defmodule MigrationsLab.Repo.Migrations.AddPublishedAtToPosts do
   use Ecto.Migration
@@ -266,6 +296,9 @@ end
 
 ### Step 7: Migration 3 — `priv/repo/migrations/20260101000003_add_published_at_not_in_future.exs`
 
+**Objective**: Migration 3 — `priv/repo/migrations/20260101000003_add_published_at_not_in_future.exs`.
+
+
 ```elixir
 defmodule MigrationsLab.Repo.Migrations.AddPublishedAtNotInFuture do
   use Ecto.Migration
@@ -279,6 +312,9 @@ end
 ```
 
 ### Step 8: Schemas — `lib/migrations_lab/user.ex`, `post.ex`
+
+**Objective**: Schemas — `lib/migrations_lab/user.ex`, `post.ex`.
+
 
 ```elixir
 defmodule MigrationsLab.User do
@@ -326,6 +362,9 @@ end
 
 ### Step 9: `lib/migrations_lab.ex`
 
+**Objective**: Implement `migrations_lab.ex` — the integration seam where external protocol semantics meet Elixir domain code.
+
+
 ```elixir
 defmodule MigrationsLab do
   alias MigrationsLab.{Repo, User, Post}
@@ -337,12 +376,18 @@ end
 
 ### Step 10: `test/test_helper.exs`
 
+**Objective**: Implement `test_helper.exs` — the integration seam where external protocol semantics meet Elixir domain code.
+
+
 ```elixir
 ExUnit.start()
 Ecto.Adapters.SQL.Sandbox.mode(MigrationsLab.Repo, :manual)
 ```
 
 ### Step 11: `test/migrations_lab_test.exs`
+
+**Objective**: Write `migrations_lab_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
 
 ```elixir
 defmodule MigrationsLabTest do
@@ -417,6 +462,9 @@ end
 
 ### Step 12: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -434,6 +482,20 @@ writes) to the form-level error (per-field message the UI can render).
 
 ---
 
+## Key Concepts
+
+Database migrations are versioned, timestamped DDL files that encode schema evolution under version control. Each migration is idempotent—running the same migration twice has no effect because the `schema_migrations` table tracks applied versions. This design prevents the class of bugs where "forgot to run migration X" silently breaks downstream code. The `change/0` callback is bidirectional: Ecto infers rollback semantics, so `create table` automatically reverses to `drop table`. However, `change/0` only works for reversible operations; data migrations, raw SQL, or destructive alterations require explicit `up/0` + `down/0` pairs. In production, index creation on large tables locks writes—use `concurrently: true` with `@disable_ddl_transaction true` to avoid this. Foreign key policies (`on_delete:`, `on_update:`) must be chosen intentionally, not left to defaults, as they determine cascade behavior during deletes. The bridge between database constraints and Elixir changesets—using `check_constraint/3`, `unique_constraint/2`, etc.—ensures the database is the source of truth while changesets provide friendly error messages for forms and APIs.
+
+---
+
+## Deep Dive: State Management and Message Handling Patterns
+
+Understanding state transitions is central to reliable OTP systems. Every `handle_call` or `handle_cast` receives current state and returns new state—immutability forces explicit reasoning. This prevents entire classes of bugs: missing state updates are immediately visible.
+
+Key insight: separate pure logic (state → new state) from side effects (logging, external calls). Move pure logic to private helpers; use handlers for orchestration. This makes servers testable—test pure functions independently.
+
+In production, monitor state size and mutation frequency. Unbounded growth is a memory leak; excessive mutations signal hot spots needing optimization. Always profile before reaching for performance solutions like ETS.
+
 ## Benchmark
 
 <!-- benchmark N/A: migrations are one-shot DDL; the metric that
@@ -441,6 +503,12 @@ writes) to the form-level error (per-field message the UI can render).
      microseconds). Target: every migration should either complete in
      under 100ms on a dev DB, or declare itself long-running via
      `@disable_ddl_transaction true` and be run concurrently. -->
+
+---
+
+## Key Concepts
+
+Migrations track database schema changes. Each migration file (timestamped, in `priv/repo/migrations/`) declares a forward change (`change/0`) that Ecto can auto-reverse. `mix ecto.migrate` applies pending migrations; `mix ecto.rollback` reverts them. The `schema_migrations` table tracks applied versions, so migrations are idempotent—running the same migration twice has no effect. This is crucial: you can safely run `mix ecto.migrate` on deployment without worrying about already-applied migrations. The trade-off: once a migration is applied in production, you cannot edit it—always write a new migration to correct past mistakes. Migrations coupled with changesets enforce the boundary: database changes are version-controlled and reversible.
 
 ---
 

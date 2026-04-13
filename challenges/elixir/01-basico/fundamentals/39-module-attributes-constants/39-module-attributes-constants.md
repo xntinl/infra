@@ -71,6 +71,17 @@ A function call has a call-site cost and lives in the module's call graph. A mod
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### `lib/versioned_schema_registry.ex`
 
 ```elixir
@@ -272,6 +283,24 @@ mix docs  # if ex_doc is configured — @moduledoc renders the module page
 
 The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
 
+
+
+---
+## Key Concepts
+
+### 1. Module Attributes Are Compile-Time Constants
+
+Module attributes like `@version` are evaluated at compile time, not runtime. Every function that references `@version` inlines that value at compile time. This makes them suitable for configuration constants, allowed values, and documentation. But they are not runtime storage.
+
+### 2. Attributes Are Not Variables
+
+You cannot rebind an attribute. If you need mutable state, use an `Agent` or process. Attributes are for read-only configuration known at compile time.
+
+### 3. Attributes Participate in Module Documentation
+
+You can embed attributes into `@moduledoc` and `@doc` at compile time. This keeps documentation in sync with actual versions automatically. Attributes are evaluated before the module definition finishes.
+
+---
 ## Benchmark
 
 ```elixir

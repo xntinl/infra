@@ -73,7 +73,21 @@ json_validator/
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"jason", "~> 1.0"},
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Scaffold Mix project structure so each artifact (mix.exs, config/, lib/) has explicit compile-time vs runtime separation from the start.
 
 ```bash
 mix new json_validator
@@ -82,6 +96,8 @@ mkdir -p config
 ```
 
 ### Step 2: `mix.exs` — real-world configuration
+
+**Objective**: Configure escript: main_module so mix escript.build produces single-file binary without runtime dependency on Erlang VM.
 
 ```elixir
 # mix.exs
@@ -138,6 +154,8 @@ Key decisions visible here:
 
 ### Step 3: `.formatter.exs`
 
+**Objective**: Commit formatter rules to .formatter.exs so style becomes compile-time checkable, not post-review drift.
+
 ```elixir
 # .formatter.exs
 [
@@ -152,6 +170,8 @@ The formatter ensures consistent style. `line_length: 98` fits most screens.
 matching the idiomatic Elixir test style.
 
 ### Step 4: `config/config.exs` and `config/runtime.exs`
+
+**Objective**: Split config.exs (compile-time) from runtime.exs (boot-time) to block System.get_env/1 from baking into compiled release.
 
 ```elixir
 # config/config.exs
@@ -202,6 +222,8 @@ in `config.exs` — it captures the value at compile time, which is almost never
 you want in a deployed system.
 
 ### Step 5: `lib/json_validator/cli.ex`
+
+**Objective**: Make main/1 a thin boundary that parses argv and delegates to pure Core so business logic stays IO-free and side-effect-testable.
 
 ```elixir
 defmodule JsonValidator.CLI do
@@ -303,6 +325,8 @@ end
 
 ### Step 6: `lib/json_validator/core.ex`
 
+**Objective**: Implement pure validation module with no IO so Core can be tested in isolation and reused beyond CLI layer.
+
 ```elixir
 defmodule JsonValidator.Core do
   @moduledoc """
@@ -392,6 +416,8 @@ end
   frequently.
 
 ### Step 7: Tests
+
+**Objective**: Test Core module directly without escript invocation so every validation step is unit-testable and isolation is proven.
 
 ```elixir
 # test/json_validator/core_test.exs
@@ -518,6 +544,8 @@ end
 
 ### Step 8: Run and verify
 
+**Objective**: Build escript and verify CLI contract end-to-end so compile and runtime paths are proven against real file I/O.
+
 ```bash
 # Install dependencies
 mix deps.get
@@ -548,6 +576,26 @@ mix escript.build
 
 The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
 
+
+
+---
+## Key Concepts
+
+### 1. Mix Projects as Dependency Boundaries
+
+Mix enforces a strict boundary between your code and external packages. Every dependency lives in `deps/`, isolated from `lib/`. This isolation prevents accidental imports of vendored code and makes version conflicts explicit — if Mix cannot resolve all versions into a valid DAG, it fails loudly at build time.
+
+In production systems with hundreds of dependencies, this boundary prevents subtle bugs: a library update breaking an internal API propagates as a compile error, not a silent behavior change weeks after deployment.
+
+### 2. The `mix.exs` is Elixir Code, Not Configuration
+
+Many developers treat `mix.exs` like YAML—as inert data. It is Elixir code executed at compile time. You can compute version strings from files, set conditional dependencies based on environment, or calculate paths. Version management, environment-specific requirements—all possible because Mix scripts are functions.
+
+### 3. Compiled Artifacts and Incremental Rebuilds
+
+Elixir compiles to BEAM bytecode stored in `_build/`. Mix tracks modification times and recompiles only affected modules. This "pay-for-what-you-change" model is why Elixir projects with 50+ modules rebuild in milliseconds. Never commit `_build/` to version control—it's environment-specific and wasteful.
+
+---
 ## Benchmark
 
 ```elixir

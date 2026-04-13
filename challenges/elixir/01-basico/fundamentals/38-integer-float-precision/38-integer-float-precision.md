@@ -68,6 +68,18 @@ Converting 1_000_000 USD to EUR and back with floats loses cents every round tri
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"ecto", "~> 1.0"},
+  ]
+end
+```
+
+
 ### `mix.exs`
 
 ```elixir
@@ -300,6 +312,24 @@ mix test
 
 The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
 
+
+
+---
+## Key Concepts
+
+### 1. Floats Are IEEE 754, Not Decimal
+
+Floats are 64-bit IEEE 754 double-precision numbers with ~15–17 decimal digits precision. Many decimal numbers cannot be represented exactly: `0.1 + 0.2 = 0.30000000000000004`. This is fundamental to IEEE 754, not a bug. For systems where exactness matters (financial, scientific), store values as integers or decimals.
+
+### 2. Float Literals Are Approximations
+
+When you write `0.1`, the compiler interprets it as the nearest IEEE 754 representation. The literal `0.1` and the parsed value from a string happen to round-trip, but other decimals do not. Avoid hardcoding floats when precision matters.
+
+### 3. Rounding and Display Are Separate Concerns
+
+Use `Float.round/2` or `Kernel.round/1` for display, but keep calculations in higher precision. Do not rely on rounding to fix IEEE 754 errors during calculation. For financial systems, use integer cents or the `Decimal` library.
+
+---
 ## Benchmark
 
 ```elixir

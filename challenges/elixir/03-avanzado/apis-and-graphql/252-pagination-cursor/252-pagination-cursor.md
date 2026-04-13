@@ -130,6 +130,8 @@ paginator code — reserve backward pagination for when product actually needs
 
 ### Step 1: Event schema and migrations
 
+**Objective**: Model events with a `(user_id, inserted_at DESC, id DESC)` index so cursor tuples seek the page in O(log n) without a sort step.
+
 ```elixir
 # lib/cursor_pagination/feed/event.ex
 defmodule CursorPagination.Feed.Event do
@@ -148,6 +150,8 @@ Migration requires an index on `(user_id, inserted_at DESC, id DESC)` for the
 tiebreaker to be efficient.
 
 ### Step 2: Reusable paginator
+
+**Objective**: Fetch `limit+1` rows with a `(col, id)` tuple seek so `has_next_page` is known without a COUNT and ties break deterministically.
 
 ```elixir
 # lib/cursor_pagination/paginator.ex
@@ -233,6 +237,8 @@ end
 
 ### Step 3: GraphQL connection types
 
+**Objective**: Shape edges/pageInfo to the Relay Connection spec so any Relay or Apollo client can paginate without a custom transport adapter.
+
 ```elixir
 # lib/cursor_pagination/graphql/types/connection_types.ex
 defmodule CursorPagination.Graphql.Types.ConnectionTypes do
@@ -291,6 +297,8 @@ end
 
 ### Step 4: Schema
 
+**Objective**: Import connection fields into the root query so `events(first, after)` is the only entry point and legacy offset APIs disappear.
+
 ```elixir
 # lib/cursor_pagination/graphql/schema.ex
 defmodule CursorPagination.Graphql.Schema do
@@ -304,6 +312,8 @@ end
 ```
 
 ### Step 5: Tests
+
+**Objective**: Seed duplicate `inserted_at` rows and walk every page so the tiebreaker holds and no edge is ever dropped or duplicated.
 
 ```elixir
 # test/cursor_pagination/paginator_test.exs
@@ -324,51 +334,53 @@ defmodule CursorPagination.PaginatorTest do
     :ok
   end
 
-  test "returns the first N and a next-page cursor" do
-    page = Paginator.paginate(Event, Repo, first: 50)
-    assert length(page.edges) == 50
-    assert page.page_info.has_next_page == true
-    assert page.page_info.end_cursor != nil
-  end
+  describe "CursorPagination.Paginator" do
+    test "returns the first N and a next-page cursor" do
+      page = Paginator.paginate(Event, Repo, first: 50)
+      assert length(page.edges) == 50
+      assert page.page_info.has_next_page == true
+      assert page.page_info.end_cursor != nil
+    end
 
-  test "cursor continuation returns the next chunk without overlap" do
-    page1 = Paginator.paginate(Event, Repo, first: 50)
-    page2 = Paginator.paginate(Event, Repo, first: 50, after: page1.page_info.end_cursor)
+    test "cursor continuation returns the next chunk without overlap" do
+      page1 = Paginator.paginate(Event, Repo, first: 50)
+      page2 = Paginator.paginate(Event, Repo, first: 50, after: page1.page_info.end_cursor)
 
-    ids1 = Enum.map(page1.edges, & &1.node.id)
-    ids2 = Enum.map(page2.edges, & &1.node.id)
+      ids1 = Enum.map(page1.edges, & &1.node.id)
+      ids2 = Enum.map(page2.edges, & &1.node.id)
 
-    assert MapSet.disjoint?(MapSet.new(ids1), MapSet.new(ids2))
-    assert length(ids2) == 50
-  end
+      assert MapSet.disjoint?(MapSet.new(ids1), MapSet.new(ids2))
+      assert length(ids2) == 50
+    end
 
-  test "inserting a new event between pages does NOT shift the second page" do
-    page1 = Paginator.paginate(Event, Repo, first: 50)
+    test "inserting a new event between pages does NOT shift the second page" do
+      page1 = Paginator.paginate(Event, Repo, first: 50)
 
-    # New event arrives after page 1, before page 2.
-    {:ok, newest} = Repo.insert(%Event{user_id: 1, kind: "view", payload: %{}})
+      # New event arrives after page 1, before page 2.
+      {:ok, newest} = Repo.insert(%Event{user_id: 1, kind: "view", payload: %{}})
 
-    page2 = Paginator.paginate(Event, Repo, first: 50, after: page1.page_info.end_cursor)
+      page2 = Paginator.paginate(Event, Repo, first: 50, after: page1.page_info.end_cursor)
 
-    refute Enum.any?(page2.edges, fn e -> e.node.id == newest.id end),
-           "page 2 must not contain events inserted after page 1"
-  end
+      refute Enum.any?(page2.edges, fn e -> e.node.id == newest.id end),
+             "page 2 must not contain events inserted after page 1"
+    end
 
-  test "last page has has_next_page=false" do
-    all_pages =
-      Stream.unfold(nil, fn cursor ->
-        page = Paginator.paginate(Event, Repo, first: 100, after: cursor)
-        if page.edges == [] do
-          nil
-        else
-          {page, if(page.page_info.has_next_page, do: page.page_info.end_cursor, else: :stop)}
-        end
-      end)
-      |> Stream.take_while(&match?(%{}, &1))
-      |> Enum.to_list()
+    test "last page has has_next_page=false" do
+      all_pages =
+        Stream.unfold(nil, fn cursor ->
+          page = Paginator.paginate(Event, Repo, first: 100, after: cursor)
+          if page.edges == [] do
+            nil
+          else
+            {page, if(page.page_info.has_next_page, do: page.page_info.end_cursor, else: :stop)}
+          end
+        end)
+        |> Stream.take_while(&match?(%{}, &1))
+        |> Enum.to_list()
 
-    last = List.last(all_pages)
-    assert last.page_info.has_next_page == false
+      last = List.last(all_pages)
+      assert last.page_info.has_next_page == false
+    end
   end
 end
 ```
@@ -379,6 +391,50 @@ end
 ### Why this works
 
 The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
+
+## Deep Dive: Query Complexity and N+1 Prevention Patterns
+
+GraphQL's flexibility is a double-edged sword. A query like `{ users { posts { comments { author { email } } } } }`
+becomes a DDoS vector if unchecked: a resolver that loads each post's comments naively yields 1000 database 
+queries for a 100-user query.
+
+**Three strategies to prevent N+1**:
+1. **Dataloader batching** (Absinthe-native): Queue fields in phase 1 (`load/3`), flush in phase 2 (`run/1`).
+   Single database call per level. Works across HTTP boundaries via custom sources.
+2. **Ecto select/5 eager loading** (preload): Best when schema relationships are known at resolver definition time.
+   Fine-grained control; requires discipline in your types.
+3. **Complexity analysis** (persisted queries): Assign a "weight" to each field (users=2, posts=5, comments=10).
+   Reject queries exceeding a threshold BEFORE execution. Prevents runaway queries entirely.
+
+**Production gotcha**: Complexity analysis doesn't prevent slow queries — it prevents expensive queries.
+A query that hits 50,000 database rows but under the complexity limit still runs. Combine with database 
+query timeouts and active monitoring.
+
+**Subscription patterns** (real-time): Subscriptions over PubSub break traditional Dataloader batching 
+because events arrive asynchronously. Use a separate resolver that doesn't call the loader; instead, 
+publish (source) and subscribe (sink) directly. This keeps subscriptions cheap and doesn't starve 
+the dataloader queue.
+
+**Field-level authorization**: Dataloader sources can enforce per-user visibility rules at load time, 
+not in the resolver. This is cleaner than filtering after the fact and reduces unnecessary database 
+queries for unauthorized fields.
+
+---
+
+## Advanced Considerations
+
+API implementations at scale require careful consideration of request handling, error responses, and the interaction between multiple clients with different performance expectations. The distinction between public APIs and internal APIs affects error reporting granularity, versioning strategies, and backwards compatibility guarantees fundamentally. Versioning APIs through headers, paths, or query parameters each have trade-offs in terms of maintenance burden, client complexity, and developer experience across multiple client versions. When deprecating API endpoints, the migration window and support period must balance client migration costs with infrastructure maintenance costs and team capacity constraints.
+
+GraphQL adds complexity around query costs, depth limits, and the interaction between nested resolvers and N+1 query problems. A deeply nested GraphQL query can trigger hundreds of database queries if not carefully managed with proper preloading and query analysis. Implementing query cost analysis prevents malicious or poorly-written queries from starving resources and degrading service for other clients. The caching layer becomes more complex with GraphQL because the same data may be accessed through multiple query paths, each with different caching semantics and TTL requirements that must be carefully coordinated at the application level.
+
+Error handling and status codes require careful design to balance information disclosure with security concerns. Too much detail in error messages helps attackers; too little detail frustrates legitimate users. Implement structured error responses with specific error codes that clients can use to handle different failure scenarios intelligently and retry appropriately. Rate limiting, circuit breakers, and backpressure mechanisms prevent API overload but require careful configuration based on expected traffic patterns and SLA requirements.
+
+
+## Deep Dive: Apis Patterns and Production Implications
+
+API testing requires testing schema validation, error messages, pagination, and rate limiting—not just happy paths. The mistake is testing only the happy path and assuming error handling works. Production APIs with weak error handling become support nightmares.
+
+---
 
 ## Trade-offs and production gotchas
 
@@ -450,3 +506,13 @@ is the whole point.
 - [`paginator` hex package](https://hexdocs.pm/paginator/readme.html) — production-ready cursor paginator
 - [Slack engineering — "Evolving API pagination at Slack"](https://slack.engineering/evolving-api-pagination-at-slack/)
 - [Shopify Bulk Operations API](https://shopify.dev/docs/api/usage/bulk-operations/queries) — cursors at GraphQL scale
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

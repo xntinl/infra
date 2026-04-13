@@ -88,7 +88,30 @@ defmodule KvCache.MixProject do
 end
 ```
 
+### Dependencies (mix.exs)
+
+```elixir
+```elixir
+defmodule KvCache.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :kv_cache, version: "0.1.0", elixir: "~> 1.16", deps: deps()]
+  end
+
+  def application do
+    [extra_applications: [:logger], mod: {KvCache.Application, []}]
+  end
+
+  defp deps do
+    [{:benchee, "~> 1.3", only: :dev}]
+  end
+end
+```
+
 ### Step 1: Persistence layer (DETS)
+
+**Objective**: Isolate every DETS call behind a single module and handle `{:repaired, ...}` so corrupt files don't crash boot.
 
 ```elixir
 # lib/kv_cache/persistence.ex
@@ -132,6 +155,8 @@ end
 ```
 
 ### Step 2: Cache owner (ETS front + DETS back)
+
+**Objective**: Serve hot reads from ETS and replay DETS into ETS at boot so cold starts don't hit disk per lookup.
 
 ```elixir
 # lib/kv_cache/cache.ex
@@ -208,6 +233,8 @@ end
 ```
 
 ### Step 3: Application
+
+**Objective**: Supervise the Cache with a configurable DETS path so tests and prod can point at different files.
 
 ```elixir
 # lib/kv_cache/application.ex
@@ -339,6 +366,24 @@ Cache.put("warm_key", :warm)
 ```
 
 Target: `ETS-front get` under 2 µs. `ETS+DETS put` dominated by DETS write (~50–200 µs on SSD). `DETS-only lookup` 5–10 µs. The cache pattern gives you ETS-like reads and DETS durability.
+
+## Deep Dive
+
+ETS (Erlang Term Storage) is RAM-only and process-linked; table destruction triggers if the owner crashes, causing silent data loss in careless designs. Match specifications (match_specs) are micro-programs that filter/transform data at the C layer, orders of magnitude faster than fetching all records and filtering in Elixir. Mnesia adds disk persistence and replication but introduces transaction overhead and deadlock potential; dirty operations bypass locks for speed but sacrifice consistency guarantees. For caching, named tables (public by design) are globally visible but require careful name management; consider ETS sharding (multiple small tables) to reduce lock contention on hot keys. DETS (Disk ETS) persists to disk but is single-process bottleneck and slower than a real database. At scale, prefer ETS for in-process state and Mnesia/PostgreSQL for shared, persistent data.
+## Advanced Considerations
+
+ETS and DETS performance characteristics change dramatically based on access patterns and table types. Ordered sets provide range queries but slower access than hash tables; set types don't support duplicate keys while bags do. The `heir` option for ETS tables is essential for fault tolerance — when a table owner crashes, the heir process can take ownership and prevent data loss. Without it, the table is lost immediately. Mnesia replicates entire tables across nodes; choosing which nodes should have replicas and whether they're RAM or disk replicas affects both consistency guarantees and network traffic during cluster operations.
+
+DETS persistence comes with significant performance implications — writes are synchronous to disk by default, creating latency spikes. Using `sync: false` improves throughput but risks data loss on crashes. The maximum DETS table size is limited by available memory and the file system; planning capacity requires understanding your growth patterns. Mnesia's transaction system provides ACID guarantees, but dirty operations bypass these guarantees for performance. Understanding when to use dirty reads versus transactional reads significantly impacts both correctness and latency.
+
+Debugging ETS and DETS issues is challenging because problems often emerge under load when many processes contend for the same table. Table memory fragmentation is invisible to code but can exhaust memory. Using match specs instead of iteration over large tables can dramatically improve performance but requires careful construction. The interaction between ETS, replication, and distributed systems creates subtle consistency issues — a node with a stale ETS replica can serve incorrect data during network partitions. Always monitor table sizes and replication status with structured logging.
+
+
+## Deep Dive: Etsdets Patterns and Production Implications
+
+ETS tables are in-memory, non-distributed key-value stores with tunable semantics (ordered_set, duplicate_bag). Under concurrent read/write load, ETS table semantics matter: bag semantics allow fast appends but slow deletes; ordered_set allows range queries but slower inserts. Testing ETS behavior under concurrent load is non-trivial; single-threaded tests miss lock contention. Production ETS tables often fail under load due to concurrency assumptions that quiet tests don't exercise.
+
+---
 
 ## Trade-offs and production gotchas
 

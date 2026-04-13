@@ -2,9 +2,6 @@
 
 **Project**: `env_config` — loads and validates required env vars at boot, fails fast if anything is missing.
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 1–2 hours
-
 ---
 
 ## Project context
@@ -66,9 +63,43 @@ you want graceful error handling.
 
 ---
 
+## Why accumulate errors and not fail on the first missing var
+
+The naive pattern — `System.fetch_env!/1` once per var — reports one problem, raises, and exits. Ops fixes that var, redeploys, hits the next missing var, redeploys again, and so on. A ten-variable service can take ten deploys to boot. Accumulating every failure into one `RuntimeError` message means ops sees the full list on the first try and fixes them in a single edit. This is the same reasoning behind Ecto changesets: the user doesn't want to learn their form has errors one field at a time.
+
+---
+
+## Design decisions
+
+**Option A — read env vars inline at each call site with `System.fetch_env!/1`**
+- Pros: no loader module; failures point to the exact caller in the stacktrace; zero indirection.
+- Cons: failure on first missing var forces one redeploy per problem; no type coercion (everything is a string); no place to document which vars the service needs.
+
+**Option B — schema-driven loader with `load!/1` called from `runtime.exs`, accumulates errors** (chosen)
+- Pros: one boot-time report listing every missing/invalid var; type coercion (`:integer`, `:boolean`, `:url`) centralised; schema doubles as documentation; required/optional distinction is explicit; empty string (`FOO=`) treated as missing, matching operator intent.
+- Cons: extra module; tiny indirection between "what the service reads" and "where it reads it".
+
+Chose **B** because the cost of a single missed deploy cycle at 03:00 (when ops is on-call) dwarfs the cost of maintaining a 100-line loader. Centralising env var policy also prevents the "grep for `System.get_env` and pray you found them all" migration pattern.
+
+---
+
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"ecto", "~> 1.0"},
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: runtime.exs (boot-time) reads env vars, not config.exs (compile-time); fail-fast with full error list.
 
 ```bash
 mix new env_config
@@ -77,6 +108,8 @@ mkdir -p config
 ```
 
 ### Step 2: `lib/env_config.ex`
+
+**Objective**: System.fetch_env/1 returns {:ok|:error}; accumulate all failures before raising with complete list.
 
 ```elixir
 defmodule EnvConfig do
@@ -178,7 +211,8 @@ defmodule EnvConfig do
   end
 
   defp coerce(name, key, raw, :url) do
-    # Minimal check — a full validator lives in exercise 68.
+    # Minimal check — a stricter validator can layer scheme whitelisting
+    # and host format on top; here we just confirm it parses as http(s).
     case URI.new(raw) do
       {:ok, %URI{scheme: s, host: h}} when s in ["http", "https"] and is_binary(h) ->
         {:ok, key, raw}
@@ -192,6 +226,8 @@ end
 
 ### Step 3: `config/config.exs`
 
+**Objective**: Compile-time config only; env vars go in runtime.exs, not here — reading env at compile-time is wrong.
+
 ```elixir
 import Config
 
@@ -201,6 +237,8 @@ config :env_config, :app_name, "env_config_demo"
 ```
 
 ### Step 4: `config/runtime.exs`
+
+**Objective**: Call env_config.load!/0 here; boot fails with complete error list if any required var is missing/invalid.
 
 ```elixir
 import Config
@@ -223,6 +261,8 @@ end
 ```
 
 ### Step 5: `test/env_config_test.exs`
+
+**Objective**: Test type coercion (":false" is truthy string; parse to bool), missing vars, empty strings as missing.
 
 ```elixir
 defmodule EnvConfigTest do
@@ -319,9 +359,34 @@ end
 
 ### Step 6: Run
 
+**Objective**: --warnings-as-errors catches unused env schema fields; test coverage validates all failures reported.
+
 ```bash
 mix test
 ```
+
+### Why this works
+
+`System.fetch_env/1` (not `fetch_env!/1`) returns `{:ok, val} | :error`, which lets the reducer keep going after a missing var and collect every problem. The spec shape `{NAME, type, opts}` keeps required-ness, defaults, and coercion together at a single callsite so ops can read `runtime.exs` and know exactly what the service needs. `load!/1` raises a `RuntimeError` with the full error list joined into one message, so the release fails to boot — OTP's supervision tree treats that as an abort rather than a restart loop, which is the correct behaviour for bad configuration.
+
+---
+
+
+## Key Concepts
+
+### 1. `System.get_env/1` Reads Environment Variables
+Environment variables are the standard way to pass configuration to applications (API keys, database URLs, feature flags).
+
+### 2. Never Hardcode Secrets
+Always read secrets from environment. This prevents accidentally committing secrets to version control.
+
+### 3. Compile-Time vs Runtime
+`System.get_env/1` reads at runtime. For compile-time configuration, use module attributes and environment-specific builds.
+
+---
+## Benchmark
+
+<!-- benchmark N/A: boot-time configuration, runs once per release start; microsecond cost is irrelevant -->
 
 ---
 
@@ -347,6 +412,13 @@ If you must log, redact known secret-bearing keys (`SECRET_`, `TOKEN`, `PASSWORD
 **5. When NOT to use this**
 For tiny scripts or one-off tasks, `System.fetch_env!/1` inline is fine. The extra
 machinery pays off when you have ≥ 5 env vars and a real deployment pipeline.
+
+---
+
+## Reflection
+
+1. `load!/1` raises on any invalid var and the release fails to boot. A platform team runs hundreds of releases and wants a "degraded mode" where non-critical vars can be missing. Would you add a `:severity` flag per spec, split `load!/1` into `load_required!/1` + `load_optional/1`, or push the policy out to each service's `runtime.exs`? Where should "this var is optional in staging but required in prod" live?
+2. The loader treats empty strings as missing. In the ops team's `.env` convention, `FOO=` actually means "explicitly disabled" (different from "unset"). How would you distinguish `:unset | :disabled | {:set, value}` in the spec and the return shape without breaking existing callers? What's the minimum change to the current API?
 
 ---
 

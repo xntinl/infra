@@ -111,13 +111,7 @@ step (the one that materializes) is an `Enum` function.
 
 ---
 
-## Design decisions
-
-**Option A — `Enum` + pagination loop, accumulating into a list**
-- Pros: simplest mental model; all tools (`Enum.map`, `Enum.filter`) work directly on the accumulated list at the end.
-- Cons: memory scales with total row count (2M rows × ~1 KB each = 2 GB resident); OOM risk on large datasets; cannot start emitting downstream until fully loaded.
-
-**Option B — `Stream.resource/3` that pulls one page at a time** (chosen)
+## Design decisions (partial - confirming Steps)
 - Pros: peak memory bounded by one page (~hundreds of KB); downstream consumers see rows as they arrive; clean `stop_fun` runs on completion or error; composes with any `Stream`/`Enum` pipeline.
 - Cons: API slightly more complex (three callbacks: start, next, stop); debugging requires understanding when each callback fires; premature termination semantics need care with external cursors.
 
@@ -127,7 +121,20 @@ Chose **B** because bounded memory is the non-negotiable constraint for "million
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Split client/paginator/exporter modules so lazy-stream vs eager boundaries are visible at module level.
 
 ```bash
 mix new page_stream
@@ -135,6 +142,8 @@ cd page_stream
 ```
 
 ### Step 2: `mix.exs`
+
+**Objective**: Use stdlib only so Stream.resource/3 pagination is visible without Flow/GenStage abstractions.
 
 ```elixir
 defmodule PageStream.MixProject do
@@ -156,6 +165,8 @@ end
 
 ### Step 3: `lib/page_stream/api_client.ex`
 
+**Objective**: Define behaviour contract so tests inject deterministic fake client instead of making real HTTP calls.
+
 ```elixir
 defmodule PageStream.ApiClient do
   @moduledoc """
@@ -172,6 +183,8 @@ end
 ```
 
 ### Step 4: `lib/page_stream/paginator.ex`
+
+**Objective**: Wrap cursor pagination via Stream.resource/3 so consumers pull pages on demand, memory bounded to one batch.
 
 ```elixir
 defmodule PageStream.Paginator do
@@ -226,6 +239,8 @@ end
 
 ### Step 5: `lib/page_stream/exporter.ex`
 
+**Objective**: Compose Stream.reject/filter/take lazily before Enum.reduce so fetch stops instant limit is hit, proving short-circuit.
+
 ```elixir
 defmodule PageStream.Exporter do
   @moduledoc """
@@ -275,6 +290,8 @@ end
 ```
 
 ### Step 6: Tests
+
+**Objective**: Prove Stream.take short-circuits paginator by asserting limit never causes extra pages to be fetched.
 
 ```elixir
 # test/page_stream/paginator_test.exs
@@ -410,6 +427,8 @@ end
 
 ### Step 7: Run and verify
 
+**Objective**: Run with warnings-as-errors to catch accidental eager `Enum` calls that would defeat the bounded-memory guarantee.
+
 ```bash
 mix compile --warnings-as-errors
 mix test --trace
@@ -421,6 +440,32 @@ mix test --trace
 
 ---
 
+
+
+---
+## Key Concepts
+
+### 1. Ranges Are Lazy Sequences
+
+```elixir
+1..1_000_000 |> Enum.map(&(&1 * 2)) |> Enum.take(5)
+```
+
+Creating a list with 1 million elements consumes memory. But a range is lazy—each element is computed on demand. Combined with `Enum.take`, only 5 elements are computed.
+
+### 2. Streams Compose Lazy Transformations
+
+```elixir
+Stream.map(1..1_000_000, &(&1 * 2)) |> Stream.filter(&(&1 > 1000)) |> Enum.to_list()
+```
+
+`Stream` functions return streams (lazy), not lists. Transformations compose without intermediate allocations. Only when you call `Enum.to_list()` do they execute.
+
+### 3. Eager vs Lazy Trade-offs
+
+Eager (`Enum`) is simpler for small datasets and familiar to imperative programmers. Lazy (`Stream`) is essential for large datasets, infinite sequences, and pipeline efficiency.
+
+---
 ## Benchmark
 
 ```elixir

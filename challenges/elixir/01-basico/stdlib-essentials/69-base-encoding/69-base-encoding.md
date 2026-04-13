@@ -2,9 +2,6 @@
 
 **Project**: `cache_key` — builds deterministic, filesystem-safe cache keys from arbitrary inputs.
 
-**Difficulty**: ★☆☆☆☆
-**Estimated time**: 1 hour
-
 ---
 
 ## Project context
@@ -65,9 +62,47 @@ that digest printable. Reverse the order and the result is huge and still unsafe
 
 ---
 
+## Why hash + Base and not `inspect/1` or `:erlang.phash2/1`
+
+Using `inspect/1` as a cache key is the shortcut that always breaks: `inspect(%{a: 1, b: 2})` and `inspect(%{b: 2, a: 1})` may render the same pair in different orders on different OTP releases, so two nodes produce two keys for equivalent data and the cache silently misses. `:erlang.phash2/1` returns 27 bits — fine for sharding but a collision factory at million-entry scale, and collisions mean the wrong cached value returned, not a miss. Hashing with SHA-256 gives 256 bits of collision resistance and `term_to_binary([:deterministic])` gives a stable byte representation across nodes. Base encoding makes the raw digest safe for filenames and URLs without losing any of that resistance.
+
+---
+
+## Design decisions
+
+**Option A — `:erlang.phash2(term)` stringified**
+- Pros: one line; no deps beyond stdlib; very fast.
+- Cons: 27 bits of entropy collides under million-entry caches; silently returns wrong values on hit.
+
+**Option B — `inspect/1` or `Jason.encode!/1` as the key**
+- Pros: human-readable; trivial to implement.
+- Cons: not stable across releases/map orderings; unbounded length; unsafe in filenames (quotes, newlines).
+
+**Option C — `deep_sort` → `term_to_binary([:deterministic])` → SHA-256 → `Base.url_encode64(padding: false)`** (chosen)
+- Pros: cross-node stable (deterministic external term format); map-order independent; 256-bit collision resistance; 43-char fixed output safe in URLs and filenames; one knob for algorithm choice.
+- Cons: keys are opaque (can't recover the input from the key); slower than `phash2` (microseconds rather than nanoseconds).
+
+Chose **C** because caches live in shared storage (Redis, filesystem) where a collision or a character mismatch is a production incident. The microsecond cost is invisible next to any real cache read.
+
+---
+
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"jason", "~> 1.0"},
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Hash + Base encode: SHA-256 (256-bit collision resistance) + url_encode64 (URL-safe) produce stable cache keys.
 
 ```bash
 mix new cache_key
@@ -75,6 +110,8 @@ cd cache_key
 ```
 
 ### Step 2: `lib/cache_key.ex`
+
+**Objective**: term_to_binary([:deterministic]) ensures same data = same bytes across nodes; inspect/1 fails on map ordering.
 
 ```elixir
 defmodule CacheKey do
@@ -145,6 +182,8 @@ end
 
 ### Step 3: `test/cache_key_test.exs`
 
+**Objective**: Test map ordering independence, nested structures, key stability across restarts, no unsafe chars in output.
+
 ```elixir
 defmodule CacheKeyTest do
   use ExUnit.Case, async: true
@@ -197,9 +236,52 @@ end
 
 ### Step 4: Run
 
+**Objective**: --warnings-as-errors catches unused encoding options; test coverage validates key format never changes.
+
 ```bash
 mix test
 ```
+
+### Why this works
+
+`deep_sort/1` recursively normalises maps to sorted key-value lists, so `%{a: 1, b: 2}` and `%{b: 2, a: 1}` reach `term_to_binary` with identical shapes. Passing `[:deterministic]` to `term_to_binary` stabilises the encoding of otherwise-internal representations (small vs big integers, atom indexes) across nodes. SHA-256 compresses arbitrary-length input to a fixed 32-byte digest with cryptographic collision resistance. `Base.url_encode64(padding: false)` produces a 43-char ASCII string using only `A–Z a–z 0–9 - _` — safe as a filename, safe in a URL path, safe in JSON, and free of padding `=` that trips some parsers.
+
+---
+
+
+## Key Concepts
+
+### 1. `Base.encode64/1` and `Base.url_encode64/1`
+Standard Base64 includes `+` and `/`, sometimes with padding. URL-safe Base64 replaces these and omits padding. Use URL-safe for URLs and JSON.
+
+### 2. Hex Encoding
+`Base.encode16` represents bytes as pairs of hex digits. Less dense than Base64 but more human-readable for small data.
+
+### 3. When to Use What
+Base64: maximum density. Hex: readability. URL-safe Base64: URLs and JSON.
+
+---
+## Benchmark
+
+```elixir
+# bench.exs
+defmodule Bench do
+  def run do
+    term = %{user_id: 42, filters: [%{field: :status, op: :eq, value: :active}], page: 1}
+
+    {us, _} =
+      :timer.tc(fn ->
+        Enum.each(1..100_000, fn _ -> CacheKey.build(term) end)
+      end)
+
+    IO.puts("build/1 x100k: #{us} µs (#{us / 100_000} µs/call)")
+  end
+end
+
+Bench.run()
+```
+
+Target: under 10 µs per call for a small map. SHA-256 dominates; `:blake2b` is roughly 2x faster if you need more throughput and don't require SHA-256 specifically.
 
 ---
 
@@ -227,6 +309,13 @@ key, store the input alongside the value instead.
 **5. When NOT to use base64**
 If the key ends up in a case-insensitive context (DNS, some Windows filesystems),
 Base64 collides (`A` vs `a`). Use Base32 there — it's case-insensitive by design.
+
+---
+
+## Reflection
+
+1. Cache keys are SHA-256 (32 bytes) encoded to 43 chars. For a Redis cache holding 100M entries, that's roughly 4.3 GB just for keys. Would you shorten the digest (truncate to 128 bits), switch to Base32 with fewer bits, or push the problem to Redis with a hash-tag scheme? At what scale does key length stop being a rounding error?
+2. Two services compute keys for the same term and must agree. One runs OTP 26 on Linux, the other OTP 27 on macOS. The `[:deterministic]` flag guarantees stability, but an engineer proposes replacing `term_to_binary` with `Jason.encode!/1` for "portability with non-Erlang services". What do you gain, what do you lose, and how do you run the migration without breaking every in-flight cache entry?
 
 ---
 

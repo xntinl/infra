@@ -128,6 +128,8 @@ is taking 3x longer since yesterday's deploy".
 
 ### Step 1: Project and deps
 
+**Objective**: Scaffold supervised app with Broadway + `:telemetry` so processor/batcher events feed observability pipelines.
+
 ```bash
 mix new broadway_pipeline --sup
 ```
@@ -143,6 +145,8 @@ end
 ```
 
 ### Step 2: The pipeline module
+
+**Objective**: Partition by customer_id + route by risk so per-key ordering holds without processor contention.
 
 ```elixir
 defmodule BroadwayPipeline.Pipeline do
@@ -211,6 +215,8 @@ end
 
 ### Step 3: Fakes — enricher, scorer, repo
 
+**Objective**: Inject test doubles so processor/batcher paths test without network or DB latency.
+
 ```elixir
 defmodule BroadwayPipeline.Enricher do
   @spec enrich(map()) :: map()
@@ -234,6 +240,8 @@ end
 
 ### Step 4: Application
 
+**Objective**: Supervise pipeline so restart atomically recovers producer+processors+batchers without message loss.
+
 ```elixir
 defmodule BroadwayPipeline.Application do
   use Application
@@ -248,6 +256,8 @@ end
 
 ### Step 5: Tests using `Broadway.test_message/3`
 
+**Objective**: Drive message routing + batch assembly via test_message so risk-branching logic is regression-safe.
+
 ```elixir
 defmodule BroadwayPipeline.PipelineTest do
   use ExUnit.Case, async: false
@@ -260,26 +270,30 @@ defmodule BroadwayPipeline.PipelineTest do
     :ok
   end
 
-  test "low-risk messages are routed to postgres batcher" do
-    ref = Broadway.test_message(Pipeline, %{customer_id: 1, amount: 10})
-    assert_receive {:ack, ^ref, [%Message{batcher: :postgres}], []}, 2_000
-  end
+  describe "BroadwayPipeline.Pipeline" do
+    test "low-risk messages are routed to postgres batcher" do
+      ref = Broadway.test_message(Pipeline, %{customer_id: 1, amount: 10})
+      assert_receive {:ack, ^ref, [%Message{batcher: :postgres}], []}, 2_000
+    end
 
-  test "high-risk messages are routed to kafka batcher" do
-    ref = Broadway.test_message(Pipeline, %{customer_id: 2, amount: 50_000})
-    assert_receive {:ack, ^ref, [%Message{batcher: :kafka}], []}, 2_000
-  end
+    test "high-risk messages are routed to kafka batcher" do
+      ref = Broadway.test_message(Pipeline, %{customer_id: 2, amount: 50_000})
+      assert_receive {:ack, ^ref, [%Message{batcher: :kafka}], []}, 2_000
+    end
 
-  test "batch is flushed by size" do
-    events = for i <- 1..200, do: %{customer_id: i, amount: 10}
-    ref = Broadway.test_batch(Pipeline, events, batch_mode: :bulk)
-    assert_receive {:ack, ^ref, acks, []}, 5_000
-    assert length(acks) == 200
+    test "batch is flushed by size" do
+      events = for i <- 1..200, do: %{customer_id: i, amount: 10}
+      ref = Broadway.test_batch(Pipeline, events, batch_mode: :bulk)
+      assert_receive {:ack, ^ref, acks, []}, 5_000
+      assert length(acks) == 200
+    end
   end
 end
 ```
 
 ### Step 6: Wire telemetry
+
+**Objective**: Attach :stop handlers so per-message + per-batch durations surface without metadata allocation doubling.
 
 ```elixir
 defmodule BroadwayPipeline.Telemetry do
@@ -325,6 +339,24 @@ IO.puts("avg: #{time_us / 10_000} µs/op")
 ```
 
 Target: operation should complete in the low-microsecond range on modern hardware; deviations by >2× indicate a regression worth investigating.
+
+## Deep Dive
+
+Data pipelines in Elixir leverage the Actor model to coordinate work across producer, consumer, and batcher stages. GenStage provides the foundation—a demand-driven backpressure mechanism that prevents memory bloat when producers exceed consumer capacity. Broadway abstracts this further, handling subscriptions, acknowledgments, and error propagation automatically. Understanding pipeline topology is critical at scale: a misconfigured batcher can serialize work and kill throughput; conversely, excessive partitioning fragments state and increases GC pressure. In production systems, always measure latency and memory per stage—Broadway's metrics integration with Telemetry makes this traceable. Consider exactly-once delivery semantics early; most pipelines require idempotency keys or deduplication at the consumer boundary. For high-volume Kafka scenarios, partition alignment (matching Broadway partitions to Kafka partitions) is essential to avoid rebalancing storms.
+## Advanced Considerations
+
+Data pipeline implementations at scale require careful consideration of backpressure, memory buffering, and failure recovery semantics. Broadway and Genstage provide demand-driven processing, but understanding the exact flow of backpressure through your pipeline is essential to avoid either starving producers or overwhelming buffers. The interaction between batcher timeouts and consumer demand can create unexpected latencies when tuples are held waiting for either a size threshold or time threshold to be reached. In systems processing millions of events, even a 100ms batch timeout can impact end-to-end latency dramatically.
+
+Idempotency and exactly-once semantics are not automatic — they require architectural decisions about checkpointing and deduplication strategies. Writing checkpoints too frequently becomes a bottleneck; writing them too infrequently means lost progress on failure and potential duplicates. The choice between in-process ETS-based deduplication versus external stores (Redis, database) changes your failure recovery story fundamentally. Broadway's acknowledgment system is flexible but requires explicit design; missing acknowledgments can cause data loss or duplicates in production environments where failures are common.
+
+When handling external systems (databases, message queues, APIs), transient failures and circuit-breaker patterns become essential. A single slow downstream service can cause backpressure to ripple through your entire pipeline catastrophically. Consider implementing bulkhead patterns where certain pipeline stages have isolated pools of workers to prevent cascading failures. For ETL pipelines combining Ecto with streaming, managing database connection pools and transaction contexts requires careful coordination to prevent connection exhaustion.
+
+
+## Deep Dive: Streaming Patterns and Production Implications
+
+Stream-based pipelines in Elixir achieve backpressure and composability by deferring computation until consumption. Unlike eager list operations that allocate all intermediate structures, Streams are lazy chains that produce one element at a time, reducing memory footprint and enabling infinite sequences. The BEAM scheduler yields between Stream operations, allowing multiple concurrent pipelines to interleave fairly. At scale (processing millions of rows or events), the difference between eager and lazy evaluation becomes the difference between consistent latency and garbage collection pauses. Production systems benefit most when Streams are composed at library boundaries, not scattered across the codebase.
+
+---
 
 ## Trade-offs and production gotchas
 
@@ -394,3 +426,13 @@ a low-volume customer's event rises from ~600ms to ~5s.
 - [Concurrent Data Processing in Elixir — Svilen Gospodinov](https://pragprog.com/titles/sgdpelixir/concurrent-data-processing-in-elixir/)
 - [`Broadway.test_message/3` docs](https://hexdocs.pm/broadway/Broadway.html#test_message/3)
 - [Telemetry events reference](https://hexdocs.pm/broadway/Broadway.html#module-telemetry)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

@@ -95,7 +95,57 @@ defmodule EdgeGateway.MixProject do
 end
 ```
 
+### Dependencies (mix.exs)
+
+```elixir
+```elixir
+plug Plug.Parsers,
+  parsers: [:urlencoded, :json],
+  json_decoder: Jason,
+  body_reader: {EdgeGatewayWeb.Plugs.RawBodyReader, :read_body, []}
+```
+
+The `body_reader` reads bytes and can cache them on `conn.assigns` before the parser consumes them. Your HMAC verifier reads `conn.assigns.raw_body` later.
+
+### 3. `halt(conn)` short-circuits
+
+Any plug that calls `send_resp(conn, ...)` AND `halt(conn)` stops the pipeline. The router never runs. That is exactly what health-check and rate-limiter plugs need.
+
+### 4. Response-mutating plugs
+
+Security headers must be added BEFORE `send_resp` is called. Use `register_before_send/2` — the callback runs right before the socket write.
+
+## Design decisions
+
+- **Option A — do it all in the router**: simple, but wastes work on every rejected request.
+- **Option B — reverse proxy (nginx) in front**: operational cost for small teams.
+- **Option C — custom endpoint plugs, ordered carefully**: minimal latency, Elixir-only.
+
+Chosen: Option C. Nginx/HAProxy in front only when you terminate TLS with session tickets, or when you already run them.
+
+## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defmodule EdgeGateway.MixProject do
+  use Mix.Project
+  def project, do: [app: :edge_gateway, version: "0.1.0", elixir: "~> 1.16", deps: deps()]
+  def application, do: [mod: {EdgeGateway.Application, []}, extra_applications: [:logger, :crypto]]
+
+  defp deps do
+    [
+      {:phoenix, "~> 1.7.14"},
+      {:plug_cowboy, "~> 2.7"},
+      {:jason, "~> 1.4"}
+    ]
+  end
+end
+```
+
 ### Step 1: Request id plug — `lib/edge_gateway_web/plugs/request_id.ex`
+
+**Objective**: Build the request id plug layer: lib/edge_gateway_web/plugs/request_id.ex.
 
 ```elixir
 defmodule EdgeGatewayWeb.Plugs.RequestId do
@@ -132,6 +182,8 @@ end
 
 ### Step 2: Health check short-circuit — `lib/edge_gateway_web/plugs/health_check.ex`
 
+**Objective**: Build the health check short-circuit layer: lib/edge_gateway_web/plugs/health_check.ex.
+
 ```elixir
 defmodule EdgeGatewayWeb.Plugs.HealthCheck do
   import Plug.Conn
@@ -151,6 +203,8 @@ end
 ```
 
 ### Step 3: Security headers — `lib/edge_gateway_web/plugs/security_headers.ex`
+
+**Objective**: Build the security headers layer: lib/edge_gateway_web/plugs/security_headers.ex.
 
 ```elixir
 defmodule EdgeGatewayWeb.Plugs.SecurityHeaders do
@@ -175,6 +229,8 @@ end
 ```
 
 ### Step 4: Raw body reader — `lib/edge_gateway_web/plugs/raw_body_reader.ex`
+
+**Objective**: Build the raw body reader layer: lib/edge_gateway_web/plugs/raw_body_reader.ex.
 
 ```elixir
 defmodule EdgeGatewayWeb.Plugs.RawBodyReader do
@@ -203,6 +259,8 @@ end
 ```
 
 ### Step 5: Endpoint — `lib/edge_gateway_web/endpoint.ex`
+
+**Objective**: Build the endpoint layer: lib/edge_gateway_web/endpoint.ex.
 
 ```elixir
 defmodule EdgeGatewayWeb.Endpoint do
@@ -246,6 +304,8 @@ end
 ```
 
 ### Step 6: Webhook controller leveraging raw body
+
+**Objective**: Implement Webhook controller leveraging raw body.
 
 ```elixir
 # lib/edge_gateway/webhooks.ex
@@ -364,6 +424,23 @@ Benchee.run(
 ```
 
 **Expected**: health-check < 5µs (no disk, no DB, no parsing). Security headers < 3µs overhead per response.
+
+## Advanced Considerations: LiveView Real-Time Patterns and Pubsub Scale
+
+LiveView bridges the browser and BEAM via WebSocket, allowing server-side renders to push incremental DOM diffs to the client. A LiveView process is long-lived, receiving events (clicks, form submissions) and broadcasting updates. For real-time features (collaborative editing, live notifications), LiveView processes subscribe to PubSub topics and receive broadcast messages.
+
+Phoenix.PubSub partitions topics across a pool of processes, allowing horizontal scaling. By default, `:local` mode uses in-memory ETS; `:redis` mode distributes across nodes via Redis. At scale (thousands of concurrent LiveViews), topic fanout can bottleneck: broadcasting to a million subscribers means delivering one million messages. The BEAM handles this, but the network cost matters on multi-node deployments.
+
+`Presence` module tracks which users are viewing which pages, syncing state via PubSub. A presence join/leave is broadcast to all nodes, allowing real-time "who's online" updates. Under partition, presence state can diverge; the library uses unique presence keys to detect and reconcile. Operationally, watching presence on every page load can amplify server load if users are flaky (mobile networks, browser reloads). Consider presence only for features where it's user-facing (collaborative editors, live sports scoreboards).
+
+---
+
+
+## Deep Dive: Streaming Patterns and Production Implications
+
+Stream-based pipelines in Elixir achieve backpressure and composability by deferring computation until consumption. Unlike eager list operations that allocate all intermediate structures, Streams are lazy chains that produce one element at a time, reducing memory footprint and enabling infinite sequences. The BEAM scheduler yields between Stream operations, allowing multiple concurrent pipelines to interleave fairly. At scale (processing millions of rows or events), the difference between eager and lazy evaluation becomes the difference between consistent latency and garbage collection pauses. Production systems benefit most when Streams are composed at library boundaries, not scattered across the codebase.
+
+---
 
 ## Trade-offs and production gotchas
 

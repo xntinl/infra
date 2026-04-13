@@ -1,8 +1,6 @@
 # Mnesia disc_copies, Transactions, and Lock Semantics
 
 **Project**: `mnesia_disc_tx` — persistent distributed ledger with ACID transactions.
-**Difficulty**: ★★★★☆
-**Estimated time**: 3–6 hours
 
 ---
 
@@ -39,6 +37,12 @@ mnesia_disc_tx/
 │       └── concurrency_test.exs    # hammer transfer/3 in parallel
 └── mix.exs
 ```
+
+---
+
+## Why Mnesia disc_copies and not external DB
+
+An external DB is another service to run, monitor, and reach over the network. Mnesia lives in-process with ACID guarantees and replicates to other BEAM nodes directly.
 
 ---
 
@@ -122,9 +126,123 @@ every transaction since the last dump.
 
 ---
 
+## Design decisions
+
+**Option A — SQL RDBMS with the app as client**
+- Pros: mature tooling, well-understood semantics, SQL query power.
+- Cons: network hop on every query; schema lives outside the code.
+
+**Option B — Mnesia `disc_copies` tables with transactions** (chosen)
+- Pros: in-process reads; BEAM-native transactions; schema is Elixir.
+- Cons: operational maturity gap vs Postgres; no SQL; tooling is sparse.
+
+→ Chose **B** because for a BEAM-native service where data stays inside the cluster, the locality and integration wins.
+
+---
+
 ## Implementation
 
 ### Step 1: `mix.exs`
+
+**Objective**: List `:mnesia` under `extra_applications` and pin its dir per-node so disc logs survive restarts without collision.
+
+```elixir
+defmodule MnesiaDiscTx.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :mnesia_disc_tx, version: "0.1.0", elixir: "~> 1.16", deps: deps()]
+  end
+
+  def application do
+    [extra_applications: [:logger, :mnesia], mod: {MnesiaDiscTx.Application, []}]
+  end
+
+  defp deps do
+    [{:benchee, "~> 1.3", only: :dev}]
+  end
+end
+```
+
+### Dependencies (mix.exs)
+
+```elixir
+```elixir
+:mnesia.transaction(fn ->
+  [src] = :mnesia.read(:wallets, src_id, :write)   # <-- :write, not :read
+  [dst] = :mnesia.read(:wallets, dst_id, :write)
+  :mnesia.write(put_elem(src, 2, src_balance - amount))
+  :mnesia.write(put_elem(dst, 2, dst_balance + amount))
+end)
+```
+
+If you use `:read` here, you have a TOCTOU bug. Mnesia will not warn you —
+both transactions commit successfully with corrupt balances.
+
+### 3. Deadlocks and the restart mechanism
+
+Two transactions acquire locks in opposite order:
+
+```
+T1: write-lock wallet A ────► tries write-lock B ... waiting
+T2: write-lock wallet B ────► tries write-lock A ... waiting
+```
+
+Mnesia detects this, aborts one transaction with `{:aborted, {:cyclic, ...}}`,
+and **automatically retries the function**. Your transaction body can therefore
+execute multiple times — it must be idempotent. Never perform side effects
+(HTTP calls, file writes, sending messages to non-transactional processes)
+inside a `:mnesia.transaction/1`.
+
+### 4. `transaction/1` vs `sync_transaction/1`
+
+```
+transaction/1:       commit returns as soon as the local node commits.
+                     Replicas apply asynchronously (but still before the
+                     next transaction sees the new state).
+
+sync_transaction/1:  commit returns only after every replica has fsynced
+                     the log. Use when a caller-observed commit must
+                     survive immediate node death.
+```
+
+For financial transfers `sync_transaction/1` is the correct default.
+
+### 5. Transaction log compaction
+
+`disc_copies` appends every committed transaction to `LATEST.LOG`. Mnesia
+periodically dumps the log into the table file and truncates it, but this
+only happens on clean shutdown by default. In long-running production
+systems you need to trigger compaction explicitly:
+
+```elixir
+:mnesia.dump_log()            # flush log → table file
+```
+
+Call it from a scheduled task — otherwise recovery after a crash replays
+every transaction since the last dump.
+
+---
+
+## Design decisions
+
+**Option A — SQL RDBMS with the app as client**
+- Pros: mature tooling, well-understood semantics, SQL query power.
+- Cons: network hop on every query; schema lives outside the code.
+
+**Option B — Mnesia `disc_copies` tables with transactions** (chosen)
+- Pros: in-process reads; BEAM-native transactions; schema is Elixir.
+- Cons: operational maturity gap vs Postgres; no SQL; tooling is sparse.
+
+→ Chose **B** because for a BEAM-native service where data stays inside the cluster, the locality and integration wins.
+
+---
+
+## Implementation
+
+### Step 1: `mix.exs`
+
+**Objective**: List `:mnesia` under `extra_applications` and pin its dir per-node so disc logs survive restarts without collision.
 
 ```elixir
 defmodule MnesiaDiscTx.MixProject do
@@ -153,6 +271,8 @@ config :mnesia, dir: ~c"priv/mnesia_#{Mix.env()}_#{node()}"
 
 ### Step 2: `lib/mnesia_disc_tx/application.ex`
 
+**Objective**: Start the Schema GenServer so table bootstrap finishes before any ledger caller issues a transaction.
+
 ```elixir
 defmodule MnesiaDiscTx.Application do
   @moduledoc false
@@ -167,6 +287,8 @@ end
 ```
 
 ### Step 3: `lib/mnesia_disc_tx/schema.ex`
+
+**Objective**: Bootstrap `disc_copies` tables idempotently and schedule periodic `dump_log/0` so transaction logs get compacted.
 
 ```elixir
 defmodule MnesiaDiscTx.Schema do
@@ -231,6 +353,8 @@ end
 ```
 
 ### Step 4: `lib/mnesia_disc_tx/ledger.ex`
+
+**Objective**: Transfer funds under `:write` locks acquired in sorted-id order so concurrent transactions never deadlock.
 
 ```elixir
 defmodule MnesiaDiscTx.Ledger do
@@ -318,6 +442,8 @@ end
 
 ### Step 5: `test/mnesia_disc_tx/ledger_test.exs`
 
+**Objective**: Assert transfers succeed, roll back on `:insufficient_funds`, and reject unknown wallets or non-positive amounts.
+
 ```elixir
 defmodule MnesiaDiscTx.LedgerTest do
   use ExUnit.Case, async: false
@@ -366,6 +492,8 @@ end
 
 ### Step 6: `test/mnesia_disc_tx/concurrency_test.exs`
 
+**Objective**: Prove funds stay conserved under 200 parallel bidirectional transfers — the canonical ACID stress test.
+
 ```elixir
 defmodule MnesiaDiscTx.ConcurrencyTest do
   use ExUnit.Case, async: false
@@ -406,6 +534,8 @@ end
 
 ### Step 7: Run
 
+**Objective**: Boot a named node and verify disc_copies survive restart — balances must reappear without replaying transactions.
+
 ```bash
 iex --name disc@127.0.0.1 -S mix
 ```
@@ -419,6 +549,28 @@ MnesiaDiscTx.Ledger.balance("bob")  # {:ok, 250}
 
 Kill the node (`Ctrl+C Ctrl+C`) and restart. The wallets are still there —
 `disc_copies` persisted them.
+
+### Why this works
+
+`disc_copies` keeps the active dataset in RAM (ETS-backed) and writes commits to a disk log. On restart, the log replays into RAM. Transactions serialize through the transaction manager, which locks rows and coordinates with other nodes.
+
+---
+
+## Deep Dive
+
+ETS (Erlang Term Storage) is RAM-only and process-linked; table destruction triggers if the owner crashes, causing silent data loss in careless designs. Match specifications (match_specs) are micro-programs that filter/transform data at the C layer, orders of magnitude faster than fetching all records and filtering in Elixir. Mnesia adds disk persistence and replication but introduces transaction overhead and deadlock potential; dirty operations bypass locks for speed but sacrifice consistency guarantees. For caching, named tables (public by design) are globally visible but require careful name management; consider ETS sharding (multiple small tables) to reduce lock contention on hot keys. DETS (Disk ETS) persists to disk but is single-process bottleneck and slower than a real database. At scale, prefer ETS for in-process state and Mnesia/PostgreSQL for shared, persistent data.
+## Advanced Considerations
+
+ETS and DETS performance characteristics change dramatically based on access patterns and table types. Ordered sets provide range queries but slower access than hash tables; set types don't support duplicate keys while bags do. The `heir` option for ETS tables is essential for fault tolerance — when a table owner crashes, the heir process can take ownership and prevent data loss. Without it, the table is lost immediately. Mnesia replicates entire tables across nodes; choosing which nodes should have replicas and whether they're RAM or disk replicas affects both consistency guarantees and network traffic during cluster operations.
+
+DETS persistence comes with significant performance implications — writes are synchronous to disk by default, creating latency spikes. Using `sync: false` improves throughput but risks data loss on crashes. The maximum DETS table size is limited by available memory and the file system; planning capacity requires understanding your growth patterns. Mnesia's transaction system provides ACID guarantees, but dirty operations bypass these guarantees for performance. Understanding when to use dirty reads versus transactional reads significantly impacts both correctness and latency.
+
+Debugging ETS and DETS issues is challenging because problems often emerge under load when many processes contend for the same table. Table memory fragmentation is invisible to code but can exhaust memory. Using match specs instead of iteration over large tables can dramatically improve performance but requires careful construction. The interaction between ETS, replication, and distributed systems creates subtle consistency issues — a node with a stale ETS replica can serve incorrect data during network partitions. Always monitor table sizes and replication status with structured logging.
+
+
+## Deep Dive: Etsdets Patterns and Production Implications
+
+ETS tables are in-memory, non-distributed key-value stores with tunable semantics (ordered_set, duplicate_bag). Under concurrent read/write load, ETS table semantics matter: bag semantics allow fast appends but slow deletes; ordered_set allows range queries but slower inserts. Testing ETS behavior under concurrent load is non-trivial; single-threaded tests miss lock contention. Production ETS tables often fail under load due to concurrency assumptions that quiet tests don't exercise.
 
 ---
 
@@ -502,6 +654,13 @@ Expected on a single-node disc_copies setup (M1, NVMe, OTP 26):
 Doubling concurrency typically halves per-thread throughput once lock
 contention hits the hot keys. The way to scale is to shard across many keys
 or move to `mnesia_frag`.
+
+---
+
+## Reflection
+
+- Your dataset outgrows RAM. `disc_only_copies` is an option. What does that cost on the read path, and is it still better than Postgres?
+- How do you back up a Mnesia cluster without stopping it, and what do you wish Postgres tooling gave you that Mnesia does not?
 
 ---
 

@@ -2,9 +2,6 @@
 
 **Project**: `meet_sched` — detects overlapping meetings across attendees in different timezones
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 2-3 hours
-
 ---
 
 ## Why date/time handling matters for a senior developer
@@ -27,6 +24,12 @@ you add the `tzdata` dependency and configure it as the time zone database.
 
 Get these distinctions right and daylight-savings bugs disappear. Get them
 wrong and every October/March you will have incident calls.
+
+---
+
+## Why `DateTime` in UTC and not `NaiveDateTime` + a zone field
+
+Storing local `NaiveDateTime` plus a separate `timezone` string looks cheap — one less conversion, easier to inspect in a DB row. It breaks the moment two regions meet: comparing "14:00 Madrid" with "14:00 New York" as naive values gives nonsense ordering, and `NaiveDateTime.diff/2` produces a number that silently ignores the 6-hour gap. During DST the same wall-clock time exists twice (or not at all), so naive math is wrong by up to 2 hours twice a year — and the bug only surfaces in production. Keeping the canonical value as a UTC `DateTime` makes every comparison an integer difference on the Unix timeline; the organiser's zone is metadata for display, never arithmetic.
 
 ---
 
@@ -68,9 +71,36 @@ meet_sched/
 
 ---
 
+## Design decisions
+
+**Option A — store local `NaiveDateTime` + timezone string, convert on every comparison**
+- Pros: DB row reads like the user wrote it; no conversion on write; intuitive for single-region teams.
+- Cons: every comparison walks the tz database; DST transitions produce ambiguous/gap values that must be re-resolved each time; cross-zone overlap logic becomes an unreadable tangle.
+
+**Option B — store UTC `DateTime`, keep organiser zone as metadata, convert only at the presentation boundary** (chosen)
+- Pros: all overlap/sort/diff math is a Unix-timeline subtraction; DST is handled once at write time; cross-zone comparisons are free; the data in the DB is canonical so backfills and analytics are simple.
+- Cons: requires `tzdata` and `config :elixir, :time_zone_database`; `DateTime.from_naive/2` returns four possible tags (`:ok | :ambiguous | :gap | :error`) which callers must handle.
+
+Chose **B** because the domain is explicitly multi-region and the DST edge cases exist whether you handle them at write time or read time — paying once at write time is cheaper and lets the rest of the codebase assume instants are totally ordered.
+
+---
+
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: DateTime in UTC + organiser zone as metadata prevents DST ambiguity; DST is handled once at write time.
 
 ```bash
 mix new meet_sched
@@ -79,6 +109,8 @@ mkdir -p config
 ```
 
 ### Step 2: `mix.exs`
+
+**Objective**: Configure tzdata dependency for real timezone database; DateTime.from_naive/2 returns 4 possible tags.
 
 ```elixir
 defmodule MeetSched.MixProject do
@@ -110,6 +142,8 @@ end
 
 ### Step 3: `config/config.exs`
 
+**Objective**: Configure `:elixir, :time_zone_database` once; all DateTime ops respect it — code doesn't pass the database around.
+
 ```elixir
 import Config
 
@@ -120,6 +154,8 @@ config :elixir, :time_zone_database, Tzdata.TimeZoneDatabase
 
 ### Step 4: `.formatter.exs`
 
+**Objective**: Formatter is opinionated; configure inputs glob + line length once; format is hermetic (no env deps).
+
 ```elixir
 [
   inputs: ["{mix,.formatter}.exs", "{config,lib,test}/**/*.{ex,exs}"],
@@ -128,6 +164,8 @@ config :elixir, :time_zone_database, Tzdata.TimeZoneDatabase
 ```
 
 ### Step 5: `lib/meet_sched/meeting.ex`
+
+**Objective**: NaiveDateTime for input; convert to DateTime in UTC via from_naive/2 with organiser timezone; store result.
 
 ```elixir
 defmodule MeetSched.Meeting do
@@ -229,6 +267,8 @@ end
   drift apart on updates.
 
 ### Step 6: `lib/meet_sched/overlap.ex`
+
+**Objective**: All comparisons in UTC via DateTime.compare/2 — integer arithmetic on timelines, no ambiguity from DST.
 
 ```elixir
 defmodule MeetSched.Overlap do
@@ -375,6 +415,8 @@ end
 
 ### Step 7: `lib/meet_sched/formatter.ex`
 
+**Objective**: DateTime.shift_zone/2 converts to attendee timezone only for display; canonical logic stays in UTC.
+
 ```elixir
 defmodule MeetSched.Formatter do
   @moduledoc """
@@ -405,6 +447,8 @@ end
 ```
 
 ### Step 8: Tests
+
+**Objective**: Test DST boundaries (March/October); from_naive returns :ambiguous/:gap around DST — all branches matter.
 
 ```elixir
 # test/meet_sched/meeting_test.exs
@@ -550,12 +594,62 @@ end
 
 ### Step 9: Run and verify
 
+**Objective**: --warnings-as-errors catches unused timezone functions; test coverage validates overlap detection across zones.
+
 ```bash
 mix deps.get
 mix compile --warnings-as-errors
 mix test --trace
 mix format
 ```
+
+### Why this works
+
+Every meeting is normalised to UTC on construction via `DateTime.from_naive/2` + `DateTime.shift_zone!/2`. The non-bang `from_naive/2` returns all four possible tags, so ambiguous (autumn fall-back) and gap (spring-forward) local times are surfaced as `{:error, {:ambiguous, _, _}}` rather than silently crashing at a deeper layer. Overlap logic compares UTC timestamps only, so DST becomes invisible to the algorithm. The sweep-line conflict detector is O(n log n): sort by start, keep an "open" set of meetings whose end is still in the future, and only compare the current meeting against that small set — linear in conflicts, not in all pairs.
+
+---
+
+
+## Key Concepts
+
+### 1. NaiveDateTime Has No Timezone Information
+`NaiveDateTime` is a local time without timezone info. `DateTime` includes timezone. Use `DateTime` for most applications; use `NaiveDateTime` only when you know the context.
+
+### 2. Microsecond Precision
+Both store microseconds. Be careful when converting to seconds (integer division loses precision).
+
+### 3. Comparison and Arithmetic
+Both types support comparison and arithmetic. Always normalize to a timezone before comparing datetimes from different sources.
+
+---
+## Benchmark
+
+```elixir
+# bench.exs
+defmodule Bench do
+  def run do
+    # 5k meetings across three zones, random overlaps.
+    zones = ["Europe/Madrid", "America/New_York", "Asia/Tokyo"]
+
+    meetings =
+      for i <- 1..5_000 do
+        tz = Enum.random(zones)
+        naive = NaiveDateTime.add(~N[2026-05-04 09:00:00], :rand.uniform(3600 * 8), :second)
+        {:ok, m} = MeetSched.Meeting.new("m#{i}", "t", naive, tz, 30, ["alice"])
+        m
+      end
+
+    {us, _} =
+      :timer.tc(fn -> MeetSched.Overlap.find_conflicts(meetings, "alice") end)
+
+    IO.puts("find_conflicts over 5k meetings: #{us} µs")
+  end
+end
+
+Bench.run()
+```
+
+Target: under 50 ms for 5k meetings on one attendee — the sort dominates. If you see seconds, check that comparisons stay in UTC and the open-set filter is actually shrinking.
 
 ---
 
@@ -617,6 +711,13 @@ normalise to UTC first.
   plus a zone, resolve to a concrete `DateTime` per occurrence.
 - **Durations**: use integer seconds (or `Duration` in 1.17+). A
   `DateTime` difference should produce a duration, not another datetime.
+
+---
+
+## Reflection
+
+1. The scheduler rejects meetings whose local start is ambiguous (`:ambiguous`) or in a gap (`:gap`). Product says: "users don't care about DST — just pick the later option for ambiguous and the next valid minute for gap". Would you push that policy into `Meeting.new/6`, add a `resolve: :later | :strict` option, or handle it in a separate pre-normaliser at the UI layer? Where does "policy" belong when it touches correctness?
+2. Currently the whole attendee list is scanned per meeting to detect conflicts. For a 10k-employee company with shared calendars, what breaks first — CPU, memory, or the `find_conflicts/2` API shape? Would you precompute a per-attendee meeting index on write, cache results per (attendee, day), or push the query to Postgres with a tstzrange + GIST index?
 
 ---
 

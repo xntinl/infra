@@ -72,11 +72,23 @@ Inside `quote do ... end`, `unquote(var)` injects a runtime value into the AST. 
 
 ### Dependencies (`mix.exs`)
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
+
 ```elixir
 defp deps, do: []
 ```
 
 ### Step 1: Whitelist and errors
+
+**Objective**: Define Guards whitelist >, <, >=, <=, ==, !=, and, or, not, in, . and InvalidRule exception for DSL safety.
 
 ```elixir
 defmodule RuleEngine.Errors do
@@ -102,6 +114,8 @@ end
 ```
 
 ### Step 2: The DSL
+
+**Objective**: Implement __using__, rule/2 macro that uses Macro.prewalk to validate when/then, emits function clauses with guards.
 
 ```elixir
 defmodule RuleEngine do
@@ -236,6 +250,8 @@ end
 
 ### Step 3: Example rules module
 
+**Objective**: Define DiscountRules using rule DSL with gold_bulk, silver_bulk, first_purchase rules to demonstrate ergonomics.
+
 ```elixir
 defmodule DiscountRules do
   use RuleEngine
@@ -359,6 +375,23 @@ Benchee.run(
 ```
 
 Target on modern hardware: < 2µs for a 3-rule module. The generated function clauses are just pattern matches and comparisons — the compiler inlines aggressively. If you see >50µs, something in `evaluate/1` is reconstructing the AST at runtime; it should not.
+
+## Advanced Considerations: Macro Hygiene and Compile-Time Validation
+
+Macros execute at compile time, walking the AST and returning new AST. That power is easy to abuse: a macro that generates variables can shadow outer scope bindings, or a quote block that references variables directly can fail if the macro is used in a context where those variables don't exist. The `unquote` mechanism is the escape hatch, but misusing it leads to hard-to-debug compile errors.
+
+Macro hygiene is about capturing intent correctly. A `defmacro` that takes `:my_option` and uses it directly might match an unrelated `:my_option` from the caller's scope. The idiomatic pattern is to use `unquote` for values that should be "from the outside" and keep AST nodes quoted for safety. The `quote` block's binding of `var!` and `binding!` provides escape valves for the rare case when shadowing is intentional.
+
+Compile-time validation unlocks errors that would otherwise surface at runtime. A macro can call functions to validate input, generate code conditionally, or fail the build with `IO.warn`. Schema libraries like `Ecto` and `Ash` use macros to define fields at compile time, so runtime queries are guaranteed type-safe. The cost is cognitive load: developers must reason about both the code as written and the code generated.
+
+---
+
+
+## Deep Dive: Metaprogramming Patterns and Production Implications
+
+Metaprogramming (macros, AST manipulation) requires testing at compile time and runtime. The challenge is that macro tests often involve parsing and expanding code, which couples tests to compiler internals. Production bugs in macros can corrupt entire modules; testing macros rigorously is non-negotiable.
+
+---
 
 ## Trade-offs and production gotchas
 

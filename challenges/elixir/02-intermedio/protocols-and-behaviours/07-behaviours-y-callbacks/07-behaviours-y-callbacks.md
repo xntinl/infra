@@ -95,9 +95,23 @@ config time", protocols are for "dispatch on this value's shape".
 
 ---
 
+### Dependencies (`mix.exs`)
+
+```elixir
+def deps do
+  [
+    {etsstore},
+    {exunit},
+    {ok},
+  ]
+end
+```
 ## Implementation
 
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
 
 ```bash
 mix new storage_behaviour
@@ -105,6 +119,9 @@ cd storage_behaviour
 ```
 
 ### Step 2: `lib/storage.ex`
+
+**Objective**: Implement `storage.ex` — polymorphism via dispatch on the data's type (protocol) or via an explicit contract (behaviour).
+
 
 ```elixir
 defmodule Storage do
@@ -142,6 +159,9 @@ end
 ```
 
 ### Step 3: `lib/storage/in_memory.ex`
+
+**Objective**: Implement `in_memory.ex` — polymorphism via dispatch on the data's type (protocol) or via an explicit contract (behaviour).
+
 
 ```elixir
 defmodule Storage.InMemory do
@@ -182,6 +202,9 @@ end
 ```
 
 ### Step 4: `lib/storage/ets_store.ex`
+
+**Objective**: Implement `ets_store.ex` — polymorphism via dispatch on the data's type (protocol) or via an explicit contract (behaviour).
+
 
 ```elixir
 defmodule Storage.EtsStore do
@@ -238,6 +261,9 @@ end
 
 ### Step 5: `test/storage_test.exs`
 
+**Objective**: Write `storage_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+
 ```elixir
 defmodule StorageTest do
   # async: false because EtsStore uses a named, globally-shared ETS table.
@@ -279,6 +305,9 @@ end
 
 ### Step 6: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -288,6 +317,14 @@ mix test
 The behaviour declares the contract once (`@callback get/1`, `put/2`, `delete/1`, plus the optional `clear/0`), and each adapter opts in with `@behaviour Storage`. The `@impl true` annotations turn typos and arity mistakes into compiler warnings — the cheapest feedback loop you can buy. The test suite is written once and parameterized over the list of adapters, so conformance is exercised, not just declared.
 
 ---
+
+
+## Key Concepts: Behaviour Contracts and Polymorphism
+
+A Behaviour is a contract: a module that defines callbacks (required functions), and other modules `@behaviour MyBehaviour` to implement those callbacks. At compile time, Elixir checks that all callbacks are implemented. This is Elixir's version of interfaces or abstract base classes in OOP.
+
+For example, `GenServer` is a behaviour: any module that `use GenServer` must implement `init/1`, `handle_call/3`, etc. Protocols (covered elsewhere) are similar but for data types, not module contracts. Use behaviours when you're designing a plugin system (different modules implementing the same interface) or wrapping OTP. The gotcha: `@behaviour` is only a compile-time check—it doesn't enforce anything at runtime, so typos in callback names go undetected until the code is called.
+
 
 ## Benchmark
 
@@ -353,3 +390,17 @@ module call is clearer.
 - [`@behaviour` and `@callback`](https://hexdocs.pm/elixir/Module.html#module-behaviour)
 - [ETS User Guide — Erlang docs](https://www.erlang.org/doc/man/ets.html)
 - ["Mocks and explicit contracts" — José Valim](http://blog.plataformatec.com.br/2015/10/mocks-and-explicit-contracts/) — why behaviours are the foundation of testable code
+
+
+## Key Concepts
+
+Protocols and behaviors are Elixir's mechanism for ad-hoc and static polymorphism. They solve different problems and are often confused.
+
+**Protocols:**
+Dispatch based on the type/struct of the first argument at runtime. A protocol defines a contract (e.g., `Enumerable`); any type can implement it by adding a corresponding implementation block. Protocols excel when you control neither the type nor the caller — e.g., a library that needs to iterate any collection. The fallback is `:any` — if no specific implementation exists, the `:any` handler is tried. This enables "optional" protocol implementations.
+
+**Behaviours:**
+Static polymorphism enforced at compile time. A module implements a behavior by defining callbacks (functions). Behaviors are about contracts between modules, not types. Use when you need multiple implementations of the same interface and the caller chooses which to use (e.g., different database adapters, different strategies). Callbacks are checked at compile time — missing a required callback is a compiler error.
+
+**Architectural patterns:**
+Behaviors excel in plugin systems (user defines modules conforming to the behavior). Protocols excel in type-driven dispatch (any type can conform). Mix both: a behavior can require that its callbacks operate on types that implement a protocol. Example: `MyAdapter` behavior requiring callbacks that work with `Enumerable` types.

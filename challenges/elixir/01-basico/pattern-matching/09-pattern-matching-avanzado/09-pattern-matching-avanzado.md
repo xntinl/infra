@@ -59,6 +59,17 @@ task_queue/
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### `lib/task_queue/job_router.ex`
 
 ```elixir
@@ -338,6 +349,29 @@ mix test test/task_queue/pattern_matching_test.exs --trace
 
 The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
 
+
+
+---
+## Key Concepts
+
+### 1. Pattern Matching Enables Multi-Clause Functions
+
+```elixir
+def process({:ok, result}), do: result
+def process({:error, reason}), do: {:error, reason}
+```
+
+Each clause is a separate pattern. Elixir tries them in order until one matches. This makes complex logic linear and avoids nested `if` statements.
+
+### 2. Guards Add Compile-Time Predicates
+
+Guards like `when is_integer(x)` narrow which clause matches. They are compile-time constraints, not runtime conditionals. If no clause matches, you get a `FunctionClauseError`.
+
+### 3. Exhaustiveness is Powerful
+
+If you handle `{:ok, x}` and `{:error, r}`, you've covered all cases. Tools like Dialyzer warn if you miss cases. This is why pattern matching is safer than boolean conditionals.
+
+---
 ## Benchmark
 
 ```elixir

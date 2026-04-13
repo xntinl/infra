@@ -10,6 +10,21 @@ Build a `task_queue` worker with structured error handling using custom exceptio
 
 ---
 
+## Project structure
+
+```
+task_queue/
+├── lib/
+│   └── task_queue/
+│       └── worker.ex
+├── test/
+│   └── task_queue/
+│       └── error_handling_test.exs
+└── mix.exs
+```
+
+---
+
 ## Why `try/rescue` and not just `{:ok, _} | {:error, _}`
 
 The functional `{:ok, value} | {:error, reason}` style is preferred for expected error paths -- validation failures, resource not found, rate limit exceeded. These are not exceptional.
@@ -46,7 +61,21 @@ Atoms like `:timeout` are too coarse for diagnosis. `defexception` defines struc
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"jason", "~> 1.0"},
+  ]
+end
+```
+
+
 ### Step 1: `mix.exs`
+
+**Objective**: Declare project without deps so try/rescue/after/reraise is focus without third-party error library abstractions.
 
 ```elixir
 defmodule TaskQueue.MixProject do
@@ -71,6 +100,8 @@ end
 ```
 
 ### Step 2: `lib/task_queue/worker.ex` -- custom exceptions and error handling
+
+**Objective**: Convert exceptions to {:error, reason} at boundary and use after for cleanup so callers never leak resources.
 
 The Worker defines two custom exception types as nested modules. `JobError` carries a `job_id` and `reason` for domain-level failures. `AgentError` carries an `agent_address` and `status_code` for communication failures. The `exception/1` callback customizes how the exception is built from keyword options.
 
@@ -214,6 +245,8 @@ end
 
 ### Step 3: Tests
 
+**Objective**: Prove the `after` block runs on both raise and return paths, and that `reraise` preserves the original stacktrace for ops diagnostics.
+
 ```elixir
 # test/task_queue/error_handling_test.exs
 defmodule TaskQueue.ErrorHandlingTest do
@@ -312,6 +345,8 @@ end
 
 ### Step 4: Run
 
+**Objective**: Run the suite to confirm no path leaks resources and no raised error loses its stacktrace on reraise.
+
 ```bash
 mix test test/task_queue/error_handling_test.exs --trace
 ```
@@ -322,6 +357,24 @@ mix test test/task_queue/error_handling_test.exs --trace
 
 ---
 
+
+
+---
+## Key Concepts
+
+### 1. `try` / `rescue` / `after` is a Control-Flow Structure
+
+`try` catches exceptions raised inside its block. `rescue` handles specific exception types. `after` runs cleanup code. This is NOT the idiomatic way to handle expected failures. Use `try` for genuinely unexpected errors (bugs, external system failures).
+
+### 2. Raise Only on Programmer Errors, Use Tuples for Expected Failures
+
+Expected failures (validation, not found) use `{:ok, result}` / `{:error, reason}`. Programmer errors (violated preconditions) use `raise`. This keeps your code linear and testable.
+
+### 3. The Stack Unwinding Stops at `try`
+
+If an exception is not caught by `rescue`, it propagates up. If a `try` block catches it, unwinding stops—but cleanup (`after`) still runs. This is critical for resource management: ensure you close files in `after` blocks.
+
+---
 ## Benchmark
 
 Compare the overhead of entering a `try/rescue` on the happy path against calling the handler directly:

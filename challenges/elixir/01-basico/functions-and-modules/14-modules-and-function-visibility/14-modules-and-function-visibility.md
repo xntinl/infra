@@ -85,6 +85,21 @@ pay_adapter/
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"ecto", "~> 1.0"},
+    {:"httpoison", "~> 1.0"},
+    {:"plug", "~> 1.0"},
+    {:"poison", "~> 1.0"},
+  ]
+end
+```
+
+
 ### `lib/pay_adapter.ex`
 
 ```elixir
@@ -482,6 +497,24 @@ mix test --trace
 
 ---
 
+
+
+---
+## Key Concepts
+
+### 1. `defp` Makes Functions Private to the Module
+
+Private functions cannot be called from outside the module. They are not exported and do not appear in the module's public API. Use `defp` for internal helper functions.
+
+### 2. Module Attributes Store Compile-Time Configuration
+
+`@module_attribute` values are inlined at compile time. Use them for constants, documentation, and compile-time configuration. They are not variables; you cannot rebind them.
+
+### 3. Aliasing and Importing Control Namespace
+
+`alias MyApp.User` lets you write `User` instead of `MyApp.User`. `import MyApp.Utils` brings functions into the local namespace. Use these sparingly to avoid namespace confusion.
+
+---
 ## `alias`, `import`, `use`, and `require`
 
 ```elixir

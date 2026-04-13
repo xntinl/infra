@@ -113,12 +113,18 @@ end
 
 ### Step 1: Create the project
 
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
+
 ```bash
 mix new shutdown_timeouts_demo
 cd shutdown_timeouts_demo
 ```
 
 ### Step 2: `lib/shutdown_timeouts_demo/slow_worker.ex`
+
+**Objective**: Implement `slow_worker.ex` — a worker whose crash behavior is the whole point — it exists so the supervisor strategy can be observed.
+
 
 ```elixir
 defmodule ShutdownTimeoutsDemo.SlowWorker do
@@ -155,6 +161,9 @@ end
 ```
 
 ### Step 3: `lib/shutdown_timeouts_demo/supervisor.ex`
+
+**Objective**: Encode the restart policy in `supervisor.ex` — the supervisor strategy is the lesson; the children exist to make it observable.
+
 
 ```elixir
 defmodule ShutdownTimeoutsDemo.Supervisor do
@@ -202,6 +211,9 @@ end
 
 ### Step 4: `test/shutdown_timeouts_demo_test.exs`
 
+**Objective**: Write `shutdown_timeouts_demo_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+
 ```elixir
 defmodule ShutdownTimeoutsDemoTest do
   use ExUnit.Case, async: false
@@ -247,6 +259,9 @@ end
 ```
 
 ### Step 5: Run
+
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
 
 ```bash
 mix test
@@ -304,3 +319,17 @@ wait that long. Only tune when you can measure the actual drain time.
 - [`GenServer.terminate/2`](https://hexdocs.pm/elixir/GenServer.html#c:terminate/2)
 - [Erlang `supervisor` — shutdown](https://www.erlang.org/doc/man/supervisor.html#shutdown)
 - ["Lies my supervisor told me" — Fred Hebert on graceful shutdown](https://ferd.ca/) (talk; search for "shutdown")
+
+
+## Advanced Considerations
+
+Supervision trees encode your application's fault tolerance strategy. The tree structure, restart policy, and shutdown semantics directly determine behavior during crashes, dependencies, and graceful shutdown.
+
+**Supervision tree design:**
+A well-designed tree mirrors data/message flow: dependencies point upward. If process A depends on process B, B should be higher in the tree (started first, shut down last). Supervisor strategies (`:one_for_one`, `:one_for_all`, `:rest_for_one`) define the scope of cascading restarts. `:one_for_one` isolates failures (each crash restarts only that child); `:one_for_all` is for tightly-coupled groups (e.g., a reader-writer pair).
+
+**Restart strategies and intensity:**
+`max_restarts: 3, max_seconds: 5` means "if 3+ restarts occur in 5 seconds, kill the supervisor." This circuit-breaker pattern prevents restart loops that consume resources. The key decision: should a crashing child take down the whole app (escalate to parent) or just itself? Transient/temporary children exit "cleanly" and don't trigger restarts — useful for request handlers.
+
+**Error propagation and shutdown ordering:**
+When a supervisor exits, it sends `:shutdown` to children in reverse start order (LIFO). Children have `shutdown: 5000` milliseconds to terminate gracefully before hard killing. Nested supervisors propagate this signal recursively. Understanding this order prevents resource leaks: a child waiting on another child's graceful shutdown will deadlock if not designed carefully.

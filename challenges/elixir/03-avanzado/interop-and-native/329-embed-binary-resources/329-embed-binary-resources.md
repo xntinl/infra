@@ -51,6 +51,16 @@ happens — stale data in the compiled module.
 
 ### 1. Module attributes are compile-time values
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
+
 ```elixir
 @data File.read!("priv/data/postal_codes.csv")
 ```
@@ -131,6 +141,8 @@ end
 
 ### Step 1: The data file
 
+**Objective**: Embed postal-code CSV in priv/ so releases include it and compile-time parsing stays deterministic.
+
 For the exercise, a trimmed CSV (`priv/data/postal_codes.csv`):
 
 ```csv
@@ -147,6 +159,8 @@ postal_code,latitude,longitude
 In production, this is regenerated from the postal authority's monthly feed during CI.
 
 ### Step 2: The lookup module (`lib/offline_geocoder/lookup.ex`)
+
+**Objective**: Parse CSV at compile time and publish to persistent_term so lookups avoid heap copying.
 
 ```elixir
 defmodule OfflineGeocoder.Lookup do
@@ -213,6 +227,8 @@ end
 ```
 
 ### Step 3: Application hook (`lib/offline_geocoder/application.ex`)
+
+**Objective**: Wire persistent_term installation at boot so first lookup skips module-attribute copy overhead.
 
 ```elixir
 defmodule OfflineGeocoder.Application do
@@ -303,6 +319,34 @@ defmodule OfflineGeocoder.LookupTest do
   end
 end
 ```
+
+## Benchmark
+
+```elixir
+{us, _} = :timer.tc(fn ->
+  for _ <- 1..10_000, do: OfflineGeocoder.Lookup.lookup("1000")
+end)
+IO.puts("Avg: #{us / 10_000} µs per op")
+```
+
+Target: **<1 µs per op** on modern hardware (compiled pattern-match jump table).
+
+## Advanced Considerations: NIF Isolation and Scheduler Integration
+
+NIF calls run atomically on a scheduler thread, blocking all other processes on that scheduler until the function returns. For operations exceeding ~1 millisecond, this starvation becomes visible: heartbeat processes delay, ETS owner replies hang, supervision timeouts fire. The BEAM's dirty scheduler pool (8 CPU + 10 IO by default) isolates long NIFs from the main scheduler ring, but they're still a finite resource.
+
+Understanding scheduler capacity is critical. Each dirty CPU scheduler can run ~1,000 100-microsecond operations per second, or ~5 100-millisecond operations. Beyond that, callers queue. A GenServer pool capping concurrency and applying backpressure prevents cascade failures: if the dirty pool saturates, reject new work immediately instead of queuing unboundedly.
+
+Resource management inside NIFs differs from pure Elixir. A `Binary<'a>` is a borrow tied to the NIF call; it cannot escape to threads or be stored in resources. An `OwnedBinary` allocation isn't visible to BEAM's garbage collector, so memory limits must be enforced in the Elixir layer. Hybrid architectures (Port processes for I/O, NIFs for CPU work) offer better observability and failure isolation than trying to do everything in a single NIF crate.
+
+---
+
+
+## Deep Dive: Interop Patterns and Production Implications
+
+Interop with native code (NIFs, ports, C extensions) introduces failure modes that pure Elixir code doesn't have: segfaults, memory leaks, deadlocks with the Erlang emulator. Testing interop requires separate test suites for the native layer and integration tests that exercise the boundary.
+
+---
 
 ## Trade-offs and production gotchas
 

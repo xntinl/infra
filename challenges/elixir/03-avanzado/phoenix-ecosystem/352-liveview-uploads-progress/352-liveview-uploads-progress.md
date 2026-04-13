@@ -99,7 +99,32 @@ defmodule MediaVault.MixProject do
 end
 ```
 
+### Dependencies (mix.exs)
+
+```elixir
+```elixir
+defmodule MediaVault.MixProject do
+  use Mix.Project
+
+  def project, do: [app: :media_vault, version: "0.1.0", elixir: "~> 1.16", deps: deps()]
+  def application, do: [mod: {MediaVault.Application, []}, extra_applications: [:logger]]
+
+  defp deps do
+    [
+      {:phoenix, "~> 1.7.14"},
+      {:phoenix_live_view, "~> 1.0"},
+      {:phoenix_html, "~> 4.1"},
+      {:jason, "~> 1.4"},
+      {:plug_cowboy, "~> 2.7"},
+      {:floki, "~> 0.36", only: :test}
+    ]
+  end
+end
+```
+
 ### Step 1: Storage stub — `lib/media_vault/storage.ex`
+
+**Objective**: Build the storage stub layer: lib/media_vault/storage.ex.
 
 ```elixir
 defmodule MediaVault.Storage do
@@ -125,6 +150,8 @@ end
 ```
 
 ### Step 2: LiveView — `lib/media_vault_web/live/upload_live.ex`
+
+**Objective**: Build the liveview layer: lib/media_vault_web/live/upload_live.ex.
 
 ```elixir
 defmodule MediaVaultWeb.UploadLive do
@@ -318,6 +345,23 @@ end
 ```
 
 **Expected**: `File.cp!` is 2–4x faster than streaming for files < 100 MB. For > 500 MB prefer streaming to avoid a second copy in the page cache.
+
+## Advanced Considerations: LiveView Real-Time Patterns and Pubsub Scale
+
+LiveView bridges the browser and BEAM via WebSocket, allowing server-side renders to push incremental DOM diffs to the client. A LiveView process is long-lived, receiving events (clicks, form submissions) and broadcasting updates. For real-time features (collaborative editing, live notifications), LiveView processes subscribe to PubSub topics and receive broadcast messages.
+
+Phoenix.PubSub partitions topics across a pool of processes, allowing horizontal scaling. By default, `:local` mode uses in-memory ETS; `:redis` mode distributes across nodes via Redis. At scale (thousands of concurrent LiveViews), topic fanout can bottleneck: broadcasting to a million subscribers means delivering one million messages. The BEAM handles this, but the network cost matters on multi-node deployments.
+
+`Presence` module tracks which users are viewing which pages, syncing state via PubSub. A presence join/leave is broadcast to all nodes, allowing real-time "who's online" updates. Under partition, presence state can diverge; the library uses unique presence keys to detect and reconcile. Operationally, watching presence on every page load can amplify server load if users are flaky (mobile networks, browser reloads). Consider presence only for features where it's user-facing (collaborative editors, live sports scoreboards).
+
+---
+
+
+## Deep Dive: Phoenix Patterns and Production Implications
+
+Phoenix's conn struct represents an HTTP request/response in flight, accumulating transformations through middleware and handler code. Testing a Phoenix endpoint end-to-end (not just the controller) catches middleware order bugs, header mismatches, and plug composition issues. The trade-off is that full integration tests are slower and harder to parallelize than unit tests. Production bugs in auth, CORS, or session handling are often due to middleware assumptions that live tests reveal.
+
+---
 
 ## Trade-offs and production gotchas
 

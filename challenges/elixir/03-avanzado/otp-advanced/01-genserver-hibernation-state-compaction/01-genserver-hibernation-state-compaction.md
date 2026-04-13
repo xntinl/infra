@@ -123,8 +123,63 @@ defp deps do
 end
 ```
 
+### Dependencies (mix.exs)
+
+```elixir
+```elixir
+{:noreply, state, @idle_ms}      # arm
+# ... message arrives, callback runs, timeout is discarded
+{:noreply, state, @idle_ms}      # re-arm, zero-leak
+```
+
+### 5. Measuring hibernation: `:erlang.process_info/2`
+
+The quantitative feedback loop for this exercise uses three keys:
+
+- `:memory` — total bytes owned by the process (heap + stack + mailbox + msg queue)
+- `:heap_size` — words on the young heap
+- `:total_heap_size` — words on young + old + stack
+
+Convert words to bytes with `:erlang.system_info(:wordsize)` (usually 8 on 64-bit).
+
+---
+
+## Why hibernation and not `:fullsweep_after`
+
+`Process.flag(:fullsweep_after, 0)` forces every minor GC to also sweep the old generation, which does reclaim tenured data, but it only fires **when the process allocates**. An idle worker allocates nothing, so `:fullsweep_after` alone never reclaims anything on an idle fleet. Hibernation, by contrast, actively runs a sweep *and* shrinks the heap to the continuation size. For the 4,800 idle workers in this system, `:fullsweep_after` would leave ~40 KB per process untouched; hibernation collapses them to < 1 KB. When the workload is a mix of active churn and idle tails, both tools combine: tune `:fullsweep_after` for the active phase, hibernate for the idle phase.
+
+---
+
+## Design decisions
+
+**Option A — driver-side idle tracking with `Process.send_after/3`**
+- Pros: explicit timer refs, easy to cancel on activity, works in any process type.
+- Cons: every callback must cancel + reschedule, easy to leak refs on hot paths, you manage monotonic timestamps by hand.
+
+**Option B — GenServer timeout tuple `{:noreply, state, @idle_ms}`** (chosen)
+- Pros: OTP re-arms the timeout on every callback return, zero leaks, no ref bookkeeping, `handle_info(:timeout, _)` is the single sink for the idle event.
+- Cons: one timeout per process — if you also need a periodic job, you must fold it into the same timeout or switch to explicit timers.
+
+→ Chose **B** because the exercise needs exactly one idle signal and OTP's built-in timeout is the zero-bookkeeping path. The "one timeout" constraint is acceptable: periodic health probes belong in a separate supervised process, not in the worker's critical path.
+
+---
+
+## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  [
+    {:benchee, "~> 1.3", only: :dev}
+  ]
+end
+```
+
 
 ### Step 1: `mix.exs`
+
+**Objective**: Restrict Benchee to `:dev` environment to exclude bench harness from release, keeping hibernation runtime clean.
 
 ```elixir
 defmodule HibernatingWorker.MixProject do
@@ -150,6 +205,8 @@ end
 ```
 
 ### Step 2: `lib/hibernating_worker/worker.ex`
+
+**Objective**: Compact state and return `:hibernate` so full GC sweeps unreferenced heap, shrinking idle workers from 40KB to <1KB RAM.
 
 ```elixir
 defmodule HibernatingWorker.Worker do
@@ -262,6 +319,8 @@ end
 
 ### Step 3: `lib/hibernating_worker/application.ex` and fleet supervisor
 
+**Objective**: Combine Registry + DynamicSupervisor so workers address by `:via` name and `:one_for_one` isolates crash containment to single worker.
+
 ```elixir
 defmodule HibernatingWorker.Application do
   use Application
@@ -290,6 +349,8 @@ end
 
 ### Step 4: `test/hibernating_worker/hibernation_test.exs`
 
+**Objective**: Verify :current_function is {:erlang, :hibernate, 3} and memory drops >2x so heap shrinking is observable, not just theoretical.
+
 ```elixir
 defmodule HibernatingWorker.HibernationTest do
   use ExUnit.Case, async: false
@@ -302,49 +363,53 @@ defmodule HibernatingWorker.HibernationTest do
     %{service: service}
   end
 
-  test "compaction drops the request log" do
-    state = %{service: "x", status: :closed, failure_count: 0, request_log: [1, 2, 3], hibernated_at: nil}
-    assert Worker.compact(state).request_log == []
-  end
+  describe "HibernatingWorker.Hibernation" do
+    test "compaction drops the request log" do
+      state = %{service: "x", status: :closed, failure_count: 0, request_log: [1, 2, 3], hibernated_at: nil}
+      assert Worker.compact(state).request_log == []
+    end
 
-  test "worker hibernates after idle timeout and reclaims memory", %{service: service} do
-    for _ <- 1..200, do: Worker.record(service, 150, true)
-    Process.sleep(50)
+    test "worker hibernates after idle timeout and reclaims memory", %{service: service} do
+      for _ <- 1..200, do: Worker.record(service, 150, true)
+      Process.sleep(50)
 
-    info_active = Worker.info(service)
-    assert info_active.log_size > 0
-    memory_active = info_active.memory_bytes
+      info_active = Worker.info(service)
+      assert info_active.log_size > 0
+      memory_active = info_active.memory_bytes
 
-    # Force the idle timeout by manipulating process dictionary is not possible;
-    # instead we send an explicit :timeout to the worker for deterministic testing.
-    pid = Registry.lookup(HibernatingWorker.Registry, service) |> hd() |> elem(0)
-    send(pid, :timeout)
-    Process.sleep(50)
+      # Force the idle timeout by manipulating process dictionary is not possible;
+      # instead we send an explicit :timeout to the worker for deterministic testing.
+      pid = Registry.lookup(HibernatingWorker.Registry, service) |> hd() |> elem(0)
+      send(pid, :timeout)
+      Process.sleep(50)
 
-    {:current_function, {_, _, _} = mfa} = Process.info(pid, :current_function)
-    assert mfa == {:erlang, :hibernate, 3}
+      {:current_function, {_, _, _} = mfa} = Process.info(pid, :current_function)
+      assert mfa == {:erlang, :hibernate, 3}
 
-    info_hibernated = Worker.info(service)
-    assert info_hibernated.log_size == 0
-    assert info_hibernated.memory_bytes < div(memory_active, 2)
-  end
+      info_hibernated = Worker.info(service)
+      assert info_hibernated.log_size == 0
+      assert info_hibernated.memory_bytes < div(memory_active, 2)
+    end
 
-  test "hibernated worker wakes on new message", %{service: service} do
-    pid = Registry.lookup(HibernatingWorker.Registry, service) |> hd() |> elem(0)
-    send(pid, :timeout)
-    Process.sleep(30)
+    test "hibernated worker wakes on new message", %{service: service} do
+      pid = Registry.lookup(HibernatingWorker.Registry, service) |> hd() |> elem(0)
+      send(pid, :timeout)
+      Process.sleep(30)
 
-    assert {:current_function, {:erlang, :hibernate, 3}} = Process.info(pid, :current_function)
+      assert {:current_function, {:erlang, :hibernate, 3}} = Process.info(pid, :current_function)
 
-    :ok = Worker.record(service, 100, true)
-    Process.sleep(10)
+      :ok = Worker.record(service, 100, true)
+      Process.sleep(10)
 
-    refute match?({:current_function, {:erlang, :hibernate, 3}}, Process.info(pid, :current_function))
+      refute match?({:current_function, {:erlang, :hibernate, 3}}, Process.info(pid, :current_function))
+    end
   end
 end
 ```
 
 ### Step 5: Wake latency benchmark
+
+**Objective**: Measure wake-path latency bump (cold heap regrowth) so RAM-vs-latency trade-off is quantified, not guessed.
 
 ```elixir
 # bench/wake_latency_bench.exs
@@ -375,6 +440,23 @@ Expected numbers on an M1 / Ryzen-class machine:
 ### Why this works
 
 The timeout-driven `:hibernate` return collapses idle state on each idle tick without leaking timer refs, and `compact/1` runs **before** the hibernation sweep so the GC has nothing to copy into the new heap. The supervisor is `:one_for_one` on a `DynamicSupervisor` because each worker is independent — one upstream's crash must not restart the other 4,999. The `Registry` indirection in `via/1` keeps callers decoupled from pids, which survives restarts without changing client code.
+
+---
+
+## Advanced Considerations: Supervision and Hot Code Upgrade Patterns
+
+The OTP supervision tree is the backbone of Elixir's fault tolerance. A DynamicSupervisor can spawn workers on demand and track them, but if a worker crashes before it's supervised, messages to it drop silently. Equally, a `:temporary` worker that crashes is restarted zero times — useful for one-off tasks, but requires the caller to handle crashes. `:transient` restarts on non-normal exits; `:permanent` always restarts.
+
+`handle_continue` callbacks and `:hibernate` reduce memory overhead in long-lived processes. After initializing, a GenServer can return `{:noreply, state, {:continue, :do_work}}` to defer expensive work past the `init/1` call, keeping the supervisor's synchronous startup fast. Hibernation moves a process's heap to disk, freeing RAM at the cost of latency when the process receives its next message.
+
+Hot code upgrades via `sys:replace_state/2` or `:sys.replace_state/3` allow changing code without restarting the VM, but only if state structure is forward- and backward-compatible. In practice, code changes that alter state shape (adding or removing fields) require a migration function. The `:code.purge/1` and `:code.load_file/1` cycle reloads the module, but old pids still run old code until they return to the scheduler. Design for graceful degradation: code that cannot upgrade hot should acknowledge that in docs and operational runbooks.
+
+---
+
+
+## Deep Dive: Contract Patterns and Production Implications
+
+Contract testing ensures that mocked collaborators honor the same interface as the real ones. Pact allows you to define contracts once (in a shared file) and verify them against both consumer and provider, catching interface drift. This is critical in microservices where a consumer upgrade can break without ever touching the provider. The discipline is high, but the payoff is fewer integration surprises in production.
 
 ---
 

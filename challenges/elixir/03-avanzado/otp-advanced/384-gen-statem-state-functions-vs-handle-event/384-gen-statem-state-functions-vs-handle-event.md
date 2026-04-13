@@ -76,7 +76,20 @@ defp deps do
 end
 ```
 
+### Dependencies (mix.exs)
+
+```elixir
+```elixir
+defp deps do
+  [
+    {:benchee, "~> 1.3", only: [:dev, :test]}
+  ]
+end
+```
+
 ### Step 1: Shared PIN validator
+
+**Objective**: Extract PIN logic to pure module so state_functions vs handle_event_function comparison isolates dispatch overhead only.
 
 ```elixir
 defmodule DoorController.Pin do
@@ -87,6 +100,8 @@ end
 ```
 
 ### Step 2: `:state_functions` implementation
+
+**Objective**: Dispatch by state function so each state colocates its legal transitions, illegal events raise FunctionClauseError.
 
 ```elixir
 defmodule DoorController.DoorSF do
@@ -168,6 +183,8 @@ end
 ```
 
 ### Step 3: `:handle_event_function` implementation
+
+**Objective**: Centralize all event dispatch so cross-state logic instruments once, at cost of per-state readability.
 
 ```elixir
 defmodule DoorController.DoorHEF do
@@ -345,6 +362,23 @@ Benchee.run(
 ```
 
 Expected result on OTP 27+ on modern hardware: the two modes are within 3% of each other (the BEAM compiler generates similar dispatch code). If you see more than 10% difference, you have a bug. The **cost is in code shape, not CPU cycles** — choose based on readability.
+
+## Advanced Considerations: Supervision and Hot Code Upgrade Patterns
+
+The OTP supervision tree is the backbone of Elixir's fault tolerance. A DynamicSupervisor can spawn workers on demand and track them, but if a worker crashes before it's supervised, messages to it drop silently. Equally, a `:temporary` worker that crashes is restarted zero times — useful for one-off tasks, but requires the caller to handle crashes. `:transient` restarts on non-normal exits; `:permanent` always restarts.
+
+`handle_continue` callbacks and `:hibernate` reduce memory overhead in long-lived processes. After initializing, a GenServer can return `{:noreply, state, {:continue, :do_work}}` to defer expensive work past the `init/1` call, keeping the supervisor's synchronous startup fast. Hibernation moves a process's heap to disk, freeing RAM at the cost of latency when the process receives its next message.
+
+Hot code upgrades via `sys:replace_state/2` or `:sys.replace_state/3` allow changing code without restarting the VM, but only if state structure is forward- and backward-compatible. In practice, code changes that alter state shape (adding or removing fields) require a migration function. The `:code.purge/1` and `:code.load_file/1` cycle reloads the module, but old pids still run old code until they return to the scheduler. Design for graceful degradation: code that cannot upgrade hot should acknowledge that in docs and operational runbooks.
+
+---
+
+
+## Deep Dive: Otp Patterns and Production Implications
+
+OTP primitives (GenServer, Supervisor, Application) are tested through their public interfaces, not by inspecting internal state. This discipline forces correct design: if you can't test a behavior without peeking into the server's state, the behavior is not public. Production systems with tight integration tests on GenServer internals are fragile and hard to refactor.
+
+---
 
 ## Trade-offs and production gotchas
 

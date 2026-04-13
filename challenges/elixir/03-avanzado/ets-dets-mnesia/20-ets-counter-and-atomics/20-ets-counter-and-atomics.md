@@ -2,9 +2,6 @@
 
 **Project**: `ets_atomics` — a micro-benchmark suite that contrasts three lock-free counter mechanisms and maps each to the production scenarios where it's the right choice.
 
-**Difficulty**: ★★★★☆
-**Estimated time**: 3–6 hours
-
 ---
 
 ## Project context
@@ -33,6 +30,12 @@ ets_atomics/
 │   └── ets_atomics_test.exs
 └── mix.exs
 ```
+
+---
+
+## Why atomics and not a counter GenServer
+
+A counter that goes through a GenServer is an integer with a message queue. An `:atomics` array is a single hardware instruction per update. The difference is orders of magnitude on contended workloads.
 
 ---
 
@@ -112,9 +115,35 @@ need a single serialization point (GenServer) or versioning via CAS (`:atomics`)
 
 ---
 
+## Design decisions
+
+**Option A — GenServer holding an integer**
+- Pros: trivial to understand; all updates serialized.
+- Cons: one message queue per counter; bottleneck at tens of thousands of updates per second.
+
+**Option B — `:ets.update_counter/3` or `:atomics`** (chosen)
+- Pros: lock-free; scales with hardware; nanoseconds per update.
+- Cons: no observer process; overflow and snapshot semantics need care.
+
+→ Chose **B** because counters are the textbook case for atomics; using a GenServer is almost always wrong.
+
+---
+
 ## Implementation
 
 ### Step 1: `mix.exs`
+
+**Objective**: Pin `{:benchee, "~> 1.3"}` so the head-to-head counter benchmark runs under parallel schedulers.
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
 
 ```elixir
 defmodule EtsAtomics.MixProject do
@@ -132,6 +161,8 @@ end
 
 ### Step 2: `lib/ets_atomics/application.ex`
 
+**Objective**: Supervise the three counter owners so each backend's table/ref survives crashes without losing the persistent_term handle.
+
 ```elixir
 defmodule EtsAtomics.Application do
   @moduledoc false
@@ -146,6 +177,8 @@ end
 ```
 
 ### Step 3: `lib/ets_atomics/ets_counter.ex`
+
+**Objective**: Wrap `:ets.update_counter/4` with `decentralized_counters: true` so sharded increments scale across schedulers.
 
 ```elixir
 defmodule EtsAtomics.EtsCounter do
@@ -193,6 +226,8 @@ end
 
 ### Step 4: `lib/ets_atomics/counters_counter.ex`
 
+**Objective**: Use `:counters.new/2` with `:write_concurrency` and stash the ref in `:persistent_term` to skip GenServer dispatch on every increment.
+
 ```elixir
 defmodule EtsAtomics.CountersCounter do
   @moduledoc """
@@ -233,6 +268,8 @@ end
 ```
 
 ### Step 5: `lib/ets_atomics/atomics_counter.ex`
+
+**Objective**: Build a lock-free max tracker on `:atomics.compare_exchange/4` so concurrent writers converge without a mutex.
 
 ```elixir
 defmodule EtsAtomics.AtomicsCounter do
@@ -285,6 +322,8 @@ end
 
 ### Step 6: `bench/run.exs`
 
+**Objective**: Benchmark ETS vs `:counters` vs `:atomics` under parallel writers to reveal the per-scheduler throughput cliff.
+
 ```elixir
 alias EtsAtomics.{EtsCounter, CountersCounter, AtomicsCounter}
 
@@ -308,6 +347,8 @@ Benchee.run(
 ```
 
 ### Step 7: `test/ets_atomics_test.exs`
+
+**Objective**: Prove all three backends accumulate correctly under 8 concurrent writers and that the CAS max-tracker converges on the true maximum.
 
 ```elixir
 defmodule EtsAtomicsTest do
@@ -367,11 +408,17 @@ end
 
 ### Step 8: Run it
 
+**Objective**: Run the suite and Benchee script to observe the order-of-magnitude gap between ETS and native atomics on hot keys.
+
 ```bash
 mix deps.get
 mix test
 mix run bench/run.exs
 ```
+
+### Why this works
+
+`:atomics.add_get/3` compiles to a CPU `lock add` (or equivalent). `:ets.update_counter/3` uses a lock on the table row but scales well with `:write_concurrency`. Both avoid the message-pass overhead of a GenServer entirely.
 
 ---
 
@@ -391,6 +438,24 @@ hit a single-key hot spot on ETS without `decentralized_counters`.
 
 ---
 
+## Deep Dive
+
+ETS (Erlang Term Storage) is RAM-only and process-linked; table destruction triggers if the owner crashes, causing silent data loss in careless designs. Match specifications (match_specs) are micro-programs that filter/transform data at the C layer, orders of magnitude faster than fetching all records and filtering in Elixir. Mnesia adds disk persistence and replication but introduces transaction overhead and deadlock potential; dirty operations bypass locks for speed but sacrifice consistency guarantees. For caching, named tables (public by design) are globally visible but require careful name management; consider ETS sharding (multiple small tables) to reduce lock contention on hot keys. DETS (Disk ETS) persists to disk but is single-process bottleneck and slower than a real database. At scale, prefer ETS for in-process state and Mnesia/PostgreSQL for shared, persistent data.
+## Advanced Considerations
+
+ETS and DETS performance characteristics change dramatically based on access patterns and table types. Ordered sets provide range queries but slower access than hash tables; set types don't support duplicate keys while bags do. The `heir` option for ETS tables is essential for fault tolerance — when a table owner crashes, the heir process can take ownership and prevent data loss. Without it, the table is lost immediately. Mnesia replicates entire tables across nodes; choosing which nodes should have replicas and whether they're RAM or disk replicas affects both consistency guarantees and network traffic during cluster operations.
+
+DETS persistence comes with significant performance implications — writes are synchronous to disk by default, creating latency spikes. Using `sync: false` improves throughput but risks data loss on crashes. The maximum DETS table size is limited by available memory and the file system; planning capacity requires understanding your growth patterns. Mnesia's transaction system provides ACID guarantees, but dirty operations bypass these guarantees for performance. Understanding when to use dirty reads versus transactional reads significantly impacts both correctness and latency.
+
+Debugging ETS and DETS issues is challenging because problems often emerge under load when many processes contend for the same table. Table memory fragmentation is invisible to code but can exhaust memory. Using match specs instead of iteration over large tables can dramatically improve performance but requires careful construction. The interaction between ETS, replication, and distributed systems creates subtle consistency issues — a node with a stale ETS replica can serve incorrect data during network partitions. Always monitor table sizes and replication status with structured logging.
+
+
+## Deep Dive: Etsdets Patterns and Production Implications
+
+ETS tables are in-memory, non-distributed key-value stores with tunable semantics (ordered_set, duplicate_bag). Under concurrent read/write load, ETS table semantics matter: bag semantics allow fast appends but slow deletes; ordered_set allows range queries but slower inserts. Testing ETS behavior under concurrent load is non-trivial; single-threaded tests miss lock contention. Production ETS tables often fail under load due to concurrency assumptions that quiet tests don't exercise.
+
+---
+
 ## Trade-offs and production gotchas
 
 **1. `:ets.update_counter` with a missing row crashes by default.** Always pass the 4-arg form
@@ -406,19 +471,25 @@ and losing the point.
 
 **4. Per-scheduler counters hide contention, not eliminate it.** Under extreme hot-key writes
 (a trending product, for instance), even `write_concurrency: :auto` can bottleneck. Sharding
-keys across multiple tables (exercise 116) is the next step.
+keys across multiple tables is the next step.
 
 **5. Reading a consistent snapshot across many counters is impossible with these primitives.**
 They give per-op atomicity, not cross-counter. For coherent snapshots, serialize through a
 single process or publish a version number via CAS.
 
 **6. Don't use `:counters`/`:atomics` for rate windowing.** These are counters, not sliding
-windows. For "requests in the last 60s" patterns, keep using ETS or a dedicated rate limiter
-(exercise 71).
+windows. For "requests in the last 60s" patterns, keep using ETS or a dedicated rate limiter.
 
 **7. When NOT to use any of these.** When the counter update triggers a side effect (alerting,
 persistence, etc.), inlining it on every request is a latency tax. Batch and flush from a
 separate process.
+
+---
+
+## Reflection
+
+- You need a counter that also resets to zero on a schedule. Is that still an atomics job, or does it deserve a GenServer? Why?
+- If multiple counters must move together (increment A iff B > 0), does atomics still fit, or do you need a CAS loop or a transaction?
 
 ---
 

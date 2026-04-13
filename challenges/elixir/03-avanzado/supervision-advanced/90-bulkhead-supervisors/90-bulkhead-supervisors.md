@@ -2,9 +2,6 @@
 
 **Project**: `bulkhead_sups` — bulkhead pattern with isolated supervisors + PartitionSupervisor per workload class.
 
-**Difficulty**: ★★★★☆
-**Estimated time**: 4–6 hours
-
 ---
 
 ## Project context
@@ -90,6 +87,16 @@ Bulkheads and rate limiters compose. A rate limiter keeps any one client from ov
 
 A router classifies incoming requests into a bulkhead BEFORE dispatching work. The classifier must be cheap — it runs in the inbound path:
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
+
 ```elixir
 def classify(%{path: "/search" <> _}), do: :search
 def classify(%{path: "/admin" <> _}), do: :admin
@@ -112,9 +119,25 @@ end
 
 ---
 
+## Design decisions
+
+**Option A — single pool with priority-aware scheduling**
+- Pros: maximum throughput; every worker can handle any request.
+- Cons: head-of-line blocking between classes; a 10 s batch stalls interactive p99; priorities drift under load.
+
+**Option B — one PartitionSupervisor per workload class with per-class budgets** (chosen)
+- Pros: fault isolation is structural, not policy-based; each class has its own restart intensity, queue, and saturation semantics.
+- Cons: total capacity is partitioned (you cannot steal idle workers across bulkheads); more supervisors to observe.
+
+→ Chose **B** because interference, not capacity, is usually the production problem. If you need steal-on-idle, add a dedicated overflow bulkhead on top.
+
+---
+
 ## Implementation
 
 ### Step 1: Application supervisor
+
+**Objective**: Wire the OTP application and supervision tree for the components built.
 
 ```elixir
 # lib/bulkhead_sups/application.ex
@@ -141,6 +164,8 @@ end
 ```
 
 ### Step 2: Interactive bulkhead — tight budget, many partitions
+
+**Objective**: Build the interactive bulkhead layer: tight budget, many partitions.
 
 ```elixir
 # lib/bulkhead_sups/interactive/supervisor.ex
@@ -196,6 +221,8 @@ end
 
 ### Step 3: Search bulkhead — generous budget, fewer partitions
 
+**Objective**: Build the search bulkhead layer: generous budget, fewer partitions.
+
 ```elixir
 # lib/bulkhead_sups/search/supervisor.ex
 defmodule BulkheadSups.Search.Supervisor do
@@ -249,6 +276,8 @@ end
 ```
 
 ### Step 4: Batch bulkhead — few partitions, long timeouts
+
+**Objective**: Build the batch bulkhead layer: few partitions, long timeouts.
 
 ```elixir
 # lib/bulkhead_sups/batch/supervisor.ex
@@ -306,6 +335,8 @@ end
 
 ### Step 5: Admin bulkhead — smallest footprint
 
+**Objective**: Build the admin bulkhead layer: smallest footprint.
+
 ```elixir
 # lib/bulkhead_sups/admin/supervisor.ex
 defmodule BulkheadSups.Admin.Supervisor do
@@ -345,6 +376,8 @@ end
 
 ### Step 6: Router
 
+**Objective**: Implement Router.
+
 ```elixir
 # lib/bulkhead_sups/router.ex
 defmodule BulkheadSups.Router do
@@ -373,6 +406,8 @@ end
 
 ### Step 7: Tests — isolation is the real assertion
 
+**Objective**: Write tests for isolation is the real assertion.
+
 ```elixir
 # test/bulkhead_sups/router_test.exs
 defmodule BulkheadSups.RouterTest do
@@ -380,19 +415,21 @@ defmodule BulkheadSups.RouterTest do
 
   alias BulkheadSups.Router
 
-  test "classify routes paths correctly" do
-    assert :search == Router.classify(%{path: "/search?q=x"})
-    assert :admin == Router.classify(%{path: "/admin/users"})
-    assert :batch == Router.classify(%{method: :post, path: "/export/users.csv"})
-    assert :interactive == Router.classify(%{path: "/checkout"})
-  end
+  describe "BulkheadSups.Router" do
+    test "classify routes paths correctly" do
+      assert :search == Router.classify(%{path: "/search?q=x"})
+      assert :admin == Router.classify(%{path: "/admin/users"})
+      assert :batch == Router.classify(%{method: :post, path: "/export/users.csv"})
+      assert :interactive == Router.classify(%{path: "/checkout"})
+    end
 
-  test "interactive request dispatches and returns fast" do
-    {t_us, result} =
-      :timer.tc(fn -> Router.dispatch(%{path: "/checkout", method: :get}) end)
+    test "interactive request dispatches and returns fast" do
+      {t_us, result} =
+        :timer.tc(fn -> Router.dispatch(%{path: "/checkout", method: :get}) end)
 
-    assert {:ok, {:interactive, _}} = result
-    assert t_us < 50_000  # <50ms
+      assert {:ok, {:interactive, _}} = result
+      assert t_us < 50_000  # <50ms
+    end
   end
 end
 ```
@@ -404,39 +441,58 @@ defmodule BulkheadSups.IsolationTest do
 
   alias BulkheadSups.{Router, Batch}
 
-  test "batch workers hogging does NOT block interactive requests" do
-    # Saturate both batch partitions with 500ms of sleep each.
-    for _ <- 1..2 do
-      Task.async(fn ->
-        pid = {:via, PartitionSupervisor, {Batch.Workers, :rand.uniform(1_000_000)}}
-        GenServer.call(pid, {:hog, 500}, 1_000)
-      end)
+  describe "BulkheadSups.Isolation" do
+    test "batch workers hogging does NOT block interactive requests" do
+      # Saturate both batch partitions with 500ms of sleep each.
+      for _ <- 1..2 do
+        Task.async(fn ->
+          pid = {:via, PartitionSupervisor, {Batch.Workers, :rand.uniform(1_000_000)}}
+          GenServer.call(pid, {:hog, 500}, 1_000)
+        end)
+      end
+
+      Process.sleep(20)
+
+      # Interactive requests should complete well under the 500ms hog window.
+      {t_us, result} =
+        :timer.tc(fn -> Router.dispatch(%{path: "/checkout", method: :get}) end)
+
+      assert {:ok, _} = result
+      assert t_us < 50_000, "interactive was blocked: #{t_us} µs"
     end
 
-    Process.sleep(20)
+    test "crash in one bulkhead does not affect siblings" do
+      # Kill all interactive workers.
+      interactive_pids =
+        PartitionSupervisor.which_children(BulkheadSups.Interactive.Workers)
+        |> Enum.map(fn {_, pid, _, _} -> pid end)
 
-    # Interactive requests should complete well under the 500ms hog window.
-    {t_us, result} =
-      :timer.tc(fn -> Router.dispatch(%{path: "/checkout", method: :get}) end)
+      for pid <- interactive_pids, do: Process.exit(pid, :kill)
 
-    assert {:ok, _} = result
-    assert t_us < 50_000, "interactive was blocked: #{t_us} µs"
-  end
-
-  test "crash in one bulkhead does not affect siblings" do
-    # Kill all interactive workers.
-    interactive_pids =
-      PartitionSupervisor.which_children(BulkheadSups.Interactive.Workers)
-      |> Enum.map(fn {_, pid, _, _} -> pid end)
-
-    for pid <- interactive_pids, do: Process.exit(pid, :kill)
-
-    # Search and batch still work.
-    assert {:ok, _} = Router.dispatch(%{path: "/search?q=elixir", method: :get})
-    assert {:ok, _} = Router.dispatch(%{method: :post, path: "/export/x.csv"})
+      # Search and batch still work.
+      assert {:ok, _} = Router.dispatch(%{path: "/search?q=elixir", method: :get})
+      assert {:ok, _} = Router.dispatch(%{method: :post, path: "/export/x.csv"})
+    end
   end
 end
 ```
+
+---
+
+## Advanced Considerations: Partitioned Supervisors and Custom Restart Strategies
+
+A standard Supervisor is a single process managing a static tree. For thousands of children, a single supervisor becomes a bottleneck: all supervisor callbacks run on one process, and supervisor restart logic is sequential. PartitionSupervisor (OTP 25+) spawns N independent supervisors, each managing a subset of children. Hashing the child ID determines which partition supervises it, distributing load and enabling horizontal scaling.
+
+Custom restart strategies (via `Supervisor.init/2` callback) allow logic beyond the defaults. A strategy might prioritize restarting dependent services in a specific order, or apply backoff based on restart frequency. The downside is complexity: custom logic is harder to test and reason about, and mistakes cascade. Start with defaults and profile before adding custom behavior.
+
+Selective restart via `:rest_for_one` or `:one_for_all` affects failure isolation. `:one_for_all` restarts all children when one fails (simulating a total system failure), which can be necessary for consistency but is expensive. `:rest_for_one` restarts the failed child and any started after it, balancing isolation and dependencies. Understanding which strategy fits your architecture prevents cascading failures and unnecessary restarts.
+
+---
+
+
+## Deep Dive: Supervisor Patterns and Production Implications
+
+Supervisor trees define fault tolerance at the application level. Testing supervisor restart strategies (one_for_one, rest_for_one, one_for_all) requires reasoning about side effects of crashes across multiple children. The insight is that your test should verify not just that a child restarts, but that dependent state (ETS tables, connections, message queues) is properly initialized after restart. Production incidents often involve restart loops under load—a supervisor that works fine in quiet tests can spin wildly when children fail faster than they recover.
 
 ---
 
@@ -458,13 +514,26 @@ end
 
 **8. When NOT to use this.** For a single-workload service (all requests roughly the same shape and duration), bulkheads add complexity without benefit. Start with one pool; add bulkheads when you measurably have latency interference between request classes.
 
+### Why this works
+
+Each bulkhead is its own supervision subtree with its own PartitionSupervisor and its own restart intensity, so saturation or crash cascades in one class cannot consume resources from another. Routing is a cheap pattern match, meaning the isolation cost at the hot path is measured in microseconds. The win is not in per-call performance but in the absence of cross-class interference at p99.
+
 ---
 
-## Performance notes
+## Benchmark
 
 Per-bulkhead dispatch adds ~1 µs (pattern match on the router + one `{:via, PartitionSupervisor, ...}` resolution). The savings come from NOT head-of-line-blocking between classes.
 
 Measure with `k6` or `wrk`: run a mixed workload (80 % interactive, 10 % search, 10 % batch) with and without bulkheads. Without: p99 interactive latency tracks p99 batch latency. With: p99 interactive stays constant even as you scale batch load up to saturate its partitions.
+
+Target: p99 interactive latency unchanged when batch bulkhead is saturated at 100 % of its capacity; routing overhead ≤ 5 µs per request.
+
+---
+
+## Reflection
+
+1. Your interactive bulkhead is saturated while the batch bulkhead sits idle. Do you enable cross-bulkhead borrowing, resize the interactive pool at runtime, or shed interactive load? Which option preserves the isolation guarantee you designed the tree for?
+2. A new workload class arrives that does not cleanly fit any existing bulkhead. How do you decide between creating a fifth bulkhead, extending an existing one, or classifying the new workload at the edge (feature flag)? Argue from ops cost, not elegance.
 
 ---
 

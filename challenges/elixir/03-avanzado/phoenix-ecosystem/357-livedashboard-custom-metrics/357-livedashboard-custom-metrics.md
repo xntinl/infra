@@ -92,7 +92,36 @@ defmodule ObservabilityStack.MixProject do
 end
 ```
 
+### Dependencies (mix.exs)
+
+```elixir
+```elixir
+defmodule ObservabilityStack.MixProject do
+  use Mix.Project
+  def project, do: [app: :observability_stack, version: "0.1.0", elixir: "~> 1.16", deps: deps()]
+
+  def application do
+    [mod: {ObservabilityStack.Application, []}, extra_applications: [:logger]]
+  end
+
+  defp deps do
+    [
+      {:phoenix, "~> 1.7.14"},
+      {:phoenix_live_view, "~> 1.0"},
+      {:phoenix_live_dashboard, "~> 0.8"},
+      {:telemetry, "~> 1.2"},
+      {:telemetry_metrics, "~> 1.0"},
+      {:telemetry_poller, "~> 1.1"},
+      {:jason, "~> 1.4"},
+      {:plug_cowboy, "~> 2.7"}
+    ]
+  end
+end
+```
+
 ### Step 1: Telemetry supervisor — `lib/observability_stack/telemetry.ex`
+
+**Objective**: Centralize metric definitions and the telemetry_poller so LiveDashboard has a single module to consume and periodic VM/business measurements run under supervision.
 
 ```elixir
 defmodule ObservabilityStack.Telemetry do
@@ -154,6 +183,8 @@ end
 
 ### Step 2: Emit events from business code — `lib/observability_stack/payments.ex`
 
+**Objective**: Emit `:start`/`:stop` telemetry spans from the domain so metrics decouple from the observability backend, keeping the business module ignorant of LiveDashboard or Prometheus.
+
 ```elixir
 defmodule ObservabilityStack.Payments do
   @event_prefix [:payments, :charge]
@@ -179,6 +210,8 @@ end
 
 ### Step 3: Custom dashboard page — `lib/observability_stack_web/dashboard_pages/business_page.ex`
 
+**Objective**: Extend LiveDashboard via `PageBuilder` so domain-specific metrics live alongside Phoenix/VM panels, reusing LD's styling and live updates without building a separate UI.
+
 ```elixir
 defmodule ObservabilityStackWeb.DashboardPages.BusinessPage do
   use Phoenix.LiveDashboard.PageBuilder
@@ -202,6 +235,8 @@ end
 ```
 
 ### Step 4: Router mount — `lib/observability_stack_web/router.ex`
+
+**Objective**: Mount `live_dashboard` behind the browser pipeline and register the custom page so the metrics module and business page are both wired to a single `/dashboard` entry point.
 
 ```elixir
 defmodule ObservabilityStackWeb.Router do
@@ -292,6 +327,23 @@ Benchee.run(
 ```
 
 **Expected**: no-handler ~200ns, single-handler ~1µs. 1000 emits/sec is well under 1% of one core.
+
+## Advanced Considerations: LiveView Real-Time Patterns and Pubsub Scale
+
+LiveView bridges the browser and BEAM via WebSocket, allowing server-side renders to push incremental DOM diffs to the client. A LiveView process is long-lived, receiving events (clicks, form submissions) and broadcasting updates. For real-time features (collaborative editing, live notifications), LiveView processes subscribe to PubSub topics and receive broadcast messages.
+
+Phoenix.PubSub partitions topics across a pool of processes, allowing horizontal scaling. By default, `:local` mode uses in-memory ETS; `:redis` mode distributes across nodes via Redis. At scale (thousands of concurrent LiveViews), topic fanout can bottleneck: broadcasting to a million subscribers means delivering one million messages. The BEAM handles this, but the network cost matters on multi-node deployments.
+
+`Presence` module tracks which users are viewing which pages, syncing state via PubSub. A presence join/leave is broadcast to all nodes, allowing real-time "who's online" updates. Under partition, presence state can diverge; the library uses unique presence keys to detect and reconcile. Operationally, watching presence on every page load can amplify server load if users are flaky (mobile networks, browser reloads). Consider presence only for features where it's user-facing (collaborative editors, live sports scoreboards).
+
+---
+
+
+## Deep Dive: Phoenix Patterns and Production Implications
+
+Phoenix's conn struct represents an HTTP request/response in flight, accumulating transformations through middleware and handler code. Testing a Phoenix endpoint end-to-end (not just the controller) catches middleware order bugs, header mismatches, and plug composition issues. The trade-off is that full integration tests are slower and harder to parallelize than unit tests. Production bugs in auth, CORS, or session handling are often due to middleware assumptions that live tests reveal.
+
+---
 
 ## Trade-offs and production gotchas
 

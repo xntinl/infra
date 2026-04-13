@@ -132,6 +132,8 @@ because expectations accumulate.
 
 ### Step 1: `mix.exs`
 
+**Objective**: Add Finch, Jason, and Bypass (test-only) to build real HTTP I/O testing without production overhead.
+
 ```elixir
 defmodule Weather.MixProject do
   use Mix.Project
@@ -161,6 +163,8 @@ end
 
 ### Step 2: Application
 
+**Objective**: Start Finch pool with connection timeout config under the app supervisor for test environment integration.
+
 ```elixir
 # lib/weather/application.ex
 defmodule Weather.Application do
@@ -182,6 +186,8 @@ end
 ```
 
 ### Step 3: Retry helper
+
+**Objective**: Implement exponential backoff with jitter so tests can verify retry semantics without sleeping real time.
 
 ```elixir
 # lib/weather/retry.ex
@@ -216,6 +222,8 @@ end
 
 ### Step 4: Parser
 
+**Objective**: Implement JSON schema extraction and error-handling struct so tests verify parsing boundaries without HTTP overhead.
+
 ```elixir
 # lib/weather/parser.ex
 defmodule Weather.Parser do
@@ -243,6 +251,8 @@ end
 ```
 
 ### Step 5: Client
+
+**Objective**: Implement Finch-based HTTP client with retry logic, Retry-After respect, and timeout handling for production resilience.
 
 ```elixir
 # lib/weather/client.ex
@@ -312,6 +322,8 @@ end
 ```
 
 ### Step 6: Tests
+
+**Objective**: Use Bypass.expect/2 to inject real HTTP failures (500s, 429s, timeouts, disconnects) and verify exponential backoff + Retry-After logic.
 
 ```elixir
 # test/weather/client_test.exs
@@ -447,6 +459,8 @@ end
 
 ### Step 7: Run
 
+**Objective**: Verify the implementation by running the test suite.
+
 ```bash
 mix test --trace
 ```
@@ -472,6 +486,21 @@ IO.puts("avg: #{time_us / 10_000} µs/op")
 ```
 
 Target: operation should complete in the low-microsecond range on modern hardware; deviations by >2× indicate a regression worth investigating.
+
+## Deep Dive: Bypass Patterns and Production Implications
+
+HTTP mocking in tests presents a false choice: mock at the client level (loses realistic errors) or spin up a real HTTP server (adds complexity and brittleness). Bypass sits in the middle—it starts a real HTTP server on localhost that captures requests and allows you to define stub responses. This catches serialization bugs, malformed headers, and timeout logic that pure client mocks miss. The downside is that Bypass tests must serialize before making requests, limiting some concurrency patterns. Production incidents often involve HTTP edge cases (partial responses, connection timeouts) that live HTTP testing reveals.
+
+---
+
+## Advanced Considerations
+
+Production testing strategies require careful attention to resource management and test isolation across multiple concurrent test processes. In large codebases, tests can consume significant memory and CPU resources, especially when using concurrent testing without proper synchronization and cleanup. The BEAM scheduler's preemptive nature means test processes may interfere with each other if shared resources aren't properly isolated at the process boundary. Pay careful attention to how Ecto's sandbox mode interacts with your supervision tree — if you have GenServers that hold state across tests, the sandbox rollback mechanism may leave phantom processes in your monitoring systems that continue consuming resources until forced cleanup occurs.
+
+When scaling tests to production-grade test suites, consider the cost of stub verification and the memory overhead of generated test cases. Each property-based test invocation can create thousands of synthetic test cases, potentially causing garbage collection pressure that's invisible during local testing but becomes critical in CI/CD pipelines running long test suites continuously. The interaction between concurrent tests and ETS tables (often used in caches and registry patterns) requires explicit `inherited: true` options to prevent unexpected sharing between test processes, which can cause mysterious failures when tests run in different orders or under load.
+
+For distributed testing scenarios using tools like `Peer`, network simulation can mask real latency issues and failure modes. Test timeouts that work locally may fail in CI due to scheduler contention and GC pauses. Always include substantial buffers for timeout values and monitor actual execution times under load. The coordination between multiple test nodes requires careful cleanup — a failure in test coordination can leave zombie processes consuming resources indefinitely. Implement proper telemetry hooks within your test helpers to diagnose production-like scenarios and capture performance characteristics.
+
 
 ## Trade-offs and production gotchas
 
@@ -543,3 +572,13 @@ domestic-datacenter HTTP call.
 - ["Testing external HTTP APIs in Elixir" — Dashbit blog](https://dashbit.co/blog) — general patterns
 - [Mint transport errors reference](https://hexdocs.pm/mint/Mint.TransportError.html)
 - [cowboy docs](https://ninenines.eu/docs/en/cowboy/2.10/manual/) — what Bypass runs under the hood
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

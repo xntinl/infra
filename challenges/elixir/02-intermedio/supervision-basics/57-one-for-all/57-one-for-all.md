@@ -102,12 +102,18 @@ end
 
 ### Step 1: Create the project
 
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
+
 ```bash
 mix new one_for_all_demo
 cd one_for_all_demo
 ```
 
 ### Step 2: `lib/one_for_all_demo/writer.ex` and `reader.ex`
+
+**Objective**: Provide `lib/one_for_all_demo/writer.ex` and `reader.ex` — these are the supporting fixtures the main module depends on to make its concept demonstrable.
+
 
 ```elixir
 defmodule OneForAllDemo.Writer do
@@ -169,6 +175,9 @@ end
 
 ### Step 3: `lib/one_for_all_demo/supervisor.ex`
 
+**Objective**: Encode the restart policy in `supervisor.ex` — the supervisor strategy is the lesson; the children exist to make it observable.
+
+
 ```elixir
 defmodule OneForAllDemo.Supervisor do
   @moduledoc """
@@ -196,6 +205,9 @@ end
 ```
 
 ### Step 4: `test/one_for_all_demo_test.exs`
+
+**Objective**: Write `one_for_all_demo_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
 
 ```elixir
 defmodule OneForAllDemoTest do
@@ -275,6 +287,9 @@ end
 
 ### Step 5: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -284,6 +299,14 @@ mix test
 ### Why this works
 
 The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+
+## Key Concepts: Restart Strategy — One-for-All
+
+With `:one_for_all`, when **any** child crashes, all children are restarted. This is stricter but ensures consistency: either all are alive or all are restarting. Use it when multiple children form a tightly coupled service (e.g., a cache + cache invalidation process).
+
+If children have heavy initialization costs, `:one_for_all` can cause thrashing (restart loop). Use `:rest_for_one` (restart only the crashed child and descendants) for more granular control.
 
 
 ## Benchmark
@@ -318,7 +341,7 @@ ETS holder) and have the group read/write through it.
 When children are independent, use `:one_for_one` — there's no upside to
 punishing healthy siblings for one child's crash. When the dependency is
 *directional* (B depends on A but not vice versa), use `:rest_for_one`
-(exercise 58) to avoid restarting A when only B crashes.
+to avoid restarting A when only B crashes.
 
 ---
 
@@ -332,3 +355,17 @@ punishing healthy siblings for one child's crash. When the dependency is
 - [`Supervisor` strategies — `:one_for_all`](https://hexdocs.pm/elixir/Supervisor.html#module-strategies)
 - [Erlang `supervisor` — restart strategies](https://www.erlang.org/doc/man/supervisor.html#restart-strategies)
 - ["Designing for Scalability with Erlang/OTP" — Ch. 8](https://www.oreilly.com/library/view/designing-for-scalability/9781449361556/)
+
+
+## Advanced Considerations
+
+Supervision trees encode your application's fault tolerance strategy. The tree structure, restart policy, and shutdown semantics directly determine behavior during crashes, dependencies, and graceful shutdown.
+
+**Supervision tree design:**
+A well-designed tree mirrors data/message flow: dependencies point upward. If process A depends on process B, B should be higher in the tree (started first, shut down last). Supervisor strategies (`:one_for_one`, `:one_for_all`, `:rest_for_one`) define the scope of cascading restarts. `:one_for_one` isolates failures (each crash restarts only that child); `:one_for_all` is for tightly-coupled groups (e.g., a reader-writer pair).
+
+**Restart strategies and intensity:**
+`max_restarts: 3, max_seconds: 5` means "if 3+ restarts occur in 5 seconds, kill the supervisor." This circuit-breaker pattern prevents restart loops that consume resources. The key decision: should a crashing child take down the whole app (escalate to parent) or just itself? Transient/temporary children exit "cleanly" and don't trigger restarts — useful for request handlers.
+
+**Error propagation and shutdown ordering:**
+When a supervisor exits, it sends `:shutdown` to children in reverse start order (LIFO). Children have `shutdown: 5000` milliseconds to terminate gracefully before hard killing. Nested supervisors propagate this signal recursively. Understanding this order prevents resource leaks: a child waiting on another child's graceful shutdown will deadlock if not designed carefully.

@@ -1,8 +1,6 @@
 # Application Start Phases for Ordered Boot
 
 **Project**: `start_phases` — use `Application.start_phase/3` to coordinate boot across applications with complex dependencies.
-**Difficulty**: ★★★★☆
-**Estimated time**: 3–6 hours
 
 ---
 
@@ -62,6 +60,16 @@ variant.
 ### 1. What `start_phases` does
 
 In `mix.exs`:
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
 
 ```elixir
 def application do
@@ -135,9 +143,25 @@ node during boot.
 
 ---
 
+## Design decisions
+
+**Option A — single `handle_continue` chain inside the root supervisor**
+- Pros: stays inside one app; no phase manifest to maintain.
+- Cons: cross-app ordering is impossible; one long chain becomes hard to reason about.
+
+**Option B — declared `start_phases` per app run by the application_controller** (chosen)
+- Pros: phases run in manifest order across all apps; each phase is a named, testable unit; boot ordering becomes declarative.
+- Cons: phases do not re-run on hot-code upgrade; tests must call `Application.start_phase/3` explicitly.
+
+→ Chose **B** when ordering needs to span multiple applications. For a single app, `handle_continue` is still the right tool.
+
+---
+
 ## Implementation
 
 ### Step 1: `mix.exs`
+
+**Objective**: Declare the project, dependencies, and OTP application in `mix.exs`.
 
 ```elixir
 defmodule StartPhases.MixProject do
@@ -167,6 +191,8 @@ end
 ```
 
 ### Step 2: `lib/start_phases/application.ex`
+
+**Objective**: Define the OTP application and supervision tree in `lib/start_phases/application.ex`.
 
 ```elixir
 defmodule StartPhases.Application do
@@ -208,6 +234,8 @@ end
 
 ### Step 3: `lib/start_phases/telemetry_spine.ex`
 
+**Objective**: Implement the module in `lib/start_phases/telemetry_spine.ex`.
+
 ```elixir
 defmodule StartPhases.TelemetrySpine do
   @moduledoc """
@@ -237,6 +265,8 @@ end
 ```
 
 ### Step 4: `lib/start_phases/lock_manager.ex`
+
+**Objective**: Implement the module in `lib/start_phases/lock_manager.ex`.
 
 ```elixir
 defmodule StartPhases.LockManager do
@@ -272,6 +302,8 @@ end
 ```
 
 ### Step 5: `lib/start_phases/cache.ex`
+
+**Objective**: Implement the module in `lib/start_phases/cache.ex`.
 
 ```elixir
 defmodule StartPhases.Cache do
@@ -311,6 +343,8 @@ end
 ```
 
 ### Step 6: `lib/start_phases/scheduler.ex`
+
+**Objective**: Implement the module in `lib/start_phases/scheduler.ex`.
 
 ```elixir
 defmodule StartPhases.Scheduler do
@@ -353,6 +387,8 @@ end
 
 ### Step 7: `lib/start_phases/http_endpoint.ex`
 
+**Objective**: Implement the module in `lib/start_phases/http_endpoint.ex`.
+
 ```elixir
 defmodule StartPhases.HttpEndpoint do
   @moduledoc """
@@ -392,56 +428,66 @@ end
 
 ### Step 8: `test/start_phases_test.exs`
 
+**Objective**: Write tests in `test/start_phases_test.exs` covering behavior and edge cases.
+
 ```elixir
 defmodule StartPhasesTest do
   use ExUnit.Case, async: false
 
-  test "all three phases complete" do
-    assert StartPhases.LockManager.reserved?()
-    assert StartPhases.Cache.warmed?()
-    assert StartPhases.HttpEndpoint.bound?()
+  describe "StartPhases" do
+    test "all three phases complete" do
+      assert StartPhases.LockManager.reserved?()
+      assert StartPhases.Cache.warmed?()
+      assert StartPhases.HttpEndpoint.bound?()
+    end
   end
 end
 ```
 
 ### Step 9: `test/ordering_test.exs`
 
+**Objective**: Write tests in `test/ordering_test.exs` covering behavior and edge cases.
+
 ```elixir
 defmodule StartPhases.OrderingTest do
   use ExUnit.Case, async: false
 
-  test "phases execute in the declared order" do
-    timeline = StartPhases.TelemetrySpine.timeline() |> Enum.map(&elem(&1, 0))
+  describe "StartPhases.Ordering" do
+    test "phases execute in the declared order" do
+      timeline = StartPhases.TelemetrySpine.timeline() |> Enum.map(&elem(&1, 0))
 
-    assert [
-             :lock_reserved_begin,
-             :lock_reserved_end,
-             :cache_warm_begin,
-             :cache_warm_end,
-             :bind_begin,
-             :bind_end
-           ] = Enum.filter(timeline, &(&1 in [
-             :lock_reserved_begin,
-             :lock_reserved_end,
-             :cache_warm_begin,
-             :cache_warm_end,
-             :bind_begin,
-             :bind_end
-           ]))
-  end
+      assert [
+               :lock_reserved_begin,
+               :lock_reserved_end,
+               :cache_warm_begin,
+               :cache_warm_end,
+               :bind_begin,
+               :bind_end
+             ] = Enum.filter(timeline, &(&1 in [
+               :lock_reserved_begin,
+               :lock_reserved_end,
+               :cache_warm_begin,
+               :cache_warm_end,
+               :bind_begin,
+               :bind_end
+             ]))
+    end
 
-  test "phase 2 does not begin until phase 1 is done" do
-    timeline = StartPhases.TelemetrySpine.timeline()
+    test "phase 2 does not begin until phase 1 is done" do
+      timeline = StartPhases.TelemetrySpine.timeline()
 
-    {_, lock_end_ts} = Enum.find(timeline, fn {e, _} -> e == :lock_reserved_end end)
-    {_, warm_begin_ts} = Enum.find(timeline, fn {e, _} -> e == :cache_warm_begin end)
+      {_, lock_end_ts} = Enum.find(timeline, fn {e, _} -> e == :lock_reserved_end end)
+      {_, warm_begin_ts} = Enum.find(timeline, fn {e, _} -> e == :cache_warm_begin end)
 
-    assert warm_begin_ts > lock_end_ts
+      assert warm_begin_ts > lock_end_ts
+    end
   end
 end
 ```
 
 ### Step 10: Multi-app variant (illustrative)
+
+**Objective**: Implement Multi-app variant (illustrative).
 
 In a real umbrella, each app declares `start_phases` in its own `mix.exs`:
 
@@ -465,6 +511,23 @@ end
 Only the apps that declare a phase participate. The union of all declared phases is
 ordered by the first app to mention them. To make the order global and explicit, use
 the `mix release` `applications` manifest plus a documented phase vocabulary.
+
+---
+
+## Advanced Considerations: Partitioned Supervisors and Custom Restart Strategies
+
+A standard Supervisor is a single process managing a static tree. For thousands of children, a single supervisor becomes a bottleneck: all supervisor callbacks run on one process, and supervisor restart logic is sequential. PartitionSupervisor (OTP 25+) spawns N independent supervisors, each managing a subset of children. Hashing the child ID determines which partition supervises it, distributing load and enabling horizontal scaling.
+
+Custom restart strategies (via `Supervisor.init/2` callback) allow logic beyond the defaults. A strategy might prioritize restarting dependent services in a specific order, or apply backoff based on restart frequency. The downside is complexity: custom logic is harder to test and reason about, and mistakes cascade. Start with defaults and profile before adding custom behavior.
+
+Selective restart via `:rest_for_one` or `:one_for_all` affects failure isolation. `:one_for_all` restarts all children when one fails (simulating a total system failure), which can be necessary for consistency but is expensive. `:rest_for_one` restarts the failed child and any started after it, balancing isolation and dependencies. Understanding which strategy fits your architecture prevents cascading failures and unnecessary restarts.
+
+---
+
+
+## Deep Dive: Property Patterns and Production Implications
+
+Property-based testing inverts the testing mindset: instead of writing examples, you state invariants (properties) and let a generator find counterexamples. StreamData's shrinking capability is its superpower—when a property fails on a 10,000-element list, the framework reduces it to the minimal list that still fails, cutting debugging time from hours to minutes. The trade-off is that properties require rigorous thinking about domain constraints, and not every invariant is worth expressing as a property. Teams that adopt property testing often find bugs in specifications themselves, not just implementations.
 
 ---
 
@@ -509,7 +572,13 @@ needs — usually when an app's "ready" is a function of state owned by another 
 
 ---
 
-## Performance notes
+### Why this works
+
+`application_controller` guarantees that phase N for every app in the release finishes before phase N+1 starts for any app. That gives you a cross-app barrier without inventing a coordination primitive. Each phase stays local to its own app's callback, so cross-app coupling is expressed in the manifest, not in code.
+
+---
+
+## Benchmark
 
 Each phase invocation is a direct function call on the app module. Overhead is sub-µs.
 The cost is whatever your phase callback does — typically I/O bound.
@@ -521,6 +590,15 @@ Typical budgets:
 
 Log a warning if any phase exceeds 1 second; kill the app if it exceeds 30 seconds.
 Use `Task` with a timeout inside your phase callback.
+
+Target: total phase sequence ≤ 5 s on cold boot; any single phase > 1 s emits a warning.
+
+---
+
+## Reflection
+
+1. You add a new phase `:migrate_db` that takes 20 s. Does it belong in `start_phases`, in a release task run before boot, or in an async `handle_continue`? Argue from the contract that phase N must finish before phase N+1 starts across all apps.
+2. Rolling deploys do not re-run phases on hot-code upgrade. Which invariants maintained by phases are at risk during a partial upgrade, and how do you detect divergence?
 
 ---
 

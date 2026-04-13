@@ -144,12 +144,16 @@ All targets execute in parallel with a shared deadline. Implementing this with `
 
 ### Step 1: Create the project
 
+**Objective**: Set up the Mix project and declare required dependencies.
+
 ```bash
 mix new rpc_demo --sup
 cd rpc_demo
 ```
 
 ### Step 2: `mix.exs`
+
+**Objective**: Declare project dependencies and configure the Mix build.
 
 ```elixir
 defmodule RpcDemo.MixProject do
@@ -169,6 +173,8 @@ end
 
 ### Step 3: `lib/rpc_demo/application.ex`
 
+**Objective**: Wire the supervision tree in `application.ex`.
+
 ```elixir
 defmodule RpcDemo.Application do
   @moduledoc false
@@ -183,6 +189,8 @@ end
 ```
 
 ### Step 4: `lib/rpc_demo/snapshot.ex`
+
+**Objective**: Implement the `snapshot.ex` module.
 
 ```elixir
 defmodule RpcDemo.Snapshot do
@@ -217,6 +225,8 @@ end
 
 ### Step 5: `lib/rpc_demo/snapshot_server.ex`
 
+**Objective**: Implement the `snapshot_server.ex` module.
+
 ```elixir
 defmodule RpcDemo.SnapshotServer do
   @moduledoc "Named GenServer exposing Snapshot.get/0."
@@ -237,6 +247,8 @@ end
 ```
 
 ### Step 6: `lib/rpc_demo/client.ex`
+
+**Objective**: Implement the `client.ex` module.
 
 ```elixir
 defmodule RpcDemo.Client do
@@ -292,6 +304,8 @@ end
 ```
 
 ### Step 7: `lib/rpc_demo/bench.ex`
+
+**Objective**: Implement the `bench.ex` module.
 
 ```elixir
 defmodule RpcDemo.Bench do
@@ -363,6 +377,8 @@ end
 
 ### Step 8: Tests
 
+**Objective**: Verify the implementation by running the test suite.
+
 ```elixir
 # test/rpc_demo/client_test.exs
 defmodule RpcDemo.ClientTest do
@@ -372,38 +388,40 @@ defmodule RpcDemo.ClientTest do
 
   @self_node node()
 
-  test "via_rpc/1 against local node returns a snapshot" do
-    assert {:ok, %{node: node, process_count: n}} = Client.via_rpc(@self_node)
-    assert node == @self_node
-    assert is_integer(n)
-  end
-
-  test "via_erpc/1 against local node returns a snapshot" do
-    assert {:ok, %{node: node}} = Client.via_erpc(@self_node)
-    assert node == @self_node
-  end
-
-  test "via_genserver/1 routes through the named SnapshotServer" do
-    assert {:ok, %{node: node}} = Client.via_genserver(@self_node)
-    assert node == @self_node
-  end
-
-  test "via_erpc/1 surfaces raised errors" do
-    assert_raise ErlangError, fn ->
-      :erpc.call(@self_node, Snapshot, :boom!, [], 500)
+  describe "RpcDemo.Client" do
+    test "via_rpc/1 against local node returns a snapshot" do
+      assert {:ok, %{node: node, process_count: n}} = Client.via_rpc(@self_node)
+      assert node == @self_node
+      assert is_integer(n)
     end
-  end
 
-  test "via_genserver/1 returns :nodedown for an unreachable node" do
-    fake = :"never_existed@127.0.0.1"
-    assert {:error, reason} = Client.via_genserver(fake, 200)
-    assert reason in [:nodedown, :server_not_running, {:genserver_exit, :noconnection}] or
-             match?({:genserver_exit, _}, reason)
-  end
+    test "via_erpc/1 against local node returns a snapshot" do
+      assert {:ok, %{node: node}} = Client.via_erpc(@self_node)
+      assert node == @self_node
+    end
 
-  test "via_rpc/1 returns {:error, {:rpc, ...}} for an unreachable node" do
-    fake = :"never_existed@127.0.0.1"
-    assert {:error, {:rpc, _}} = Client.via_rpc(fake, 200)
+    test "via_genserver/1 routes through the named SnapshotServer" do
+      assert {:ok, %{node: node}} = Client.via_genserver(@self_node)
+      assert node == @self_node
+    end
+
+    test "via_erpc/1 surfaces raised errors" do
+      assert_raise ErlangError, fn ->
+        :erpc.call(@self_node, Snapshot, :boom!, [], 500)
+      end
+    end
+
+    test "via_genserver/1 returns :nodedown for an unreachable node" do
+      fake = :"never_existed@127.0.0.1"
+      assert {:error, reason} = Client.via_genserver(fake, 200)
+      assert reason in [:nodedown, :server_not_running, {:genserver_exit, :noconnection}] or
+               match?({:genserver_exit, _}, reason)
+    end
+
+    test "via_rpc/1 returns {:error, {:rpc, ...}} for an unreachable node" do
+      fake = :"never_existed@127.0.0.1"
+      assert {:error, {:rpc, _}} = Client.via_rpc(fake, 200)
+    end
   end
 end
 ```
@@ -415,6 +433,8 @@ elixir --name test@127.0.0.1 --cookie devcluster -S mix test
 ```
 
 ### Step 9: Multi-node benchmark
+
+**Objective**: Implement: Multi-node benchmark.
 
 Boot `beta@127.0.0.1` and from `alpha@127.0.0.1`:
 
@@ -439,6 +459,24 @@ RpcDemo.Bench.concurrent(:"beta@127.0.0.1", 64)
 ### Why this works
 
 The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
+
+## Deep Dive
+
+Distributed Erlang relies on a heartbeat mechanism (net_kernel tick) to detect node failure, but the network is fundamentally asynchronous—split-brain scenarios are inevitable. A partitioned cluster may have two sets of nodes, each believing the other is dead. Libraries like Horde and Phoenix.PubSub solve this with quorum-aware consensus, but they add latency and complexity. At scale, choose your consistency model explicitly: eventual consistency (via Redis PubSub) is faster but allows temporary divergence; strong consistency (via Horde DLM or distributed transactions) is slower but guarantees atomicity. For global registries, the order of operations matters—registering a process before its monitor is live creates race conditions. In multi-region setups, latency between nodes compounds these issues; consider regional clusters with a lightweight coordinator rather than a fully meshed topology.
+## Advanced Considerations
+
+Distributed Elixir systems require careful consideration of network partitions, consistent hashing for distributed state, and the interaction between clustering libraries and node discovery mechanisms. Network partitions are not rare edge cases; they happen regularly in cloud deployments due to maintenance windows and infrastructure issues. A system that works perfectly during local testing but fails under network partitions indicates insufficient failure handling throughout the codebase. Split-brain scenarios where multiple network partitions lead to different cluster views require explicit recovery mechanisms that are often business-specific and context-dependent.
+
+Horde and distributed registries provide eventual consistency guarantees, but "eventual" can mean minutes during network partitions. Applications must handle the case where the same name is registered on multiple nodes simultaneously without coordination. Consistent hashing for distributed services requires understanding rebalancing costs — a single node failure can cause significant key redistribution and thundering herd problems if not carefully managed. The cost of distributed consensus using algorithms like Raft is high; choose it only when consistency is more important than availability and can afford the performance cost.
+
+Global state replication across nodes creates synchronization challenges at scale. Choosing between replicating everywhere versus replicating to specific nodes affects both consistency latency and network bandwidth utilization fundamentally. Node monitoring and heartbeat mechanisms require careful timeout tuning — too aggressive and you get false positives during network hiccups; too conservative and you don't detect actual failures quickly enough for recovery. The EPMD (Erlang Port Mapper Daemon) is a critical component that can become a bottleneck in large clusters and requires careful capacity planning.
+
+
+## Deep Dive: Cluster Patterns and Production Implications
+
+Clustering distributes computation across nodes using Erlang's distribution protocol. Testing clusters requires simulating node failures, network partitions, and message delays—challenges that single-node tests don't expose. Production clusters fail in ways that cluster tests reveal: nodes can become isolated (stuck), messages can be reordered, and consensus is expensive.
+
+---
 
 ## Trade-offs and production gotchas
 
@@ -497,3 +535,13 @@ On two BEAM nodes over loopback, 2 000 iterations each:
 - [Saša Jurić — "To spawn or not to spawn"](https://www.theerlangelist.com/article/spawn_or_not) — when to use cross-node calls vs message passing
 - [Fred Hébert — Erlang in Anger, ch. 8](https://www.erlang-in-anger.com/) — busy dist ports, RPC pitfalls
 - [Dashbit blog — "Introducing `:erpc` in Elixir"](https://dashbit.co/blog) — practical Elixir usage
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

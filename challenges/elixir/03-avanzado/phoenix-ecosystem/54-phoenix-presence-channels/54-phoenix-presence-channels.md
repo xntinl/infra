@@ -2,14 +2,11 @@
 
 **Project**: `presence_channels` — "who's online in this chat room" across a multi-node Phoenix cluster.
 
-**Difficulty**: ★★★★☆
-**Estimated time**: 4–6 hours
-
 ---
 
 ## Project context
 
-Continuing the chat backend from exercise 53, product wants a live "who's here"
+You are building a chat backend where product wants a live "who's here"
 indicator in each room: agent avatars on the left, customer avatars on the right,
 with typing indicators. The tricky part is that the app runs on three Phoenix
 nodes behind a load balancer. User A's WebSocket may land on node 1; user B's
@@ -61,6 +58,12 @@ presence_channels/
 
 ---
 
+## Why Presence and not roster-by-hand
+
+A per-node roster is straightforward; a distributed roster with netsplit recovery is a distributed systems project. Phoenix.Presence packages the hard parts.
+
+---
+
 ## Core concepts
 
 ### 1. Why CRDTs for presence
@@ -105,6 +108,16 @@ In a 1000-user room, one person joining transmits ~100 bytes, not 100KB.
 
 ### 3. Keys and metas
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
+
 ```elixir
 Presence.track(socket, _key = "user-1", _meta = %{online_at: 1234, typing?: false})
 ```
@@ -140,9 +153,25 @@ Redis-based solutions.
 
 ---
 
+## Design decisions
+
+**Option A — custom roster GenServer + broadcasts**
+- Pros: full control; simple per-node model.
+- Cons: cross-node replication and netsplit recovery are your problem.
+
+**Option B — Phoenix.Presence** (chosen)
+- Pros: distributed, CRDT-backed; drops into any channel with a `handle_info({:after_join, ...}, ...)`.
+- Cons: eventual consistency; metadata needs care to stay small.
+
+→ Chose **B** because distributed presence is a solved problem; custom versions keep rediscovering the same bugs.
+
+---
+
 ## Implementation
 
 ### Step 1: Create the project and the Presence module
+
+**Objective**: Use `Phoenix.Presence` with a `fetch/2` callback so metas are enriched server-side — clients never forge display names.
 
 ```bash
 mix phx.new presence_channels --no-ecto --no-mailer --no-html
@@ -177,6 +206,8 @@ end
 
 ### Step 2: Supervise Presence
 
+**Objective**: Order children so `PubSub` starts before `Presence` before `Endpoint` — later children depend on earlier ones.
+
 ```elixir
 # lib/presence_channels/application.ex — children list
 children = [
@@ -191,6 +222,8 @@ The order matters: `PubSub` must start before `Presence`, `Presence` before
 the `Endpoint` (channels reference it).
 
 ### Step 3: UserSocket
+
+**Objective**: Authenticate sockets via `Phoenix.Token` so presence keys come from verified identities, never client-supplied strings.
 
 ```elixir
 defmodule PresenceChannelsWeb.UserSocket do
@@ -213,10 +246,12 @@ defmodule PresenceChannelsWeb.UserSocket do
 end
 ```
 
-(The `PresenceChannels.Auth` module is a copy of exercise 53's, using
-`Phoenix.Token.sign/verify` — included in the starter repo.)
+(The `PresenceChannels.Auth` module mirrors the earlier chat channel's auth,
+using `Phoenix.Token.sign/verify` — included in the starter repo.)
 
 ### Step 4: RoomChannel
+
+**Objective**: Call `Presence.track/3` from `:after_join` so tracking runs after subscription is established, avoiding a race.
 
 ```elixir
 defmodule PresenceChannelsWeb.RoomChannel do
@@ -267,6 +302,8 @@ Two important details:
   automatically.
 
 ### Step 5: Tests — `test/presence_channels_web/channels/room_channel_test.exs`
+
+**Objective**: Assert `presence_state` and `presence_diff` pushes with `async: false` so shared tracker CRDT state is deterministic across scenarios.
 
 ```elixir
 defmodule PresenceChannelsWeb.RoomChannelTest do
@@ -352,6 +389,8 @@ end
 
 ### Step 6: Multi-node smoke test (optional but recommended)
 
+**Objective**: Connect two `--sname` nodes with a shared cookie so the Presence CRDT merges across the cluster and diffs cross the BEAM boundary.
+
 Start two nodes in separate terminals:
 
 ```bash
@@ -366,6 +405,27 @@ Node.connect(:"node_b@hostname")
 # Now open two browser tabs, one per node, join the same room.
 # Users from both nodes appear in each other's presence list.
 ```
+
+### Why this works
+
+On channel join, the channel tracks the user via `Phoenix.Presence.track/3`. The Presence module rides on Phoenix.Tracker, which gossips state as a CRDT. `list/1` returns the current roster, with metas merged across connections.
+
+---
+
+## Advanced Considerations: LiveView Real-Time Patterns and Pubsub Scale
+
+LiveView bridges the browser and BEAM via WebSocket, allowing server-side renders to push incremental DOM diffs to the client. A LiveView process is long-lived, receiving events (clicks, form submissions) and broadcasting updates. For real-time features (collaborative editing, live notifications), LiveView processes subscribe to PubSub topics and receive broadcast messages.
+
+Phoenix.PubSub partitions topics across a pool of processes, allowing horizontal scaling. By default, `:local` mode uses in-memory ETS; `:redis` mode distributes across nodes via Redis. At scale (thousands of concurrent LiveViews), topic fanout can bottleneck: broadcasting to a million subscribers means delivering one million messages. The BEAM handles this, but the network cost matters on multi-node deployments.
+
+`Presence` module tracks which users are viewing which pages, syncing state via PubSub. A presence join/leave is broadcast to all nodes, allowing real-time "who's online" updates. Under partition, presence state can diverge; the library uses unique presence keys to detect and reconcile. Operationally, watching presence on every page load can amplify server load if users are flaky (mobile networks, browser reloads). Consider presence only for features where it's user-facing (collaborative editors, live sports scoreboards).
+
+---
+
+
+## Deep Dive: Phoenix Patterns and Production Implications
+
+Phoenix's conn struct represents an HTTP request/response in flight, accumulating transformations through middleware and handler code. Testing a Phoenix endpoint end-to-end (not just the controller) catches middleware order bugs, header mismatches, and plug composition issues. The trade-off is that full integration tests are slower and harder to parallelize than unit tests. Production bugs in auth, CORS, or session handling are often due to middleware assumptions that live tests reveal.
 
 ---
 
@@ -433,6 +493,25 @@ broadcasts. Measure with `:telemetry`:
 
 If diffs become CPU-heavy, look at (a) meta size, (b) topic fan-out (10k
 subscribers per topic is a lot — consider sharding rooms).
+
+---
+
+## Benchmark
+
+```elixir
+# :timer.tc / Benchee measurement sketch
+{time_us, _} = :timer.tc(fn -> :ok end)
+IO.puts("elapsed: #{time_us} us")
+```
+
+Target: join-to-roster-visible latency under 100 ms cluster-wide; roster size bounded by meta payload.
+
+---
+
+## Reflection
+
+- Your presence list shows a user as online for 30 seconds after they disconnect. Which timer is at fault, and is that the right default for your app?
+- If the channel process crashes, what does Presence do, and does the user experience a flicker in the roster? How do you test that?
 
 ---
 

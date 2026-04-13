@@ -96,6 +96,16 @@ For very large outputs (> 10MB) this becomes memory pressure — then Option B w
 
 ### Dependencies (`mix.exs`)
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
+
 ```elixir
 defmodule ImagePipeline.MixProject do
   use Mix.Project
@@ -123,6 +133,8 @@ end
 
 ### Step 1: Cargo manifest
 
+**Objective**: Declare image processing deps so Rust NIF can decode, resize, and hash JPEGs efficiently.
+
 ```toml
 # native/imgnif/Cargo.toml
 [package]
@@ -140,6 +152,8 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 ```
 
 ### Step 2: Rust NIF (`native/imgnif/src/lib.rs`)
+
+**Objective**: Schedule JPEG decode/resize/hash on DirtyCpu so image work never blocks regular BEAM schedulers.
 
 ```rust
 use image::{imageops::FilterType, ImageFormat};
@@ -191,6 +205,8 @@ rustler::init!("Elixir.ImagePipeline.Imgnif", [resize_jpeg, phash]);
 ```
 
 ### Step 3: Elixir wrapper with bounded concurrency
+
+**Objective**: Cap concurrent NIF calls at dirty scheduler count so queue depth becomes measurable instead of hidden.
 
 ```elixir
 defmodule ImagePipeline.Imgnif do
@@ -256,6 +272,8 @@ end
 ```
 
 ### Step 4: Supervision (`lib/image_pipeline/application.ex`)
+
+**Objective**: Boot the concurrency gate so dirty NIF calls remain visible to monitoring and backpressure mechanisms.
 
 ```elixir
 defmodule ImagePipeline.Application do
@@ -391,6 +409,23 @@ Benchee.run(
 **Expected on a 16-core box**: `phash` < 20ms p99, `resize` < 40ms p99 with parallel: 16.
 If you remove the gate (parallel: 100), dirty_cpu oversubscription pushes p99 past 500ms
 even though total throughput barely changes — that is back-pressure invisibility biting you.
+
+## Advanced Considerations: NIF Isolation and Scheduler Integration
+
+NIF calls run atomically on a scheduler thread, blocking all other processes on that scheduler until the function returns. For operations exceeding ~1 millisecond, this starvation becomes visible: heartbeat processes delay, ETS owner replies hang, supervision timeouts fire. The BEAM's dirty scheduler pool (8 CPU + 10 IO by default) isolates long NIFs from the main scheduler ring, but they're still a finite resource.
+
+Understanding scheduler capacity is critical. Each dirty CPU scheduler can run ~1,000 100-microsecond operations per second, or ~5 100-millisecond operations. Beyond that, callers queue. A GenServer pool capping concurrency and applying backpressure prevents cascade failures: if the dirty pool saturates, reject new work immediately instead of queuing unboundedly.
+
+Resource management inside NIFs differs from pure Elixir. A `Binary<'a>` is a borrow tied to the NIF call; it cannot escape to threads or be stored in resources. An `OwnedBinary` allocation isn't visible to BEAM's garbage collector, so memory limits must be enforced in the Elixir layer. Hybrid architectures (Port processes for I/O, NIFs for CPU work) offer better observability and failure isolation than trying to do everything in a single NIF crate.
+
+---
+
+
+## Deep Dive: Interop Patterns and Production Implications
+
+Interop with native code (NIFs, ports, C extensions) introduces failure modes that pure Elixir code doesn't have: segfaults, memory leaks, deadlocks with the Erlang emulator. Testing interop requires separate test suites for the native layer and integration tests that exercise the boundary.
+
+---
 
 ## Trade-offs and production gotchas
 

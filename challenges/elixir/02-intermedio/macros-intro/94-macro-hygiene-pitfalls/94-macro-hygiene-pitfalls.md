@@ -2,9 +2,6 @@
 
 **Project**: `hygiene_pitfalls` — reproduce and understand the classic macro hygiene pitfalls: accidental variable capture, how Elixir prevents it by default, when `var!/2` is the correct escape hatch, and how to use `Macro.expand/2` to audit what your macros actually generate.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -39,6 +36,16 @@ hygiene_pitfalls/
 │   └── hygiene_pitfalls_test.exs
 └── mix.exs
 ```
+
+---
+
+## Why hygiene by default and not opt-in
+
+Macros no-hygienic ponen la carga en cada caller: "acordate qué
+variables usa este macro". Hygiene invierte el default: macros
+seguros por defecto, `var!/2` como opt-out explícito para DSLs que
+necesitan compartir una variable nombrada (Ecto `from/2`). Hacer que
+el caso peligroso sea el ruidoso es todo el diseño.
 
 ---
 
@@ -109,9 +116,40 @@ node tells you which scope it belongs to.
 
 ---
 
+## Design decisions
+
+**Option A — Pasar estado compartido como argumento al macro**
+- Pros: Explícito; sin break de hygiene.
+- Cons: Boilerplate; no encaja con DSLs de contexto implícito.
+
+**Option B — Usar `var!/2` para introducir una variable nombrada** (elegida solo para casos DSL)
+- Pros: Habilita DSLs de binding implícito.
+- Cons: Contrato-por-nombre permanente; colisiones silenciosas.
+
+→ Elegida **A** como regla default: romper hygiene solo cuando la
+semántica del DSL **es** introducir un binding nombrado.
+
+---
+
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"ecto", "~> 1.0"},
+    {:"plug", "~> 1.0"},
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
 
 ```bash
 mix new hygiene_pitfalls
@@ -119,6 +157,9 @@ cd hygiene_pitfalls
 ```
 
 ### Step 2: `lib/hygiene_pitfalls.ex`
+
+**Objective**: Implement `hygiene_pitfalls.ex` — AST manipulation that runs at compile time — making the macro's hygiene and unquoting choices observable.
+
 
 ```elixir
 defmodule HygienePitfalls do
@@ -190,6 +231,9 @@ end
 
 ### Step 3: `test/hygiene_pitfalls_test.exs`
 
+**Objective**: Write `hygiene_pitfalls_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+
 ```elixir
 defmodule HygienePitfallsTest do
   use ExUnit.Case, async: true
@@ -260,6 +304,9 @@ end
 
 ### Step 4: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -271,6 +318,31 @@ iex> require HygienePitfalls
 iex> ast = quote do: HygienePitfalls.tag(do: 1)
 iex> Macro.expand(ast, __ENV__) |> Macro.to_string() |> IO.puts
 ```
+
+### Why this works
+
+Las variables dentro de `quote` llevan un campo `:context` en su
+metadata AST (el módulo del macro), que el compilador usa para
+distinguir "mi `result`" de "tu `result`". `var!(x)` setea ese
+contexto a `nil`, diciéndole al compilador "resolvé esto en el
+scope del caller". `Macro.expand/2` devuelve el AST para inspeccionar
+los `:context` directamente.
+
+---
+
+
+## Deep Dive: State Management and Message Handling Patterns
+
+Understanding state transitions is central to reliable OTP systems. Every `handle_call` or `handle_cast` receives current state and returns new state—immutability forces explicit reasoning. This prevents entire classes of bugs: missing state updates are immediately visible.
+
+Key insight: separate pure logic (state → new state) from side effects (logging, external calls). Move pure logic to private helpers; use handlers for orchestration. This makes servers testable—test pure functions independently.
+
+In production, monitor state size and mutation frequency. Unbounded growth is a memory leak; excessive mutations signal hot spots needing optimization. Always profile before reaching for performance solutions like ETS.
+
+## Benchmark
+
+<!-- benchmark N/A: hygiene es expand-time; no agrega costo en
+runtime. Las variables hygienic compilan a los mismos opcodes BEAM. -->
 
 ---
 
@@ -313,6 +385,18 @@ Almost always. Breaking hygiene turns local reasoning into global
 reasoning: the caller now needs to know about your macro's variable
 names forever. Ecto and a handful of library-level DSLs earn it. Most
 application code does not. Treat `var!` as a "license required" tool.
+
+---
+
+## Reflection
+
+- Heredás un macro con `var!(conn)` asumiendo que el caller tiene
+  `conn` de Plug. Un compañero lo llama desde LiveView donde `conn`
+  no existe. El compilador emite warning pero compila. ¿Qué agregás
+  al macro para convertir eso en error explícito en expand-time?
+- Diseñás un DSL que necesita "introducir una variable con el nombre
+  de una tabla SQL" (Ecto con `u in User`). ¿`var!/2` o un approach
+  distinto (fn bindings -> ...)? Justificá en términos de legibilidad.
 
 ---
 

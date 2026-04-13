@@ -3,9 +3,6 @@
 **Project**: `count_agent` — an in-memory visit counter and a simple
 per-key rate limiter, both built on `Agent`.
 
-**Difficulty**: ★★☆☆☆
-**Time**: 2-3 hours
-
 ---
 
 ## Project structure
@@ -71,9 +68,56 @@ Both are read-heavy, small state, no persistence — textbook Agent territory.
 
 ---
 
+## Why `Agent` and not `GenServer` or ETS
+
+- A full `GenServer` is strictly more powerful, but requires callbacks and boilerplate for what is really just `get / update / get_and_update` over a map.
+- ETS gives truly parallel reads but has no built-in atomic read-modify-write without careful `:ets.update_counter/3` or match-specs — wrong shape for a per-key fixed-window decision.
+- A plain module-level process dict or a global variable doesn't exist in Elixir for a reason: it would hide who owns the state.
+
+`Agent` is the minimum viable process-based state container — exactly when "hold a value, mutate it under a function" is the whole requirement.
+
+---
+
+## Design decisions
+
+**Option A — separate `get` + `update` call for rate-limit decision**
+- Pros: two simple functions; easier to unit-test each piece.
+- Cons: another caller can slip between the two messages and both reach "count = limit - 1" → the limit is violated. Classic check-then-act race.
+
+**Option B — single `get_and_update/3` atomically deciding and mutating** (chosen)
+- Pros: decision + state transition happen inside one agent message, so every caller sees a consistent view; no race possible under any concurrency.
+- Cons: slightly more complex `decide/4` helper; the agent's mailbox is the serialisation point (one process = one bottleneck).
+
+→ Chose **B** because the rate-limit contract is "at most N per window" — correctness under concurrency is non-negotiable.
+
+---
+
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"phoenix", "~> 1.0"},
+  ]
+end
+```
+
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  # Agent ships with Elixir. No external deps.
+  []
+end
+```
+
 ### Step 1: Create the project
+
+**Objective**: Establish a standard Mix layout so both services live as siblings under one OTP app, making later supervision and shared tests trivial.
 
 ```bash
 mix new count_agent
@@ -81,6 +125,8 @@ cd count_agent
 ```
 
 ### Step 2: `mix.exs`
+
+**Objective**: Pin the Elixir version and declare zero external deps, proving Agent is a stdlib primitive that needs no third-party library to build a real service.
 
 ```elixir
 defmodule CountAgent.MixProject do
@@ -104,6 +150,8 @@ end
 
 ### Step 3: `.formatter.exs`
 
+**Objective**: Lock formatting rules up front so style drift never becomes a reviewable concern and diffs stay focused on semantics.
+
 ```elixir
 [
   inputs: ["{mix,.formatter}.exs", "{config,lib,test}/**/*.{ex,exs}"],
@@ -112,6 +160,8 @@ end
 ```
 
 ### Step 4: `lib/count_agent/visits.ex`
+
+**Objective**: Prove Agent's serialisation guarantee by letting concurrent callers hit the same counter without locks, losses, or torn updates.
 
 ```elixir
 defmodule CountAgent.Visits do
@@ -181,6 +231,8 @@ end
 ```
 
 ### Step 5: `lib/count_agent/rate_limit.ex`
+
+**Objective**: Collapse the check-then-act race into a single `get_and_update/3` message so "at most N per window" holds even under contended, concurrent access.
 
 ```elixir
 defmodule CountAgent.RateLimit do
@@ -254,6 +306,8 @@ end
 ```
 
 ### Step 6: Tests
+
+**Objective**: Exercise the services under 200-way concurrent load to demonstrate that no increments are lost and no request ever slips past the configured limit.
 
 ```elixir
 # test/count_agent/visits_test.exs
@@ -366,12 +420,52 @@ end
 
 ### Step 7: Run
 
+**Objective**: Treat warnings as errors on compile so subtle Agent misuse (unused state, dead clauses) fails the build before it reaches review.
+
 ```bash
 mix deps.get
 mix compile --warnings-as-errors
 mix test
 mix format
 ```
+
+### Why this works
+
+The Agent's process is a single mailbox — every `Agent.get/2`, `update/2`, and `get_and_update/2` is one message to that mailbox, handled to completion before the next. That serialisation IS the concurrency control: no mutex, no retry, just FIFO. `get_and_update/3` collapses read-modify-write into a single message, which is the only primitive strong enough to implement a correct fixed-window rate limiter. `Map.update/4` with a default avoids a separate "initialise" branch for first-time keys.
+
+---
+
+
+## Key Concepts
+
+### 1. Agents Wrap Stateful Functions in Processes
+An Agent maintains state across calls. It's a lightweight wrapper for process-based state management, simpler than `GenServer` for read/update operations.
+
+### 2. Agent Operations Are Synchronous
+When you call `Agent.update`, the call blocks until the Agent completes. Agents are suitable for configuration state or shared caches.
+
+### 3. Agents Die with the Process
+If you don't supervise the Agent, it's not restarted on crash. Always start Agents under a supervisor in production.
+
+---
+## Benchmark
+
+```elixir
+# bench/agent.exs
+{:ok, a} = CountAgent.Visits.start_link()
+
+{t_hit, _} = :timer.tc(fn ->
+  Enum.each(1..100_000, fn _ -> CountAgent.Visits.hit(a, "/home") end)
+end)
+
+{t_get, _} = :timer.tc(fn ->
+  Enum.each(1..100_000, fn _ -> CountAgent.Visits.get(a, "/home") end)
+end)
+
+IO.puts("hit: #{t_hit / 100_000} µs/call   get: #{t_get / 100_000} µs/call")
+```
+
+Target: < 5 µs per call on modern hardware (message send + map op + reply). Under concurrent load, the agent saturates around 100–200k messages/s — past that, shard by key or move to ETS.
 
 ---
 
@@ -435,11 +529,18 @@ an awkward dependency to thread through code.
 ## When NOT to use Agent
 
 - State is durable or shared across nodes — use a database.
-- You need high-throughput concurrent reads — use ETS (see 03-avanzado).
+- You need high-throughput concurrent reads — use ETS.
 - You need behaviour (timers, child processes, custom messages) —
-  use `GenServer` (02-intermedio).
-- You need pub/sub — use `Registry` (next exercise) or Phoenix.PubSub.
+  use `GenServer`.
+- You need pub/sub — use `Registry` or Phoenix.PubSub.
 - State is per-request — don't use a process at all; use a plain map.
+
+---
+
+## Reflection
+
+- At 100k rate-limit checks per second the single Agent saturates. You shard into 32 agents keyed by `:erlang.phash2(key, 32)`. What becomes harder (snapshots? global reset?) and what becomes trivial (throughput)? Walk the trade.
+- Your product wants rate limits that survive process restart. Which part of the `check/2` implementation needs to change, and which stays untouched if you swap the in-memory state for ETS or Redis?
 
 ---
 

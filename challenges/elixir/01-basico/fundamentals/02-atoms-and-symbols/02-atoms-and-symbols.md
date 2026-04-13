@@ -66,6 +66,17 @@ order_fsm/
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### `lib/order_fsm/state.ex`
 
 ```elixir
@@ -442,6 +453,24 @@ mix test --trace
 
 The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
 
+
+## Key Concepts
+
+### 1. Atom Table as a Global Resource
+
+The BEAM maintains a single atom table per VM. Atoms are constants, and every atom ever created persists until the VM shuts down—unlike strings, which are garbage-collected. For system code, this is fine; you control atom creation at compile time. For untrusted input (webhooks, API payloads), creating atoms is a denial-of-service vector.
+
+A malicious actor sending unique payloads can exhaust the atom table and crash the VM. The fix: never use `String.to_atom/1` on external input. Always use `String.to_existing_atom/1` (raises if the atom doesn't exist), or skip atoms for untrusted data.
+
+### 2. Atoms Enable Pattern-Matchable Errors
+
+The `{:ok, value}` and `{:error, reason}` pattern is the foundation of Elixir's error handling. It's idiomatic because pattern matching on atoms is compile-time-checked and O(1). Compare to nullable return types where `null` is silent. Atoms force errors to be explicit and pattern-matchable in your code.
+
+### 3. Module Names Are Atoms
+
+`is_atom(Enum)` returns `true`. Every module name is an atom prefixed internally with `Elixir.`. This means module references consume atom table entries too. In a distributed Erlang cluster, atoms must match exactly.
+
+---
 ## The atom table security problem
 
 The BEAM atom table has a default limit of 1,048,576 atoms. Atoms are never garbage

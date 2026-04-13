@@ -99,7 +99,33 @@ defmodule ClusterConfig.MixProject do
 end
 ```
 
+### Dependencies (mix.exs)
+
+```elixir
+```elixir
+defmodule ClusterConfig.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :cluster_config, version: "0.1.0", elixir: "~> 1.16", deps: deps()]
+  end
+
+  def application do
+    [
+      extra_applications: [:logger, :mnesia],
+      mod: {ClusterConfig.Application, []}
+    ]
+  end
+
+  defp deps do
+    [{:benchee, "~> 1.3", only: :dev}]
+  end
+end
+```
+
 ### Step 1: Schema setup (safe to run on every node at boot)
+
+**Objective**: Idempotently create a mixed `disc_copies`/`ram_copies` replica set and join peers via `change_config(:extra_db_nodes)`.
 
 ```elixir
 # lib/cluster_config/schema.ex
@@ -170,6 +196,8 @@ end
 
 ### Step 2: Public API
 
+**Objective**: Expose dirty local reads for hot paths and transactional writes so cross-node commits stay atomic under 2PC.
+
 ```elixir
 # lib/cluster_config/config.ex
 defmodule ClusterConfig.Config do
@@ -236,6 +264,8 @@ end
 ```
 
 ### Step 3: Application
+
+**Objective**: Run `Schema.setup/1` at boot so replicas join the cluster before any caller issues a transaction.
 
 ```elixir
 # lib/cluster_config/application.ex
@@ -371,6 +401,24 @@ Benchee.run(
 ```
 
 Target on a single node: dirty read < 2 µs, strict read < 40 µs, put < 150 µs. On a 3-node LAN cluster the `put` latency grows to ~500 µs due to 2PC round-trips; reads remain local and do not change.
+
+## Deep Dive
+
+ETS (Erlang Term Storage) is RAM-only and process-linked; table destruction triggers if the owner crashes, causing silent data loss in careless designs. Match specifications (match_specs) are micro-programs that filter/transform data at the C layer, orders of magnitude faster than fetching all records and filtering in Elixir. Mnesia adds disk persistence and replication but introduces transaction overhead and deadlock potential; dirty operations bypass locks for speed but sacrifice consistency guarantees. For caching, named tables (public by design) are globally visible but require careful name management; consider ETS sharding (multiple small tables) to reduce lock contention on hot keys. DETS (Disk ETS) persists to disk but is single-process bottleneck and slower than a real database. At scale, prefer ETS for in-process state and Mnesia/PostgreSQL for shared, persistent data.
+## Advanced Considerations
+
+ETS and DETS performance characteristics change dramatically based on access patterns and table types. Ordered sets provide range queries but slower access than hash tables; set types don't support duplicate keys while bags do. The `heir` option for ETS tables is essential for fault tolerance — when a table owner crashes, the heir process can take ownership and prevent data loss. Without it, the table is lost immediately. Mnesia replicates entire tables across nodes; choosing which nodes should have replicas and whether they're RAM or disk replicas affects both consistency guarantees and network traffic during cluster operations.
+
+DETS persistence comes with significant performance implications — writes are synchronous to disk by default, creating latency spikes. Using `sync: false` improves throughput but risks data loss on crashes. The maximum DETS table size is limited by available memory and the file system; planning capacity requires understanding your growth patterns. Mnesia's transaction system provides ACID guarantees, but dirty operations bypass these guarantees for performance. Understanding when to use dirty reads versus transactional reads significantly impacts both correctness and latency.
+
+Debugging ETS and DETS issues is challenging because problems often emerge under load when many processes contend for the same table. Table memory fragmentation is invisible to code but can exhaust memory. Using match specs instead of iteration over large tables can dramatically improve performance but requires careful construction. The interaction between ETS, replication, and distributed systems creates subtle consistency issues — a node with a stale ETS replica can serve incorrect data during network partitions. Always monitor table sizes and replication status with structured logging.
+
+
+## Deep Dive: Distributed Patterns and Production Implications
+
+Distributed testing with Peer spawns multiple Erlang nodes in separate BEAM instances, allowing you to test actual node failure, network partitions, and message delays. This is essential for OTP applications but adds latency and complexity. The key insight is that distributed tests reveal assumptions about network reliability that single-node tests cannot—timeouts, partial failures, and split-brain scenarios are invisible to local tests.
+
+---
 
 ## Trade-offs and production gotchas
 

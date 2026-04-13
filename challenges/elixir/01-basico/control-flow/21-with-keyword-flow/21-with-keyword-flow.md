@@ -100,7 +100,20 @@ Rules that trip everyone at least once:
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Organize cart/coupon/shipping/checkout modules so with pipeline dispatches to single-responsibility functions.
 
 ```bash
 mix new checkout_flow
@@ -108,6 +121,8 @@ cd checkout_flow
 ```
 
 ### Step 2: `mix.exs`
+
+**Objective**: Use stdlib only so with pattern-matching on {:ok/:error} tuples is visible without HTTP/DB noise.
 
 ```elixir
 defmodule CheckoutFlow.MixProject do
@@ -130,6 +145,8 @@ end
 ```
 
 ### Step 3: `lib/checkout_flow/cart.ex`
+
+**Objective**: Return {:error, {:out_of_stock, sku}} so caller can highlight specific item in UI without generic failure message.
 
 ```elixir
 defmodule CheckoutFlow.Cart do
@@ -166,6 +183,8 @@ end
 ```
 
 ### Step 4: `lib/checkout_flow/coupon.ex`
+
+**Objective**: Distinguish absent, invalid, and expired coupons as separate error atoms so the frontend can highlight the right field.
 
 ```elixir
 defmodule CheckoutFlow.Coupon do
@@ -246,6 +265,8 @@ end
 
 ### Step 5: `lib/checkout_flow/shipping.ex`
 
+**Objective**: Keep money in integer cents and weight in whole grams so no floating-point drift creeps into the checkout totals.
+
 ```elixir
 defmodule CheckoutFlow.Shipping do
   @moduledoc """
@@ -281,6 +302,8 @@ end
 ```
 
 ### Step 6: `lib/checkout_flow/checkout.ex` — the `with` pipeline
+
+**Objective**: Omit `else` so each step's typed error tuple propagates unchanged — the caller sees exactly which stage rejected the request.
 
 ```elixir
 defmodule CheckoutFlow.Checkout do
@@ -364,6 +387,34 @@ end
 
 The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
 
+
+
+---
+## Key Concepts
+
+### 1. `with` Chains Multiple Pattern Matches
+
+```elixir
+with {:ok, user} <- fetch_user(id),
+     {:ok, profile} <- fetch_profile(user),
+     :ok <- validate(profile) do
+  {:ok, {user, profile}}
+else
+  error -> error
+end
+```
+
+Each line pattern-matches. If any line fails, control jumps to `else`. This reads left-to-right like a Unix pipeline and avoids nested `case` statements.
+
+### 2. `with` Threads Successful Results
+
+Each successful result is bound to the variable on the left. Subsequent lines can reference previous variables. This is powerful for stateful transformations where each step depends on the previous.
+
+### 3. `else` Handles All Failures
+
+The `else` block pattern-matches on any non-matching result from the `with` lines. You can handle specific errors differently. If no pattern matches in `else`, an exception is raised.
+
+---
 ## When you DO need `else`
 
 Add an `else` when you want to change the error shape:
@@ -380,6 +431,8 @@ end
 ```
 
 ### Step 7: Tests
+
+**Objective**: Assert empty cart short-circuits before the expired coupon check, proving `with` halts at the first failure rather than collecting them.
 
 ```elixir
 # test/checkout_flow/checkout_test.exs
@@ -475,6 +528,8 @@ end
 ```
 
 ### Step 8: Run the tests
+
+**Objective**: Run with `--trace` so the short-circuit order is visible in the output and nobody ships a silently reordered pipeline.
 
 ```bash
 mix test --trace

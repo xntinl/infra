@@ -108,9 +108,29 @@ retry. Or, wrap it in a `find_or_start` helper.
 
 ---
 
+### Dependencies (`mix.exs`)
+
+```elixir
+def deps do
+  [
+    {already_started},
+    {badarg},
+    {error},
+    {ets_via},
+    {exunit},
+    {genserver},
+    {ok},
+    {reply},
+    {via},
+  ]
+end
+```
 ## Implementation
 
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
 
 ```bash
 mix new via_tuple_patterns --sup
@@ -118,6 +138,9 @@ cd via_tuple_patterns
 ```
 
 ### Step 2: `lib/via_tuple_patterns/application.ex`
+
+**Objective**: Wire `application.ex` to start the supervision tree that starts the Registry before any via-tuple lookup can happen.
+
 
 ```elixir
 defmodule ViaTuplePatterns.Application do
@@ -137,6 +160,9 @@ end
 ```
 
 ### Step 3: `lib/via_tuple_patterns/worker.ex`
+
+**Objective**: Implement `worker.ex` — the naming/lookup strategy that decides how processes are addressed under concurrency and failure.
+
 
 ```elixir
 defmodule ViaTuplePatterns.Worker do
@@ -164,6 +190,9 @@ end
 ```
 
 ### Step 4: `lib/via_tuple_patterns.ex` — the Registry-backed pattern
+
+**Objective**: Edit `via_tuple_patterns.ex` — the Registry-backed pattern, exposing the naming/lookup strategy that decides how processes are addressed under concurrency and failure.
+
 
 ```elixir
 defmodule ViaTuplePatterns do
@@ -205,6 +234,9 @@ end
 ```
 
 ### Step 5: `lib/via_tuple_patterns/ets_via.ex` — a handwritten via backend
+
+**Objective**: Edit `ets_via.ex` — a handwritten via backend, exposing the naming/lookup strategy that decides how processes are addressed under concurrency and failure.
+
 
 ```elixir
 defmodule ViaTuplePatterns.EtsVia do
@@ -266,6 +298,9 @@ end
 
 ### Step 6: `test/via_tuple_patterns_test.exs`
 
+**Objective**: Write `via_tuple_patterns_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+
 ```elixir
 defmodule ViaTuplePatternsTest do
   use ExUnit.Case, async: false
@@ -318,6 +353,9 @@ end
 ```
 
 ### Step 7: Run
+
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
 
 ```bash
 mix test
@@ -399,3 +437,15 @@ for via when the set of names is dynamic.
 - [`Registry` — `{:via, Registry, ...}` usage](https://hexdocs.pm/elixir/Registry.html#module-using-in-via)
 - [Erlang `:global` module — the oldest via backend](https://www.erlang.org/doc/man/global.html)
 - [Horde.Registry — drop-in distributed Registry](https://hexdocs.pm/horde/Horde.Registry.html)
+
+
+## Key Concepts
+
+Registry patterns in Elixir provide distributed name resolution through a central registry process. Unlike traditional naming services, Elixir registries are per-node by default but can be partitioned globally. Process name resolution follows a lookup chain: local registry → distributed registry (if configured) → `:global` → fallback mechanisms.
+
+**Critical concepts:**
+- **Via tuple pattern** `{:via, module, name}`: Enables pluggable naming backends. The registry module intercepts `:whereis`, `:register`, `:unregister` calls, allowing both local and distributed strategies.
+- **Partitioned registries** (`Registry.start_link(partitions: 8)`): Reduce contention by sharding the registry across multiple ETS tables. Each partition handles independent name lookups, improving throughput under high concurrency.
+- **Clustering implications**: Global registries across nodes require consensus. Elixir's registry design favors availability (CAP theorem) — a node can register locally and replicate asynchronously. This is why `:global` exists separately from local registries.
+
+**Senior-level gotcha**: Mixing local and global registration without explicit sync logic can cause "phantom" processes — a process registered locally appears available to local callers but fails remote calls. Always make registry scope explicit in your architecture.

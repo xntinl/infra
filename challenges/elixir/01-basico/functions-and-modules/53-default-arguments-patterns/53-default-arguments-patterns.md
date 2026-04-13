@@ -2,9 +2,6 @@
 
 **Project**: `api_client_defaults` — a small HTTP-ish client with configurable endpoint and timeout
 
-**Difficulty**: ★☆☆☆☆
-**Estimated time**: 1–2 hours
-
 ---
 
 ## Project structure
@@ -57,9 +54,53 @@ while still allowing full control (`Client.request("/ping", base_url: "...", tim
 
 ---
 
+## Why `\\` defaults and not overloaded arities by hand
+
+- Writing `def request(path), do: request(path, [])` and `def request(path, opts), do: ...` works, but duplicates the call site and drifts: add a third arg and you maintain N! clauses.
+- `\\` expands to the same overloads **mechanically** — the compiler guarantees they stay in sync.
+- An options struct (`%Request{}`) is cleaner once the option set grows, but for 1–2 knobs it's over-engineering.
+
+---
+
+## Design decisions
+
+**Option A — positional defaults for every knob** (`def request(path, base \\ ..., timeout \\ ...)`)
+- Pros: call site is short for the one-knob case (`request(path, "https://x")`).
+- Cons: two-knob override forces callers to remember positional order; adding a knob breaks every call site.
+
+**Option B — single keyword list with `Keyword.get/3` defaults** (chosen)
+- Pros: every override is named at the call site; adding a knob is backward-compatible; the public signature stays `request(path, opts \\ [])`.
+- Cons: one extra dereference per option; typos in keys fail silently unless validated.
+
+→ Chose **B** because API clients grow new knobs over time. Keyword-list-with-defaults scales; positional defaults do not.
+
+---
+
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  # No runtime deps — stdlib only.
+  []
+end
+```
+
 ### Step 1 — Create the project
+
+**Objective**: Create a single-module project so the focus stays on how `\\` default arguments expand into multiple function heads at compile time.
 
 ```bash
 mix new api_client_defaults
@@ -67,6 +108,8 @@ cd api_client_defaults
 ```
 
 ### Step 2 — `lib/api_client_defaults/client.ex`
+
+**Objective**: Use `\\` with a head clause so defaults live at the public API and pattern-matched clauses stay free of the boilerplate.
 
 ```elixir
 defmodule ApiClientDefaults.Client do
@@ -105,6 +148,8 @@ end
 ```
 
 ### Step 3 — `test/api_client_defaults_test.exs`
+
+**Objective**: Call the function with every arity combination to prove each expanded head is reachable and defaults behave exactly as at the call site.
 
 ```elixir
 defmodule ApiClientDefaultsTest do
@@ -146,11 +191,51 @@ end
 
 ### Step 4 — Run the tests
 
+**Objective**: Run the suite to confirm the compiler did not generate a second default-args head clause — a silent ambiguity that bites in reviews.
+
 ```bash
 mix test
 ```
 
 All 5 tests pass.
+
+### Why this works
+
+The compiler expands `opts \\ []` into a zero-arg wrapper (`request(path)` → `request(path, [])`), so callers get a one-arg call site without any hand-written overload. `Keyword.get/3` supplies the per-knob default only when the caller omits that key — the two defaulting mechanisms layer cleanly because `opts` defaults to an empty list, and every `Keyword.get` then falls back to its own default. The guard `when is_binary(path)` is attached once and applies to both generated clauses.
+
+---
+
+
+## Key Concepts
+
+### 1. Default Arguments Create Multiple Arities
+The shorthand `\\` creates two functions: one with and one without the default. Defaults are evaluated in the calling scope.
+
+### 2. Defaults Are Evaluated in the Calling Scope
+This is usually what you want, but be careful with mutable defaults (they're not re-evaluated on each call).
+
+### 3. Combine with Guards
+You can combine defaults with guards: `def process(x \\ 10) when is_integer(x)`. The guard applies to both arities.
+
+---
+## Benchmark
+
+```elixir
+# bench/defaults.exs
+{t_default, _} = :timer.tc(fn ->
+  Enum.each(1..1_000_000, fn _ -> ApiClientDefaults.Client.request("/ping") end)
+end)
+
+{t_override, _} = :timer.tc(fn ->
+  Enum.each(1..1_000_000, fn _ ->
+    ApiClientDefaults.Client.request("/ping", base_url: "https://x.test", timeout_ms: 250)
+  end)
+end)
+
+IO.puts("default: #{t_default} µs   override: #{t_override} µs")
+```
+
+Target: < 1 µs per call for both paths on modern hardware. `Keyword.get/3` on a short list is O(n) but n ≤ 2 here — the cost is negligible.
 
 ---
 
@@ -216,6 +301,13 @@ atoms. Keyword lists self-document: `send(msg, mode: :async)`.
 Lists and maps used as defaults are fine (Elixir is immutable), but people coming from
 Python sometimes worry about "shared default" bugs. There is no shared mutation to worry
 about — but do precompute large defaults at compile time using module attributes.
+
+---
+
+## Reflection
+
+- Your client now needs a `:retries` option that defaults to 3 but must be **validated** (integer, 0..10). Where does that validation live — inside `request/2`, in a separate `validate_opts/1`, or as a NimbleOptions schema? What does each choice cost?
+- Suppose callers start misspelling `timeout_ms` as `timeout`. Your code silently uses the default. How would you make that a loud failure without breaking existing correct call sites?
 
 ---
 

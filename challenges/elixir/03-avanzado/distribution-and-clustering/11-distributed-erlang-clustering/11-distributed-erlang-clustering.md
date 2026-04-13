@@ -136,12 +136,16 @@ Rule of thumb: disterl messages should be small (< a few KB) and infrequent (< a
 
 ### Step 1: Create the project
 
+**Objective**: Bootstrap supervised app so :net_kernel starts before any distributed process tries to reach remote nodes."""
+
 ```bash
 mix new node_cluster_demo --sup
 cd node_cluster_demo
 ```
 
 ### Step 2: `mix.exs`
+
+**Objective**: Keep deps empty so disterl semantics (serialization, backpressure, ETF encoding) are observable without abstractions."""
 
 ```elixir
 defmodule NodeClusterDemo.MixProject do
@@ -170,6 +174,8 @@ end
 
 ### Step 3: `lib/node_cluster_demo/application.ex`
 
+**Objective**: Use :one_for_one strategy so GenServer crashes don't restart :net_kernel during cluster convergence."""
+
 ```elixir
 defmodule NodeClusterDemo.Application do
   @moduledoc false
@@ -188,6 +194,8 @@ end
 ```
 
 ### Step 4: `lib/node_cluster_demo/cluster_monitor.ex`
+
+**Objective**: Wrap :net_kernel.monitor_nodes events with Process.monitor cleanup so slow subscribers don't leak."""
 
 ```elixir
 defmodule NodeClusterDemo.ClusterMonitor do
@@ -269,6 +277,8 @@ end
 
 ### Step 5: `lib/node_cluster_demo/remote_echo.ex`
 
+**Objective**: Register GenServer by name so {ModuleName, remote_node} tuples route transparently via disterl."""
+
 ```elixir
 defmodule NodeClusterDemo.RemoteEcho do
   @moduledoc """
@@ -296,6 +306,8 @@ end
 ```
 
 ### Step 6: `lib/node_cluster_demo/cross_node_ping.ex`
+
+**Objective**: Measure send/2 vs GenServer.call vs :erpc round-trip to expose ETF + TCP + scheduler serialization cost."""
 
 ```elixir
 defmodule NodeClusterDemo.CrossNodePing do
@@ -355,6 +367,8 @@ end
 
 ### Step 7: Running three nodes locally
 
+**Objective**: Observe transitive full-mesh formation so N·(N-1)/2 connections emerge from explicit pair-wise Node.connect calls."""
+
 Open three terminals. In each, export the same cookie.
 
 ```bash
@@ -395,6 +409,8 @@ NodeClusterDemo.CrossNodePing.genserver_call_roundtrip(:"beta@127.0.0.1", 2_000)
 
 ### Step 8: Tests
 
+**Objective**: Send synthetic :nodeup/:nodedown and assert ClusterMonitor broadcasts without requiring multi-node IEx."""
+
 ```elixir
 # test/node_cluster_demo/cluster_monitor_test.exs
 defmodule NodeClusterDemo.ClusterMonitorTest do
@@ -407,24 +423,26 @@ defmodule NodeClusterDemo.ClusterMonitorTest do
     :ok
   end
 
-  test "known_nodes/0 returns the current list" do
-    assert is_list(ClusterMonitor.known_nodes())
-  end
+  describe "NodeClusterDemo.ClusterMonitor" do
+    test "known_nodes/0 returns the current list" do
+      assert is_list(ClusterMonitor.known_nodes())
+    end
 
-  test "subscribe/0 receives a synthetic nodeup event" do
-    :ok = ClusterMonitor.subscribe()
-    fake = :"synthetic@127.0.0.1"
-    send(Process.whereis(ClusterMonitor), {:nodeup, fake})
+    test "subscribe/0 receives a synthetic nodeup event" do
+      :ok = ClusterMonitor.subscribe()
+      fake = :"synthetic@127.0.0.1"
+      send(Process.whereis(ClusterMonitor), {:nodeup, fake})
 
-    assert_receive {:cluster_event, {:nodeup, ^fake}}, 500
-  end
+      assert_receive {:cluster_event, {:nodeup, ^fake}}, 500
+    end
 
-  test "subscribe/0 receives a synthetic nodedown event" do
-    :ok = ClusterMonitor.subscribe()
-    fake = :"synthetic@127.0.0.1"
-    send(Process.whereis(ClusterMonitor), {:nodedown, fake})
+    test "subscribe/0 receives a synthetic nodedown event" do
+      :ok = ClusterMonitor.subscribe()
+      fake = :"synthetic@127.0.0.1"
+      send(Process.whereis(ClusterMonitor), {:nodedown, fake})
 
-    assert_receive {:cluster_event, {:nodedown, ^fake}}, 500
+      assert_receive {:cluster_event, {:nodedown, ^fake}}, 500
+    end
   end
 end
 ```
@@ -441,6 +459,27 @@ elixir --name test@127.0.0.1 --cookie devcluster -S mix test
 ### Why this works
 
 The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
+
+## Key Concepts: Node Discovery and Network Formation
+
+Distributed Erlang requires all nodes in a cluster to know about each other. When you start a node with `iex --sname node1 --cookie secret`, the EPMD daemon (Erlang Port Mapper Daemon) registers that node name. When another node (`iex --sname node2 --cookie secret`) connects, it resolves the peer's hostname via EPMD, establishes a TCP connection, and exchanges a handshake that verifies the cookie matches. Only then can they send messages.
+
+The cookie is a shared secret; mismatched cookies prevent connection. In production, cookies are managed via environment variables or config files, never hardcoded. The cluster topology is often **discoverable rather than static**: libcluster libraries probe DNS for new nodes, or read a file of node names. The gotchas: DNS latency can block cluster formation; node names must be unique; and network splits (partition events) can leave clusters in inconsistent states. This is why split-brain detection and quorum mechanisms exist.
+
+## Deep Dive: Distributed Patterns and Production Implications
+
+Distributed testing with Peer spawns multiple Erlang nodes in separate BEAM instances, allowing you to test actual node failure, network partitions, and message delays. This is essential for OTP applications but adds latency and complexity. The key insight is that distributed tests reveal assumptions about network reliability that single-node tests cannot—timeouts, partial failures, and split-brain scenarios are invisible to local tests.
+
+---
+
+## Advanced Considerations
+
+Distributed Elixir systems require careful consideration of network partitions, consistent hashing for distributed state, and the interaction between clustering libraries and node discovery mechanisms. Network partitions are not rare edge cases; they happen regularly in cloud deployments due to maintenance windows and infrastructure issues. A system that works perfectly during local testing but fails under network partitions indicates insufficient failure handling throughout the codebase. Split-brain scenarios where multiple network partitions lead to different cluster views require explicit recovery mechanisms that are often business-specific and context-dependent.
+
+Horde and distributed registries provide eventual consistency guarantees, but "eventual" can mean minutes during network partitions. Applications must handle the case where the same name is registered on multiple nodes simultaneously without coordination. Consistent hashing for distributed services requires understanding rebalancing costs — a single node failure can cause significant key redistribution and thundering herd problems if not carefully managed. The cost of distributed consensus using algorithms like Raft is high; choose it only when consistency is more important than availability and can afford the performance cost.
+
+Global state replication across nodes creates synchronization challenges at scale. Choosing between replicating everywhere versus replicating to specific nodes affects both consistency latency and network bandwidth utilization fundamentally. Node monitoring and heartbeat mechanisms require careful timeout tuning — too aggressive and you get false positives during network hiccups; too conservative and you don't detect actual failures quickly enough for recovery. The EPMD (Erlang Port Mapper Daemon) is a critical component that can become a bottleneck in large clusters and requires careful capacity planning.
+
 
 ## Trade-offs and production gotchas
 
@@ -499,3 +538,13 @@ Cross-node calls add ~200µs overhead from TCP + ETF encode/decode. Across a 1Gb
 - [Saša Jurić — "Why Elixir"](https://www.theerlangelist.com/article/why_elixir) — background on BEAM distribution model
 - [Discord Engineering — Scaling Elixir to 5M concurrent users](https://discord.com/blog/how-discord-scaled-elixir-to-5-000-000-concurrent-users) — production disterl
 - [`inet_tls_dist` — Erlang/OTP](https://www.erlang.org/doc/apps/ssl/ssl_distribution.html) — securing disterl with TLS
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

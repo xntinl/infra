@@ -1,8 +1,6 @@
 # Freezing a GenServer with `:sys.suspend/1` and `:sys.resume/1`
 
 **Project**: `sys_suspend_resume` — pause a process in place for live inspection and staged upgrades.
-**Difficulty**: ★★★★☆
-**Estimated time**: 3–5 hours
 
 ---
 
@@ -106,9 +104,35 @@ first-class production primitive, not a debugging curiosity.
 
 ---
 
+## Design decisions
+
+**Option A — feature-flag the work inside the callback**
+- Pros: mailbox keeps flowing; trivial rollback; no special protocol.
+- Cons: you cannot inspect a truly quiescent state; requires touching the callback code on every new flag.
+
+**Option B — use `:sys.suspend/1` for a short, operator-driven window** (chosen)
+- Pros: pauses the process atomically without modifying callbacks; resume drains the pending queue deterministically.
+- Cons: only works for processes that speak the sys protocol; the in-flight callback is not cancelled; misuse can stall release upgrades.
+
+→ Chose **B** because the use case is short-window inspection and staged upgrades, where the ability to freeze without touching code outweighs the protocol constraint.
+
+---
+
 ## Implementation
 
 ### Step 1: `mix.exs`
+
+**Objective**: Build stdlib-only so :sys.suspend/1 and :sys.resume/1 are sole levers, no library masking semantics.
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
 
 ```elixir
 defmodule SysSuspendResume.MixProject do
@@ -130,6 +154,8 @@ end
 
 ### Step 2: `lib/sys_suspend_resume/application.ex`
 
+**Objective**: Wire :one_for_one so maintenance crash during :sys.resume restarts only Primer, not entire app.
+
 ```elixir
 defmodule SysSuspendResume.Application do
   @moduledoc false
@@ -146,6 +172,8 @@ end
 ```
 
 ### Step 3: `lib/sys_suspend_resume/primer.ex`
+
+**Objective**: Implement tick-driven GenServer so counter proves :sys.suspend/1 freezes callbacks, not just I/O.
 
 ```elixir
 defmodule SysSuspendResume.Primer do
@@ -187,6 +215,8 @@ end
 ```
 
 ### Step 4: `lib/sys_suspend_resume/operator.ex`
+
+**Objective**: Wrap :sys.suspend/:sys.resume with idempotent with_suspended/2 so resume always fires even on crash.
 
 ```elixir
 defmodule SysSuspendResume.Operator do
@@ -256,6 +286,8 @@ Drop that snippet at the top of `application.ex`.
 
 ### Step 5: `test/sys_suspend_resume/primer_test.exs`
 
+**Objective**: Prove baseline: tick counter advances monotonically without suspension as control for suspend test.
+
 ```elixir
 defmodule SysSuspendResume.PrimerTest do
   use ExUnit.Case, async: false
@@ -267,17 +299,21 @@ defmodule SysSuspendResume.PrimerTest do
     %{pid: pid}
   end
 
-  test "ticks grow over time when not suspended", %{pid: pid} do
-    Process.sleep(200)
-    first = Primer.ticks(pid)
-    assert first >= 2
-    Process.sleep(200)
-    assert Primer.ticks(pid) > first
+  describe "SysSuspendResume.Primer" do
+    test "ticks grow over time when not suspended", %{pid: pid} do
+      Process.sleep(200)
+      first = Primer.ticks(pid)
+      assert first >= 2
+      Process.sleep(200)
+      assert Primer.ticks(pid) > first
+    end
   end
 end
 ```
 
 ### Step 6: `test/sys_suspend_resume/operator_test.exs`
+
+**Objective**: Assert tick freezes during suspend and resumes cleanly after, with_suspended/2 survives crash.
 
 ```elixir
 defmodule SysSuspendResume.OperatorTest do
@@ -290,43 +326,62 @@ defmodule SysSuspendResume.OperatorTest do
     %{pid: pid}
   end
 
-  test "suspended primer stops incrementing ticks", %{pid: pid} do
-    Process.sleep(150)
-    :ok = Operator.suspend(pid)
+  describe "SysSuspendResume.Operator" do
+    test "suspended primer stops incrementing ticks", %{pid: pid} do
+      Process.sleep(150)
+      :ok = Operator.suspend(pid)
 
-    before = :sys.get_state(pid).ticks
-    Process.sleep(200)
-    # :sys.get_state works while suspended; verify no progress.
-    assert :sys.get_state(pid).ticks == before
+      before = :sys.get_state(pid).ticks
+      Process.sleep(200)
+      # :sys.get_state works while suspended; verify no progress.
+      assert :sys.get_state(pid).ticks == before
 
-    :ok = Operator.resume(pid)
-    Process.sleep(200)
-    assert :sys.get_state(pid).ticks > before
-  end
-
-  test "GenServer.call times out while suspended", %{pid: pid} do
-    :ok = Operator.suspend(pid)
-    assert catch_exit(GenServer.call(pid, :ticks, 100)) |> elem(0) == :timeout
-    :ok = Operator.resume(pid)
-    assert is_integer(Primer.ticks(pid))
-  end
-
-  test "with_suspended resumes even if fun raises", %{pid: pid} do
-    assert_raise RuntimeError, "boom", fn ->
-      Operator.with_suspended(pid, fn -> raise "boom" end)
+      :ok = Operator.resume(pid)
+      Process.sleep(200)
+      assert :sys.get_state(pid).ticks > before
     end
 
-    # Server resumed and is serving again.
-    assert is_integer(Primer.ticks(pid))
-  end
+    test "GenServer.call times out while suspended", %{pid: pid} do
+      :ok = Operator.suspend(pid)
+      assert catch_exit(GenServer.call(pid, :ticks, 100)) |> elem(0) == :timeout
+      :ok = Operator.resume(pid)
+      assert is_integer(Primer.ticks(pid))
+    end
 
-  test "double suspend is idempotent", %{pid: pid} do
-    :ok = Operator.suspend(pid)
-    :ok = Operator.suspend(pid)
-    :ok = Operator.resume(pid)
+    test "with_suspended resumes even if fun raises", %{pid: pid} do
+      assert_raise RuntimeError, "boom", fn ->
+        Operator.with_suspended(pid, fn -> raise "boom" end)
+      end
+
+      # Server resumed and is serving again.
+      assert is_integer(Primer.ticks(pid))
+    end
+
+    test "double suspend is idempotent", %{pid: pid} do
+      :ok = Operator.suspend(pid)
+      :ok = Operator.suspend(pid)
+      :ok = Operator.resume(pid)
+    end
   end
 end
 ```
+
+---
+
+## Advanced Considerations: Supervision and Hot Code Upgrade Patterns
+
+The OTP supervision tree is the backbone of Elixir's fault tolerance. A DynamicSupervisor can spawn workers on demand and track them, but if a worker crashes before it's supervised, messages to it drop silently. Equally, a `:temporary` worker that crashes is restarted zero times — useful for one-off tasks, but requires the caller to handle crashes. `:transient` restarts on non-normal exits; `:permanent` always restarts.
+
+`handle_continue` callbacks and `:hibernate` reduce memory overhead in long-lived processes. After initializing, a GenServer can return `{:noreply, state, {:continue, :do_work}}` to defer expensive work past the `init/1` call, keeping the supervisor's synchronous startup fast. Hibernation moves a process's heap to disk, freeing RAM at the cost of latency when the process receives its next message.
+
+Hot code upgrades via `sys:replace_state/2` or `:sys.replace_state/3` allow changing code without restarting the VM, but only if state structure is forward- and backward-compatible. In practice, code changes that alter state shape (adding or removing fields) require a migration function. The `:code.purge/1` and `:code.load_file/1` cycle reloads the module, but old pids still run old code until they return to the scheduler. Design for graceful degradation: code that cannot upgrade hot should acknowledge that in docs and operational runbooks.
+
+---
+
+
+## Deep Dive: Otp Patterns and Production Implications
+
+OTP primitives (GenServer, Supervisor, Application) are tested through their public interfaces, not by inspecting internal state. This discipline forces correct design: if you can't test a behavior without peeking into the server's state, the behavior is not public. Production systems with tight integration tests on GenServer internals are fragile and hard to refactor.
 
 ---
 
@@ -354,7 +409,7 @@ times out). Combine suspend with explicit timeouts inside callbacks.
 **5. Cannot `:sys.suspend` a process that does not speak the sys protocol.**
 Raw `spawn` / `spawn_link` processes will not respond. You need `gen_server`,
 `gen_statem`, `gen_event`, or a `proc_lib` special process that handles
-system messages (see exercise 80).
+system messages.
 
 **6. Suspend blocks `code_change/3`.** During a release upgrade, a process
 must be resumed for the upgrade to apply. A forgotten suspend at deploy
@@ -372,9 +427,13 @@ calls on the same server will call `resume` twice; the second resume hits
 `{:not_suspended, _}` (handled here) but you have now un-suspended someone
 else's window. Use a mutex or a supervisor-level pause lock for nested use.
 
+### Why this works
+
+Suspend flips a flag in the generic behaviour loop: new user messages queue on the side while the sys protocol still answers. Resume replays the pending queue in arrival order, so FIFO is preserved across the window. Because the pause is cooperative with callbacks (not preemptive), there is no torn state to reason about — the server is always between callbacks when suspended.
+
 ---
 
-## Performance notes
+## Benchmark
 
 Measure the cost of the suspend/resume round-trip on your hardware:
 
@@ -392,6 +451,15 @@ On an M-series MacBook you should see 20–40 µs per pair. The suspend itself
 is `O(1)` — it is a single message round-trip plus a boolean flip. The
 expensive part is always the pending queue drain on resume, which is
 `O(pending)`.
+
+Target: ≤ 40 µs per suspend/resume pair on modern hardware with an empty pending queue.
+
+---
+
+## Reflection
+
+1. You suspend a process to inspect state, but the pending queue is accumulating at ~5k msg/s. How long can you afford the window before resume itself becomes a latency event, and what telemetry would you need to detect the tipping point?
+2. You discover a production bug where a forgotten suspend left a process paused for 3 minutes. What hook would you add — automatic timeout on suspend, supervisor-level deadline, telemetry watchdog — and why? Justify against the cost of false positives.
 
 ---
 

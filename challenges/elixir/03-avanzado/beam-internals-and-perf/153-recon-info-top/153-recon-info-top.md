@@ -142,6 +142,8 @@ three fields let you say "it's `MyApp.Cache.Worker` started from
 
 ### Step 1: `mix.exs`
 
+**Objective**: Pin `:recon` so bounded :proc_count/:proc_window avoid Process.list/0 heap explosion on 500k-process nodes.
+
 ```elixir
 defmodule ReconInfoTop.MixProject do
   use Mix.Project
@@ -156,6 +158,8 @@ end
 ```
 
 ### Step 2: `lib/recon_info_top/application.ex`
+
+**Objective**: Host DynamicSupervisor so multiple watch streams coexist without resource leaks on operator disconnect.
 
 ```elixir
 defmodule ReconInfoTop.Application do
@@ -174,6 +178,8 @@ end
 ```
 
 ### Step 3: `lib/recon_info_top/top.ex`
+
+**Objective**: Wrap :proc_count/:proc_window returning rows with registered_name + current_function so operators see actionable pid context.
 
 ```elixir
 defmodule ReconInfoTop.Top do
@@ -223,6 +229,8 @@ end
 
 ### Step 4: `lib/recon_info_top/formatter.ex`
 
+**Objective**: Format rows as aligned table with KB/MB units so operators triage without mental math or context switching.
+
 ```elixir
 defmodule ReconInfoTop.Formatter do
   @moduledoc false
@@ -260,6 +268,8 @@ end
 ```
 
 ### Step 5: `lib/recon_info_top/watcher.ex`
+
+**Objective**: Stream periodic snapshots to subscriber with Process.monitor cleanup so watch survives shell reconnect without orphan tasks.
 
 ```elixir
 defmodule ReconInfoTop.Watcher do
@@ -319,6 +329,8 @@ end
 ```
 
 ### Step 6: `test/recon_info_top/top_test.exs`
+
+**Objective**: Assert descending order, row shape, reduction-window detection on a busy spawn, and watcher teardown on subscriber exit.
 
 ```elixir
 defmodule ReconInfoTop.TopTest do
@@ -393,6 +405,8 @@ end
 
 ### Step 7: Run it
 
+**Objective**: Format top-memory and top-reductions rows via formatter to verify end-to-end render pipeline in iex shell.
+
 ```elixir
 # iex -S mix
 ReconInfoTop.Top.count(:memory, 10) |> ReconInfoTop.Formatter.render(:memory) |> IO.puts()
@@ -420,6 +434,46 @@ IO.puts("avg: #{time_us / 10_000} µs/op")
 ```
 
 Target: operation should complete in the low-microsecond range on modern hardware; deviations by >2× indicate a regression worth investigating.
+
+## Deep Dive: BEAM Scheduler Tuning and Memory Profiling in Production
+
+The BEAM scheduler is not "magic" — it's a preemptive work-stealing scheduler that divides CPU time 
+into reductions (bytecode instructions). Understanding scheduler tuning is critical when you suspect 
+latency spikes in production.
+
+**Key concepts**:
+- **Reductions budget**: By default, a process gets ~2000 reductions before yielding to another process.
+  Heavy CPU work (binary matching, list recursion) can exhaust the budget and cause tail latency.
+- **Dirty schedulers**: If a process does CPU-intensive work (crypto, compression, numerical), it blocks 
+  the main scheduler. Use dirty NIFs or `spawn_opt(..., [{:fullsweep_after, 0}])` for GC tuning.
+- **Heap tuning per process**: `Process.flag(:min_heap_size, ...)` reserves heap upfront, reducing GC 
+  pauses. Measure; don't guess.
+
+**Memory profiling workflow**:
+1. Run `recon:memory/0` in iex; identify top 10 memory consumers by type (atoms, binaries, ets).
+2. If binaries dominate, check for refc binary leaks (binary held by process that should have been freed).
+3. Use `eprof` or `fprof` for function-level CPU attribution; `recon:proc_window/3` for process memory trends.
+
+**Production pattern**: Deploy with `+K true` (async IO), `-env ERL_MAX_PORTS 65536` (port limit), 
+`+T 9` (async threads). Measure GC time with `erlang:statistics(garbage_collection)` — if >5% of uptime, 
+tune heap or reduce allocation pressure. Never assume defaults are optimal for YOUR workload.
+
+---
+
+## Advanced Considerations
+
+Understanding BEAM internals at production scale requires deep knowledge of scheduler behavior, memory models, and garbage collection dynamics. The soft real-time guarantees of BEAM only hold under specific conditions — high system load, uneven process distribution across schedulers, or GC pressure can break predictable latency completely. Monitor `erlang:statistics(run_queue)` in production to catch scheduler saturation before it degrades latency significantly. The difference between immediate, offheap, and continuous GC garbage collection strategies can significantly impact tail latencies in systems with millions of messages per second and sustained memory pressure.
+
+Process reductions and the reduction counter affect scheduler fairness fundamentally. A process that runs for extended periods without yielding can starve other processes, even though the scheduler treats it fairly by reduction count per scheduling interval. This is especially critical in pipelines processing large data structures or performing recursive computations where yielding points are infrequent and difficult to predict. The BEAM's preemption model is deterministic per reduction, making performance testing reproducible but sometimes hiding race conditions that only manifest under specific load patterns and GC interactions.
+
+The interaction between ETS, Mnesia, and process message queues creates subtle bottlenecks in distributed systems. ETS reads don't block other processes, but writes require acquiring locks; understanding when your workload transitions from read-heavy to write-heavy is crucial for capacity planning. Port drivers and NIFs bypass the BEAM scheduler entirely, which can lead to unexpected priority inversions if not carefully managed. Always profile with `eprof` and `fprof` in realistic production-like environments before deployment to catch performance surprises.
+
+
+## Deep Dive: Otp Patterns and Production Implications
+
+OTP primitives (GenServer, Supervisor, Application) are tested through their public interfaces, not by inspecting internal state. This discipline forces correct design: if you can't test a behavior without peeking into the server's state, the behavior is not public. Production systems with tight integration tests on GenServer internals are fragile and hard to refactor.
+
+---
 
 ## Trade-offs and production gotchas
 
@@ -483,3 +537,13 @@ on the fly.
 - [Scott Lystig Fritchie — Troubleshooting the BEAM](https://youtu.be/wfSbINnIvw0) — talk covering proc_count in an incident walkthrough
 - [Bleacher Report engineering — Elixir memory debugging](https://medium.com/bleacher-report-labs) — real-world memory forensics with recon
 - [`:observer` vs `:recon`](https://dashbit.co/blog/observability-and-elixir) — when each tool helps
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

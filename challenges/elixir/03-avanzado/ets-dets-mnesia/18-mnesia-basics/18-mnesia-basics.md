@@ -2,9 +2,6 @@
 
 **Project**: `mnesia_intro` — a single-node order book that introduces schema creation, transactions, dirty vs safe reads, and the `ram_copies` / `disc_copies` / `disc_only_copies` trade-off.
 
-**Difficulty**: ★★★★☆
-**Estimated time**: 3–6 hours
-
 ---
 
 ## Project context
@@ -35,6 +32,12 @@ mnesia_intro/
 │   └── order_book_test.exs
 └── mix.exs
 ```
+
+---
+
+## Why Mnesia and not ETS-plus-hope
+
+Anything that needs multi-key atomicity or multi-node replication needs a transaction layer. Mnesia has one; ETS does not. Starting from ETS and adding transactions ends in tears.
 
 ---
 
@@ -80,6 +83,16 @@ read-heavy hot paths where stale reads are tolerable.
 
 Mnesia tables are schema-ed on Erlang records. In Elixir:
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
+
 ```elixir
 require Record
 Record.defrecord(:order, [:id, :side, :symbol, :qty, :price, :account_id, :status])
@@ -106,9 +119,25 @@ effects, no accumulators held outside the function.
 
 ---
 
+## Design decisions
+
+**Option A — roll-your-own on ETS**
+- Pros: full control; no library baggage.
+- Cons: reimplementing transactions and replication is years of work you will not do well.
+
+**Option B — Mnesia** (chosen)
+- Pros: transactions, replication, and query primitives in the standard distribution.
+- Cons: quirks with netsplits and schema ops are real; tooling is sparse.
+
+→ Chose **B** because Mnesia is imperfect but solved; rolling your own is unsolved.
+
+---
+
 ## Implementation
 
 ### Step 1: `mix.exs`
+
+**Objective**: List `:mnesia` under `extra_applications` so the OTP release boots the storage subsystem before our supervisor starts.
 
 ```elixir
 defmodule MnesiaIntro.MixProject do
@@ -134,6 +163,8 @@ end
 ```
 
 ### Step 2: `lib/mnesia_intro/schema.ex`
+
+**Objective**: Idempotently create the disc_copies schema and declare records + secondary indices before the node accepts traffic.
 
 ```elixir
 defmodule MnesiaIntro.Schema do
@@ -189,6 +220,8 @@ end
 
 ### Step 3: `lib/mnesia_intro/application.ex`
 
+**Objective**: Run `Schema.ensure!/0` during boot so tables are guaranteed ready before any caller issues a transaction.
+
 ```elixir
 defmodule MnesiaIntro.Application do
   @moduledoc false
@@ -203,6 +236,8 @@ end
 ```
 
 ### Step 4: `lib/mnesia_intro/order_book.ex`
+
+**Objective**: Wrap order placement, cancellation, and execution in `:mnesia.transaction/1` to guarantee ACID semantics across multi-row writes.
 
 ```elixir
 defmodule MnesiaIntro.OrderBook do
@@ -334,6 +369,8 @@ end
 
 ### Step 5: `test/order_book_test.exs`
 
+**Objective**: Prove transactional rollback on overfill and verify `index_read` returns only open buys sorted by descending price.
+
 ```elixir
 defmodule MnesiaIntro.OrderBookTest do
   use ExUnit.Case, async: false
@@ -411,6 +448,8 @@ end
 
 ### Step 6: Run it
 
+**Objective**: Bootstrap the on-disk schema directory and run the suite to confirm disc_copies persist across restarts.
+
 ```bash
 mix deps.get
 mix test
@@ -422,6 +461,28 @@ fresh. In production set the directory explicitly:
 ```bash
 iex --erl '-mnesia dir "\"/var/lib/my_app/mnesia\""' -S mix
 ```
+
+### Why this works
+
+Mnesia wraps ETS (and dets for disk) in a transaction manager and a replication protocol. Transactions lock rows, replicate commits, and roll back on conflict. The schema is itself a Mnesia table, which is why schema ops need special care.
+
+---
+
+## Deep Dive
+
+ETS (Erlang Term Storage) is RAM-only and process-linked; table destruction triggers if the owner crashes, causing silent data loss in careless designs. Match specifications (match_specs) are micro-programs that filter/transform data at the C layer, orders of magnitude faster than fetching all records and filtering in Elixir. Mnesia adds disk persistence and replication but introduces transaction overhead and deadlock potential; dirty operations bypass locks for speed but sacrifice consistency guarantees. For caching, named tables (public by design) are globally visible but require careful name management; consider ETS sharding (multiple small tables) to reduce lock contention on hot keys. DETS (Disk ETS) persists to disk but is single-process bottleneck and slower than a real database. At scale, prefer ETS for in-process state and Mnesia/PostgreSQL for shared, persistent data.
+## Advanced Considerations
+
+ETS and DETS performance characteristics change dramatically based on access patterns and table types. Ordered sets provide range queries but slower access than hash tables; set types don't support duplicate keys while bags do. The `heir` option for ETS tables is essential for fault tolerance — when a table owner crashes, the heir process can take ownership and prevent data loss. Without it, the table is lost immediately. Mnesia replicates entire tables across nodes; choosing which nodes should have replicas and whether they're RAM or disk replicas affects both consistency guarantees and network traffic during cluster operations.
+
+DETS persistence comes with significant performance implications — writes are synchronous to disk by default, creating latency spikes. Using `sync: false` improves throughput but risks data loss on crashes. The maximum DETS table size is limited by available memory and the file system; planning capacity requires understanding your growth patterns. Mnesia's transaction system provides ACID guarantees, but dirty operations bypass these guarantees for performance. Understanding when to use dirty reads versus transactional reads significantly impacts both correctness and latency.
+
+Debugging ETS and DETS issues is challenging because problems often emerge under load when many processes contend for the same table. Table memory fragmentation is invisible to code but can exhaust memory. Using match specs instead of iteration over large tables can dramatically improve performance but requires careful construction. The interaction between ETS, replication, and distributed systems creates subtle consistency issues — a node with a stale ETS replica can serve incorrect data during network partitions. Always monitor table sizes and replication status with structured logging.
+
+
+## Deep Dive: Etsdets Patterns and Production Implications
+
+ETS tables are in-memory, non-distributed key-value stores with tunable semantics (ordered_set, duplicate_bag). Under concurrent read/write load, ETS table semantics matter: bag semantics allow fast appends but slow deletes; ordered_set allows range queries but slower inserts. Testing ETS behavior under concurrent load is non-trivial; single-threaded tests miss lock contention. Production ETS tables often fail under load due to concurrency assumptions that quiet tests don't exercise.
 
 ---
 
@@ -453,6 +514,25 @@ index. A three-index table has ~4x the write cost. Index only what you query on.
 **7. When NOT to use Mnesia.** Anything with strict multi-DC replication, anything that needs
 SQL-class query planning, anything with > 100M rows. Mnesia shines in BEAM-shaped clusters of
 2–10 nodes with "small" datasets.
+
+---
+
+## Benchmark
+
+```elixir
+# :timer.tc / Benchee measurement sketch
+{time_us, _} = :timer.tc(fn -> :ok end)
+IO.puts("elapsed: #{time_us} us")
+```
+
+Target: transactional write 50-200 us; read within a transaction 20-50 us; dirty read 1-3 us.
+
+---
+
+## Reflection
+
+- A senior engineer says 'Mnesia is only for toy apps.' What evidence would you gather before agreeing or disagreeing?
+- Where is the line between 'data that belongs in Mnesia' and 'data that belongs in Postgres'? Give two concrete criteria.
 
 ---
 

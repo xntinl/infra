@@ -75,7 +75,21 @@ Chose **B** because the domain invariant (`email` and `password_hash` must exist
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"ecto", "~> 1.0"},
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Create the smallest Mix library so the struct and its invariants live in a single, reviewable compilation unit.
 
 ```bash
 mix new user_signup
@@ -83,6 +97,8 @@ cd user_signup
 ```
 
 ### Step 2: `lib/user_signup.ex`
+
+**Objective**: Use `@enforce_keys` to make missing mandatory fields fail at struct creation rather than hours later inside a downstream worker.
 
 ```elixir
 defmodule UserSignup do
@@ -143,6 +159,8 @@ end
 
 ### Step 3: `test/user_signup_test.exs`
 
+**Objective**: Lock in the `ArgumentError` contract for missing required keys so no future refactor can silently weaken the enforcement.
+
 ```elixir
 defmodule UserSignupTest do
   use ExUnit.Case, async: true
@@ -182,6 +200,8 @@ end
 
 ### Step 4: Run the tests
 
+**Objective**: Run the suite to confirm the struct enforces its contract at compile and construction time, not only in docs.
+
 ```bash
 mix test
 ```
@@ -194,6 +214,22 @@ All tests must pass.
 
 ---
 
+
+## Key Concepts
+
+### 1. `@enforce_keys` Requires Fields at Creation
+
+Enforced keys must be provided when creating a struct, even if they have defaults. This prevents silent bugs where required fields are omitted.
+
+### 2. Enforced Keys Are Compile-Time Constraints
+
+The constraint is only checked in `%User{}` literal construction. If you manually create a map and convert it with `struct(User, map)`, no check happens.
+
+### 3. Use Changesets for Validation in Production
+
+For real applications, `@enforce_keys` is not enough. Use `Ecto.Changeset` or build your own validation layer to handle type checking, format validation, and detailed error messages.
+
+---
 ## Benchmark
 
 ```elixir

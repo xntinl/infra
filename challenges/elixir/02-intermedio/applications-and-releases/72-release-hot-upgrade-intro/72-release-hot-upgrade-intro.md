@@ -107,18 +107,23 @@ state.
 
 ## Implementation
 
-### Dependencies (`mix.exs`)
+### Dependencies (mix.exs)
 
 ```elixir
 defp deps do
   [
-    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+    # Standard library: no external dependencies required
   ]
 end
 ```
 
 
+
+
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
 
 ```bash
 mix new hot_upgrade_intro --sup
@@ -127,6 +132,9 @@ mkdir -p config
 ```
 
 ### Step 2: `mix.exs` — enable appup generation
+
+**Objective**: Edit `mix.exs` — enable appup generation, exposing release-time behavior that depends on application env resolution and runtime boot semantics.
+
 
 ```elixir
 defmodule HotUpgradeIntro.MixProject do
@@ -164,6 +172,9 @@ end
 ```
 
 ### Step 3: `lib/hot_upgrade_intro.ex` and `lib/hot_upgrade_intro/application.ex`
+
+**Objective**: Provide `lib/hot_upgrade_intro.ex` and `lib/hot_upgrade_intro/application.ex` — these are the supporting fixtures the main module depends on to make its concept demonstrable.
+
 
 ```elixir
 defmodule HotUpgradeIntro.Application do
@@ -225,6 +236,9 @@ end
 
 ### Step 4: `test/hot_upgrade_intro_test.exs`
 
+**Objective**: Write `hot_upgrade_intro_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+
 ```elixir
 defmodule HotUpgradeIntroTest do
   use ExUnit.Case, async: false
@@ -243,6 +257,9 @@ end
 ```
 
 ### Step 5: Sketch of the upgrade workflow
+
+**Objective**: Sketch of the upgrade workflow.
+
 
 A full hot-upgrade cycle looks roughly like this (not run here — use a
 dedicated tool in practice):
@@ -272,6 +289,21 @@ which is Mix's polite way of steering you toward rolling restarts.
 
 The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
 
+
+
+## Key Concepts
+
+Hot upgrades (appups) allow code changes without stopping the VM—the OTP application code is reloaded in place. This requires precise tracking of code changes and careful state migration via `code_change/3` callbacks. Hot upgrades are powerful but fragile: a mistake can corrupt state or lose messages. Most production systems skip hot upgrades and instead redeploy, accepting brief downtime for simplicity and safety. Hot upgrades are valuable for critical infrastructure (telecom, financial) where downtime is unacceptable; for most CRUD apps, a restart is faster and safer. If you implement hot upgrades, invest heavily in testing—state migration bugs are subtle and hard to diagnose.
+
+---
+
+## Deep Dive: Compile-Time vs Runtime Configuration Boundaries
+
+A release is a static artifact: code and compile-time config are baked in. Runtime config must be provided at boot via environment variables, config files, or config providers. Simple rule: if a value changes between dev and prod, it goes in `config/runtime.exs`, not `config/config.exs`.
+
+Footgun: putting config in compile-time files and assuming environment variables work at runtime. Releases ignore env vars unless `config/runtime.exs` explicitly reads them. If you need env vars, fetch them in `config/runtime.exs` and store in application state.
+
+For distributed systems, config providers (modules loading config from Consul, S3, etc.) are powerful but complex. Start with environment variables and `config/runtime.exs`; only reach for providers if you need dynamic reloading without downtime or multi-tenant config switching. Premature provider complexity is a mistake.
 
 ## Benchmark
 

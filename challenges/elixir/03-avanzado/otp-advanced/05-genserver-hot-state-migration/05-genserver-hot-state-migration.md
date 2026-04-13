@@ -119,8 +119,99 @@ defp deps do
 end
 ```
 
+### Dependencies (mix.exs)
+
+```elixir
+```elixir
+defmodule HotStateMigration.PaymentQueue do
+  use GenServer
+  @vsn 4
+  # ...
+end
+```
+
+When OTP performs a release upgrade, it compares the new module's `@vsn` to the running one. If they differ, it calls `code_change/3` with the old version and the old state.
+
+### 2. `code_change/3` callback
+
+```elixir
+@impl true
+def code_change({:down, 4}, state, _extra), do: {:ok, downgrade_v4_to_v3(state)}
+def code_change(3, state, _extra), do: {:ok, upgrade_v3_to_v4(state)}
+def code_change(_old, state, _extra), do: {:ok, state}
+```
+
+The callback is invoked synchronously during the upgrade. The new module is already loaded; the process is suspended; your job is to transform the state from the old shape to the new shape and return.
+
+### 3. The upgrade dance
+
+```
+sys:suspend(pid)                 ← OTP suspends process; pending msgs buffer
+load_new_module(Module)          ← new BEAM file swapped in
+sys:change_code(pid, Mod, vsn, extra)  ← calls code_change/3
+sys:resume(pid)                  ← process runs with new state shape
+```
+
+The mailbox keeps buffering during suspension; on resume, all queued messages are processed against the new shape. If your `code_change/3` is buggy, the process crashes and the supervisor decides what happens next — you may have just lost an entire pending queue.
+
+### 4. `.appup` and `.relup` files
+
+A hot upgrade requires a `.appup` describing module-level changes (upgrade/downgrade instructions per module) and a `.relup` describing the release-level transition. For a single GenServer upgrade the `.appup` looks like:
+
+```erlang
+{"4.0.0",
+ [{"3.0.0", [{update, 'Elixir.HotStateMigration.PaymentQueue', {advanced, []}}]}],
+ [{"3.0.0", [{update, 'Elixir.HotStateMigration.PaymentQueue', {advanced, []}}]}]}.
+```
+
+Tools like `distillery` used to generate these; `mix release` supports it via `:appup` and `:relup` configuration, but few people use it.
+
+### 5. Why this is mostly legacy
+
+- **Blue/green deploys are simpler.** Spin up v4, drain v3, kill v3. No in-place magic.
+- **State in databases moots the problem.** If your queue is in Postgres, restart freely.
+- **Tooling is thin.** Generating `.relup` files for real release chains is brittle.
+- **Clustered apps need coordinated upgrades.** A heterogeneous cluster during upgrade is a distributed-systems nightmare.
+- **`@vsn` drift is easy to mis-manage.** One missed bump and the upgrade silently skips your migration.
+
+The niches where it still wins: embedded devices (Nerves), telecom-style single-node systems with strict uptime SLAs, and research-grade long-running processes whose state cannot be serialized out.
+
+---
+
+## Why `code_change` and not blue/green
+
+Blue/green spins up a v4 instance, drains v3, and cuts over. It requires an external queue or database to hold state during the cut — which this system lacks (the pending queue is memory-resident, financial, and cannot be replayed). `code_change/3` transforms state in-place in < 10 ms of apparent downtime. The cost is tooling (`.appup`/`.relup`) and rollout discipline (`@vsn` bumps). Blue/green wins for anything that can persist state externally; `code_change` wins when the process *is* the state.
+
+---
+
+## Design decisions
+
+**Option A — ship a single `upgrade_v1_to_v4` that jumps versions**
+- Pros: one function to test; no chain.
+- Cons: impossible to deploy incrementally; a node at v2 has no upgrade path; forces "skip versions" which breaks downgrade.
+
+**Option B — composable step functions, one per adjacent pair** (chosen)
+- Pros: each transform is isolated and independently testable; `code_change/3` pipes them (`v1 |> up_1_2 |> up_2_3 |> up_3_4`); supports downgrades symmetrically.
+- Cons: N² potential bug surface if you compose incorrectly; must keep every step function alive forever.
+
+→ Chose **B** because a production upgrade chain survives 3+ years of evolution, and each step must be provable in isolation. The cost of keeping old step functions is trivial; the cost of a silently wrong composed upgrade is a corrupted financial queue.
+
+---
+
+## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  []
+end
+```
+
 
 ### Step 1: `mix.exs`
+
+**Objective**: Lock version 4.0.0 and skip deps so @vsn-driven code_change/3 is sole migration contract under test.
 
 ```elixir
 defmodule HotStateMigration.MixProject do
@@ -137,6 +228,8 @@ end
 ```
 
 ### Step 2: `lib/hot_state_migration/payment_queue.ex`
+
+**Objective**: Stack small upgrade_N_to_N+1 functions so v1→v4 ladder is pure, testable, and reversible for downgrades.
 
 ```elixir
 defmodule HotStateMigration.PaymentQueue do
@@ -235,6 +328,8 @@ end
 
 ### Step 3: `lib/hot_state_migration/application.ex`
 
+**Objective**: Wire :one_for_one so migration-time crash restarts cleanly without cascading to rest of node.
+
 ```elixir
 defmodule HotStateMigration.Application do
   use Application
@@ -248,6 +343,8 @@ end
 ```
 
 ### Step 4: `test/hot_state_migration/payment_queue_test.exs`
+
+**Objective**: Test every upgrade/downgrade rung as pure functions so migrations verify without release machinery.
 
 ```elixir
 defmodule HotStateMigration.PaymentQueueTest do
@@ -326,6 +423,23 @@ end
 ### Why this works
 
 Splitting the migration into adjacent-pair step functions means each is O(n) over the live state and provably preserves invariants (counts, merchant bucketing). The `code_change/3` clauses dispatch on the incoming version and compose the appropriate subset of steps. Downgrades invert the transformation deterministically — flattening a nested map is information-losing but reversible for the data domain. `@vsn 4` is the single source of truth OTP consults during `sys:change_code`; missing the bump is the #1 silent-failure mode.
+
+---
+
+## Advanced Considerations: Supervision and Hot Code Upgrade Patterns
+
+The OTP supervision tree is the backbone of Elixir's fault tolerance. A DynamicSupervisor can spawn workers on demand and track them, but if a worker crashes before it's supervised, messages to it drop silently. Equally, a `:temporary` worker that crashes is restarted zero times — useful for one-off tasks, but requires the caller to handle crashes. `:transient` restarts on non-normal exits; `:permanent` always restarts.
+
+`handle_continue` callbacks and `:hibernate` reduce memory overhead in long-lived processes. After initializing, a GenServer can return `{:noreply, state, {:continue, :do_work}}` to defer expensive work past the `init/1` call, keeping the supervisor's synchronous startup fast. Hibernation moves a process's heap to disk, freeing RAM at the cost of latency when the process receives its next message.
+
+Hot code upgrades via `sys:replace_state/2` or `:sys.replace_state/3` allow changing code without restarting the VM, but only if state structure is forward- and backward-compatible. In practice, code changes that alter state shape (adding or removing fields) require a migration function. The `:code.purge/1` and `:code.load_file/1` cycle reloads the module, but old pids still run old code until they return to the scheduler. Design for graceful degradation: code that cannot upgrade hot should acknowledge that in docs and operational runbooks.
+
+---
+
+
+## Deep Dive: Otp Patterns and Production Implications
+
+OTP primitives (GenServer, Supervisor, Application) are tested through their public interfaces, not by inspecting internal state. This discipline forces correct design: if you can't test a behavior without peeking into the server's state, the behavior is not public. Production systems with tight integration tests on GenServer internals are fragile and hard to refactor.
 
 ---
 

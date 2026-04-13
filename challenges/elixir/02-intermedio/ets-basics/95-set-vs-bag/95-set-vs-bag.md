@@ -115,7 +115,21 @@ makes the diff between types visible to the reader.
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
 
 ```bash
 mix new set_vs_bag
@@ -123,6 +137,9 @@ cd set_vs_bag
 ```
 
 ### Step 2: `lib/set_vs_bag/tag_store.ex`
+
+**Objective**: Implement `tag_store.ex` — the access pattern that exposes the trade-off between ETS concurrency flags, match specs, and lookup cost.
+
 
 ```elixir
 defmodule SetVsBag.TagStore do
@@ -165,6 +182,9 @@ end
 
 ### Step 3: `lib/set_vs_bag.ex`
 
+**Objective**: Implement `set_vs_bag.ex` — the access pattern that exposes the trade-off between ETS concurrency flags, match specs, and lookup cost.
+
+
 ```elixir
 defmodule SetVsBag do
   @moduledoc """
@@ -196,6 +216,9 @@ end
 ```
 
 ### Step 4: `test/set_vs_bag_test.exs`
+
+**Objective**: Write `set_vs_bag_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
 
 ```elixir
 defmodule SetVsBagTest do
@@ -255,6 +278,9 @@ end
 
 ### Step 5: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -269,6 +295,14 @@ assert on the exact shape of `lookup/2`'s return — the list length tells
 you, without ambiguity, whether dedup happened.
 
 ---
+
+
+## Key Concepts: Table Type Trade-offs and Concurrency
+
+The choice between `:set`, `:bag`, `:ordered_set`, and `:duplicate_bag` affects both semantics and performance. A `:set` enforces key uniqueness and is the fastest for lookups (O(1) hash-based). A `:bag` allows multiple tuples per key but still maintains hash-based access. An `:ordered_set` maintains keys in sorted order (useful for range queries) but costs O(log N) per operation. A `:duplicate_bag` is rarely used—it's a `:bag` that allows duplicate tuples even with identical key-value pairs.
+
+For multi-process workloads, you'll also encounter concurrency options: `:public` (any process can read/write), `:protected` (owner writes, all read—default), and `:private` (only owner). The bottleneck isn't the table type; it's write contention. ETS serializes writes through a global lock per table. If you have many writers fighting over the same table, you hit a ceiling. Sharding—splitting one logical table across multiple ETS tables—is the common fix. The Trade-off is: `:set` is fast and simple but forces uniqueness; `:bag` lets you store multiple values per key but adds query complexity; `:ordered_set` gives you range scans but at O(log N) cost.
+
 
 ## Benchmark
 
@@ -291,6 +325,12 @@ Target esperado en hardware moderno: `:set` y `:ordered_set` en el orden de
 similar a `:bag` pero con listas de retorno crecientes (10k tuplas para una
 key "caliente"). La diferencia absoluta es secundaria; lo importante es que
 `:bag`/`:duplicate_bag` escalan con el tamaño de la lista por key.
+
+---
+
+## Key Concepts
+
+ETS table types determine duplicate handling strategies. `set` tables store exactly one value per key—new inserts replace old values. `ordered_set` is similar but maintains sort order on keys, enabling range queries efficiently. `bag` allows multiple values per key, perfect for building indexes (multiple documents per tag) or collecting related items. Choosing the right type prevents silent data loss: using `set` when you need to track multiple events with the same ID causes the last event to overwrite earlier ones. `bag` is ideal when you need to preserve all entries with a given key. The trade-off: `bag` operations are slightly slower because lookups return lists of values instead of single values, and you must iterate to find specific records. Most code uses `set` for simple key-value patterns; `bag` is specialty but essential for specific use cases. Understanding this distinction prevents production bugs where events silently disappear because someone chose `set` instead of `bag`.
 
 ---
 

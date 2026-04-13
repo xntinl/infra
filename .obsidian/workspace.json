@@ -13,12 +13,12 @@
             "state": {
               "type": "markdown",
               "state": {
-                "file": "challenges/elixir/04-insane/55-build-distributed-saga-orchestrator/55-build-distributed-saga-orchestrator.md",
+                "file": "challenges/elixir/01-basico/collections/11-enum-module-and-immutability/11-enum-module-and-immutability.md",
                 "mode": "source",
                 "source": false
               },
               "icon": "lucide-file",
-              "title": "55-build-distributed-saga-orchestrator"
+              "title": "11-enum-module-and-immutability"
             }
           }
         ]
@@ -174,19 +174,9 @@
               "icon": "spreadsheet",
               "title": "Advanced Tables"
             }
-          },
-          {
-            "id": "e4965354ab0fb955",
-            "type": "leaf",
-            "state": {
-              "type": "git-view",
-              "state": {},
-              "icon": "git-pull-request",
-              "title": "Source Control"
-            }
           }
         ],
-        "currentTab": 6
+        "currentTab": 5
       }
     ],
     "direction": "horizontal",
@@ -210,42 +200,42 @@
   },
   "active": "1ad63260abcf073e",
   "lastOpenFiles": [
-    "challenges/elixir/03-avanzado/ecto-advanced/287-custom-query-macros/287-custom-query-macros.md",
-    "challenges/elixir/03-avanzado/ecto-advanced/287-custom-query-macros",
-    "challenges/elixir/03-avanzado/ecto-advanced/286-embedded-schemas-nested-changesets/286-embedded-schemas-nested-changesets.md",
-    "challenges/elixir/03-avanzado/ecto-advanced/286-embedded-schemas-nested-changesets",
-    "challenges/elixir/03-avanzado/ecto-advanced/285-full-text-search-tsvector/285-full-text-search-tsvector.md",
-    "challenges/elixir/03-avanzado/ecto-advanced/285-full-text-search-tsvector",
-    "challenges/elixir/03-avanzado/interop-and-native/330-system-cmd-timeout-wrapper/330-system-cmd-timeout-wrapper.md",
-    "challenges/elixir/03-avanzado/ecto-advanced/284-soft-delete-global-filter/284-soft-delete-global-filter.md",
-    "challenges/elixir/03-avanzado/ecto-advanced/284-soft-delete-global-filter",
-    "challenges/elixir/03-avanzado/supervision-advanced/391-partition-supervisor-lock-contention/391-partition-supervisor-lock-contention.md",
-    "challenges/elixir/03-avanzado/beam-internals-and-perf/366-recon-production-diagnosis/366-recon-production-diagnosis.md",
-    "challenges/elixir/03-avanzado/interop-and-native/329-embed-binary-resources/329-embed-binary-resources.md",
-    "challenges/elixir/03-avanzado/ecto-advanced/283-row-level-locking/283-row-level-locking.md",
-    "challenges/elixir/03-avanzado/ecto-advanced/283-row-level-locking",
-    "challenges/elixir/03-avanzado/resilience-patterns/317-adaptive-concurrency-limits/317-adaptive-concurrency-limits.md",
-    "challenges/elixir/03-avanzado/resilience-patterns/317-adaptive-concurrency-limits",
-    "challenges/elixir/03-avanzado/beam-internals-and-perf/365-jit-beamasm-considerations/365-jit-beamasm-considerations.md",
-    "challenges/elixir/03-avanzado/ets-dets-mnesia/379-ets-shard-pattern/379-ets-shard-pattern.md",
-    "challenges/elixir/03-avanzado/ets-dets-mnesia/379-ets-shard-pattern",
-    "challenges/elixir/03-avanzado/supervision-advanced/390-rest-for-one-custom-restart-intensity/390-rest-for-one-custom-restart-intensity.md",
-    "challenges/elixir/03-avanzado/interop-and-native/328-port-nodejs-json-framing/328-port-nodejs-json-framing.md",
-    "challenges/elixir/03-avanzado/advanced-testing/302-contract-testing-pact/302-contract-testing-pact.md",
-    "challenges/elixir/03-avanzado/beam-internals-and-perf/364-binary-refc-leaks/364-binary-refc-leaks.md",
-    "challenges/elixir/03-avanzado/resilience-patterns/316-hedged-requests/316-hedged-requests.md",
-    "challenges/elixir/03-avanzado/resilience-patterns/316-hedged-requests",
-    "challenges/elixir/03-avanzado/ets-dets-mnesia/378-mnesia-distributed-replicas/378-mnesia-distributed-replicas.md",
-    "challenges/elixir/03-avanzado/ets-dets-mnesia/378-mnesia-distributed-replicas",
-    "challenges/elixir/03-avanzado/ecto-advanced/282-zero-downtime-migrations/282-zero-downtime-migrations.md",
-    "challenges/elixir/03-avanzado/ecto-advanced/282-zero-downtime-migrations",
-    "challenges/elixir/03-avanzado/metaprogramming/389-dsl-macro-prewalk-special-forms/389-dsl-macro-prewalk-special-forms.md",
-    "challenges/elixir/03-avanzado/interop-and-native/327-erlport-python-bridge/327-erlport-python-bridge.md",
-    "challenges/elixir/03-avanzado/beam-internals-and-perf/363-gc-tuning-per-process/363-gc-tuning-per-process.md",
-    "challenges/elixir/03-avanzado/advanced-testing/301-mutation-testing-elixir/301-mutation-testing-elixir.md",
-    "challenges/elixir/03-avanzado/resilience-patterns/315-saga-compensating-actions/315-saga-compensating-actions.md",
-    "challenges/elixir/03-avanzado/ets-dets-mnesia/377-mnesia-transactions-indices/377-mnesia-transactions-indices.md",
-    "challenges/elixir/03-avanzado/ecto-advanced/281-schemaless-queries-etl/281-schemaless-queries-etl.md",
+    "challenges/elixir/01-basico/collections/06-lists-and-head-tail-pattern/06-lists-and-head-tail-pattern.md",
+    "challenges/elixir/04-insane/network-and-proxies/21-build-message-broker-amqp-like/21-build-message-broker-amqp-like.md",
+    "challenges/elixir/04-insane/storage-engines/19-build-search-engine-inverted-index/19-build-search-engine-inverted-index.md",
+    "challenges/elixir/01-basico/collections/11-enum-module-and-immutability/11-enum-module-and-immutability.md",
+    "challenges/elixir/02-intermedio/protocols-and-behaviours/08-protocols/08-protocols.md",
+    "challenges/elixir/04-insane/storage-engines/03-build-distributed-cache-redis-like/03-build-distributed-cache-redis-like.md",
+    "challenges/elixir/04-insane/concurrency-primitives/10-build-custom-genserver-supervisor/10-build-custom-genserver-supervisor.md",
+    "challenges/elixir/03-avanzado/apis-and-graphql/59-absinthe-graphql-schema/59-absinthe-graphql-schema.md",
+    "challenges/elixir/04-insane/data-and-integrations/20-build-crdt-data-structures/20-build-crdt-data-structures.md",
+    "challenges/elixir/04-insane/data-and-integrations/47-build-workflow-engine-temporal-like/47-build-workflow-engine-temporal-like.md",
+    "challenges/elixir/04-insane/data-and-integrations/43-build-ai-inference-engine/43-build-ai-inference-engine.md",
+    "challenges/elixir/04-insane/data-and-integrations/37-build-blockchain-simulation/37-build-blockchain-simulation.md",
+    "challenges/elixir/04-insane/data-and-integrations/20-build-crdt-data-structures",
+    "challenges/elixir/04-insane/data-and-integrations/47-build-workflow-engine-temporal-like",
+    "challenges/elixir/04-insane/data-and-integrations/43-build-ai-inference-engine",
+    "challenges/elixir/04-insane/data-and-integrations/37-build-blockchain-simulation",
+    "challenges/elixir/04-insane/data-and-integrations",
+    "challenges/elixir/04-insane/observability/06-build-distributed-tracing-system/06-build-distributed-tracing-system.md",
+    "challenges/elixir/04-insane/observability/29-build-metrics-collector-prometheus-like/29-build-metrics-collector-prometheus-like.md",
+    "challenges/elixir/04-insane/observability/30-build-profiler-performance-analyzer/30-build-profiler-performance-analyzer.md",
+    "challenges/elixir/04-insane/observability/28-build-log-aggregation-system/28-build-log-aggregation-system.md",
+    "challenges/elixir/04-insane/observability/30-build-profiler-performance-analyzer",
+    "challenges/elixir/04-insane/observability/29-build-metrics-collector-prometheus-like",
+    "challenges/elixir/04-insane/observability/28-build-log-aggregation-system",
+    "challenges/elixir/04-insane/observability/06-build-distributed-tracing-system",
+    "challenges/elixir/04-insane/observability",
+    "challenges/elixir/04-insane/languages-and-compilers/25-build-lisp-interpreter/25-build-lisp-interpreter.md",
+    "challenges/elixir/04-insane/languages-and-compilers/40-build-wasm-interpreter/40-build-wasm-interpreter.md",
+    "challenges/elixir/04-insane/languages-and-compilers/27-build-regex-engine/27-build-regex-engine.md",
+    "challenges/elixir/04-insane/languages-and-compilers/26-build-mini-language-compiler/26-build-mini-language-compiler.md",
+    "challenges/elixir/04-insane/network-and-proxies/22-build-stream-processor-flink-like/22-build-stream-processor-flink-like.md",
+    "challenges/elixir/04-insane/network-and-proxies/36-build-video-streaming-server/36-build-video-streaming-server.md",
+    "challenges/elixir/04-insane/network-and-proxies/39-build-service-mesh-proxy/39-build-service-mesh-proxy.md",
+    "challenges/elixir/04-insane/network-and-proxies/38-build-p2p-file-sharing/38-build-p2p-file-sharing.md",
+    "challenges/elixir/04-insane/network-and-proxies/35-build-load-balancer/35-build-load-balancer.md",
+    "challenges/elixir/04-insane/network-and-proxies/34-build-api-gateway/34-build-api-gateway.md",
     "Presentacion/poc-just/web/node_modules/ordered-binary/assets/powers-dre.png",
     "Presentacion/poc-just/web/node_modules/retry/equation.gif",
     "Untitled.canvas"

@@ -1,8 +1,6 @@
 # Phoenix.Presence Metas and CRDT Merge Semantics
 
 **Project**: `presence_metas` — per-device presence with multi-tab aware merge/reduce.
-**Difficulty**: ★★★★☆
-**Estimated time**: 4–6 hours
 
 ---
 
@@ -44,6 +42,12 @@ presence_metas/
 │           └── dashboard_channel_test.exs
 └── mix.exs
 ```
+
+---
+
+## Why Presence and not a custom GenServer
+
+Presence across nodes needs conflict-free replication. Phoenix.Presence implements an ORSWOT-style CRDT and rides on Phoenix.PubSub. Rebuilding that is months of work for no gain.
 
 ---
 
@@ -113,9 +117,25 @@ does exactly this merge.
 
 ---
 
+## Design decisions
+
+**Option A — custom GenServer tracking who is online**
+- Pros: full control over state shape.
+- Cons: distribution, CRDT conflict resolution, and netsplit recovery are your problem.
+
+**Option B — Phoenix.Presence with per-connection metas** (chosen)
+- Pros: distributed, CRDT-backed, netsplit-tolerant; metas carry per-connection state.
+- Cons: eventual consistency; metadata size affects gossip cost.
+
+→ Chose **B** because distributed presence with metadata is a textbook CRDT problem; Phoenix.Presence has solved it.
+
+---
+
 ## Implementation
 
 ### Step 1: `mix.exs`
+
+**Objective**: Declare the project, dependencies, and OTP application in `mix.exs`.
 
 ```elixir
 defmodule PresenceMetas.MixProject do
@@ -140,7 +160,35 @@ defmodule PresenceMetas.MixProject do
 end
 ```
 
+### Dependencies (mix.exs)
+
+```elixir
+```elixir
+defmodule PresenceMetas.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :presence_metas, version: "0.1.0", elixir: "~> 1.16", deps: deps()]
+  end
+
+  def application do
+    [mod: {PresenceMetas.Application, []}, extra_applications: [:logger]]
+  end
+
+  defp deps do
+    [
+      {:phoenix, "~> 1.7"},
+      {:phoenix_pubsub, "~> 2.1"},
+      {:jason, "~> 1.4"},
+      {:bandit, "~> 1.5"}
+    ]
+  end
+end
+```
+
 ### Step 2: `lib/presence_metas/presence.ex`
+
+**Objective**: Implement the module in `lib/presence_metas/presence.ex`.
 
 ```elixir
 defmodule PresenceMetas.Presence do
@@ -197,6 +245,8 @@ client to consume. Because it runs *per `list/1` call*, not per presence change,
 absorbs the cost of DB enrichment without slowing the gossip loop.
 
 ### Step 3: `lib/presence_metas/channels/dashboard_channel.ex`
+
+**Objective**: Implement the module in `lib/presence_metas/channels/dashboard_channel.ex`.
 
 ```elixir
 defmodule PresenceMetas.Channels.DashboardChannel do
@@ -264,6 +314,8 @@ online dot. `update/4` emits a single diff that keeps the ref stable.
 
 ### Step 4: `lib/presence_metas/user_socket.ex`
 
+**Objective**: Implement the module in `lib/presence_metas/user_socket.ex`.
+
 ```elixir
 defmodule PresenceMetas.UserSocket do
   use Phoenix.Socket
@@ -280,6 +332,8 @@ end
 
 ### Step 5: `lib/presence_metas/endpoint.ex`
 
+**Objective**: Implement the module in `lib/presence_metas/endpoint.ex`.
+
 ```elixir
 defmodule PresenceMetas.Endpoint do
   use Phoenix.Endpoint, otp_app: :presence_metas
@@ -289,6 +343,8 @@ end
 ```
 
 ### Step 6: `lib/presence_metas/application.ex`
+
+**Objective**: Define the OTP application and supervision tree in `lib/presence_metas/application.ex`.
 
 ```elixir
 defmodule PresenceMetas.Application do
@@ -308,6 +364,8 @@ end
 ```
 
 ### Step 7: Tests
+
+**Objective**: Add tests that cover the expected behavior and edge cases.
 
 ```elixir
 # test/presence_metas/presence_test.exs
@@ -458,6 +516,27 @@ defmodule PresenceMetas.Channels.DashboardChannelTest do
 end
 ```
 
+### Why this works
+
+Each node tracks its own users via `Phoenix.Tracker`. Nodes gossip state deltas using a CRDT that converges regardless of message order. Metas are per-connection data merged into the user's presence record.
+
+---
+
+## Advanced Considerations: LiveView Real-Time Patterns and Pubsub Scale
+
+LiveView bridges the browser and BEAM via WebSocket, allowing server-side renders to push incremental DOM diffs to the client. A LiveView process is long-lived, receiving events (clicks, form submissions) and broadcasting updates. For real-time features (collaborative editing, live notifications), LiveView processes subscribe to PubSub topics and receive broadcast messages.
+
+Phoenix.PubSub partitions topics across a pool of processes, allowing horizontal scaling. By default, `:local` mode uses in-memory ETS; `:redis` mode distributes across nodes via Redis. At scale (thousands of concurrent LiveViews), topic fanout can bottleneck: broadcasting to a million subscribers means delivering one million messages. The BEAM handles this, but the network cost matters on multi-node deployments.
+
+`Presence` module tracks which users are viewing which pages, syncing state via PubSub. A presence join/leave is broadcast to all nodes, allowing real-time "who's online" updates. Under partition, presence state can diverge; the library uses unique presence keys to detect and reconcile. Operationally, watching presence on every page load can amplify server load if users are flaky (mobile networks, browser reloads). Consider presence only for features where it's user-facing (collaborative editors, live sports scoreboards).
+
+---
+
+
+## Deep Dive: Phoenix Patterns and Production Implications
+
+Phoenix's conn struct represents an HTTP request/response in flight, accumulating transformations through middleware and handler code. Testing a Phoenix endpoint end-to-end (not just the controller) catches middleware order bugs, header mismatches, and plug composition issues. The trade-off is that full integration tests are slower and harder to parallelize than unit tests. Production bugs in auth, CORS, or session handling are often due to middleware assumptions that live tests reveal.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -499,6 +578,25 @@ if you need to do meaningful work on every change.
 (e.g., billing-relevant seat-counting), Presence is the wrong tool — the metas live in
 memory only. Persist to Postgres with a last-seen-at timestamp and use Presence as a
 UX hint layered on top, not as the source of truth.
+
+---
+
+## Benchmark
+
+```elixir
+# :timer.tc / Benchee measurement sketch
+{time_us, _} = :timer.tc(fn -> :ok end)
+IO.puts("elapsed: #{time_us} us")
+```
+
+Target: presence update propagates cluster-wide in tens of ms under normal load; metas add <1 KB per connection.
+
+---
+
+## Reflection
+
+- Your metas grow to 20 KB per connection. What breaks first, and how do you keep the same visible behavior while shrinking the payload?
+- During a netsplit, two halves show disjoint users. What does Presence do on heal, and is 'last writer wins' the right policy for your domain?
 
 ---
 

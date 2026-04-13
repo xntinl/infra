@@ -76,6 +76,8 @@ end
 
 ### Step 1: Version-resolving plug
 
+**Objective**: Resolve URL > header > Accept > default into a single `assign(:api_version)` and append sunset headers for retired versions.
+
 ```elixir
 defmodule PaymentsApiWeb.Plugs.ApiVersion do
   @behaviour Plug
@@ -142,6 +144,8 @@ end
 
 ### Step 2: Router wires URL, header, and content-type strategies
 
+**Objective**: Mount `/v1`, `/v2`, and an unversioned scope through the same pipeline so precedence (URL beats header beats media type) is proven by routing alone.
+
 ```elixir
 defmodule PaymentsApiWeb.Router do
   use PaymentsApiWeb, :router
@@ -176,6 +180,8 @@ end
 
 ### Step 3: Controller — version-agnostic
 
+**Objective**: Keep controller actions version-blind and dispatch to per-version views via `pick_view/1`, isolating shape churn from business logic.
+
 ```elixir
 defmodule PaymentsApiWeb.ChargeController do
   use PaymentsApiWeb, :controller
@@ -200,6 +206,8 @@ end
 
 ### Step 4: Version-specific views
 
+**Objective**: Encode v1's legacy string amount and v2's structured money object in separate views so each contract evolves independently.
+
 ```elixir
 defmodule PaymentsApiWeb.ChargeViewV1 do
   def render("index.json", %{charges: cs}), do: %{charges: Enum.map(cs, &to_map/1)}
@@ -219,6 +227,8 @@ end
 ```
 
 ### Step 5: Domain module
+
+**Objective**: Model `Charge` as a pure struct with `amount_cents` + currency so the domain never leaks version-specific serialization.
 
 ```elixir
 defmodule PaymentsApi.Billing do
@@ -320,6 +330,50 @@ Benchee.run(%{
 
 **Expected**: < 20 µs overhead from the plug itself.
 
+## Deep Dive: Query Complexity and N+1 Prevention Patterns
+
+GraphQL's flexibility is a double-edged sword. A query like `{ users { posts { comments { author { email } } } } }`
+becomes a DDoS vector if unchecked: a resolver that loads each post's comments naively yields 1000 database 
+queries for a 100-user query.
+
+**Three strategies to prevent N+1**:
+1. **Dataloader batching** (Absinthe-native): Queue fields in phase 1 (`load/3`), flush in phase 2 (`run/1`).
+   Single database call per level. Works across HTTP boundaries via custom sources.
+2. **Ecto select/5 eager loading** (preload): Best when schema relationships are known at resolver definition time.
+   Fine-grained control; requires discipline in your types.
+3. **Complexity analysis** (persisted queries): Assign a "weight" to each field (users=2, posts=5, comments=10).
+   Reject queries exceeding a threshold BEFORE execution. Prevents runaway queries entirely.
+
+**Production gotcha**: Complexity analysis doesn't prevent slow queries — it prevents expensive queries.
+A query that hits 50,000 database rows but under the complexity limit still runs. Combine with database 
+query timeouts and active monitoring.
+
+**Subscription patterns** (real-time): Subscriptions over PubSub break traditional Dataloader batching 
+because events arrive asynchronously. Use a separate resolver that doesn't call the loader; instead, 
+publish (source) and subscribe (sink) directly. This keeps subscriptions cheap and doesn't starve 
+the dataloader queue.
+
+**Field-level authorization**: Dataloader sources can enforce per-user visibility rules at load time, 
+not in the resolver. This is cleaner than filtering after the fact and reduces unnecessary database 
+queries for unauthorized fields.
+
+---
+
+## Advanced Considerations
+
+API implementations at scale require careful consideration of request handling, error responses, and the interaction between multiple clients with different performance expectations. The distinction between public APIs and internal APIs affects error reporting granularity, versioning strategies, and backwards compatibility guarantees fundamentally. Versioning APIs through headers, paths, or query parameters each have trade-offs in terms of maintenance burden, client complexity, and developer experience across multiple client versions. When deprecating API endpoints, the migration window and support period must balance client migration costs with infrastructure maintenance costs and team capacity constraints.
+
+GraphQL adds complexity around query costs, depth limits, and the interaction between nested resolvers and N+1 query problems. A deeply nested GraphQL query can trigger hundreds of database queries if not carefully managed with proper preloading and query analysis. Implementing query cost analysis prevents malicious or poorly-written queries from starving resources and degrading service for other clients. The caching layer becomes more complex with GraphQL because the same data may be accessed through multiple query paths, each with different caching semantics and TTL requirements that must be carefully coordinated at the application level.
+
+Error handling and status codes require careful design to balance information disclosure with security concerns. Too much detail in error messages helps attackers; too little detail frustrates legitimate users. Implement structured error responses with specific error codes that clients can use to handle different failure scenarios intelligently and retry appropriately. Rate limiting, circuit breakers, and backpressure mechanisms prevent API overload but require careful configuration based on expected traffic patterns and SLA requirements.
+
+
+## Deep Dive: Apis Patterns and Production Implications
+
+API testing requires testing schema validation, error messages, pagination, and rate limiting—not just happy paths. The mistake is testing only the happy path and assuming error handling works. Production APIs with weak error handling become support nightmares.
+
+---
+
 ## Trade-offs and production gotchas
 
 **1. Missing `accepts` for custom media types**
@@ -350,3 +404,13 @@ You discovered that 3% of traffic still hits `/v1`, mostly from one large integr
 - [Phoenix — accepts plug](https://hexdocs.pm/phoenix/Phoenix.Controller.html#accepts/2)
 - [Stripe — API versioning](https://stripe.com/docs/api/versioning)
 - [Fielding — REST APIs must be hypertext-driven](https://roy.gbiv.com/untangled/2008/rest-apis-must-be-hypertext-driven)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

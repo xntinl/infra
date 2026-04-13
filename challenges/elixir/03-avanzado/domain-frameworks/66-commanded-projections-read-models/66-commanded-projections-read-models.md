@@ -6,7 +6,7 @@
 
 ## Project context
 
-Continuing the fintech ledger from exercise 65, the write side is live: every deposit, withdrawal, and closure is appended as an event to the event store. Now the product team needs a dashboard that shows, for each account, the current balance, the last 20 transactions, and daily aggregated totals per customer. The aggregate cannot serve these queries — it holds only one account's state and hitting it means a GenServer round-trip that competes with write traffic.
+You are building a fintech ledger using event sourcing: every deposit, withdrawal, and closure is appended as an event to an event store. Now the product team needs a dashboard that shows, for each account, the current balance, the last 20 transactions, and daily aggregated totals per customer. The aggregate cannot serve these queries — it holds only one account's state and hitting it means a GenServer round-trip that competes with write traffic.
 
 The solution is **projections**: background processes that consume the event stream and write denormalized rows into Postgres. Queries hit Postgres, never the aggregate. This is the "Q" in CQRS: query models tailored to the read patterns, independent of the write model.
 
@@ -116,6 +116,8 @@ Because events are the source of truth, you can drop the projection table, reset
 
 ### Step 1: `mix.exs`
 
+**Objective**: Add Commanded, Ecto, and commanded_ecto_projections for event-driven read-model synchronization.
+
 ```elixir
 defmodule CommandedProjections.MixProject do
   use Mix.Project
@@ -141,6 +143,8 @@ end
 ```
 
 ### Step 2: Repo — `lib/commanded_projections/repo.ex`
+
+**Objective**: Define Ecto Repo and Commanded configuration to separate event write-store from Postgres read-models.
 
 ```elixir
 defmodule CommandedProjections.Repo do
@@ -172,6 +176,8 @@ config :commanded_projections, CommandedProjections.App,
 ```
 
 ### Step 3: Migrations — `priv/repo/migrations/`
+
+**Objective**: Create account_balances, transaction_log, and daily_totals tables with projection_versions tracking.
 
 ```elixir
 # 001_create_account_balances.exs
@@ -228,6 +234,8 @@ end
 
 ### Step 4: Ecto schemas — `lib/commanded_projections/projections/*.ex`
 
+**Objective**: Map read-model tables to Ecto schemas to enable ORM queries against projected state.
+
 ```elixir
 defmodule CommandedProjections.Projections.AccountBalance do
   use Ecto.Schema
@@ -267,6 +275,8 @@ end
 ```
 
 ### Step 5: The projectors
+
+**Objective**: Implement: The projectors.
 
 ```elixir
 # lib/commanded_projections/projectors/account_balance_projector.ex
@@ -395,6 +405,8 @@ end
 
 ### Step 6: Supervision — `lib/commanded_projections/application.ex`
 
+**Objective**: Wire the supervision tree: Supervision — `lib/commanded_projections/application.ex`.
+
 ```elixir
 defmodule CommandedProjections.App do
   use Commanded.Application, otp_app: :commanded_projections
@@ -420,6 +432,8 @@ end
 
 ### Step 7: Tests — `test/projectors_test.exs`
 
+**Objective**: Provide tests that exercise: Tests — `test/projectors_test.exs`.
+
 ```elixir
 defmodule CommandedProjections.ProjectorsTest do
   use ExUnit.Case
@@ -434,45 +448,47 @@ defmodule CommandedProjections.ProjectorsTest do
     :ok
   end
 
-  test "AccountBalance projector inserts on open and updates on deposit" do
-    account_id = "acc-" <> Integer.to_string(System.unique_integer([:positive]))
+  describe "CommandedProjections.Projectors" do
+    test "AccountBalance projector inserts on open and updates on deposit" do
+      account_id = "acc-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    publish_events([
-      %AccountOpened{account_id: account_id, owner: "Alice", overdraft_limit: 0},
-      %MoneyDeposited{
-        account_id: account_id,
-        amount: 500,
-        new_balance: 500,
-        deposited_at: DateTime.utc_now()
-      }
-    ])
+      publish_events([
+        %AccountOpened{account_id: account_id, owner: "Alice", overdraft_limit: 0},
+        %MoneyDeposited{
+          account_id: account_id,
+          amount: 500,
+          new_balance: 500,
+          deposited_at: DateTime.utc_now()
+        }
+      ])
 
-    wait_for_projection(fn ->
-      Repo.get(AccountBalance, account_id)
-    end)
+      wait_for_projection(fn ->
+        Repo.get(AccountBalance, account_id)
+      end)
 
-    row = Repo.get(AccountBalance, account_id)
-    assert row.balance == 500
-    assert row.status == "open"
-  end
+      row = Repo.get(AccountBalance, account_id)
+      assert row.balance == 500
+      assert row.status == "open"
+    end
 
-  test "TransactionLog appends one row per money event" do
-    account_id = "acc-tx-" <> Integer.to_string(System.unique_integer([:positive]))
+    test "TransactionLog appends one row per money event" do
+      account_id = "acc-tx-" <> Integer.to_string(System.unique_integer([:positive]))
 
-    publish_events([
-      %AccountOpened{account_id: account_id, owner: "Bob", overdraft_limit: 0},
-      %MoneyDeposited{account_id: account_id, amount: 100, new_balance: 100, deposited_at: DateTime.utc_now()},
-      %MoneyWithdrawn{account_id: account_id, amount: 30, new_balance: 70, withdrawn_at: DateTime.utc_now()}
-    ])
+      publish_events([
+        %AccountOpened{account_id: account_id, owner: "Bob", overdraft_limit: 0},
+        %MoneyDeposited{account_id: account_id, amount: 100, new_balance: 100, deposited_at: DateTime.utc_now()},
+        %MoneyWithdrawn{account_id: account_id, amount: 30, new_balance: 70, withdrawn_at: DateTime.utc_now()}
+      ])
 
-    wait_for_projection(fn ->
-      import Ecto.Query
-      Repo.aggregate(from(t in TransactionLog, where: t.account_id == ^account_id), :count)
-      |> case do
-        n when n >= 2 -> :ok
-        _ -> nil
-      end
-    end)
+      wait_for_projection(fn ->
+        import Ecto.Query
+        Repo.aggregate(from(t in TransactionLog, where: t.account_id == ^account_id), :count)
+        |> case do
+          n when n >= 2 -> :ok
+          _ -> nil
+        end
+      end)
+    end
   end
 
   # ---- helpers ----
@@ -504,6 +520,8 @@ end
 
 ### Step 8: Run
 
+**Objective**: Verify the implementation by running the test suite.
+
 ```bash
 mix ecto.create
 mix ecto.migrate
@@ -528,6 +546,24 @@ IO.puts("avg: #{time_us / 10_000} µs/op")
 ```
 
 Target: operation should complete in the low-microsecond range on modern hardware; deviations by >2× indicate a regression worth investigating.
+
+## Deep Dive
+
+Specialized frameworks like Ash (business logic), Commanded (event sourcing), and Nx (numerical computing) abstract away common infrastructure but impose architectural constraints. Ash's declarative resource definitions simplify authorization and querying at the cost of reduced flexibility—deeply nested association policies can degrade query performance. Commanded's event store and aggregate roots enforce event sourcing discipline, making audit trails and temporal queries natural, but require careful snapshot strategy to avoid replaying years of events. Nx brings numerical computing to Elixir, but JIT compilation and lazy evaluation introduce latency; production models benefit from ahead-of-time compilation for inference. For IoT (Nerves), firmware updates must be atomic and resumable—OTA rollback on failure is non-negotiable. Choose frameworks that align with your scaling assumptions: Ash scales horizontally via read replicas; Commanded scales via sharding; Nx scales via distributed training.
+## Advanced Considerations
+
+Framework choices like Ash, Commanded, and Nerves create significant architectural constraints that are difficult to change later. Ash's powerful query builder and declarative approach simplify common patterns but can be opaque when debugging complex permission logic or custom filters at scale. Event sourcing with Commanded is powerful for audit trails but creates a different mental model for state management — replaying events to derive current state has CPU and latency costs that aren't apparent in traditional CRUD systems.
+
+Nerves requires understanding the full embedded system stack — from bootloader configuration to over-the-air update mechanisms. A Nerves system that works on your development board may fail in production due to hardware variations, network conditions, or power supply issues. NX's numerical computing is powerful but requires understanding GPU acceleration trade-offs and memory management for large datasets. Livebook provides interactive development but shouldn't be used for production deployments without careful containerization and resource isolation.
+
+The integration between these frameworks and traditional BEAM patterns (supervisors, processes, GenServers) requires careful design. A Commanded projection that rebuilds state from the event log can consume all available CPU, starving other services. NX autograd computations can create unexpected memory usage if not carefully managed. Nerves systems are memory-constrained; performance assumptions from desktop Elixir don't hold. Always prototype these frameworks in realistic environments before committing to them in production systems to validate assumptions.
+
+
+## Deep Dive: Domain Patterns and Production Implications
+
+Domain-specific frameworks enforce module dependencies and architectural boundaries. Testing domain isolation ensures that constraints are maintained as the codebase grows. Production systems without boundary enforcement often become monolithic and hard to test.
+
+---
 
 ## Trade-offs and production gotchas
 
@@ -582,3 +618,13 @@ For the daily totals upsert pattern above, the `ON CONFLICT DO UPDATE SET value 
 - [Chris Keathley — "Consistency in distributed systems"](https://keathley.io/blog/consistency-in-distributed-systems.html)
 - [Ecto.Multi hexdocs](https://hexdocs.pm/ecto/Ecto.Multi.html) — the transactional building block used by every projector
 - [Greg Young — "Polyglot Data"](https://www.youtube.com/watch?v=hv2dKtPq0ME) — why different read models belong in different stores
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

@@ -66,6 +66,8 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ### Step 1: `mix.exs`
 
+**Objective**: Declare project dependencies and configure the Mix build.
+
 ```elixir
 defp deps do
   [
@@ -77,6 +79,8 @@ end
 ```
 
 ### Step 2: `lib/api_gateway/ml/feature_extractor.ex`
+
+**Objective**: Normalize 8 request features (rate, size, diversity, error, time, weekend, latency, burst) to [0,1] tensors.
 
 ```elixir
 defmodule ApiGateway.ML.FeatureExtractor do
@@ -129,6 +133,8 @@ end
 
 ### Step 3: `lib/api_gateway/ml/classifier.ex`
 
+**Objective**: Build 4-layer neural net (16→8→3 neurons) with ReLU, Dropout, and softmax for 3-class classification.
+
 ```elixir
 defmodule ApiGateway.ML.Classifier do
   @moduledoc """
@@ -165,6 +171,8 @@ The `build/0` function defines a sequential network:
 - Dense(3, softmax): output layer with 3 neurons, one per class. Softmax ensures outputs sum to 1.0, making them interpretable as probabilities.
 
 ### Step 4: `lib/api_gateway/ml/training.ex`
+
+**Objective**: Loop Axon training for N epochs with Adam optimizer, batching, and checkpointing best weights.
 
 ```elixir
 defmodule ApiGateway.ML.Training do
@@ -291,6 +299,8 @@ end
 
 ### Step 5: Given tests — must pass without modification
 
+**Objective**: Implement: Given tests — must pass without modification.
+
 ```elixir
 # test/api_gateway/ml_classifier_test.exs
 defmodule ApiGateway.ML.ClassifierTest do
@@ -370,6 +380,8 @@ end
 
 ### Step 6: Run the tests
 
+**Objective**: Verify the implementation by running the test suite.
+
 ```bash
 mix test test/api_gateway/ml_classifier_test.exs --trace
 ```
@@ -380,6 +392,21 @@ mix test test/api_gateway/ml_classifier_test.exs --trace
 ### Why this works
 
 The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
+
+
+## Deep Dive: Neural Networks and Deep Learning Framework Patterns in Production
+
+Axon is Elixir's deep learning library, built on top of Nx (Numerical Elixir). Production machine learning systems must handle retraining pipelines, model versioning, and inference latency budgets. The architecture decision—whether to embed models in the gateway or delegate to a sidecar service—affects failure isolation: a crashed model inference should not take down the entire gateway. Axon models are deterministic and pure, allowing you to test them offline before deployment. The trade-off is that model accuracy depends on training data quality; a model trained on stale attack patterns becomes a liability. Production ML systems require monitoring prediction confidence, not just accuracy, because low-confidence predictions often precede mode failures. Elixir's functional semantics and immutable tensors make it natural to build reproducible training pipelines that survive restarts.
+
+
+## Advanced Considerations
+
+Framework choices like Ash, Commanded, and Nerves create significant architectural constraints that are difficult to change later. Ash's powerful query builder and declarative approach simplify common patterns but can be opaque when debugging complex permission logic or custom filters at scale. Event sourcing with Commanded is powerful for audit trails but creates a different mental model for state management — replaying events to derive current state has CPU and latency costs that aren't apparent in traditional CRUD systems.
+
+Nerves requires understanding the full embedded system stack — from bootloader configuration to over-the-air update mechanisms. A Nerves system that works on your development board may fail in production due to hardware variations, network conditions, or power supply issues. NX's numerical computing is powerful but requires understanding GPU acceleration trade-offs and memory management for large datasets. Livebook provides interactive development but shouldn't be used for production deployments without careful containerization and resource isolation.
+
+The integration between these frameworks and traditional BEAM patterns (supervisors, processes, GenServers) requires careful design. A Commanded projection that rebuilds state from the event log can consume all available CPU, starving other services. NX autograd computations can create unexpected memory usage if not carefully managed. Nerves systems are memory-constrained; performance assumptions from desktop Elixir don't hold. Always prototype these frameworks in realistic environments before committing to them in production systems to validate assumptions.
+
 
 ## Trade-off analysis
 
@@ -433,3 +460,13 @@ Target: operation should complete in the low-microsecond range on modern hardwar
 - [Axon HexDocs](https://hexdocs.pm/axon/Axon.html) — layers, build, predict
 - [Axon.Loop](https://hexdocs.pm/axon/Axon.Loop.html) — trainer, metric, run
 - [Machine Learning in Elixir — Sean Moriarity](https://pragprog.com/titles/smelixir/machine-learning-in-elixir/)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

@@ -145,7 +145,24 @@ all emit into the same bus.
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"ecto", "~> 1.0"},
+    {:"phoenix", "~> 1.0"},
+    {:"plug", "~> 1.0"},
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
 
 ```bash
 mix new metrics_prom --sup
@@ -153,6 +170,9 @@ cd metrics_prom
 ```
 
 ### Step 2: `mix.exs`
+
+**Objective**: Declare dependencies and project config in `mix.exs`.
+
 
 ```elixir
 defmodule MetricsProm.MixProject do
@@ -187,6 +207,9 @@ end
 Run `mix deps.get`.
 
 ### Step 3: `lib/metrics_prom/metrics.ex`
+
+**Objective**: Implement `metrics.ex` — the integration seam where external protocol semantics meet Elixir domain code.
+
 
 ```elixir
 defmodule MetricsProm.Metrics do
@@ -237,6 +260,9 @@ end
 
 ### Step 4: `lib/metrics_prom/application.ex`
 
+**Objective**: Wire `application.ex` to start the supervision tree that boots Repo and external adapters in the correct order before serving traffic.
+
+
 ```elixir
 defmodule MetricsProm.Application do
   @moduledoc false
@@ -261,6 +287,9 @@ end
 ```
 
 ### Step 5: `lib/metrics_prom.ex`
+
+**Objective**: Implement `metrics_prom.ex` — the integration seam where external protocol semantics meet Elixir domain code.
+
 
 ```elixir
 defmodule MetricsProm do
@@ -304,6 +333,9 @@ end
 ```
 
 ### Step 6: `test/metrics_prom_test.exs`
+
+**Objective**: Write `metrics_prom_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
 
 ```elixir
 defmodule MetricsPromTest do
@@ -372,6 +404,9 @@ end
 
 ### Step 7: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -389,6 +424,15 @@ dashboards expect.
 
 ---
 
+
+## Deep Dive: State Management and Message Handling Patterns
+
+Understanding state transitions is central to reliable OTP systems. Every `handle_call` or `handle_cast` receives current state and returns new state—immutability forces explicit reasoning. This prevents entire classes of bugs: missing state updates are immediately visible.
+
+Key insight: separate pure logic (state → new state) from side effects (logging, external calls). Move pure logic to private helpers; use handlers for orchestration. This makes servers testable—test pure functions independently.
+
+In production, monitor state size and mutation frequency. Unbounded growth is a memory leak; excessive mutations signal hot spots needing optimization. Always profile before reaching for performance solutions like ETS.
+
 ## Benchmark
 
 Emitting an event via `:telemetry.execute/3` with 2-3 attached handlers
@@ -397,6 +441,12 @@ runs in a few hundred microseconds. Target: emission latency should
 stay under 20µs at the 99th percentile (it's in the request's hot path).
 If it exceeds that, you have too many handlers or a handler doing work
 it shouldn't (blocking I/O, heavy encoding).
+
+---
+
+## Key Concepts
+
+Telemetry metrics are aggregated views of telemetry events—counters, distributions, summaries. The Telemetry.Metrics library defines metrics (e.g., "http requests per route"), and Prometheus integration (via `TelemetryMetricsPrometheus`) exports them to Prometheus. Prometheus scrapes endpoints (usually `/metrics`) and stores time series. This is the modern observability stack: telemetry events (fine-grained, high-volume), metrics (aggregated, low-volume), Prometheus storage (queryable, alertable). The pipeline: library emits telemetry → metrics definitions aggregate → Prometheus exports → visualization and alerting. Understanding this layering is essential for production observability.
 
 ---
 

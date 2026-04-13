@@ -2,9 +2,6 @@
 
 **Project**: `macro_expand_debug` — build a tiny interactive diagnostic tool that takes a quoted expression and shows the step-by-step expansion, the final AST, and the final source, mirroring what you do by hand when a macro misbehaves.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 3–4 hours
-
 ---
 
 ## Project context
@@ -28,6 +25,12 @@ macro_expand_debug/
 │   └── inspector_test.exs
 └── mix.exs
 ```
+
+---
+
+## Why structured expansion and not print-the-AST
+
+Elixir AST is lists of three-element tuples. Reading them by eye past three levels is error-prone. `Macro.to_string/1` reconstructs valid Elixir source, and `Macro.expand/2` forces hidden macros to their final form.
 
 ---
 
@@ -69,9 +72,35 @@ these leaves and stop.
 
 ---
 
+## Design decisions
+
+**Option A — print the macro output via `IO.inspect`**
+- Pros: immediate; no extra tooling.
+- Cons: inspects AST tuples, which are unreadable for non-trivial output.
+
+**Option B — `Macro.to_string/1` + `Macro.expand/2`** (chosen)
+- Pros: round-trips AST to readable source; shows exactly what the compiler will see.
+- Cons: need to pick the right expansion depth; `expand_once` vs `expand` shows different views.
+
+→ Chose **B** because when the macro misbehaves, reading the emitted source is the fastest path to the bug.
+
+---
+
 ## Implementation
 
 ### Step 1: `lib/macro_expand_debug/inspector.ex`
+
+**Objective**: Implement trace_expansion/3 using Macro.expand_once and Macro.to_string to step through macro layers visually.
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
 
 ```elixir
 defmodule MacroExpandDebug.Inspector do
@@ -148,6 +177,8 @@ end
 
 ### Step 2: `lib/macro_expand_debug/sample_macros.ex`
 
+**Objective**: Define sample macros (greet, unless_positive, assert_type!) to exercise multi-step expansion visibly.
+
 ```elixir
 defmodule MacroExpandDebug.SampleMacros do
   @moduledoc """
@@ -190,6 +221,8 @@ end
 ```
 
 ### Step 3: Tests
+
+**Objective**: Assert expand_step detects changes, trace_expansion terminates, max_steps bounds runaway macros.
 
 ```elixir
 defmodule MacroExpandDebug.InspectorTest do
@@ -250,6 +283,27 @@ defmodule MacroExpandDebug.InspectorTest do
 end
 ```
 
+### Why this works
+
+`Macro.expand_once/2` expands the outermost macro exactly once; `Macro.expand/2` recurses until fixed point. Combining them with `Macro.to_string/1` at each level gives a layered view of what the compiler did, which is essential when a macro's output is itself a macro call.
+
+---
+
+## Advanced Considerations: Macro Hygiene and Compile-Time Validation
+
+Macros execute at compile time, walking the AST and returning new AST. That power is easy to abuse: a macro that generates variables can shadow outer scope bindings, or a quote block that references variables directly can fail if the macro is used in a context where those variables don't exist. The `unquote` mechanism is the escape hatch, but misusing it leads to hard-to-debug compile errors.
+
+Macro hygiene is about capturing intent correctly. A `defmacro` that takes `:my_option` and uses it directly might match an unrelated `:my_option` from the caller's scope. The idiomatic pattern is to use `unquote` for values that should be "from the outside" and keep AST nodes quoted for safety. The `quote` block's binding of `var!` and `binding!` provides escape valves for the rare case when shadowing is intentional.
+
+Compile-time validation unlocks errors that would otherwise surface at runtime. A macro can call functions to validate input, generate code conditionally, or fail the build with `IO.warn`. Schema libraries like `Ecto` and `Ash` use macros to define fields at compile time, so runtime queries are guaranteed type-safe. The cost is cognitive load: developers must reason about both the code as written and the code generated.
+
+---
+
+
+## Deep Dive: Metaprogramming Patterns and Production Implications
+
+Metaprogramming (macros, AST manipulation) requires testing at compile time and runtime. The challenge is that macro tests often involve parsing and expanding code, which couples tests to compiler internals. Production bugs in macros can corrupt entire modules; testing macros rigorously is non-negotiable.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -285,6 +339,19 @@ enough for runtime debugging. Reserve `Inspector` for compile-time diagnosis.
 one-liner `IO.puts(Macro.to_string(Macro.expand(quote(do: ...), __ENV__)))` does
 the job. Build an Inspector module only if macro debugging is a team-wide
 activity.
+
+---
+
+## Benchmark
+
+<!-- benchmark N/A: tema conceptual / plumbing de compile-time -->
+
+---
+
+## Reflection
+
+- A macro works in your tests but fails in a user's module. Which of `expand_once`, `expand`, or manual environment inspection is most likely to surface the difference? Why?
+- Would you ship a macro without an `expand_debug/1` helper? What does that helper look like, and who is it for?
 
 ---
 

@@ -2,9 +2,6 @@
 
 **Project**: `protocol_derive` — use `@derive` for built-in protocols (`Inspect`, `Jason.Encoder`), then implement a custom protocol that supports its own `@derive` via the `Protocol` module's generation hooks.
 
-**Difficulty**: ★★★★☆
-**Estimated time**: 3–5 hours
-
 ---
 
 ## Project context
@@ -33,6 +30,12 @@ protocol_derive/
 │   └── protocol_derive_test.exs
 └── mix.exs
 ```
+
+---
+
+## Why derivation and not manual impl
+
+Hand implementations become N copies of the same `defimpl`. `@derive` calls a single code-generating function per struct at compile time, keeping the protocol's contract in one place.
 
 ---
 
@@ -102,9 +105,35 @@ a "conflicting implementation" error.
 
 ---
 
+## Design decisions
+
+**Option A — hand-implement the protocol per struct**
+- Pros: full control; no macro surprises.
+- Cons: boilerplate multiplies with every new struct; drift between implementations.
+
+**Option B — `@derive` + default implementation** (chosen)
+- Pros: one-line opt-in; consistency enforced by the protocol.
+- Cons: customization requires overriding, which is easy to forget; compile error surface is wider.
+
+→ Chose **B** because most structs need the default behavior; deriving keeps that the obvious path.
+
+---
+
 ## Implementation
 
 ### Step 1: `lib/protocol_derive/audit_encoder.ex`
+
+**Objective**: Define protocol and implement __deriving__/3 on Any so @derive annotation generates struct-specific defimpl blocks.
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
 
 ```elixir
 defprotocol ProtocolDerive.AuditEncoder do
@@ -149,6 +178,8 @@ end
 
 ### Step 2: `lib/protocol_derive/helpers.ex`
 
+**Objective**: Isolate @pii_fields allow-list so all derived impls mask sensitive fields uniformly.
+
 ```elixir
 defmodule ProtocolDerive.AuditEncoder.Helpers do
   @moduledoc false
@@ -166,6 +197,8 @@ end
 ```
 
 ### Step 3: `lib/protocol_derive/schemas.ex`
+
+**Objective**: Define sample structs with @derive annotations (default, only, except) to exercise __deriving__/3 code paths.
 
 ```elixir
 defmodule ProtocolDerive.Schemas do
@@ -188,6 +221,8 @@ end
 ```
 
 ### Step 4: Tests
+
+**Objective**: Verify derive shapes, PII masking, the Any fallback, and that derive options round-trip through generated impls.
 
 ```elixir
 defmodule ProtocolDeriveTest do
@@ -247,6 +282,35 @@ defmodule ProtocolDeriveTest do
 end
 ```
 
+### Why this works
+
+`@derive Protocol` triggers `Protocol.derive/3` at module compilation, which invokes the protocol's `__deriving__/3` callback. That callback emits a full `defimpl` block against the deriving module, so the result is indistinguishable from a hand-written impl — except maintenance lives in the protocol.
+
+---
+
+
+## Key Concepts: Automatic Implementation via Protocol Derive
+
+Protocol derivation uses macros to automatically generate protocol implementations for structs. Instead of manually implementing `@derive Enumerable` via a module, you declare `@derive Enumerable` on the struct definition, and the macro generates the code at compile time. This saves boilerplate for common protocols like `Enumerable`, `Inspect`, `String.Chars`.
+
+For custom protocols, you can define a custom derive implementation via a macro that receives the struct definition and generates the protocol functions. This is powerful for implementing repetitive patterns (e.g., auto-generating a JSON encoder from struct fields), but requires careful macro design to avoid hygiene issues.
+
+
+## Advanced Considerations: Macro Hygiene and Compile-Time Validation
+
+Macros execute at compile time, walking the AST and returning new AST. That power is easy to abuse: a macro that generates variables can shadow outer scope bindings, or a quote block that references variables directly can fail if the macro is used in a context where those variables don't exist. The `unquote` mechanism is the escape hatch, but misusing it leads to hard-to-debug compile errors.
+
+Macro hygiene is about capturing intent correctly. A `defmacro` that takes `:my_option` and uses it directly might match an unrelated `:my_option` from the caller's scope. The idiomatic pattern is to use `unquote` for values that should be "from the outside" and keep AST nodes quoted for safety. The `quote` block's binding of `var!` and `binding!` provides escape valves for the rare case when shadowing is intentional.
+
+Compile-time validation unlocks errors that would otherwise surface at runtime. A macro can call functions to validate input, generate code conditionally, or fail the build with `IO.warn`. Schema libraries like `Ecto` and `Ash` use macros to define fields at compile time, so runtime queries are guaranteed type-safe. The cost is cognitive load: developers must reason about both the code as written and the code generated.
+
+---
+
+
+## Deep Dive: Metaprogramming Patterns and Production Implications
+
+Metaprogramming (macros, AST manipulation) requires testing at compile time and runtime. The challenge is that macro tests often involve parsing and expanding code, which couples tests to compiler internals. Production bugs in macros can corrupt entire modules; testing macros rigorously is non-negotiable.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -295,6 +359,13 @@ Benchee.run(%{
 
 Expect ~1–3 µs per call — dominated by the `Map.take/2` step, not the protocol
 dispatch.
+
+---
+
+## Reflection
+
+- Your protocol now needs a struct-specific knob (e.g. a formatting option). Do you keep `@derive` and take it via a module attribute, or switch to explicit impls? What is the readability cost of each?
+- After consolidation, protocols become static. How does that change your feelings about `@derive` for libraries loaded at runtime by plugins?
 
 ---
 

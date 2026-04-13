@@ -125,18 +125,23 @@ host.
 
 ## Implementation
 
-### Dependencies (`mix.exs`)
+### Dependencies (mix.exs)
 
 ```elixir
 defp deps do
   [
-    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+    # Standard library: no external dependencies required
   ]
 end
 ```
 
 
+
+
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
 
 ```bash
 mix new systemd_packaged --sup
@@ -145,6 +150,9 @@ mkdir -p config rel/overlays/systemd
 ```
 
 ### Step 2: `config/config.exs` and `config/runtime.exs`
+
+**Objective**: Provide `config/config.exs` and `config/runtime.exs` — these are the supporting fixtures the main module depends on to make its concept demonstrable.
+
 
 ```elixir
 # config/config.exs
@@ -163,6 +171,9 @@ config :systemd_packaged,
 ```
 
 ### Step 3: `rel/overlays/systemd/systemd_packaged.service`
+
+**Objective**: Provide `rel/overlays/systemd/systemd_packaged.service` — these are the supporting fixtures the main module depends on to make its concept demonstrable.
+
 
 ```ini
 [Unit]
@@ -215,6 +226,9 @@ WantedBy=multi-user.target
 
 ### Step 4: `rel/overlays/env.sample`
 
+**Objective**: Provide `rel/overlays/env.sample` — these are the supporting fixtures the main module depends on to make its concept demonstrable.
+
+
 ```sh
 # Copy to /etc/systemd_packaged/env and lock down permissions:
 #   install -o systemd_packaged -g systemd_packaged -m 0600 env.sample /etc/systemd_packaged/env
@@ -231,6 +245,9 @@ RELEASE_COOKIE=change-me-to-a-long-random-string
 ```
 
 ### Step 5: `mix.exs` with overlay step
+
+**Objective**: Provide `mix.exs` with overlay step — these are the supporting fixtures the main module depends on to make its concept demonstrable.
+
 
 ```elixir
 defmodule SystemdPackaged.MixProject do
@@ -270,6 +287,9 @@ end
 
 ### Step 6: `lib/systemd_packaged/application.ex` and `lib/systemd_packaged.ex`
 
+**Objective**: Provide `lib/systemd_packaged/application.ex` and `lib/systemd_packaged.ex` — these are the supporting fixtures the main module depends on to make its concept demonstrable.
+
+
 ```elixir
 defmodule SystemdPackaged.Application do
   @moduledoc false
@@ -298,6 +318,9 @@ end
 
 ### Step 7: `test/systemd_packaged_test.exs`
 
+**Objective**: Write `systemd_packaged_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+
 ```elixir
 defmodule SystemdPackagedTest do
   use ExUnit.Case, async: false
@@ -317,6 +340,9 @@ end
 ```
 
 ### Step 8: Install on a host (typical flow)
+
+**Objective**: Install on a host (typical flow).
+
 
 ```bash
 # On the build host:
@@ -345,6 +371,21 @@ sudo journalctl -u systemd_packaged -f
 
 The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
 
+
+
+## Key Concepts
+
+Systemd units package Elixir releases for Linux deployments, providing process supervision and restart-on-failure. A unit file specifies `ExecStart: /path/to/bin/myapp start` and Systemd ensures the process restarts if it crashes. You get two layers of supervision—OTP inside the VM, Systemd outside. OTP handles application logic and state; Systemd handles machine-level concerns (restart, resource limits, log aggregation). Coordinating both correctly requires understanding the boundary: OTP stops a crashed process and lets Systemd restart the whole VM; Systemd enforces timeout limits so stuck VMs eventually restart. This layering is standard practice for production Linux deployments.
+
+---
+
+## Deep Dive: Compile-Time vs Runtime Configuration Boundaries
+
+A release is a static artifact: code and compile-time config are baked in. Runtime config must be provided at boot via environment variables, config files, or config providers. Simple rule: if a value changes between dev and prod, it goes in `config/runtime.exs`, not `config/config.exs`.
+
+Footgun: putting config in compile-time files and assuming environment variables work at runtime. Releases ignore env vars unless `config/runtime.exs` explicitly reads them. If you need env vars, fetch them in `config/runtime.exs` and store in application state.
+
+For distributed systems, config providers (modules loading config from Consul, S3, etc.) are powerful but complex. Start with environment variables and `config/runtime.exs`; only reach for providers if you need dynamic reloading without downtime or multi-tenant config switching. Premature provider complexity is a mistake.
 
 ## Benchmark
 

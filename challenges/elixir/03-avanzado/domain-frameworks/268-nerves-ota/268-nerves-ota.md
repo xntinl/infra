@@ -155,6 +155,8 @@ Device certificates expire. In a 7-year fleet lifetime, you will rotate them at 
 
 ### Step 1: Project skeleton
 
+**Objective**: Scaffold with `mix nerves.new` targeting rpi4 — Nerves generators bake in A/B partitions, fwup, and release steps that are painful to retrofit.
+
 ```bash
 mix nerves.new nerves_ota --target rpi4
 cd nerves_ota
@@ -162,6 +164,8 @@ mix deps.get
 ```
 
 ### Step 2: `mix.exs` — dependencies
+
+**Objective**: Pin `nerves_hub_link`, `nerves_runtime`, `shoehorn` — these deliver OTA transport, KV access, and boot-loop recovery; Mox is test-only.
 
 ```elixir
 defmodule NervesOta.MixProject do
@@ -220,6 +224,8 @@ end
 
 ### Step 3: `config/target.exs` — NervesHub client
 
+**Objective**: Configure `nerves_hub_link` with heartbeat + reconnect backoff — the socket must survive flaky networks without DoSing the hub on reconnect.
+
 ```elixir
 import Config
 
@@ -240,6 +246,8 @@ config :nerves, :firmware, fwup_conf: "config/fwup.conf"
 ```
 
 ### Step 4: `lib/nerves_ota/application.ex`
+
+**Objective**: Branch the supervision tree on target vs host — the firmware validator only runs on-device; host keeps iteration fast during dev.
 
 ```elixir
 defmodule NervesOta.Application do
@@ -271,6 +279,8 @@ end
 ```
 
 ### Step 5: `lib/nerves_ota/nerves_hub_client.ex`
+
+**Objective**: Implement the `NervesHubLink.Client` behaviour — delegate the `apply | reschedule | ignore` decision to a pure policy module for testability.
 
 ```elixir
 defmodule NervesOta.NervesHubClient do
@@ -341,6 +351,8 @@ end
 
 ### Step 6: `lib/nerves_ota/update_policy.ex`
 
+**Objective**: Keep the apply/reschedule/ignore rules pure — health, time, and `[force]` metadata are inputs; no IO means property-testable decisions.
+
 ```elixir
 defmodule NervesOta.UpdatePolicy do
   @moduledoc """
@@ -399,6 +411,8 @@ end
 ```
 
 ### Step 7: `lib/nerves_ota/health.ex`
+
+**Objective**: Gate `validate_firmware/0` behind N green health cycles — without this, a boot-looping firmware can self-mark as good and brick the device.
 
 ```elixir
 defmodule NervesOta.Health do
@@ -484,6 +498,8 @@ end
 
 ### Step 8: `lib/nerves_ota/firmware_metadata.ex`
 
+**Objective**: Wrap `Nerves.Runtime.KV` behind a testable facade — an env-based override lets tests inject active partition, UUID, and validation state.
+
 ```elixir
 defmodule NervesOta.FirmwareMetadata do
   @moduledoc "Thin wrapper around `Nerves.Runtime.KV` and error counting."
@@ -541,6 +557,8 @@ end
 ```
 
 ### Step 9: Tests
+
+**Objective**: Cover the policy's branch matrix (healthy/unhealthy × in-window/out/force) — the policy IS the safety story; tests must be exhaustive.
 
 ```elixir
 # test/nerves_ota/update_policy_test.exs
@@ -614,6 +632,8 @@ end
 
 ### Step 10: CI — `.github/workflows/firmware.yml`
 
+**Objective**: Build, sign, and publish firmware to NervesHub's canary deployment — unsigned firmware cannot be applied, so signing failure blocks rollout.
+
 ```yaml
 name: firmware
 on:
@@ -662,6 +682,24 @@ IO.puts("avg: #{time_us / 10_000} µs/op")
 ```
 
 Target: operation should complete in the low-microsecond range on modern hardware; deviations by >2× indicate a regression worth investigating.
+
+## Deep Dive
+
+Specialized frameworks like Ash (business logic), Commanded (event sourcing), and Nx (numerical computing) abstract away common infrastructure but impose architectural constraints. Ash's declarative resource definitions simplify authorization and querying at the cost of reduced flexibility—deeply nested association policies can degrade query performance. Commanded's event store and aggregate roots enforce event sourcing discipline, making audit trails and temporal queries natural, but require careful snapshot strategy to avoid replaying years of events. Nx brings numerical computing to Elixir, but JIT compilation and lazy evaluation introduce latency; production models benefit from ahead-of-time compilation for inference. For IoT (Nerves), firmware updates must be atomic and resumable—OTA rollback on failure is non-negotiable. Choose frameworks that align with your scaling assumptions: Ash scales horizontally via read replicas; Commanded scales via sharding; Nx scales via distributed training.
+## Advanced Considerations
+
+Framework choices like Ash, Commanded, and Nerves create significant architectural constraints that are difficult to change later. Ash's powerful query builder and declarative approach simplify common patterns but can be opaque when debugging complex permission logic or custom filters at scale. Event sourcing with Commanded is powerful for audit trails but creates a different mental model for state management — replaying events to derive current state has CPU and latency costs that aren't apparent in traditional CRUD systems.
+
+Nerves requires understanding the full embedded system stack — from bootloader configuration to over-the-air update mechanisms. A Nerves system that works on your development board may fail in production due to hardware variations, network conditions, or power supply issues. NX's numerical computing is powerful but requires understanding GPU acceleration trade-offs and memory management for large datasets. Livebook provides interactive development but shouldn't be used for production deployments without careful containerization and resource isolation.
+
+The integration between these frameworks and traditional BEAM patterns (supervisors, processes, GenServers) requires careful design. A Commanded projection that rebuilds state from the event log can consume all available CPU, starving other services. NX autograd computations can create unexpected memory usage if not carefully managed. Nerves systems are memory-constrained; performance assumptions from desktop Elixir don't hold. Always prototype these frameworks in realistic environments before committing to them in production systems to validate assumptions.
+
+
+## Deep Dive: Domain Patterns and Production Implications
+
+Domain-specific frameworks enforce module dependencies and architectural boundaries. Testing domain isolation ensures that constraints are maintained as the codebase grows. Production systems without boundary enforcement often become monolithic and hard to test.
+
+---
 
 ## Trade-offs and production gotchas
 
@@ -714,3 +752,13 @@ Measure on your actual target. A raspberry pi 3B+ with a slow SD card can easily
 - [Justin Schneck — "Smart Rockets with Nerves"](https://www.youtube.com/watch?v=oSE4Lc4LTyw) — co-creator of Nerves, covers OTA at fleet scale.
 - [`nerves_hub_link` source](https://github.com/nerves-hub/nerves_hub_link) — reference implementation of the `Client` behaviour, connection supervisor, fwup GenServer.
 - [Fred Hébert — "Reliable software" chapter on upgrades](https://ferd.ca/) — language-agnostic discussion of staged rollouts and rollback.
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

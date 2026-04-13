@@ -118,12 +118,18 @@ end
 
 ### Step 1: Create the project
 
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
+
 ```bash
 mix new fire_forget_sup --sup
 cd fire_forget_sup
 ```
 
 ### Step 2: `lib/fire_forget_sup/application.ex`
+
+**Objective**: Wire `application.ex` to start the supervisor wiring Task.Supervisor so async work has an explicit failure boundary.
+
 
 ```elixir
 defmodule FireForgetSup.Application do
@@ -158,6 +164,9 @@ end
 ```
 
 ### Step 3: `lib/fire_forget_sup/audit.ex`
+
+**Objective**: Implement `audit.ex` — the concurrency primitive whose back-pressure, linking, and timeout semantics we are isolating.
+
 
 ```elixir
 defmodule FireForgetSup.Audit do
@@ -200,6 +209,9 @@ end
 ```
 
 ### Step 4: `test/fire_forget_sup_test.exs`
+
+**Objective**: Write `fire_forget_sup_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
 
 ```elixir
 defmodule FireForgetSupTest do
@@ -247,6 +259,9 @@ prefer, wrap the poison test in a `capture_log` block.
 
 ### Step 5: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -257,6 +272,15 @@ mix test
 
 The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
 
+
+
+## Deep Dive: Task Spawn vs GenServer for Ephemeral Work
+
+A Task is lightweight `spawn/1` for bounded, self-contained work: compute, return, exit. Unlike GenServer (which receives messages indefinitely), Task is inherently ephemeral. This shapes everything: no callbacks, no state management, no back-pressure.
+
+Advantages: simplicity (few lines vs GenServer boilerplate). Disadvantages: no explicit state or message handling—Tasks assume pure computation or simple I/O. If you need a long-lived process responding to external events, you've outgrown Task.
+
+For CPU-bound work (calculations, parsing), Task.Supervisor with `:temporary` is ideal: spawn tasks, let them exit, don't restart. For coordinated async work (multiple tasks handing off results), GenServer + worker tasks often clarifies intent despite more boilerplate. Measure first: if code clarity improves with GenServer, the overhead is justified.
 
 ## Benchmark
 
@@ -291,7 +315,7 @@ supervisor's `shutdown:` or have the task checkpoint periodically.
 tasks as `enqueue/1` is called. If callers enqueue faster than the
 tasks complete, you'll pile up thousands of processes. For steady-state
 throughput, put a `max_children:` option on the supervisor or front it
-with a bounded pool (exercise 55).
+with a bounded pool.
 
 **6. When NOT to use Task.Supervisor**
 - Durable work that must survive a crash → `Oban`, a proper queue.

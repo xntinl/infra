@@ -1,8 +1,6 @@
 # Patching Live GenServer State with `:sys.replace_state/2`
 
 **Project**: `sys_replace_state` — surgical state rewrites on running production processes.
-**Difficulty**: ★★★★☆
-**Estimated time**: 3–5 hours
 
 ---
 
@@ -141,9 +139,35 @@ auditable, and correct.
 
 ---
 
+## Design decisions
+
+**Option A — restart the GenServer and replay from the event log**
+- Pros: deterministic; exercises the same path as a real crash; no callback invariants bypassed.
+- Cons: replay can take minutes for large ledgers; during replay the system is unavailable.
+
+**Option B — patch live state via `:sys.replace_state/2` with a validated rescue helper** (chosen)
+- Pros: sub-millisecond fix; avoids unavailability window; survives read-only replay sources.
+- Cons: bypasses `handle_call` invariants; mutator errors are silent; demands an audit log.
+
+→ Chose **B** for incident-response scenarios where unavailability cost dominates correctness purity, wrapped in a rescue helper that re-reads state after the mutation to catch silent failures.
+
+---
+
 ## Implementation
 
 ### Step 1: `mix.exs`
+
+**Objective**: Bootstrap project with OTP app config so Ledger GenServer starts under supervision.
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
 
 ```elixir
 defmodule SysReplaceState.MixProject do
@@ -172,6 +196,8 @@ end
 
 ### Step 2: `lib/sys_replace_state/application.ex`
 
+**Objective**: Wire supervision tree so Ledger GenServer binds lifecycle to OTP restart policies.
+
 ```elixir
 defmodule SysReplaceState.Application do
   @moduledoc false
@@ -186,6 +212,8 @@ end
 ```
 
 ### Step 3: `lib/sys_replace_state/ledger.ex`
+
+**Objective**: Implement in-memory ledger with public API so :sys.replace_state/2 bypasses handle_call invariants.
 
 ```elixir
 defmodule SysReplaceState.Ledger do
@@ -241,6 +269,8 @@ crashes and the process restarts. That is exactly the production bug we are
 simulating.
 
 ### Step 4: `lib/sys_replace_state/rescue.ex`
+
+**Objective**: Wrap :sys.replace_state/2 with invariant checks so operators can safely patch live state in production.
 
 ```elixir
 defmodule SysReplaceState.Rescue do
@@ -308,6 +338,8 @@ end
 
 ### Step 5: `test/sys_replace_state/ledger_test.exs`
 
+**Objective**: Test credit/balance operations and verify state mutation under supervised lifecycle.
+
 ```elixir
 defmodule SysReplaceState.LedgerTest do
   use ExUnit.Case, async: false
@@ -319,25 +351,29 @@ defmodule SysReplaceState.LedgerTest do
     %{pid: pid}
   end
 
-  test "credit adds to running balance", %{pid: pid} do
-    :ok = GenServer.call(pid, {:credit, "m1", Decimal.new("10")})
-    :ok = GenServer.call(pid, {:credit, "m1", Decimal.new("2.5")})
-    assert Decimal.equal?(GenServer.call(pid, {:balance, "m1"}), Decimal.new("12.5"))
-  end
+  describe "SysReplaceState.Ledger" do
+    test "credit adds to running balance", %{pid: pid} do
+      :ok = GenServer.call(pid, {:credit, "m1", Decimal.new("10")})
+      :ok = GenServer.call(pid, {:credit, "m1", Decimal.new("2.5")})
+      assert Decimal.equal?(GenServer.call(pid, {:balance, "m1"}), Decimal.new("12.5"))
+    end
 
-  test "corrupt value crashes the server on credit", %{pid: pid} do
-    _ = :sys.replace_state(pid, fn _ -> %{"m_bad" => {:error, :decode}} end)
-    Process.flag(:trap_exit, true)
-    Process.monitor(pid)
+    test "corrupt value crashes the server on credit", %{pid: pid} do
+      _ = :sys.replace_state(pid, fn _ -> %{"m_bad" => {:error, :decode}} end)
+      Process.flag(:trap_exit, true)
+      Process.monitor(pid)
 
-    # handle_call will raise when Decimal.add gets a tuple.
-    catch_exit(GenServer.call(pid, {:credit, "m_bad", Decimal.new(1)}))
-    assert_receive {:DOWN, _ref, :process, ^pid, _reason}, 500
+      # handle_call will raise when Decimal.add gets a tuple.
+      catch_exit(GenServer.call(pid, {:credit, "m_bad", Decimal.new(1)}))
+      assert_receive {:DOWN, _ref, :process, ^pid, _reason}, 500
+    end
   end
 end
 ```
 
 ### Step 6: `test/sys_replace_state/rescue_test.exs`
+
+**Objective**: Test Rescue patch_balance guards and verify server remains live after state mutation.
 
 ```elixir
 defmodule SysReplaceState.RescueTest do
@@ -350,32 +386,55 @@ defmodule SysReplaceState.RescueTest do
     %{pid: pid}
   end
 
-  test "patches a corrupt balance and logs a diff", %{pid: pid} do
-    _ = :sys.replace_state(pid, fn _ -> %{"m_bad" => {:error, :decode}} end)
+  describe "SysReplaceState.Rescue" do
+    test "patches a corrupt balance and logs a diff", %{pid: pid} do
+      _ = :sys.replace_state(pid, fn _ -> %{"m_bad" => {:error, :decode}} end)
 
-    assert {:ok, diff} =
-             Rescue.patch_balance(pid, "m_bad", Decimal.new("42.0"), "INC-2031 decode bug")
+      assert {:ok, diff} =
+               Rescue.patch_balance(pid, "m_bad", Decimal.new("42.0"), "INC-2031 decode bug")
 
-    assert diff.before == {:error, :decode}
-    assert Decimal.equal?(diff.after, Decimal.new("42.0"))
+      assert diff.before == {:error, :decode}
+      assert Decimal.equal?(diff.after, Decimal.new("42.0"))
 
-    # The server keeps serving after the rescue; no restart occurred.
-    assert Decimal.equal?(GenServer.call(pid, {:balance, "m_bad"}), Decimal.new("42.0"))
-  end
+      # The server keeps serving after the rescue; no restart occurred.
+      assert Decimal.equal?(GenServer.call(pid, {:balance, "m_bad"}), Decimal.new("42.0"))
+    end
 
-  test "refuses to overwrite a healthy balance", %{pid: pid} do
-    :ok = GenServer.call(pid, {:credit, "m_ok", Decimal.new("10")})
-    assert {:error, :current_is_healthy} =
-             Rescue.patch_balance(pid, "m_ok", Decimal.new("99"), "manual override")
-  end
+    test "refuses to overwrite a healthy balance", %{pid: pid} do
+      :ok = GenServer.call(pid, {:credit, "m_ok", Decimal.new("10")})
+      assert {:error, :current_is_healthy} =
+               Rescue.patch_balance(pid, "m_ok", Decimal.new("99"), "manual override")
+    end
 
-  test "refuses garbage replacements", %{pid: pid} do
-    _ = :sys.replace_state(pid, fn _ -> %{"m_bad" => :broken} end)
-    assert {:error, :new_balance_not_decimal} =
-             Rescue.patch_balance(pid, "m_bad", "not a decimal", "typo")
+    test "refuses garbage replacements", %{pid: pid} do
+      _ = :sys.replace_state(pid, fn _ -> %{"m_bad" => :broken} end)
+      assert {:error, :new_balance_not_decimal} =
+               Rescue.patch_balance(pid, "m_bad", "not a decimal", "typo")
+    end
   end
 end
 ```
+
+### Why this works
+
+`:sys.replace_state/2` runs the mutator inside the target process, serialised against the mailbox, so no `handle_call` can observe a half-patched state. The rescue wrapper adds two things the raw primitive lacks: type-checked transforms and post-mutation re-reads that surface silent mutator crashes. Together these make the operation safe to run during an incident without coupling it to replay infrastructure.
+
+---
+
+## Advanced Considerations: Supervision and Hot Code Upgrade Patterns
+
+The OTP supervision tree is the backbone of Elixir's fault tolerance. A DynamicSupervisor can spawn workers on demand and track them, but if a worker crashes before it's supervised, messages to it drop silently. Equally, a `:temporary` worker that crashes is restarted zero times — useful for one-off tasks, but requires the caller to handle crashes. `:transient` restarts on non-normal exits; `:permanent` always restarts.
+
+`handle_continue` callbacks and `:hibernate` reduce memory overhead in long-lived processes. After initializing, a GenServer can return `{:noreply, state, {:continue, :do_work}}` to defer expensive work past the `init/1` call, keeping the supervisor's synchronous startup fast. Hibernation moves a process's heap to disk, freeing RAM at the cost of latency when the process receives its next message.
+
+Hot code upgrades via `sys:replace_state/2` or `:sys.replace_state/3` allow changing code without restarting the VM, but only if state structure is forward- and backward-compatible. In practice, code changes that alter state shape (adding or removing fields) require a migration function. The `:code.purge/1` and `:code.load_file/1` cycle reloads the module, but old pids still run old code until they return to the scheduler. Design for graceful degradation: code that cannot upgrade hot should acknowledge that in docs and operational runbooks.
+
+---
+
+
+## Deep Dive: Otp Patterns and Production Implications
+
+OTP primitives (GenServer, Supervisor, Application) are tested through their public interfaces, not by inspecting internal state. This discipline forces correct design: if you can't test a behavior without peeking into the server's state, the behavior is not public. Production systems with tight integration tests on GenServer internals are fragile and hard to refactor.
 
 ---
 
@@ -423,7 +482,7 @@ the scalpel.
 
 ---
 
-## Performance notes
+## Benchmark
 
 `:sys.replace_state/2` costs roughly the same as a `GenServer.call/2` round-trip
 plus the mutator runtime. Because it runs inside the server, a heavy mutator
@@ -437,6 +496,15 @@ backlog behind it.
 {us, _} = :timer.tc(fn -> :sys.replace_state(pid, fun) end)
 IO.puts("replace_state took #{us} µs")
 ```
+
+Target: mutator runtime ≤ 1 ms for point edits on maps up to ~10k entries.
+
+---
+
+## Reflection
+
+1. Your rescue helper re-reads state after the patch to detect silent mutator failure. How would you extend it to also verify invariants across multiple related GenServers (e.g. ledger + mirror + cache) in one atomic operator action, and what is the cost of that atomicity?
+2. A teammate argues every `:sys.replace_state` should be replaced by a dedicated `handle_call({:admin_patch, ...}, ...)`. Under which incident profiles is this advice correct, and under which does it make the system worse?
 
 ---
 

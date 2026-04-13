@@ -107,9 +107,29 @@ Reach for **B** only when an unexpected crash should end the test.
 
 ---
 
+### Dependencies (`mix.exs`)
+
+```elixir
+def deps do
+  [
+    {DOWN},
+    {bump},
+    {error},
+    {exunit},
+    {genserver},
+    {global},
+    {noreply},
+    {ok},
+    {reply},
+  ]
+end
+```
 ## Implementation
 
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
 
 ```bash
 mix new start_supervised_demo
@@ -117,6 +137,9 @@ cd start_supervised_demo
 ```
 
 ### Step 2: `lib/counter.ex`
+
+**Objective**: Implement `counter.ex` — the subject under test — shaped specifically to make the testing technique of this lab observable.
+
 
 ```elixir
 defmodule Counter do
@@ -153,6 +176,9 @@ end
 ```
 
 ### Step 3: `test/counter_test.exs`
+
+**Objective**: Write `counter_test.exs` exercising the exact ExUnit feature under study — assertions should fail loudly if the technique is misused.
+
 
 ```elixir
 defmodule CounterTest do
@@ -220,6 +246,9 @@ end
 ```
 
 ### Step 4: Run
+
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
 
 ```bash
 mix test
@@ -290,3 +319,17 @@ or a test-local supervisor you fully control.
 - [`ExUnit.Callbacks.start_link_supervised!/2`](https://hexdocs.pm/ex_unit/ExUnit.Callbacks.html#start_link_supervised!/2)
 - [`ExUnit.Callbacks.stop_supervised/1`](https://hexdocs.pm/ex_unit/ExUnit.Callbacks.html#stop_supervised/1)
 - ["Testing GenServers" — Chris Keathley's blog](https://keathley.io/blog/) — the pattern `start_supervised!` + `async: true` popularized in the community
+
+
+## Key Concepts
+
+ExUnit testing in Elixir balances speed, isolation, and readability. The framework provides fixtures, setup hooks, and async mode to achieve both performance and determinism.
+
+**ExUnit patterns and fixtures:**
+`setup_all` runs once per module (module-scoped state); `setup` runs before each test. Returning `{:ok, map}` injects variables into the test context. For side-effectful setup (e.g., starting supervised processes), use `start_supervised` — it automatically stops the process when the test ends, ensuring cleanup.
+
+**Async safety and isolation:**
+Tests with `async: true` run in parallel, but they must be isolated. Shared resources (database, ETS tables, Registry) require careful locking. A common pattern: `setup :set_myflag` — a private setup that configures a unique state for that test. Avoid global state unless protected by locks.
+
+**Mocking trade-offs:**
+Libraries like `Mox` provide compile-time mock modules that behave like real modules but with controlled behavior. The benefit: you catch missing function implementations at test time. The trade-off: mocks don't catch runtime errors (e.g., a real function that crashes). For critical paths, complement mocks with integration tests against real dependencies. Dependency injection (passing modules as arguments) is more testable than direct calls.

@@ -93,6 +93,8 @@ end
 
 ### Step 1: Quorum predicate
 
+**Objective**: Compute majority/minority/tied purely from visible nodes and expected size so every partition shape is unit-testable offline.
+
 ```elixir
 # lib/split_brain_guard/quorum.ex
 defmodule SplitBrainGuard.Quorum do
@@ -116,6 +118,8 @@ end
 ```
 
 ### Step 2: Worker supervisor (suspendable)
+
+**Objective**: Model the stateful workload with explicit enable/disable so the guard can quiesce writes on the minority side of a split.
 
 ```elixir
 # lib/split_brain_guard/worker.ex
@@ -162,6 +166,8 @@ end
 ```
 
 ### Step 3: The guard
+
+**Objective**: React to `:net_kernel` nodeup/nodedown events by reapplying the quorum predicate and toggling the worker only on state transitions.
 
 ```elixir
 # lib/split_brain_guard/guard.ex
@@ -217,6 +223,8 @@ end
 ```
 
 ### Step 4: Application
+
+**Objective**: Use `:rest_for_one` so a guard crash restarts the worker to a known-safe default rather than leaving stale quorum state.
 
 ```elixir
 # lib/split_brain_guard/application.ex
@@ -366,6 +374,24 @@ Benchee.run(
 
 Target: < 1 µs. This is pure arithmetic and `length/1`; it is the cheapest part of the system. The expensive part is the distribution-level nodedown detection (bounded by `net_ticktime`).
 
+## Deep Dive
+
+Distributed Erlang relies on a heartbeat mechanism (net_kernel tick) to detect node failure, but the network is fundamentally asynchronous—split-brain scenarios are inevitable. A partitioned cluster may have two sets of nodes, each believing the other is dead. Libraries like Horde and Phoenix.PubSub solve this with quorum-aware consensus, but they add latency and complexity. At scale, choose your consistency model explicitly: eventual consistency (via Redis PubSub) is faster but allows temporary divergence; strong consistency (via Horde DLM or distributed transactions) is slower but guarantees atomicity. For global registries, the order of operations matters—registering a process before its monitor is live creates race conditions. In multi-region setups, latency between nodes compounds these issues; consider regional clusters with a lightweight coordinator rather than a fully meshed topology.
+## Advanced Considerations
+
+Distributed Elixir systems require careful consideration of network partitions, consistent hashing for distributed state, and the interaction between clustering libraries and node discovery mechanisms. Network partitions are not rare edge cases; they happen regularly in cloud deployments due to maintenance windows and infrastructure issues. A system that works perfectly during local testing but fails under network partitions indicates insufficient failure handling throughout the codebase. Split-brain scenarios where multiple network partitions lead to different cluster views require explicit recovery mechanisms that are often business-specific and context-dependent.
+
+Horde and distributed registries provide eventual consistency guarantees, but "eventual" can mean minutes during network partitions. Applications must handle the case where the same name is registered on multiple nodes simultaneously without coordination. Consistent hashing for distributed services requires understanding rebalancing costs — a single node failure can cause significant key redistribution and thundering herd problems if not carefully managed. The cost of distributed consensus using algorithms like Raft is high; choose it only when consistency is more important than availability and can afford the performance cost.
+
+Global state replication across nodes creates synchronization challenges at scale. Choosing between replicating everywhere versus replicating to specific nodes affects both consistency latency and network bandwidth utilization fundamentally. Node monitoring and heartbeat mechanisms require careful timeout tuning — too aggressive and you get false positives during network hiccups; too conservative and you don't detect actual failures quickly enough for recovery. The EPMD (Erlang Port Mapper Daemon) is a critical component that can become a bottleneck in large clusters and requires careful capacity planning.
+
+
+## Deep Dive: Cluster Patterns and Production Implications
+
+Clustering distributes computation across nodes using Erlang's distribution protocol. Testing clusters requires simulating node failures, network partitions, and message delays—challenges that single-node tests don't expose. Production clusters fail in ways that cluster tests reveal: nodes can become isolated (stuck), messages can be reordered, and consensus is expensive.
+
+---
+
 ## Trade-offs and production gotchas
 
 1. **Static expected size is a liability during scaling**: if you resize from 5 to 7 nodes, forgetting to update the config means your new 7-node cluster thinks it has quorum at 3 — which is wrong. Use config-management discipline or dynamic quorum with a witness.
@@ -386,3 +412,13 @@ You run a 4-node cluster. The network partitions into `{a, b}` and `{c, d}`. Bot
 - [Raft paper — Ongaro & Ousterhout](https://raft.github.io/raft.pdf)
 - [Call Me Maybe — Kyle Kingsbury (Jepsen)](https://aphyr.com/tags/jepsen)
 - [`:net_kernel` tuning](https://www.erlang.org/doc/man/kernel_app.html#net_ticktime)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

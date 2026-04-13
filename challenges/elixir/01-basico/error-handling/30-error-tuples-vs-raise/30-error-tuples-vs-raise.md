@@ -71,7 +71,21 @@ them through two thin facades.
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"jason", "~> 1.0"},
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Organize Rules, Safe, Bang into separate modules so safe/bang facades stay thin wrappers over shared validation.
 
 ```bash
 mix new validate_lib
@@ -79,6 +93,8 @@ cd validate_lib
 ```
 
 ### Step 2: `mix.exs`
+
+**Objective**: Use zero dependencies so dual API pattern (safe/bang) is visible without framework abstractions obscuring it.
 
 ```elixir
 defmodule ValidateLib.MixProject do
@@ -101,6 +117,8 @@ end
 ```
 
 ### Step 3: `lib/validate_lib/rules.ex`
+
+**Objective**: Return structured errors like {:too_short, min} so callers can i18n without string parsing.
 
 ```elixir
 defmodule ValidateLib.Rules do
@@ -155,6 +173,8 @@ end
 
 ### Step 4: `lib/validate_lib/safe.ex`
 
+**Objective**: Tag each failure with its field name at the facade boundary so Rules stays oblivious to which form slot it is validating.
+
 ```elixir
 defmodule ValidateLib.Safe do
   @moduledoc """
@@ -207,6 +227,8 @@ end
 
 ### Step 5: `lib/validate_lib/bang.ex`
 
+**Objective**: Make Bang a three-line wrapper over Safe so the two APIs physically cannot drift in the validation rules they enforce.
+
 ```elixir
 defmodule ValidateLib.Bang do
   @moduledoc """
@@ -255,6 +277,8 @@ end
 
 ### Step 6: Tests — `test/validate_lib/safe_test.exs`
 
+**Objective**: Pin the exact `{:field, reason}` shape so i18n and telemetry callers can rely on the tags rather than message strings.
+
 ```elixir
 defmodule ValidateLib.SafeTest do
   use ExUnit.Case, async: true
@@ -301,6 +325,8 @@ end
 
 ### Step 7: Tests — `test/validate_lib/bang_test.exs`
 
+**Objective**: Assert the exception's `:reason` field equals the Safe tuple so the two APIs stay provably equivalent for observability.
+
 ```elixir
 defmodule ValidateLib.BangTest do
   use ExUnit.Case, async: true
@@ -336,6 +362,8 @@ end
 
 ### Step 8: Run and verify
 
+**Objective**: Run with warnings-as-errors to catch unused `Rules` or unreachable pattern clauses that would hide API drift.
+
 ```bash
 mix test --trace
 mix compile --warnings-as-errors
@@ -349,6 +377,24 @@ Both facades delegate to the same `Rules` module, so there is exactly one implem
 
 ---
 
+
+
+---
+## Key Concepts
+
+### 1. Use Tuples for Expected Failures
+
+Expected failures are part of normal business logic: validation fails, a query returns no rows, a network request times out. Handle these with `{:ok, value}` / `{:error, reason}`. This pattern threads errors through your code explicitly and prevents silent failures.
+
+### 2. Raise Only on Programmer Errors
+
+Programmer errors are bugs—violations of preconditions that should never happen in production. You raise because this is a failure of the programmer's contract, not a failure of the system.
+
+### 3. Exception Handling is Expensive
+
+Raising and catching involves stack unwinding. For frequently-occurring failures (validation), use tuples. For rare, unexpected errors, raising is fine. In a loop processing 1 million items where validation fails on 10%, tuples are much faster.
+
+---
 ## Design decisions
 
 **Option A — one facade with a `raise?: true` option**

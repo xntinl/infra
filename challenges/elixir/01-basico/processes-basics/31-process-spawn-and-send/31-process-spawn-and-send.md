@@ -2,9 +2,6 @@
 
 **Project**: `chat_relay` — a minimal coordinator + two worker processes that exchange messages via raw spawn/send
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 2-3 hours
-
 ---
 
 ## Core concepts in this exercise
@@ -15,7 +12,8 @@
    against them; failure to match leaves the message in the mailbox.
 
 You will deliberately NOT use `GenServer` here. Understanding the primitives before
-the abstractions is what makes later exercises on OTP click.
+the abstractions makes it much easier to debug concurrency issues and understand how 
+higher-level frameworks like `GenServer` and `Phoenix.PubSub` work under the hood.
 
 ---
 
@@ -66,9 +64,57 @@ is the mental model everything else is built on.
 
 ---
 
+## Why raw primitives and not `GenServer`
+
+- `GenServer` is the right answer in production — but it hides the exact `send`/`receive` plumbing you need to understand when diagnosing a stuck process.
+- `Task` gives you async-return-a-value, not a long-lived mailbox loop.
+- `Agent` gives you shared state but no custom message protocol.
+
+For a coordinator that owns a routing table and a worker that keeps an inbox, the primitives are a 25-line model that matches the abstraction layer we want to teach.
+
+---
+
+## Design decisions
+
+**Option A — fire-and-forget `register/3` (just `send`, no reply)**
+- Pros: simpler code; no ref, no receive on the caller side.
+- Cons: caller races ahead and may `relay` before the coordinator stores the pid. Intermittent test flakes.
+
+**Option B — synchronous `register/3` with `make_ref/0` + timeout** (chosen)
+- Pros: caller has a happens-before guarantee; timeouts make stuck coordinators loud; test for "register returns :ok before relays" is meaningful.
+- Cons: more code per public call; introduces the manual ref/receive dance.
+
+→ Chose **B** because the whole point of the exercise is to see the ref-based request/reply pattern `GenServer.call` later hides. `relay/3` stays fire-and-forget on purpose — chat senders shouldn't block on recipient processing.
+
+---
+
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"phoenix", "~> 1.0"},
+  ]
+end
+```
+
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  # No runtime deps — BEAM primitives only.
+  []
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Set up a plain Mix project so raw `spawn`/`send`/`receive` are the only primitives on the stage, with no OTP abstraction leaking in.
 
 ```bash
 mix new chat_relay
@@ -76,6 +122,8 @@ cd chat_relay
 ```
 
 ### Step 2: `mix.exs`
+
+**Objective**: Declare an empty dep list to prove the BEAM's primitives alone implement a working chat relay — no Registry, no GenServer required.
 
 ```elixir
 defmodule ChatRelay.MixProject do
@@ -98,6 +146,8 @@ end
 ```
 
 ### Step 3: `lib/chat_relay/coordinator.ex`
+
+**Objective**: Hold the name→pid table inside a single process's state so routing stays consistent without a shared mutable structure.
 
 ```elixir
 defmodule ChatRelay.Coordinator do
@@ -188,6 +238,8 @@ end
 
 ### Step 4: `lib/chat_relay/worker.ex`
 
+**Objective**: Build a long-running receive loop whose tail-recursive state shows how BEAM processes maintain memory without mutable variables.
+
 ```elixir
 defmodule ChatRelay.Worker do
   @moduledoc """
@@ -250,6 +302,8 @@ end
   a matching message.
 
 ### Step 5: Tests
+
+**Objective**: Drive the relay from the test process itself — using `self()` as a reply target proves the mailbox is first-class and address-based.
 
 ```elixir
 # test/chat_relay/relay_test.exs
@@ -335,12 +389,59 @@ end
 
 ### Step 6: Run and verify
 
+**Objective**: Run with warnings-as-errors so unused messages or unreachable receive clauses — typical hand-rolled-process bugs — fail the build.
+
 ```bash
 mix test --trace
 mix compile --warnings-as-errors
 ```
 
 All 5 tests must pass.
+
+### Why this works
+
+The BEAM gives each process its own mailbox and its own heap — no shared memory, no locks. `receive` walks the mailbox in order and runs the first clause that matches, so a tail-recursive `loop(state)` is a legitimate server shape: the function argument IS the state, and the BEAM TCO's the recursion so the stack doesn't grow. `make_ref/0` returns a term unique across the BEAM node, which is what makes the synchronous `register/3` safe — no stray message can impersonate the reply. `Process.monitor/1` on each worker means dead pids are evicted from the registry before they can be relayed to.
+
+---
+
+
+
+---
+## Key Concepts
+
+### 1. Processes Are Isolated, Lightweight Actors
+
+Each process is a separate entity with its own heap and message queue. Sending a message does not block the sender. The process handles it asynchronously. This isolation is the foundation of fault tolerance: if one process crashes, others continue.
+
+### 2. Message Passing is the Only Way to Share Data Between Processes
+
+There is no global state, no shared memory, no locks. One process sends a message, the other receives it. This prevents data races and makes concurrent systems easier to reason about.
+
+### 3. `spawn/1` Returns a PID Immediately
+
+The spawned function runs asynchronously. If you need to wait for a result, use `Task.await/2` or implement your own reply mechanism. Forgetting this leads to race conditions where you assume a process has finished when it has not.
+
+---
+## Benchmark
+
+```elixir
+# bench/relay.exs
+coord = ChatRelay.Coordinator.start()
+a = ChatRelay.Worker.start()
+b = ChatRelay.Worker.start()
+:ok = ChatRelay.Coordinator.register(coord, :a, a)
+:ok = ChatRelay.Coordinator.register(coord, :b, b)
+
+{t, _} = :timer.tc(fn ->
+  Enum.each(1..100_000, fn i ->
+    ChatRelay.Coordinator.relay(coord, :a, :b, "msg-#{i}")
+  end)
+end)
+
+IO.puts("100k relays: #{t} µs — #{t / 100_000} µs/relay")
+```
+
+Target: < 5 µs per relay on modern hardware (two `send` hops + a Map.fetch). If the worker inbox grows unbounded (no draining in the benchmark), memory scales linearly — a real deployment would bound it.
 
 ---
 
@@ -357,9 +458,9 @@ All 5 tests must pass.
 | Learning the model            | Everything explicit               | Machinery hidden                |
 
 The lesson: `GenServer` is not magic. It is the same loop you wrote, with the
-reply/timeout/error-handling boilerplate factored out. When you move to
-`GenServer` in the next exercises, you'll recognize every callback as one of
-these `receive` clauses.
+reply/timeout/error-handling boilerplate factored out. When you encounter `GenServer`
+callbacks (handle_call, handle_cast, handle_info), you'll recognize each as a 
+specialized `receive` clause from this pattern.
 
 ---
 
@@ -409,6 +510,13 @@ task for heavy work, or offload to a pool.
 Raw `spawn`/`send` is correct when you are learning the model, when you are
 writing a brand-new abstraction on top of the primitives, or when you want
 an extremely lightweight process with no OTP overhead (rare).
+
+---
+
+## Reflection
+
+- Your coordinator is a single process. At 50k relays/sec, its mailbox becomes the bottleneck. What do you shard on (sender name? recipient? random), and what does that break in the "registered name" abstraction?
+- Workers currently accumulate every message forever. In a long-lived chat session this is an unbounded memory leak. How do you bound the inbox without losing the "query synchronously" ergonomics?
 
 ---
 

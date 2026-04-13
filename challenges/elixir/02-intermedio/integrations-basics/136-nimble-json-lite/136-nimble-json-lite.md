@@ -6,9 +6,6 @@ numbers, booleans, null, arrays, objects) implemented with
 Not a replacement for Jason; the point is to see how parser combinators
 compile to binary pattern matching.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 3–5 hours
-
 ---
 
 ## Project context
@@ -81,9 +78,38 @@ you want (a map, a struct, a number).
 
 ---
 
+## Design decisions
+
+**Option A — write the parser by hand with `case` and binary pattern matching**
+- Pros: no dependency; total control; you see exactly the compiled shape.
+- Cons: lots of repetitive clauses for whitespace, escapes, and recursion; the recursion story (values inside arrays inside objects) gets verbose fast.
+
+**Option B — compose combinators with `NimbleParsec` (chosen)**
+- Pros: declarative grammar reads close to BNF; `parsec/2` expresses recursion cleanly; compiles to the same binary pattern matches you'd write by hand; easy to extend with `label/2` for better errors.
+- Cons: extra dep; compile time grows with grammar; hitting left-recursion or ambiguity can be confusing if you haven't internalized the combinator model.
+
+→ Chose **B** because the exercise is about learning combinators; writing the same parser by hand would produce identical runtime code but zero pedagogical value.
+
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"ecto", "~> 1.0"},
+    {:"jason", "~> 1.0"},
+    {:"phoenix", "~> 1.0"},
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
 
 ```bash
 mix new nimble_json_lite
@@ -99,6 +125,9 @@ end
 ```
 
 ### Step 2: `lib/nimble_json_lite.ex`
+
+**Objective**: Implement `nimble_json_lite.ex` — the integration seam where external protocol semantics meet Elixir domain code.
+
 
 ```elixir
 defmodule NimbleJsonLite do
@@ -237,6 +266,9 @@ end
 
 ### Step 3: `test/nimble_json_lite_test.exs`
 
+**Objective**: Write `nimble_json_lite_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+
 ```elixir
 defmodule NimbleJsonLiteTest do
   use ExUnit.Case, async: true
@@ -324,6 +356,21 @@ mix test
 
 ---
 
+
+## Key Concepts
+
+External integrations in Elixir split across multiple patterns: Ecto for relational databases with changesets and migrations; Telemetry for metrics and observability; HTTP libraries like Req or Finch for REST APIs; and specialized parsers like Jason, NimbleCSV, and NimbleParsec for data formats. Choosing the right tool avoids the trap of one library solving everything poorly.
+
+Ecto is the de facto standard for databases because changesets encode validation before queries, migrations manage schema evolution, and the Repo pattern separates query logic from business logic. Migrations are version-controlled SQL, ensuring reproducible deployments. For integrating external services, Req is the modern HTTP client with built-in retry, redirect, and error handling policies.
+
+Telemetry decouples metrics collection from application code: you emit events and let listeners subscribe. This separation keeps business logic clean and metrics infrastructure pluggable. Use metrics, not print statements, in production.
+
+## Key Concepts
+
+NimbleJSON is a tiny JSON parsing library, useful for minimal dependencies. It's not as fast as Jason but has zero dependencies beyond Elixir stdlib. Use when you need JSON parsing but cannot depend on compiled Rust (Jason is a Rust binary under the hood). For most projects, Jason is better; NimbleJSON is for constraint-heavy environments.
+
+---
+
 ## Trade-offs and production gotchas
 
 **1. This is *not* a conformant JSON parser**
@@ -361,6 +408,14 @@ Use NimbleParsec for **medium-complexity structured text**: log lines,
 small DSLs, protocol framing, query strings, versioned-header parsing.
 
 ---
+
+## Benchmark
+
+<!-- benchmark N/A: integration/configuration exercise -->
+
+## Reflection
+
+- This parser fails on `\u00e9` and scientific notation. If you were asked to make it RFC-8259 conformant, which of the two gaps do you think would cost more in grammar complexity — and what does that tell you about why Jason does not expose a user-extensible grammar at all?
 
 ## Resources
 

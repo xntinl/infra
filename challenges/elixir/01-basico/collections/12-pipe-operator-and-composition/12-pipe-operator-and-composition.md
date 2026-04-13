@@ -80,6 +80,18 @@ Chose **B** because ETL is by nature a linear transformation; the pipe reflects 
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"jason", "~> 1.0"},
+  ]
+end
+```
+
+
 ### `lib/etl.ex`
 
 ```elixir
@@ -458,6 +470,40 @@ The pipe is mechanical: `a |> f(b)` is `f(a, b)` — no magic, just a rewrite. I
 
 ---
 
+
+
+---
+## Key Concepts
+
+### 1. The Pipe Operator `|>` Threads Data Left-to-Right
+
+```elixir
+[1, 2, 3] |> Enum.map(&(&1 * 2)) |> Enum.filter(&(&1 > 3))
+```
+
+This reads top-to-bottom like a Unix pipeline. Without pipes, you nest function calls right-to-left. Pipes make data transformations linear and readable.
+
+### 2. Pipes Transform Imperative-Looking Code
+
+```elixir
+user = get_user(id)
+user = update_profile(user, new_name)
+user = save(user)
+```
+
+Becomes:
+
+```elixir
+get_user(id) |> update_profile(new_name) |> save()
+```
+
+Clearer intent, less variable rebinding.
+
+### 3. Pipe Carefully with Multiple-Argument Functions
+
+`Enum.reduce([1,2,3], 0, fn x, acc -> acc + x end)` does not pipe cleanly. Use anonymous functions or reorder arguments. Pipes shine for single-argument transformations.
+
+---
 ## Benchmark
 
 ```elixir

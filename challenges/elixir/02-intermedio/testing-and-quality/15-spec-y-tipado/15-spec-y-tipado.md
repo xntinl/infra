@@ -3,9 +3,6 @@
 **Project**: `typespec_basics` — a tiny money/pricing module fully annotated with
 typespecs, validated by Dialyxir.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -34,6 +31,17 @@ typespec_basics/
 
 ---
 
+## Why `@spec` + Dialyzer and not runtime type checks
+
+Los runtime checks cuestan ciclos en cada call y duplican información
+que el compilador ya tiene. `@spec` + Dialyzer mueve esa verificación
+a build time: cero costo runtime, atrapa violaciones cross call-sites.
+El trade-off es precisión — success typing se pierde algunos bugs —
+pero `@spec` + tests + guards en IO boundaries cubre más que cualquier
+disciplina sola.
+
+---
+
 ## Core concepts
 
 ### 1. `@type` vs `@typep` vs `@opaque`
@@ -46,7 +54,7 @@ typespec_basics/
 
 Rule of thumb: expose `@type` for anything callers need to *pattern-match* or
 *construct*. Use `@typep` for intermediate helpers that don't leak. `@opaque`
-comes later (see exercise 115).
+is for types whose shape you want to hide from callers entirely.
 
 ### 2. `@spec` is not runtime enforcement
 
@@ -72,9 +80,43 @@ safety net.
 
 ---
 
+## Design decisions
+
+**Option A — Spec solo funciones públicas**
+- Pros: Mantenimiento mínimo.
+- Cons: Helpers privados pueden desviarse silenciosamente.
+
+**Option B — Spec públicas y helpers privados no triviales** (elegida)
+- Pros: Dialyzer tiene ancla en cada capa; warnings apuntan al
+  helper, no a un caller tres frames arriba.
+- Cons: Más líneas de `@spec`.
+
+→ Elegida **B** para módulos de dominio. Para glue/CRUD, Option A.
+
+---
+
+### Dependencies (`mix.exs`)
+
+```elixir
+def deps do
+  [
+    {cont},
+    {dialyxir},
+    {error},
+    {exunit},
+    {flat},
+    {halt},
+    {ok},
+    {percent},
+  ]
+end
+```
 ## Implementation
 
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
 
 ```bash
 mix new typespec_basics
@@ -92,6 +134,9 @@ end
 Then `mix deps.get`.
 
 ### Step 2: `lib/pricing.ex`
+
+**Objective**: Implement `pricing.ex` — the subject under test — shaped specifically to make the testing technique of this lab observable.
+
 
 ```elixir
 defmodule Pricing do
@@ -159,6 +204,9 @@ end
 
 ### Step 3: `test/pricing_test.exs`
 
+**Objective**: Write `pricing_test.exs` exercising the exact ExUnit feature under study — assertions should fail loudly if the technique is misused.
+
+
 ```elixir
 defmodule PricingTest do
   use ExUnit.Case, async: true
@@ -203,6 +251,9 @@ end
 
 ### Step 4: Run tests and Dialyzer
 
+**Objective**: Run tests and Dialyzer.
+
+
 ```bash
 mix test
 mix dialyzer
@@ -210,6 +261,22 @@ mix dialyzer
 
 The first `mix dialyzer` run builds the PLT and is slow (minutes). Subsequent
 runs are fast. A clean run prints `done (passed successfully)`.
+
+### Why this works
+
+`@type`/`@typep`/`@opaque` registran tipos nombrados en la metadata
+del módulo; `@spec` ata arity a tipos input/output. Dialyzer lee eso
+más los tipos success inferidos, y marca cualquier call site que no
+pueda matchear el contrato. Por ser estático, el check es gratis en
+runtime; por usar success typing, los falsos positivos son bajos.
+
+---
+
+## Benchmark
+
+<!-- benchmark N/A: `@spec` no agrega código en runtime. La medición
+relevante es el tiempo de `mix dialyzer` y la cantidad de warnings;
+ninguno se mide con `:timer.tc`. -->
 
 ---
 
@@ -239,9 +306,34 @@ and don't agonize over specing every private one.
 
 ---
 
+## Reflection
+
+- Agregás `@spec` a 40 funciones legacy y Dialyzer pasa de 0 a 120
+  warnings. ¿Por qué aumentan? ¿Cómo priorizás cuáles arreglar versus
+  cuáles agregás a `.dialyzer_ignore.exs`?
+- `Pricing` es consumido por 10 servicios. Una migración cambia
+  `money()` de map a struct. ¿Qué rompés al hacerlo `@opaque` y cómo
+  facilitás la migración sin big-bang?
+
+---
+
 ## Resources
 
 - [Typespecs — Elixir reference](https://hexdocs.pm/elixir/typespecs.html)
 - [Dialyxir](https://hexdocs.pm/dialyxir/readme.html)
 - ["Success Typings for Erlang" — Lindahl & Sagonas, 2006](https://user.it.uu.se/~kostis/Papers/succ_types.pdf) — the paper behind Dialyzer
 - [Learn You Some Erlang: Dialyzer](https://learnyousomeerlang.com/dialyzer)
+
+
+## Key Concepts
+
+ExUnit testing in Elixir balances speed, isolation, and readability. The framework provides fixtures, setup hooks, and async mode to achieve both performance and determinism.
+
+**ExUnit patterns and fixtures:**
+`setup_all` runs once per module (module-scoped state); `setup` runs before each test. Returning `{:ok, map}` injects variables into the test context. For side-effectful setup (e.g., starting supervised processes), use `start_supervised` — it automatically stops the process when the test ends, ensuring cleanup.
+
+**Async safety and isolation:**
+Tests with `async: true` run in parallel, but they must be isolated. Shared resources (database, ETS tables, Registry) require careful locking. A common pattern: `setup :set_myflag` — a private setup that configures a unique state for that test. Avoid global state unless protected by locks.
+
+**Mocking trade-offs:**
+Libraries like `Mox` provide compile-time mock modules that behave like real modules but with controlled behavior. The benefit: you catch missing function implementations at test time. The trade-off: mocks don't catch runtime errors (e.g., a real function that crashes). For critical paths, complement mocks with integration tests against real dependencies. Dependency injection (passing modules as arguments) is more testable than direct calls.

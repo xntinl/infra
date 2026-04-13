@@ -120,12 +120,18 @@ end
 
 ### Step 1: Create the project
 
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
+
 ```bash
 mix new image_processor
 cd image_processor
 ```
 
 ### Step 2: `lib/image_processor.ex`
+
+**Objective**: Implement `image_processor.ex` — the concurrency primitive whose back-pressure, linking, and timeout semantics we are isolating.
+
 
 ```elixir
 defmodule ImageProcessor do
@@ -182,6 +188,9 @@ end
 ```
 
 ### Step 3: `test/image_processor_test.exs`
+
+**Objective**: Write `image_processor_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
 
 ```elixir
 defmodule ImageProcessorTest do
@@ -269,6 +278,9 @@ end
 
 ### Step 4: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -279,6 +291,15 @@ mix test
 
 The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
 
+
+
+## Deep Dive: Task Spawn vs GenServer for Ephemeral Work
+
+A Task is lightweight `spawn/1` for bounded, self-contained work: compute, return, exit. Unlike GenServer (which receives messages indefinitely), Task is inherently ephemeral. This shapes everything: no callbacks, no state management, no back-pressure.
+
+Advantages: simplicity (few lines vs GenServer boilerplate). Disadvantages: no explicit state or message handling—Tasks assume pure computation or simple I/O. If you need a long-lived process responding to external events, you've outgrown Task.
+
+For CPU-bound work (calculations, parsing), Task.Supervisor with `:temporary` is ideal: spawn tasks, let them exit, don't restart. For coordinated async work (multiple tasks handing off results), GenServer + worker tasks often clarifies intent despite more boilerplate. Measure first: if code clarity improves with GenServer, the overhead is justified.
 
 ## Benchmark
 
@@ -302,7 +323,7 @@ size). If you don't know, start at 8 and measure.
 **2. `on_timeout: :kill_task` leaks resources held by the worker**
 `:brutal_kill` can't be trapped and won't run cleanup. For workers that
 hold external resources, prefer a cooperative in-worker deadline or
-switch to `Task.yield_many` + explicit shutdown (exercise 53).
+switch to `Task.yield_many` + explicit shutdown.
 
 **3. `ordered: true` hides head-of-line blocking**
 One slow worker at position 0 blocks every subsequent result from being
@@ -326,7 +347,7 @@ materializing a list of results.
 - Batch size is tiny (< 10) and known fixed: plain `Task.async` + `await_many`
   is simpler.
 - You need a shared resource (connection, rate limiter) across workers:
-  the stream doesn't coordinate them — use a pool (exercise 55).
+  the stream doesn't coordinate them — use a pool.
 - Workers must report progress individually to a consumer mid-flight:
   `GenStage` or a supervised fan-out pipeline fits better.
 

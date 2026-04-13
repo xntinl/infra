@@ -74,6 +74,8 @@ Chosen: **Option C**.
 
 ### Step 1: the registry
 
+**Objective**: Wrap `:global.register_name/2` so tests can assert cluster-wide name collisions return `{:error, :already_registered}` instead of leaking raw `:no`.
+
 ```elixir
 # lib/cluster_registry/registry.ex
 defmodule ClusterRegistry.Registry do
@@ -98,6 +100,8 @@ end
 ```
 
 ### Step 2: the ClusterCase helper
+
+**Objective**: Bootstrap `:peer` nodes with project code paths and a shared cookie so every test runs against a real multi-node VM, not a mocked one.
 
 ```elixir
 # test/support/cluster_case.ex
@@ -149,6 +153,8 @@ end
 ```
 
 ### Step 3: tests
+
+**Objective**: Drive `:global.sync/0` plus `:peer.call/4` across nodes so registration, duplicate rejection, and netsplit cleanup are asserted cluster-wide.
 
 ```elixir
 # test/cluster_registry/multi_node_test.exs
@@ -283,6 +289,21 @@ IO.puts("peer lifecycle: #{t / 1000}ms")
 
 Target: peer start+stop < 1s.
 
+## Deep Dive: Distributed Patterns and Production Implications
+
+Distributed testing with Peer spawns multiple Erlang nodes in separate BEAM instances, allowing you to test actual node failure, network partitions, and message delays. This is essential for OTP applications but adds latency and complexity. The key insight is that distributed tests reveal assumptions about network reliability that single-node tests cannot—timeouts, partial failures, and split-brain scenarios are invisible to local tests.
+
+---
+
+## Advanced Considerations
+
+Production testing strategies require careful attention to resource management and test isolation across multiple concurrent test processes. In large codebases, tests can consume significant memory and CPU resources, especially when using concurrent testing without proper synchronization and cleanup. The BEAM scheduler's preemptive nature means test processes may interfere with each other if shared resources aren't properly isolated at the process boundary. Pay careful attention to how Ecto's sandbox mode interacts with your supervision tree — if you have GenServers that hold state across tests, the sandbox rollback mechanism may leave phantom processes in your monitoring systems that continue consuming resources until forced cleanup occurs.
+
+When scaling tests to production-grade test suites, consider the cost of stub verification and the memory overhead of generated test cases. Each property-based test invocation can create thousands of synthetic test cases, potentially causing garbage collection pressure that's invisible during local testing but becomes critical in CI/CD pipelines running long test suites continuously. The interaction between concurrent tests and ETS tables (often used in caches and registry patterns) requires explicit `inherited: true` options to prevent unexpected sharing between test processes, which can cause mysterious failures when tests run in different orders or under load.
+
+For distributed testing scenarios using tools like `Peer`, network simulation can mask real latency issues and failure modes. Test timeouts that work locally may fail in CI due to scheduler contention and GC pauses. Always include substantial buffers for timeout values and monitor actual execution times under load. The coordination between multiple test nodes requires careful cleanup — a failure in test coordination can leave zombie processes consuming resources indefinitely. Implement proper telemetry hooks within your test helpers to diagnose production-like scenarios and capture performance characteristics.
+
+
 ## Trade-offs and production gotchas
 
 **1. Forgetting `Node.start/1` on the primary**
@@ -323,3 +344,13 @@ tests, and what tooling (Jepsen, Concuerror, fault injection) would close the ga
 - [OTP 25 release notes — peer](https://www.erlang.org/blog/my-otp-25-highlights/)
 - [`:global` module](https://www.erlang.org/doc/man/global.html)
 - [Elixir Forum — migrating from :slave to :peer](https://elixirforum.com/t/migrating-from-slave-to-peer/)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

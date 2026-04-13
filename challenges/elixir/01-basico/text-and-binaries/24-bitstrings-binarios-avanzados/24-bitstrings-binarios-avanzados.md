@@ -6,6 +6,21 @@ Build a `task_queue` binary protocol encoder/decoder using Elixir's `<<>>` synta
 
 ---
 
+## Project structure
+
+```
+task_queue/
+├── lib/
+│   └── task_queue/
+│       └── protocol.ex
+├── test/
+│   └── task_queue/
+│       └── protocol_test.exs
+└── mix.exs
+```
+
+---
+
 ## The binary frame format
 
 External agents communicate over TCP using a fixed-format binary frame:
@@ -51,7 +66,20 @@ Strings in Elixir are UTF-8 binaries. A multibyte character like `e` occupies 2 
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### Step 1: `mix.exs`
+
+**Objective**: Boilerplate; focus on bit patterns — bitwise ops are rare in high-level code but essential in comms.
 
 ```elixir
 defmodule TaskQueue.MixProject do
@@ -76,6 +104,8 @@ end
 ```
 
 ### Step 2: `lib/task_queue/protocol.ex` -- binary frame encoder/decoder
+
+**Objective**: Bit-level packing (flags in bits 6-7, seqno in bits 0-5) saves bandwidth; bitwise extraction is O(1).
 
 ```elixir
 defmodule TaskQueue.Protocol do
@@ -202,6 +232,8 @@ end
 
 ### Step 3: Tests
 
+**Objective**: Test boundary: max seqno (63), all flag combos, fragmented vs unfragmented; bit patterns have 2^n states.
+
 ```elixir
 # test/task_queue/protocol_test.exs
 defmodule TaskQueue.ProtocolTest do
@@ -276,12 +308,27 @@ end
 
 ### Step 4: Run
 
+**Objective**: --warnings-as-errors finds shadowed variables in nested matches; bit patterns are error-prone without coverage.
+
 ```bash
 mix test test/task_queue/protocol_test.exs --trace
 ```
 
 ---
 
+
+## Key Concepts
+
+### 1. Bit Syntax Matches or Constructs at the Bit Level
+Bit syntax lets you work with sub-byte granularity. This is essential for binary protocols, image formats, compression.
+
+### 2. Endianness Matters
+`<<0x1234::16>>` is big-endian (default). `<<0x1234::16-little>>` is little-endian. Network protocols often specify endianness.
+
+### 3. Pattern Matching Extracts Fields
+`<<type::8, length::16, payload::binary>> = packet` simultaneously validates structure and extracts fields. Much more powerful than manual byte slicing.
+
+---
 ## Trade-off analysis
 
 | Aspect | `<<>>` binary syntax | String concat `<>` | External library |

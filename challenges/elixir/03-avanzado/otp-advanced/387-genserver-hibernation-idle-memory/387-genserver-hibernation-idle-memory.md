@@ -67,11 +67,23 @@ The process knows it is idle because it receives a `:timeout` or an `:idle_check
 
 ### Dependencies (`mix.exs`)
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
+
 ```elixir
 defp deps, do: [{:benchee, "~> 1.3", only: [:dev, :test]}]
 ```
 
 ### Step 1: Registry and Supervisor
+
+**Objective**: Wire Registry + DynamicSupervisor so per-user sessions hibernate independently via :via addressing.
 
 ```elixir
 defmodule ChatPresence.SessionRegistry do
@@ -99,6 +111,8 @@ end
 
 ### Step 2: Application
 
+**Objective**: Start Registry before DynamicSupervisor so sessions register :via names atomically, avoiding startup races.
+
 ```elixir
 defmodule ChatPresence.Application do
   use Application
@@ -116,6 +130,8 @@ end
 ```
 
 ### Step 3: Session GenServer with hibernation
+
+**Objective**: Return :hibernate on idle timeout so dormant sessions shrink from GBs to MBs for 100k users at scale.
 
 ```elixir
 defmodule ChatPresence.Session do
@@ -272,6 +288,23 @@ Process.sleep(15_000)
 Expected on a warm BEAM: processes memory drops 3–6× after all sessions hibernate. With 10k sessions × ~6 KB active vs ~2 KB hibernated, you save roughly 40 MB across the cohort. At 500k sessions the saving is ~2 GB.
 
 Cost of wake-up (measure with `:timer.tc` inside a `handle_cast`): typically 10–30µs for a fresh heap, invisible to interactive users but visible in a tight loop of synthetic messages.
+
+## Advanced Considerations: Supervision and Hot Code Upgrade Patterns
+
+The OTP supervision tree is the backbone of Elixir's fault tolerance. A DynamicSupervisor can spawn workers on demand and track them, but if a worker crashes before it's supervised, messages to it drop silently. Equally, a `:temporary` worker that crashes is restarted zero times — useful for one-off tasks, but requires the caller to handle crashes. `:transient` restarts on non-normal exits; `:permanent` always restarts.
+
+`handle_continue` callbacks and `:hibernate` reduce memory overhead in long-lived processes. After initializing, a GenServer can return `{:noreply, state, {:continue, :do_work}}` to defer expensive work past the `init/1` call, keeping the supervisor's synchronous startup fast. Hibernation moves a process's heap to disk, freeing RAM at the cost of latency when the process receives its next message.
+
+Hot code upgrades via `sys:replace_state/2` or `:sys.replace_state/3` allow changing code without restarting the VM, but only if state structure is forward- and backward-compatible. In practice, code changes that alter state shape (adding or removing fields) require a migration function. The `:code.purge/1` and `:code.load_file/1` cycle reloads the module, but old pids still run old code until they return to the scheduler. Design for graceful degradation: code that cannot upgrade hot should acknowledge that in docs and operational runbooks.
+
+---
+
+
+## Deep Dive: Otp Patterns and Production Implications
+
+OTP primitives (GenServer, Supervisor, Application) are tested through their public interfaces, not by inspecting internal state. This discipline forces correct design: if you can't test a behavior without peeking into the server's state, the behavior is not public. Production systems with tight integration tests on GenServer internals are fragile and hard to refactor.
+
+---
 
 ## Trade-offs and production gotchas
 

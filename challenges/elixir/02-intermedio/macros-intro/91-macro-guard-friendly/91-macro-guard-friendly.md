@@ -2,9 +2,6 @@
 
 **Project**: `guard_macros` — reusable guards via `defguard`, plus a dual-purpose macro that emits guard-legal code inside `when` and richer code outside, using `Macro.Env.in_guard?/1`.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -36,6 +33,17 @@ guard_macros/
 │   └── guard_macros_test.exs
 └── mix.exs
 ```
+
+---
+
+## Why dual-context and not two separate names
+
+La alternativa obvia es `is_user_id_guard/1` (un `defguard`) más
+`user_id?/1` (una función). Funciona, pero cada caller tiene que
+elegir el nombre correcto para su contexto — un impuesto que crece con
+el codebase. Un único `is_user_id/1` que introspecciona
+`Macro.Env.in_guard?/1` permite escribir el mismo nombre en todos
+lados, y el macro emite la forma legal para el contexto actual.
 
 ---
 
@@ -90,9 +98,39 @@ doesn't need to distinguish between them.
 
 ---
 
+## Design decisions
+
+**Option A — Duplicar `unquote(value)` en ambas ramas del form no-guard**
+- Pros: Expansión más simple.
+- Cons: Cualquier argumento con efectos corre dos veces.
+
+**Option B — Bindear `value` a un local y pattern-matchear** (elegida)
+- Pros: Argumento evaluado exactamente una vez; seguro para callers
+  con side effects.
+- Cons: Un local extra; AST generado marginalmente mayor.
+
+→ Elegida **B** porque duplicar evaluación es un bug latente; bindear
+una vez es el default correcto.
+
+---
+
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
 
 ```bash
 mix new guard_macros
@@ -100,6 +138,9 @@ cd guard_macros
 ```
 
 ### Step 2: `lib/guard_macros.ex`
+
+**Objective**: Implement `guard_macros.ex` — AST manipulation that runs at compile time — making the macro's hygiene and unquoting choices observable.
+
 
 ```elixir
 defmodule GuardMacros do
@@ -187,6 +228,9 @@ end
 
 ### Step 3: `test/guard_macros_test.exs`
 
+**Objective**: Write `guard_macros_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+
 ```elixir
 defmodule GuardMacrosTest do
   use ExUnit.Case, async: true
@@ -263,9 +307,57 @@ end
 
 ### Step 4: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
+
+### Why this works
+
+`defguard` expande a un macro cuya salida es garantizada guard-legal
+(sin call en runtime, sin overhead). Para `is_user_id/1`, el macro
+chequea `Macro.Env.in_guard?(__CALLER__)` en **expand-time**: dentro
+de un `when` emite una única expresión booleana de BIFs; afuera, un
+`case` que bindea el argumento una vez y patternmatchea. Mismo call
+site, dos ASTs válidos — todo dirigido por la vista del compilador.
+
+---
+
+
+## Deep Dive: State Management and Message Handling Patterns
+
+Understanding state transitions is central to reliable OTP systems. Every `handle_call` or `handle_cast` receives current state and returns new state—immutability forces explicit reasoning. This prevents entire classes of bugs: missing state updates are immediately visible.
+
+Key insight: separate pure logic (state → new state) from side effects (logging, external calls). Move pure logic to private helpers; use handlers for orchestration. This makes servers testable—test pure functions independently.
+
+In production, monitor state size and mutation frequency. Unbounded growth is a memory leak; excessive mutations signal hot spots needing optimization. Always profile before reaching for performance solutions like ETS.
+
+## Benchmark
+
+```elixir
+import GuardMacros
+
+{guard_path, _} =
+  :timer.tc(fn ->
+    Enum.each(1..1_000_000, fn _ ->
+      GuardMacros.validate(42)
+    end)
+  end)
+
+{expr_path, _} =
+  :timer.tc(fn ->
+    Enum.each(1..1_000_000, fn _ ->
+      is_user_id(42)
+    end)
+  end)
+
+IO.puts("guard: #{guard_path}µs, expr: #{expr_path}µs")
+```
+
+Target esperado: ambas rutas <0.5µs por call. Diferencia grande indica
+mala optimización del `case`.
 
 ---
 
@@ -305,6 +397,17 @@ If the predicate is used in exactly one `when` clause in your codebase,
 just inline it. `defguard` is for reuse. And if you find yourself
 branching on `in_guard?` more than once in a project, your API is asking
 for two separate macros (or a macro + a function) with clearer names.
+
+---
+
+## Reflection
+
+- Necesitás validar un "código postal argentino": 4 u 8 dígitos.
+  `String.length/1` no es guard-legal. ¿Cómo reestructurás la API para
+  que la validación rápida sea usable en `when`? Proponé dos capas.
+- Un compañero duplica `is_user_id/1` como `is_admin_id/1` copiando.
+  ¿Qué extraés en común? ¿Vale un helper que genere "dual-context ID
+  checkers" o es sobreingeniería para dos usos?
 
 ---
 

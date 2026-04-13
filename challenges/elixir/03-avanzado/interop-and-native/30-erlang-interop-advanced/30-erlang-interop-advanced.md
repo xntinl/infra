@@ -44,6 +44,16 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 An Elixir module `Foo.Bar` compiles to the Erlang atom `Elixir.Foo.Bar`. Erlang modules are lowercase atoms (`:crypto`, `:inet`, `:ets`). To call an Erlang function:
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
+
 ```elixir
 :crypto.hash(:sha256, "payload")   # Erlang: crypto:hash(sha256, <<"payload">>)
 ```
@@ -116,6 +126,8 @@ Elixir idiom: `[timeout: 5000, retries: 3]`. Erlang "proplist" also accepts bare
 
 ### Step 1: `mix.exs`
 
+**Objective**: Declare Erlang ports in `extra_applications` so crypto/inets start before BEAM scheduler touches stdlib calls.
+
 ```elixir
 defmodule ErlangInterop.MixProject do
   use Mix.Project
@@ -129,6 +141,8 @@ end
 ```
 
 ### Step 2: `lib/erlang_interop/crypto.ex`
+
+**Objective**: Normalize GCM tag authentication failures to typed tuples so callers never pattern-match bare `:error` atoms.
 
 ```elixir
 defmodule ErlangInterop.Crypto do
@@ -180,6 +194,8 @@ end
 
 ### Step 3: `lib/erlang_interop/fifo.ex`
 
+**Objective**: Use Okasaki's banker's queue for O(1) amortized enqueue/dequeue, avoiding O(n) list-reversal on every push.
+
 ```elixir
 defmodule ErlangInterop.Fifo do
   @moduledoc "O(1) FIFO backed by Erlang's `:queue` (Okasaki's banker's queue)."
@@ -210,6 +226,8 @@ end
 
 ### Step 4: `lib/erlang_interop/dns.ex`
 
+**Objective**: Normalize binary hostnames to charlists at the boundary so Erlang's charlist-only resolver doesn't confuse callers.
+
 ```elixir
 defmodule ErlangInterop.Dns do
   @moduledoc "DNS lookups via `:inet_res`. Takes **charlists**, not binaries."
@@ -233,6 +251,8 @@ end
 ```
 
 ### Step 5: `lib/erlang_interop/graph.ex`
+
+**Objective**: Enforce explicit ETS cleanup via `delete/1` so users never leak the three backing tables per digraph instance.
 
 ```elixir
 defmodule ErlangInterop.Graph do
@@ -272,6 +292,8 @@ end
 
 ### Step 6: `lib/erlang_interop/records.ex`
 
+**Objective**: Compile guard-safe record macros so Erlang tuple interop remains type-aware and pattern-matching safe.
+
 ```elixir
 defmodule ErlangInterop.Records do
   @moduledoc "Example usage of `Record.defrecord/2` for Erlang record shapes."
@@ -293,6 +315,8 @@ end
 ```
 
 ### Step 7: `test/erlang_interop_test.exs`
+
+**Objective**: Assert deterministic crypto, tamper-resistant GCM, cycle detection, and FIFO ordering to validate every wrapper boundary.
 
 ```elixir
 defmodule ErlangInteropTest do
@@ -382,6 +406,23 @@ IO.puts("avg: #{time_us / 10_000} µs/op")
 ```
 
 Target: operation should complete in the low-microsecond range on modern hardware; deviations by >2× indicate a regression worth investigating.
+
+## Advanced Considerations: NIF Isolation and Scheduler Integration
+
+NIF calls run atomically on a scheduler thread, blocking all other processes on that scheduler until the function returns. For operations exceeding ~1 millisecond, this starvation becomes visible: heartbeat processes delay, ETS owner replies hang, supervision timeouts fire. The BEAM's dirty scheduler pool (8 CPU + 10 IO by default) isolates long NIFs from the main scheduler ring, but they're still a finite resource.
+
+Understanding scheduler capacity is critical. Each dirty CPU scheduler can run ~1,000 100-microsecond operations per second, or ~5 100-millisecond operations. Beyond that, callers queue. A GenServer pool capping concurrency and applying backpressure prevents cascade failures: if the dirty pool saturates, reject new work immediately instead of queuing unboundedly.
+
+Resource management inside NIFs differs from pure Elixir. A `Binary<'a>` is a borrow tied to the NIF call; it cannot escape to threads or be stored in resources. An `OwnedBinary` allocation isn't visible to BEAM's garbage collector, so memory limits must be enforced in the Elixir layer. Hybrid architectures (Port processes for I/O, NIFs for CPU work) offer better observability and failure isolation than trying to do everything in a single NIF crate.
+
+---
+
+
+## Deep Dive: Interop Patterns and Production Implications
+
+Interop with native code (NIFs, ports, C extensions) introduces failure modes that pure Elixir code doesn't have: segfaults, memory leaks, deadlocks with the Erlang emulator. Testing interop requires separate test suites for the native layer and integration tests that exercise the boundary.
+
+---
 
 ## Trade-offs and production gotchas
 

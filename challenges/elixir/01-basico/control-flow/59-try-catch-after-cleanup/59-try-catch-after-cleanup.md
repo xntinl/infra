@@ -73,7 +73,20 @@ file handle leaks. This exercise makes the leak impossible.
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### Step 1 — Create the project
+
+**Objective**: Build single module so try/rescue/catch/after structure is visible and cleanup contract is the entire surface.
 
 ```bash
 mix new file_processor
@@ -81,6 +94,8 @@ cd file_processor
 ```
 
 ### Step 2 — `lib/file_processor/processor.ex`
+
+**Objective**: Evaluate IO.stream eagerly inside try so after clause closes handle only after all lines are read.
 
 ```elixir
 defmodule FileProcessor.Processor do
@@ -138,6 +153,8 @@ end
 ```
 
 ### Step 3 — `test/file_processor_test.exs`
+
+**Objective**: Run the path a second time after a raising transform to prove the first call released the handle cleanly.
 
 ```elixir
 defmodule FileProcessorTest do
@@ -199,6 +216,8 @@ end
 
 ### Step 4 — Run the tests
 
+**Objective**: Prove every exit path (ok/rescue/catch) runs File.close via after so handle is released before test continues.
+
 ```bash
 mix test
 ```
@@ -211,6 +230,19 @@ All 6 tests pass.
 
 The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
 
+
+## Key Concepts
+
+### 1. `try`/`catch` Catches Thrown Values (Rare)
+`catch` handles values thrown with `throw`, distinct from exceptions (raised with `raise`). This pattern is rare; most error handling uses `rescue` or tuples.
+
+### 2. `after` Always Runs
+`after` executes whether an exception is raised or caught. Use it for cleanup (closing files, releasing locks).
+
+### 3. Prefer Tuples and Streams for Resource Management
+The `try`/`after` pattern is error-prone. Modern Elixir uses streams (auto-cleanup) or explicit resource management modules.
+
+---
 ## Benchmark
 
 ```elixir

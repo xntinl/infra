@@ -68,6 +68,20 @@ http_client/
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"httpoison", "~> 1.0"},
+    {:"jason", "~> 1.0"},
+    {:"poison", "~> 1.0"},
+  ]
+end
+```
+
+
 ### `lib/http_client/response.ex`
 
 ```elixir
@@ -427,6 +441,26 @@ mix test --trace
 
 The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
 
+
+
+---
+## Key Concepts
+
+### 1. Pattern Matching is Unification, Not Equality
+
+Pattern matching binds variables to values by structure. The pattern `{x, y}` unifies with `{1, 2}`, binding `x` to `1` and `y` to `2`. If you want to match a literal value, you must write it: `{1, y} = {1, 2}` binds `y`; `{1, y} = {2, 2}` raises `MatchError`.
+
+This is why you can build multi-clause functions: each clause patterns on different structures, and Elixir tries them in order until one matches.
+
+### 2. Tuples Are Fixed-Size, Ordered Structures
+
+Tuples are stackable—fixed at compile time and stored contiguously in memory. Lists are linked and grow at the head. Use tuples for return values with known arity (`{:ok, result}`), lightweight records, and pattern matching on structure. For dynamic collections, use lists or maps.
+
+### 3. Compound Patterns Nest
+
+You can match nested structures arbitrarily deep: `{:ok, {id, status}} = {:ok, {123, :pending}}`. This is powerful for extracting deeply nested data, but it can become brittle if the API changes shape. Consider building wrapper modules with helper functions.
+
+---
 ## When to use tuples vs other data structures
 
 | Data structure | Access | Size | Use when |

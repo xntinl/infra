@@ -96,7 +96,36 @@ defmodule PaymentsBreaker.MixProject do
 end
 ```
 
+### Dependencies (mix.exs)
+
+```elixir
+```elixir
+defmodule PaymentsBreaker.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :payments_breaker,
+      version: "0.1.0",
+      elixir: "~> 1.17",
+      start_permanent: Mix.env() == :prod,
+      deps: deps()
+    ]
+  end
+
+  def application do
+    [mod: {PaymentsBreaker.Application, []}, extra_applications: [:logger]]
+  end
+
+  defp deps do
+    [{:benchee, "~> 1.3", only: :dev}]
+  end
+end
+```
+
 ### Step 1: Application supervision
+
+**Objective**: Boot per-service breaker instances with isolated ETS rows so concurrent readers avoid GenServer mailbox serialization at 10k req/s scale.
 
 ```elixir
 defmodule PaymentsBreaker.Application do
@@ -118,6 +147,8 @@ end
 ```
 
 ### Step 2: Pure state logic (`lib/payments_breaker/breaker/state.ex`)
+
+**Objective**: Extract FSM transitions as pure functions to decouple business logic from GenServer/ETS, enabling deterministic unit tests without process state.
 
 ```elixir
 defmodule PaymentsBreaker.Breaker.State do
@@ -178,6 +209,8 @@ end
 ```
 
 ### Step 3: GenServer with ETS-backed hot path (`lib/payments_breaker/breaker.ex`)
+
+**Objective**: Publish FSM state to :public ETS so lock-free reads bypass GenServer; only state transitions route through mailbox to guarantee atomic correctness.
 
 ```elixir
 defmodule PaymentsBreaker.Breaker do
@@ -384,6 +417,23 @@ Benchee.run(
 ```
 
 Expected on a modern laptop: p99 < 2µs, p50 < 500ns. If you see > 10µs the call is hitting the GenServer — verify the ETS row is present and `:closed`.
+
+## Advanced Considerations: Circuit Breakers and Bulkheads in Production
+
+A circuit breaker monitors downstream service health and rejects new requests when failures exceed a threshold, failing fast instead of queuing indefinitely. States: `:closed` (normal), `:open` (fast-fail), `:half_open` (testing recovery). A timeout-based pattern monitors; once requests succeed again, the circuit closes. Half-open tests with a single request; if it succeeds, all requests resume.
+
+Bulkheads isolate resource pools so one slow endpoint doesn't starve others. A GenServer pool with a bounded queue (e.g., `:queue.len(state) >= 100`) can return `{:error, :overloaded}` immediately, preventing queue buildup. Combined with exponential backoff on the client (caller retries with increasing delays), this creates a natural circuit breaker behavior without explicit state.
+
+Graceful degradation means serving stale data or reduced functionality when a service is slow. A cached value with a 5-minute TTL is acceptable for many reads; serve it if the live source is timing out. Feature flags allow disabling expensive operations at runtime. Cascading timeout windows (outer service times out after 5s, inner calls must complete in 3s) prevent unbounded waiting. The cost is complexity: tracking degradation modes, testing failure scenarios, and ensuring data consistency under partial failures.
+
+---
+
+
+## Deep Dive: Etsdets Patterns and Production Implications
+
+ETS tables are in-memory, non-distributed key-value stores with tunable semantics (ordered_set, duplicate_bag). Under concurrent read/write load, ETS table semantics matter: bag semantics allow fast appends but slow deletes; ordered_set allows range queries but slower inserts. Testing ETS behavior under concurrent load is non-trivial; single-threaded tests miss lock contention. Production ETS tables often fail under load due to concurrency assumptions that quiet tests don't exercise.
+
+---
 
 ## Trade-offs and production gotchas
 

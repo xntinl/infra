@@ -59,7 +59,7 @@ with `DynamicSupervisor.start_child(sup, child_spec)`.
 ```
 
 The caller owns the pid. You can monitor it, message it, or look it up
-via a `Registry` later (exercise 61).
+via a `Registry` later.
 
 ### 3. Only `:one_for_one` is supported
 
@@ -109,12 +109,18 @@ end
 
 ### Step 1: Create the project
 
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
+
 ```bash
 mix new worker_factory
 cd worker_factory
 ```
 
 ### Step 2: `lib/worker_factory/job_worker.ex`
+
+**Objective**: Implement `job_worker.ex` — a worker whose crash behavior is the whole point — it exists so the supervisor strategy can be observed.
+
 
 ```elixir
 defmodule WorkerFactory.JobWorker do
@@ -161,6 +167,9 @@ end
 
 ### Step 3: `lib/worker_factory/supervisor.ex`
 
+**Objective**: Encode the restart policy in `supervisor.ex` — the supervisor strategy is the lesson; the children exist to make it observable.
+
+
 ```elixir
 defmodule WorkerFactory.Supervisor do
   @moduledoc """
@@ -202,6 +211,9 @@ end
 ```
 
 ### Step 4: `test/worker_factory_test.exs`
+
+**Objective**: Write `worker_factory_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
 
 ```elixir
 defmodule WorkerFactoryTest do
@@ -266,6 +278,9 @@ end
 
 ### Step 5: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -286,7 +301,7 @@ The design leans on OTP primitives that already encode the invariants we care ab
 **1. You lose the pid when you don't register it**
 `start_child/2` returns a pid but the DynamicSupervisor does not index
 children by name. If callers need "find the worker for job 42 later", pair
-it with a `Registry` (exercise 61). Otherwise you'll be walking
+it with a `Registry`. Otherwise you'll be walking
 `which_children/1` linearly — fine for dozens of children, terrible for
 thousands.
 
@@ -303,7 +318,7 @@ hour, not thousands.
 **4. Graceful shutdown kills children in parallel, not in order**
 Dynamic children have no ordering. On `Supervisor.stop/1`, all children
 get the shutdown signal simultaneously. Set each worker's `:shutdown`
-option (exercise 62) thoughtfully — especially for workers holding open
+option thoughtfully — especially for workers holding open
 connections or writing to disk.
 
 **5. When NOT to use DynamicSupervisor**
@@ -327,3 +342,17 @@ not zero.
 - [`Registry` — stdlib](https://hexdocs.pm/elixir/Registry.html) — pairs naturally with DynamicSupervisor
 - [`nimble_pool` — bounded resource pool](https://hexdocs.pm/nimble_pool/) — for connection-like workloads
 - ["Migrating from `:simple_one_for_one`"](https://hexdocs.pm/elixir/DynamicSupervisor.html#module-migrating-from-supervisor-simple_one_for_one) — historical context
+
+
+## Advanced Considerations
+
+Supervision trees encode your application's fault tolerance strategy. The tree structure, restart policy, and shutdown semantics directly determine behavior during crashes, dependencies, and graceful shutdown.
+
+**Supervision tree design:**
+A well-designed tree mirrors data/message flow: dependencies point upward. If process A depends on process B, B should be higher in the tree (started first, shut down last). Supervisor strategies (`:one_for_one`, `:one_for_all`, `:rest_for_one`) define the scope of cascading restarts. `:one_for_one` isolates failures (each crash restarts only that child); `:one_for_all` is for tightly-coupled groups (e.g., a reader-writer pair).
+
+**Restart strategies and intensity:**
+`max_restarts: 3, max_seconds: 5` means "if 3+ restarts occur in 5 seconds, kill the supervisor." This circuit-breaker pattern prevents restart loops that consume resources. The key decision: should a crashing child take down the whole app (escalate to parent) or just itself? Transient/temporary children exit "cleanly" and don't trigger restarts — useful for request handlers.
+
+**Error propagation and shutdown ordering:**
+When a supervisor exits, it sends `:shutdown` to children in reverse start order (LIFO). Children have `shutdown: 5000` milliseconds to terminate gracefully before hard killing. Nested supervisors propagate this signal recursively. Understanding this order prevents resource leaks: a child waiting on another child's graceful shutdown will deadlock if not designed carefully.

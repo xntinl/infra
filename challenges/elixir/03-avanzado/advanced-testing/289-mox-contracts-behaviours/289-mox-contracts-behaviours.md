@@ -90,6 +90,8 @@ defp elixirc_paths(_),     do: ["lib"]
 
 ### Step 1: define the behaviour (the contract)
 
+**Objective**: Seal behaviour contract so Mox enforces callback signatures at compile-time, catching drift between real and mock implementations.
+
 ```elixir
 # lib/notification_service/adapter.ex
 defmodule NotificationService.Adapter do
@@ -105,6 +107,8 @@ end
 ```
 
 ### Step 2: real adapter
+
+**Objective**: Map HTTP status codes to semantic errors so callers branch on domain reasons, not transport/status details.
 
 ```elixir
 # lib/notification_service/sms/twilio_adapter.ex
@@ -133,6 +137,8 @@ end
 
 ### Step 3: dispatcher resolves the adapter via config
 
+**Objective**: Dispatch via Application.fetch_env! at call-time so tests inject mocks without code changes or module rewrites.
+
 ```elixir
 # lib/notification_service/dispatcher.ex
 defmodule NotificationService.Dispatcher do
@@ -151,6 +157,8 @@ end
 
 ### Step 4: declare the mocks
 
+**Objective**: Generate mocks via Mox.defmock and inject via Application env so tests get clean per-process expectations with no cross-test pollution.
+
 ```elixir
 # test/support/mocks.ex
 Mox.defmock(NotificationService.SmsMock,   for: NotificationService.Adapter)
@@ -168,6 +176,8 @@ Code.require_file("support/mocks.ex", __DIR__)
 ```
 
 ### Step 5: tests
+
+**Objective**: Assert dispatch logic catches behaviour drift and provider failures so mock contract violations fail at test-compile, not production deploy time.
 
 ```elixir
 # test/notification_service/dispatcher_test.exs
@@ -263,6 +273,21 @@ Benchee.run(%{
 Target: each iteration < 5µs. If Mox becomes the bottleneck of a suite, the suite has another
 issue (probably synchronous I/O).
 
+## Deep Dive: Mox Patterns and Production Implications
+
+Testing through explicit behavior contracts requires careful design of expectations. In production systems with many mocked dependencies, the cost of maintaining contracts grows with each new adapter or integration point. The key insight is that Mox's private-mode isolation prevents test pollution only when all pids involved are accounted for—the moment you spawn unowned processes (Tasks, Oban workers, Broadway pipelines), you must switch to global mode, trading parallelism for simplicity. Understanding when to reach for expect/3 vs stub_with/2 vs global mode separates brittle test suites from maintainable ones. A senior engineer recognizes that mocking boundaries—not implementation details—pays dividends over time.
+
+---
+
+## Advanced Considerations
+
+Production testing strategies require careful attention to resource management and test isolation across multiple concurrent test processes. In large codebases, tests can consume significant memory and CPU resources, especially when using concurrent testing without proper synchronization and cleanup. The BEAM scheduler's preemptive nature means test processes may interfere with each other if shared resources aren't properly isolated at the process boundary. Pay careful attention to how Ecto's sandbox mode interacts with your supervision tree — if you have GenServers that hold state across tests, the sandbox rollback mechanism may leave phantom processes in your monitoring systems that continue consuming resources until forced cleanup occurs.
+
+When scaling tests to production-grade test suites, consider the cost of stub verification and the memory overhead of generated test cases. Each property-based test invocation can create thousands of synthetic test cases, potentially causing garbage collection pressure that's invisible during local testing but becomes critical in CI/CD pipelines running long test suites continuously. The interaction between concurrent tests and ETS tables (often used in caches and registry patterns) requires explicit `inherited: true` options to prevent unexpected sharing between test processes, which can cause mysterious failures when tests run in different orders or under load.
+
+For distributed testing scenarios using tools like `Peer`, network simulation can mask real latency issues and failure modes. Test timeouts that work locally may fail in CI due to scheduler contention and GC pauses. Always include substantial buffers for timeout values and monitor actual execution times under load. The coordination between multiple test nodes requires careful cleanup — a failure in test coordination can leave zombie processes consuming resources indefinitely. Implement proper telemetry hooks within your test helpers to diagnose production-like scenarios and capture performance characteristics.
+
+
 ## Trade-offs and production gotchas
 
 **1. Forgetting `verify_on_exit!/1`**
@@ -306,3 +331,13 @@ cost outweigh the testability benefit?
 - [José Valim — Mocks and explicit contracts](http://blog.plataformatec.com.br/2015/10/mocks-and-explicit-contracts/)
 - [Adopting Mox at scale — Dashbit blog](https://dashbit.co/blog/mocks-and-explicit-contracts)
 - [`Mox.set_mox_from_context/1` docs](https://hexdocs.pm/mox/Mox.html#set_mox_from_context/1)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

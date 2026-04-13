@@ -89,6 +89,8 @@ Logger.configure(level: :debug)
 
 ### Step 1: the recorder emits structured logs
 
+**Objective**: Split `:allowed` vs `:forbidden` branches across `Logger.info` and `Logger.warning` so level-aware assertions can prove severity, not just content.
+
 ```elixir
 # lib/audit_log/recorder.ex
 defmodule AuditLog.Recorder do
@@ -114,6 +116,8 @@ end
 ```
 
 ### Step 2: the validator raises on contract violations
+
+**Objective**: Raise a struct-bearing `InvalidEventError` with `:field` so adapters can pattern-match on the violation instead of parsing error messages.
 
 ```elixir
 # lib/audit_log/validator.ex
@@ -152,6 +156,8 @@ end
 ```
 
 ### Step 3: log assertion tests
+
+**Objective**: Use `capture_log/2` with explicit `:level` so async tests assert both presence of the expected line and absence of the wrong-severity one.
 
 ```elixir
 # test/audit_log/recorder_test.exs
@@ -210,6 +216,8 @@ end
 ```
 
 ### Step 4: exception assertion tests
+
+**Objective**: Combine `assert_raise/3` with regex and struct-level rescue so both the message shape and the `:field` tag form part of the contract.
 
 ```elixir
 # test/audit_log/validator_test.exs
@@ -301,6 +309,21 @@ Benchee.run(%{
 
 Target: < 50µs/op on a modern laptop.
 
+## Deep Dive: Logging Patterns and Production Implications
+
+Capturing logs during tests ensures that error messages and diagnostics are actionable for operators. The trap is logging too much (noise) or too little (invisibility). Senior teams log at boundaries (HTTP handlers, database calls) and sparingly on happy paths, then rigorously test error paths to ensure operators see actionable information. Under production load, verbose logging becomes a bottleneck; testing log output early prevents information overload in critical moments.
+
+---
+
+## Advanced Considerations
+
+Production testing strategies require careful attention to resource management and test isolation across multiple concurrent test processes. In large codebases, tests can consume significant memory and CPU resources, especially when using concurrent testing without proper synchronization and cleanup. The BEAM scheduler's preemptive nature means test processes may interfere with each other if shared resources aren't properly isolated at the process boundary. Pay careful attention to how Ecto's sandbox mode interacts with your supervision tree — if you have GenServers that hold state across tests, the sandbox rollback mechanism may leave phantom processes in your monitoring systems that continue consuming resources until forced cleanup occurs.
+
+When scaling tests to production-grade test suites, consider the cost of stub verification and the memory overhead of generated test cases. Each property-based test invocation can create thousands of synthetic test cases, potentially causing garbage collection pressure that's invisible during local testing but becomes critical in CI/CD pipelines running long test suites continuously. The interaction between concurrent tests and ETS tables (often used in caches and registry patterns) requires explicit `inherited: true` options to prevent unexpected sharing between test processes, which can cause mysterious failures when tests run in different orders or under load.
+
+For distributed testing scenarios using tools like `Peer`, network simulation can mask real latency issues and failure modes. Test timeouts that work locally may fail in CI due to scheduler contention and GC pauses. Always include substantial buffers for timeout values and monitor actual execution times under load. The coordination between multiple test nodes requires careful cleanup — a failure in test coordination can leave zombie processes consuming resources indefinitely. Implement proper telemetry hooks within your test helpers to diagnose production-like scenarios and capture performance characteristics.
+
+
 ## Trade-offs and production gotchas
 
 **1. Default log level too high**
@@ -343,3 +366,13 @@ without falling back to `Process.sleep`?
 - [`ExUnit.Assertions.assert_raise/3`](https://hexdocs.pm/ex_unit/ExUnit.Assertions.html#assert_raise/3)
 - [`Logger` configuration](https://hexdocs.pm/logger/Logger.html)
 - [Structured logging — Dashbit](https://dashbit.co/blog/structured-logging-with-elixir)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

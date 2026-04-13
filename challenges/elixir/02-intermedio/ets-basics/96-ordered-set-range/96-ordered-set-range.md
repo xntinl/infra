@@ -88,7 +88,7 @@ key, and use `:ordered_set` as the table type.
 
 ### 4. When a hand-written match spec is OK vs when to use `fun2ms`
 
-Match specs are notoriously hard to write by hand. `:ets.fun2ms/1` (exercise 98)
+Match specs are notoriously hard to write by hand. `:ets.fun2ms/1`
 compiles an Elixir/Erlang fun into the equivalent match spec at compile time —
 much nicer. But you should be able to read a raw match spec in logs and in
 OTP library internals, so this exercise writes them by hand deliberately.
@@ -114,7 +114,21 @@ tracing (`:dbg`). `fun2ms` is introduced in a later exercise.
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
 
 ```bash
 mix new ordered_set_range
@@ -122,6 +136,9 @@ cd ordered_set_range
 ```
 
 ### Step 2: `lib/ordered_set_range.ex`
+
+**Objective**: Implement `ordered_set_range.ex` — the access pattern that exposes the trade-off between ETS concurrency flags, match specs, and lookup cost.
+
 
 ```elixir
 defmodule OrderedSetRange do
@@ -176,7 +193,7 @@ defmodule OrderedSetRange do
   equal to `level`. Demonstrates a range PLUS a value-shape filter in the
   same match spec.
 
-  For anything more complex than this, reach for `:ets.fun2ms/1` (exercise 98)
+  For anything more complex than this, reach for `:ets.fun2ms/1`
   — hand-writing deep match specs is a debugging nightmare.
   """
   @spec range_with_level(:ets.tid(), integer(), integer(), atom()) :: [event()]
@@ -203,6 +220,9 @@ end
 ```
 
 ### Step 3: `test/ordered_set_range_test.exs`
+
+**Objective**: Write `ordered_set_range_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
 
 ```elixir
 defmodule OrderedSetRangeTest do
@@ -252,6 +272,9 @@ end
 
 ### Step 4: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -266,6 +289,15 @@ them it would scan the whole table. Returning `{{:"$1", :"$2"}}` as the body
 preserves the original tuple shape so the caller sees familiar data.
 
 ---
+
+
+## Deep Dive: ETS Concurrency Trade-Offs and Operation Atomicity
+
+ETS (Erlang Term Storage) is mutable, shared, in-process state—antithetical to Elixir's immutability. But it's required for specific cases: large shared datasets, fast lookups under contention, atomic counters across processes. Trade-off: operations aren't composable (no atomic multi-table updates without extra bookkeeping), and debugging is harder because mutations are invisible in code.
+
+Use ETS when: (1) true sharing between processes, (2) data is large (megabytes), (3) sub-millisecond latency required. Use GenServer when: (1) single process owns state, (2) dataset is small, (3) complex transition logic.
+
+Most common mistake: using ETS to work around GenServer bottlenecks without profiling. Profile usually shows either handler logic is expensive (move it out) or contention from N processes calling it. ETS solves contention via sharding: split state across tables/processes indexed by key. Always profile before choosing ETS.
 
 ## Benchmark
 
@@ -291,6 +323,12 @@ IO.puts("ordered_set: #{us_os}µs  set: #{us_s}µs")
 Target esperado: sobre 100k filas con ventana del 1%, `:ordered_set` debería
 completar en <1ms mientras `:set` escanea la tabla completa (~5–20ms). La
 relación debería ser al menos 10× a favor de `:ordered_set`.
+
+---
+
+## Key Concepts
+
+Ordered sets (`ordered_set` tables) maintain sort order on keys, enabling powerful range queries. Instead of scanning the entire table, `ets:match_spec/2` with range patterns allows queries like "all keys between X and Y" in O(log n) time—far faster than scanning a regular `set` table. This is crucial for time-series data, pagination, and sorted indexes. The binary search-like behavior means 1M keys might need only ~20 comparisons to find a range. The trade-off: inserts are slightly slower because keys must be maintained in sort order, and memory usage is slightly higher. Use `ordered_set` when you need sorted iteration or range queries; use plain `set` for equality lookups only. In production systems tracking time-based data (events, metrics, logs), `ordered_set` becomes invaluable for efficient pagination and time-window queries.
 
 ---
 

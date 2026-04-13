@@ -104,18 +104,23 @@ canonical place for cross-app settings.
 
 ## Implementation
 
-### Dependencies (`mix.exs`)
+### Dependencies (mix.exs)
 
 ```elixir
 defp deps do
   [
-    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+    # Standard library: no external dependencies required
   ]
 end
 ```
 
 
+
+
 ### Step 1: Create the umbrella
+
+**Objective**: Create the umbrella.
+
 
 ```bash
 mix new tiny_umbrella --umbrella
@@ -127,6 +132,9 @@ cd ..
 ```
 
 ### Step 2: Umbrella root `mix.exs`
+
+**Objective**: Umbrella root `mix.exs`.
+
 
 ```elixir
 defmodule TinyUmbrella.MixProject do
@@ -160,6 +168,9 @@ end
 ```
 
 ### Step 3: `apps/tiny_core/mix.exs` and `apps/tiny_core/lib/tiny_core.ex`
+
+**Objective**: Provide `apps/tiny_core/mix.exs` and `apps/tiny_core/lib/tiny_core.ex` — these are the supporting fixtures the main module depends on to make its concept demonstrable.
+
 
 ```elixir
 defmodule TinyCore.MixProject do
@@ -215,6 +226,9 @@ end
 ```
 
 ### Step 4: `apps/tiny_web/mix.exs` and `apps/tiny_web/lib/tiny_web.ex`
+
+**Objective**: Provide `apps/tiny_web/mix.exs` and `apps/tiny_web/lib/tiny_web.ex` — these are the supporting fixtures the main module depends on to make its concept demonstrable.
+
 
 ```elixir
 defmodule TinyWeb.MixProject do
@@ -280,6 +294,9 @@ end
 
 ### Step 5: `apps/tiny_core/test/tiny_core_test.exs` and `apps/tiny_web/test/tiny_web_test.exs`
 
+**Objective**: Provide `apps/tiny_core/test/tiny_core_test.exs` and `apps/tiny_web/test/tiny_web_test.exs` — these are the supporting fixtures the main module depends on to make its concept demonstrable.
+
+
 ```elixir
 defmodule TinyCoreTest do
   use ExUnit.Case, async: true
@@ -310,6 +327,9 @@ end
 
 ### Step 6: Run from the umbrella root
 
+**Objective**: Run from the umbrella root.
+
+
 ```bash
 mix test              # runs both apps' tests
 mix compile           # compiles both apps
@@ -322,6 +342,21 @@ MIX_ENV=prod mix release  # packages both into one release
 
 The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
 
+
+
+## Key Concepts
+
+Umbrella projects group multiple Mix applications under one root, sharing a single `mix.exs` and `mix.lock`. Each app under `apps/` is independent with its own supervision tree, but they coordinate via shared dependencies. This pattern is ideal for splitting large systems: one app for domain logic, one for HTTP API, one for background jobs. The key advantage: true separation—test each app independently, reason about boundaries clearly. The trap: umbrellas are not microservices; they're still in the same VM, so crashes cascade. Use umbrellas for modular monoliths, not for avoiding deployment coordination. Each sub-app can be released separately but typically they deploy as a unit.
+
+---
+
+## Deep Dive: Compile-Time vs Runtime Configuration Boundaries
+
+A release is a static artifact: code and compile-time config are baked in. Runtime config must be provided at boot via environment variables, config files, or config providers. Simple rule: if a value changes between dev and prod, it goes in `config/runtime.exs`, not `config/config.exs`.
+
+Footgun: putting config in compile-time files and assuming environment variables work at runtime. Releases ignore env vars unless `config/runtime.exs` explicitly reads them. If you need env vars, fetch them in `config/runtime.exs` and store in application state.
+
+For distributed systems, config providers (modules loading config from Consul, S3, etc.) are powerful but complex. Start with environment variables and `config/runtime.exs`; only reach for providers if you need dynamic reloading without downtime or multi-tenant config switching. Premature provider complexity is a mistake.
 
 ## Benchmark
 

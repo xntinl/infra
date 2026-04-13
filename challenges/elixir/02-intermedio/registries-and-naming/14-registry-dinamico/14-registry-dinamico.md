@@ -97,9 +97,31 @@ the registry is empty.
 
 ---
 
+### Dependencies (`mix.exs`)
+
+```elixir
+def deps do
+  [
+    {DOWN},
+    {already_registered},
+    {already_started},
+    {error},
+    {exunit},
+    {genserver},
+    {noreply},
+    {ok},
+    {post},
+    {reply},
+    {via},
+  ]
+end
+```
 ## Implementation
 
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
 
 ```bash
 mix new chat_rooms_registry --sup
@@ -110,6 +132,9 @@ The `--sup` flag generates an `Application` module — we'll extend it to
 start the `Registry` and a `DynamicSupervisor`.
 
 ### Step 2: `lib/chat_rooms_registry/application.ex`
+
+**Objective**: Wire `application.ex` to start the supervision tree that starts the Registry before any via-tuple lookup can happen.
+
 
 ```elixir
 defmodule ChatRoomsRegistry.Application do
@@ -141,6 +166,9 @@ end
 ```
 
 ### Step 3: `lib/chat_rooms_registry/room.ex`
+
+**Objective**: Implement `room.ex` — the naming/lookup strategy that decides how processes are addressed under concurrency and failure.
+
 
 ```elixir
 defmodule ChatRoomsRegistry.Room do
@@ -189,6 +217,9 @@ end
 ```
 
 ### Step 4: `lib/chat_rooms_registry/rooms.ex`
+
+**Objective**: Implement `rooms.ex` — the naming/lookup strategy that decides how processes are addressed under concurrency and failure.
+
 
 ```elixir
 defmodule ChatRoomsRegistry.Rooms do
@@ -245,6 +276,9 @@ end
 ```
 
 ### Step 5: `test/chat_rooms_registry_test.exs`
+
+**Objective**: Write `chat_rooms_registry_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
 
 ```elixir
 defmodule ChatRoomsRegistryTest do
@@ -315,6 +349,9 @@ end
 
 ### Step 6: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -324,6 +361,14 @@ mix test
 `Registry` in `:unique` mode gives you a lock-free ETS index keyed by room name, and its monitor on each registered pid guarantees entries vanish when the owner dies. The `:via` tuple lets every call site address rooms by name without ever touching pids, and the `DynamicSupervisor` turns `find_or_start/1` into a race-safe idempotent operation thanks to `{:already_started, pid}`.
 
 ---
+
+
+## Key Concepts: Dynamic Process Registration and Discovery
+
+The `Registry` module is a key-value store for process names. Unlike `Process.register/2` which stores pids in a global atoms-based namespace (limited to atoms as names), `Registry` lets you store any term as a key and associate multiple pids with one key. It's the standard way to implement pub-sub, named worker pools, or gatekeeper patterns.
+
+Registries are local to a node (not distributed). Each registry is a GenServer-backed table that you include in your supervision tree. When you register a pid with a key, the registry monitors the pid and auto-removes the entry on exit. The `match/2` and `lookup/2` functions let you query by key or pattern. The gotcha: registration is synchronous, so registering many pids in a loop can become a bottleneck—use bulk operations or Registry.dispatch/3 to send messages directly without fetching pids first.
+
 
 ## Benchmark
 
@@ -394,3 +439,15 @@ need duplicate-key pubsub semantics.
 - [`DynamicSupervisor` — Elixir stdlib](https://hexdocs.pm/elixir/DynamicSupervisor.html)
 - [Demystifying the Registry module in Elixir — Arpan Ghoshal](https://arpanghoshal3.medium.com/demystifying-the-registry-module-in-elixir-f0e07e770ec0)
 - [José Valim / Dashbit — "What's new in Elixir 1.4" (Registry announcement)](https://dashbit.co/blog/whats-new-in-elixir-1-4)
+
+
+## Key Concepts
+
+Registry patterns in Elixir provide distributed name resolution through a central registry process. Unlike traditional naming services, Elixir registries are per-node by default but can be partitioned globally. Process name resolution follows a lookup chain: local registry → distributed registry (if configured) → `:global` → fallback mechanisms.
+
+**Critical concepts:**
+- **Via tuple pattern** `{:via, module, name}`: Enables pluggable naming backends. The registry module intercepts `:whereis`, `:register`, `:unregister` calls, allowing both local and distributed strategies.
+- **Partitioned registries** (`Registry.start_link(partitions: 8)`): Reduce contention by sharding the registry across multiple ETS tables. Each partition handles independent name lookups, improving throughput under high concurrency.
+- **Clustering implications**: Global registries across nodes require consensus. Elixir's registry design favors availability (CAP theorem) — a node can register locally and replicate asynchronously. This is why `:global` exists separately from local registries.
+
+**Senior-level gotcha**: Mixing local and global registration without explicit sync logic can cause "phantom" processes — a process registered locally appears available to local callers but fails remote calls. Always make registry scope explicit in your architecture.

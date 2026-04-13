@@ -61,6 +61,16 @@ Maximum total elapsed time (`total_budget_ms`) trumps `max_attempts`. A request 
 
 ### Dependencies (`mix.exs`)
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
+
 ```elixir
 defmodule ResilientHttp.MixProject do
   use Mix.Project
@@ -70,6 +80,8 @@ end
 ```
 
 ### Step 1: Backoff math (`lib/resilient_http/retry/backoff.ex`)
+
+**Objective**: Decouple jitter computation from randomness source via injectable RNG so curves are deterministic in tests and independent of :rand global state.
 
 ```elixir
 defmodule ResilientHttp.Retry.Backoff do
@@ -104,6 +116,8 @@ end
 ```
 
 ### Step 2: Retry executor (`lib/resilient_http/retry.ex`)
+
+**Objective**: Enforce total_budget_ms ceiling so final sleep never pushes completion past SLO; budget trumps max_attempts to prevent runaway retry storms.
 
 ```elixir
 defmodule ResilientHttp.Retry do
@@ -295,6 +309,23 @@ IO.puts("avg: #{t / 100_000} µs")
 ```
 
 Expected: < 1µs per call. If over 5µs, you have an accidental allocation (likely keyword list lookup) on the hot path.
+
+## Advanced Considerations: Circuit Breakers and Bulkheads in Production
+
+A circuit breaker monitors downstream service health and rejects new requests when failures exceed a threshold, failing fast instead of queuing indefinitely. States: `:closed` (normal), `:open` (fast-fail), `:half_open` (testing recovery). A timeout-based pattern monitors; once requests succeed again, the circuit closes. Half-open tests with a single request; if it succeeds, all requests resume.
+
+Bulkheads isolate resource pools so one slow endpoint doesn't starve others. A GenServer pool with a bounded queue (e.g., `:queue.len(state) >= 100`) can return `{:error, :overloaded}` immediately, preventing queue buildup. Combined with exponential backoff on the client (caller retries with increasing delays), this creates a natural circuit breaker behavior without explicit state.
+
+Graceful degradation means serving stale data or reduced functionality when a service is slow. A cached value with a 5-minute TTL is acceptable for many reads; serve it if the live source is timing out. Feature flags allow disabling expensive operations at runtime. Cascading timeout windows (outer service times out after 5s, inner calls must complete in 3s) prevent unbounded waiting. The cost is complexity: tracking degradation modes, testing failure scenarios, and ensuring data consistency under partial failures.
+
+---
+
+
+## Deep Dive: Resilience Patterns and Production Implications
+
+Resilience patterns (circuit breakers, timeouts, retries) are easy to implement but hard to test. The insight is that resilience patterns must be tested under failure: timeouts matter only when calls actually take time, retries matter only when transient failures occur. Production systems with untested resilience patterns often fail gracefully in test and catastrophically in production.
+
+---
 
 ## Trade-offs and production gotchas
 

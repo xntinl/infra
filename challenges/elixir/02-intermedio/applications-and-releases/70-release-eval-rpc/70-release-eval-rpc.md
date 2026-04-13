@@ -111,18 +111,24 @@ because they run under `eval` without the full supervision tree.
 
 ## Implementation
 
-### Dependencies (`mix.exs`)
+### Dependencies (mix.exs)
 
 ```elixir
 defp deps do
   [
-    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+    # Standard library: no external dependencies required
+    {:"ecto", "~> 1.0"},
   ]
 end
 ```
 
 
+
+
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
 
 ```bash
 mix new release_eval_rpc --sup
@@ -131,6 +137,9 @@ mkdir -p config
 ```
 
 ### Step 2: `mix.exs`, `config/config.exs`, `config/runtime.exs`
+
+**Objective**: Provide `mix.exs`, `config/config.exs`, `config/runtime.exs` — these are the supporting fixtures the main module depends on to make its concept demonstrable.
+
 
 ```elixir
 # mix.exs — relevant parts
@@ -159,6 +168,9 @@ config :release_eval_rpc, :label, System.get_env("LABEL", "default-label")
 ```
 
 ### Step 3: `lib/release_eval_rpc/counter.ex`
+
+**Objective**: Implement `counter.ex` — release-time behavior that depends on application env resolution and runtime boot semantics.
+
 
 ```elixir
 defmodule ReleaseEvalRpc.Counter do
@@ -189,6 +201,9 @@ end
 
 ### Step 4: `lib/release_eval_rpc/application.ex` and `lib/release_eval_rpc.ex`
 
+**Objective**: Provide `lib/release_eval_rpc/application.ex` and `lib/release_eval_rpc.ex` — these are the supporting fixtures the main module depends on to make its concept demonstrable.
+
+
 ```elixir
 defmodule ReleaseEvalRpc.Application do
   @moduledoc false
@@ -210,6 +225,9 @@ end
 ```
 
 ### Step 5: `lib/release_eval_rpc/release.ex` — the admin module
+
+**Objective**: Edit `release.ex` — the admin module, exposing release-time behavior that depends on application env resolution and runtime boot semantics.
+
 
 ```elixir
 defmodule ReleaseEvalRpc.Release do
@@ -264,6 +282,9 @@ end
 
 ### Step 6: `test/release_eval_rpc_test.exs`
 
+**Objective**: Write `release_eval_rpc_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+
 ```elixir
 defmodule ReleaseEvalRpcTest do
   use ExUnit.Case, async: false
@@ -286,6 +307,9 @@ end
 ```
 
 ### Step 7: Build and demonstrate both commands
+
+**Objective**: Build and demonstrate both commands.
+
 
 ```bash
 MIX_ENV=prod mix release
@@ -315,6 +339,21 @@ $REL/bin/release_eval_rpc stop
 
 The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
 
+
+
+## Key Concepts
+
+Releases support `bin/myapp eval CODE` and `bin/myapp rpc MODULE FUNCTION` for operational tasks without a full IEx shell. `eval` runs arbitrary Elixir code in the running node; `rpc` calls a specific function. Both assume the node is already running—they are operational tools, not deployment tools. This enables patterns: `bin/myapp rpc Myapp.Maintenance clean_old_data` or `bin/myapp eval 'IO.puts Myapp.version()'. These are powerful but dangerous if exposed; in production, restrict access and log all invocations. Most production systems use these for migrations, cleanup tasks, or diagnostic queries—never for data mutations in untrusted environments.
+
+---
+
+## Deep Dive: Compile-Time vs Runtime Configuration Boundaries
+
+A release is a static artifact: code and compile-time config are baked in. Runtime config must be provided at boot via environment variables, config files, or config providers. Simple rule: if a value changes between dev and prod, it goes in `config/runtime.exs`, not `config/config.exs`.
+
+Footgun: putting config in compile-time files and assuming environment variables work at runtime. Releases ignore env vars unless `config/runtime.exs` explicitly reads them. If you need env vars, fetch them in `config/runtime.exs` and store in application state.
+
+For distributed systems, config providers (modules loading config from Consul, S3, etc.) are powerful but complex. Start with environment variables and `config/runtime.exs`; only reach for providers if you need dynamic reloading without downtime or multi-tenant config switching. Premature provider complexity is a mistake.
 
 ## Benchmark
 

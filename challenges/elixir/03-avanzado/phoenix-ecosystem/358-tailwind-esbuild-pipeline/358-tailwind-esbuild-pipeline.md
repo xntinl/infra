@@ -151,7 +151,119 @@ defmodule AdminUi.MixProject do
 end
 ```
 
+### Dependencies (mix.exs)
+
+```elixir
+```elixir
+config :esbuild,
+  version: "0.21.5",
+  default: [
+    args: ~w(js/app.js --bundle --target=es2022 --outdir=../priv/static/assets --external:/fonts/* --external:/images/*),
+    cd: Path.expand("../assets", __DIR__),
+    env: %{"NODE_PATH" => Path.expand("../deps", __DIR__)}
+  ]
+```
+
+`--external:/fonts/*` keeps the paths unresolved; Phoenix serves them from `priv/static/fonts/`.
+
+### 2. `tailwind` mix task
+
+Similar shape:
+
+```elixir
+config :tailwind,
+  version: "3.4.3",
+  default: [
+    args: ~w(--config=tailwind.config.js --input=css/app.css --output=../priv/static/assets/app.css),
+    cd: Path.expand("../assets", __DIR__)
+  ]
+```
+
+### 3. `watchers` for dev
+
+In `config/dev.exs`:
+
+```elixir
+config :admin_ui, AdminUiWeb.Endpoint,
+  watchers: [
+    esbuild: {Esbuild, :install_and_run, [:default, ~w(--sourcemap=inline --watch)]},
+    tailwind: {Tailwind, :install_and_run, [:default, ~w(--watch)]}
+  ]
+```
+
+Phoenix starts both in watch mode when `mix phx.server` runs. No `package.json`.
+
+### 4. `deploy` profile
+
+Production uses separate profiles with minification:
+
+```elixir
+config :esbuild,
+  deploy: [args: ~w(js/app.js --bundle --minify --target=es2022 --outdir=../priv/static/assets)]
+```
+
+And `mix phx.digest` fingerprints the output for long-cache immutability.
+
+## Design decisions
+
+- **Option A — webpack + npm**: industry standard 5 years ago, heavy today.
+- **Option B — Vite + npm**: fast HMR, still Node.
+- **Option C — `:esbuild` + `:tailwind` Hex packages**: no Node, supervised, reproducible.
+
+Chosen: Option C. Migrate only if you ship a full SPA (React/Vue) that needs Vite-style features. For LV + a few sprinkles of Alpine, Option C is optimal.
+
+## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defmodule AdminUi.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :admin_ui,
+      version: "0.1.0",
+      elixir: "~> 1.16",
+      aliases: aliases(),
+      deps: deps()
+    ]
+  end
+
+  def application do
+    [mod: {AdminUi.Application, []}, extra_applications: [:logger]]
+  end
+
+  defp deps do
+    [
+      {:phoenix, "~> 1.7.14"},
+      {:phoenix_live_view, "~> 1.0"},
+      {:phoenix_html, "~> 4.1"},
+      {:esbuild, "~> 0.8", runtime: Mix.env() == :dev},
+      {:tailwind, "~> 0.2", runtime: Mix.env() == :dev},
+      {:jason, "~> 1.4"},
+      {:plug_cowboy, "~> 2.7"}
+    ]
+  end
+
+  defp aliases do
+    [
+      setup: ["deps.get", "assets.setup", "assets.build"],
+      "assets.setup": ["tailwind.install --if-missing", "esbuild.install --if-missing"],
+      "assets.build": ["tailwind default", "esbuild default"],
+      "assets.deploy": [
+        "tailwind default --minify",
+        "esbuild default --minify",
+        "phx.digest"
+      ]
+    ]
+  end
+end
+```
+
 ### Step 1: `config/config.exs`
+
+**Objective**: Implement the script in `config/config.exs`.
 
 ```elixir
 import Config
@@ -183,6 +295,8 @@ import_config "#{config_env()}.exs"
 
 ### Step 2: `config/dev.exs`
 
+**Objective**: Implement the script in `config/dev.exs`.
+
 ```elixir
 import Config
 
@@ -204,6 +318,8 @@ config :admin_ui, AdminUiWeb.Endpoint,
 ```
 
 ### Step 3: Tailwind config — `assets/tailwind.config.js`
+
+**Objective**: Build the tailwind config layer: assets/tailwind.config.js.
 
 ```javascript
 // assets/tailwind.config.js
@@ -235,6 +351,8 @@ module.exports = {
 
 ### Step 4: CSS entry — `assets/css/app.css`
 
+**Objective**: Build the css entry layer: assets/css/app.css.
+
 ```css
 @import "tailwindcss/base";
 @import "tailwindcss/components";
@@ -248,6 +366,8 @@ module.exports = {
 
 ### Step 5: JS entry — `assets/js/app.js`
 
+**Objective**: Build the js entry layer: assets/js/app.js.
+
 ```javascript
 import "phoenix_html";
 import { Socket } from "phoenix";
@@ -260,6 +380,8 @@ window.liveSocket = liveSocket;
 ```
 
 ### Step 6: Deploy target — `config/runtime.exs` (excerpt)
+
+**Objective**: Build the deploy target layer: config/runtime.exs (excerpt).
 
 ```elixir
 import Config
@@ -329,6 +451,23 @@ real  0m0.410s
 ```
 
 **Expected**: cold < 5s, warm < 1s on modern hardware. If warm rebuilds are > 3s, Tailwind's `content` globs are scanning too much — narrow them.
+
+## Advanced Considerations: LiveView Real-Time Patterns and Pubsub Scale
+
+LiveView bridges the browser and BEAM via WebSocket, allowing server-side renders to push incremental DOM diffs to the client. A LiveView process is long-lived, receiving events (clicks, form submissions) and broadcasting updates. For real-time features (collaborative editing, live notifications), LiveView processes subscribe to PubSub topics and receive broadcast messages.
+
+Phoenix.PubSub partitions topics across a pool of processes, allowing horizontal scaling. By default, `:local` mode uses in-memory ETS; `:redis` mode distributes across nodes via Redis. At scale (thousands of concurrent LiveViews), topic fanout can bottleneck: broadcasting to a million subscribers means delivering one million messages. The BEAM handles this, but the network cost matters on multi-node deployments.
+
+`Presence` module tracks which users are viewing which pages, syncing state via PubSub. A presence join/leave is broadcast to all nodes, allowing real-time "who's online" updates. Under partition, presence state can diverge; the library uses unique presence keys to detect and reconcile. Operationally, watching presence on every page load can amplify server load if users are flaky (mobile networks, browser reloads). Consider presence only for features where it's user-facing (collaborative editors, live sports scoreboards).
+
+---
+
+
+## Deep Dive: Streaming Patterns and Production Implications
+
+Stream-based pipelines in Elixir achieve backpressure and composability by deferring computation until consumption. Unlike eager list operations that allocate all intermediate structures, Streams are lazy chains that produce one element at a time, reducing memory footprint and enabling infinite sequences. The BEAM scheduler yields between Stream operations, allowing multiple concurrent pipelines to interleave fairly. At scale (processing millions of rows or events), the difference between eager and lazy evaluation becomes the difference between consistent latency and garbage collection pauses. Production systems benefit most when Streams are composed at library boundaries, not scattered across the codebase.
+
+---
 
 ## Trade-offs and production gotchas
 

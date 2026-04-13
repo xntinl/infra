@@ -2,15 +2,22 @@
 
 **Project**: `schema_dsl` — build a miniature schema DSL — `schema "users" do field :name, :string ... end` — that generates a struct, cast/validate functions, and a `dump/1` to map. Understand how Ecto.Schema is wired.
 
-**Difficulty**: ★★★★☆
-**Estimated time**: 5–6 hours
-
 ---
 
 ## Project context
 
 You are writing a framework that needs structured records but does not want to pull
 all of Ecto. You want the familiar Ecto-like ergonomics:
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
 
 ```elixir
 defmodule MyApp.User do
@@ -43,6 +50,12 @@ schema_dsl/
 │   └── schema_dsl_test.exs
 └── mix.exs
 ```
+
+---
+
+## Why compile-time DSL and not runtime validation
+
+Runtime validation needs a schema description in data form and branches at every call. A compile-time DSL converts the description into a `def` clause per field with the type baked in, giving the fast path for free.
 
 ---
 
@@ -84,9 +97,25 @@ but brittle. Wrap casting in `Types.cast(type, value)` so a user can later add
 
 ---
 
+## Design decisions
+
+**Option A — plain struct + hand-written validation**
+- Pros: zero macros; trivially readable.
+- Cons: scales poorly across tens of schemas; validation drifts from shape.
+
+**Option B — compile-time DSL that emits struct + validators** (chosen)
+- Pros: single declaration becomes struct, spec, validators, and docs; mirrors Ecto.Schema.
+- Cons: macro layer to maintain; debugging requires reading expanded code.
+
+→ Chose **B** because the app has many schemas with parallel validation rules; the DSL removes the per-schema boilerplate.
+
+---
+
 ## Implementation
 
 ### Step 1: `lib/schema_dsl/types.ex`
+
+**Objective**: Implement cast/2 for :string, :integer, :boolean, :float, :date so schema casting is type-aware and extensible.
 
 ```elixir
 defmodule SchemaDSL.Types do
@@ -142,6 +171,8 @@ end
 
 ### Step 2: `lib/schema_dsl/casting.ex`
 
+**Objective**: Implement cast/3 driver that accumulates cast errors and missing-required errors in one Enum.reduce pass.
+
 ```elixir
 defmodule SchemaDSL.Casting do
   @moduledoc false
@@ -182,6 +213,8 @@ end
 ```
 
 ### Step 3: `lib/schema_dsl/schema.ex`
+
+**Objective**: Implement __using__, schema/2, field/2-3 macros with @before_compile to emit defstruct, __schema__/1, cast/1, dump/1.
 
 ```elixir
 defmodule SchemaDSL do
@@ -266,6 +299,8 @@ end
 
 ### Step 4: Sample schema
 
+**Objective**: Declare User schema with multiple types and defaults to demonstrate DSL usage realistically.
+
 ```elixir
 defmodule SchemaDSL.Sample.User do
   use SchemaDSL
@@ -281,6 +316,8 @@ end
 ```
 
 ### Step 5: Tests
+
+**Objective**: Assert introspection, casts succeed/fail correctly, defaults apply, dump/1 works, compile-time rejects unsupported types.
 
 ```elixir
 defmodule SchemaDSLTest do
@@ -360,6 +397,27 @@ defmodule SchemaDSLTest do
 end
 ```
 
+### Why this works
+
+The DSL collects field declarations via `accumulate: true` attributes. `@before_compile` reads the list, emits a `defstruct`, a `__schema__/1` introspection function, and a `validate/1` function whose body is generated from the field list. Each generated clause pattern-matches against the expected type.
+
+---
+
+## Advanced Considerations: Macro Hygiene and Compile-Time Validation
+
+Macros execute at compile time, walking the AST and returning new AST. That power is easy to abuse: a macro that generates variables can shadow outer scope bindings, or a quote block that references variables directly can fail if the macro is used in a context where those variables don't exist. The `unquote` mechanism is the escape hatch, but misusing it leads to hard-to-debug compile errors.
+
+Macro hygiene is about capturing intent correctly. A `defmacro` that takes `:my_option` and uses it directly might match an unrelated `:my_option` from the caller's scope. The idiomatic pattern is to use `unquote` for values that should be "from the outside" and keep AST nodes quoted for safety. The `quote` block's binding of `var!` and `binding!` provides escape valves for the rare case when shadowing is intentional.
+
+Compile-time validation unlocks errors that would otherwise surface at runtime. A macro can call functions to validate input, generate code conditionally, or fail the build with `IO.warn`. Schema libraries like `Ecto` and `Ash` use macros to define fields at compile time, so runtime queries are guaranteed type-safe. The cost is cognitive load: developers must reason about both the code as written and the code generated.
+
+---
+
+
+## Deep Dive: Metaprogramming Patterns and Production Implications
+
+Metaprogramming (macros, AST manipulation) requires testing at compile time and runtime. The challenge is that macro tests often involve parsing and expanding code, which couples tests to compiler internals. Production bugs in macros can corrupt entire modules; testing macros rigorously is non-negotiable.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -411,6 +469,13 @@ Benchee.run(%{
 ```
 
 Expect ~4–8 µs per cast — dominated by map operations.
+
+---
+
+## Reflection
+
+- Your DSL now has three builders (field, embeds, has_many). What prevents it from collapsing into a pile of special cases? Where do you draw the architectural line?
+- If a user wanted to add a custom validator, would you extend the DSL or let them override a generated function? Which one preserves introspection?
 
 ---
 

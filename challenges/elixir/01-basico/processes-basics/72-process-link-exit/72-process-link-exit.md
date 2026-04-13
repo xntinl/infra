@@ -2,9 +2,6 @@
 
 **Project**: `worker_pair` — two linked workers that live and die together.
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 1–2 hours
-
 ---
 
 ## Project context
@@ -69,9 +66,56 @@ sent to linked processes. Only abnormal exits (crashes, `exit(:bang)`) propagate
 
 ---
 
+## Why raw links and not `Supervisor`
+
+- `Supervisor` is the production answer, but it **is** built on links + trap_exit. Using it here would hide the very mechanism we're teaching.
+- `Process.monitor/1` observes without dying, but it's one-directional — wrong shape when A and B must be *co-alive*.
+- `Task.async/1` uses a link, but only for the async-return pattern, not for peer co-lifetime.
+
+Raw `spawn_link` is the primitive; everything else layers on top.
+
+---
+
+## Design decisions
+
+**Option A — `spawn/1` + `Process.link/1` after start**
+- Pros: link is explicit and reversible (`unlink/1`).
+- Cons: race window — if the child crashes between `spawn` and `link`, you never see the EXIT.
+
+**Option B — `spawn_link/1`** (chosen)
+- Pros: atomic link creation; no startup race; the link is in place before the child runs the first instruction.
+- Cons: slightly less flexible (you can still `unlink/1` later if needed).
+
+→ Chose **B** because the whole guarantee we're teaching — "if one dies, the other dies" — is invalidated by a startup race. `spawn_link` makes the invariant hold from tick zero.
+
+---
+
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  # BEAM primitives only — no deps.
+  []
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Create a bare Mix project so the link semantics are studied on raw processes, without Supervisor or GenServer hiding the propagation.
 
 ```bash
 mix new worker_pair
@@ -79,6 +123,8 @@ cd worker_pair
 ```
 
 ### Step 2: `lib/worker_pair.ex`
+
+**Objective**: Show that `spawn_link` bidirectionally binds two processes so an abnormal exit in one tears down the other — the foundation Supervisor builds on.
 
 ```elixir
 defmodule WorkerPair do
@@ -163,6 +209,8 @@ end
 
 ### Step 3: `test/worker_pair_test.exs`
 
+**Objective**: Assert that `:normal` exits do not propagate while abnormal exits do, exposing the rule that determines when links actually cascade.
+
 ```elixir
 defmodule WorkerPairTest do
   use ExUnit.Case, async: true
@@ -239,9 +287,34 @@ end
 
 ### Step 4: Run
 
+**Objective**: Run the tests under the supervision of the ExUnit runner — its own trap-exit behaviour is the guardrail that makes linked-crash tests observable.
+
 ```bash
 mix test
 ```
+
+### Why this works
+
+`spawn_link/1` inserts the link into the BEAM's link table atomically with process creation — the scheduler cannot interleave anything between "process exists" and "link exists". When a linked process dies abnormally, the BEAM walks its link table and sends EXIT signals to all linked processes; those signals are delivered by the scheduler, not the mailbox, so they bypass normal receive ordering. `trap_exit` doesn't prevent the signal — it converts it at delivery time into a regular `{:EXIT, pid, reason}` message, which is what lets supervisors observe and react instead of dying.
+
+---
+
+
+## Key Concepts
+
+### 1. Links Create Bidirectional Exit Notifications
+When you `spawn_link`, exiting one process sends an exit signal to the other. This is how supervision works.
+
+### 2. Supervisors Trap Exits to Handle Child Failures
+With `Process.flag(:trap_exit, true)`, supervisors can monitor and restart child processes.
+
+### 3. Unlinked Processes are Independent
+`spawn` creates independent processes. They can crash without affecting the parent. Use `spawn` for fire-and-forget tasks.
+
+---
+## Benchmark
+
+<!-- benchmark N/A: tema conceptual — link signalling is sub-microsecond BEAM internals; measuring it adds no insight beyond "essentially free". -->
 
 ---
 
@@ -263,12 +336,20 @@ defeats clean termination in your children.
 
 **4. Links are for dependency, monitors are for observation**
 If you want to *watch* a process without dying with it and without the ceremony
-of `trap_exit`, you want `Process.monitor/1` — see the next exercise.
+of `trap_exit`, use `Process.monitor/1` instead — it's one-directional and
+doesn't require the trap_exit commitment.
 
 **5. When NOT to use raw links**
 In production, almost always use `Supervisor` (or `DynamicSupervisor`). Raw links
 are for learning and for the rare case where you need a co-lifetime guarantee
 outside the supervision tree.
+
+---
+
+## Reflection
+
+- A process traps exits but never pattern-matches on `{:EXIT, _, _}`. Over a few minutes, the node OOMs. Walk through what exactly fills memory, and why the supervisor-shaped workaround (match and ignore) is both idiomatic and mandatory.
+- Your pair ends up with 500 linked worker chains node-wide. One worker crashes; the crash propagates across dozens of processes simultaneously. Is this a design defect or is this *exactly* the "let it crash" philosophy? Justify by pointing to what a `Supervisor` would do differently.
 
 ---
 

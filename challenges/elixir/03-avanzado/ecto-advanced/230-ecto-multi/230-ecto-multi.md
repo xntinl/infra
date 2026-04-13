@@ -127,6 +127,8 @@ pass the result in as data — or use a two-phase commit via `Oban` jobs.
 
 ### Step 1: Schemas (concise)
 
+**Objective**: Define Ecto schemas (Order, LineItem, Payment, AuditLog) with proper associations so Multi chains across aggregates in one DB transaction.
+
 ```elixir
 defmodule EctoMultiDeep.Schemas.Product do
   use Ecto.Schema
@@ -216,6 +218,8 @@ end
 
 ### Step 2: Simulated payment gateway
 
+**Objective**: Implement PaymentGateway stub so tests drive :declined/:network errors deterministically without external HTTP.
+
 ```elixir
 defmodule EctoMultiDeep.Orders.PaymentGateway do
   @moduledoc "Simulated gateway. In production replace with Stripe/MP HTTP client."
@@ -233,6 +237,8 @@ end
 ```
 
 ### Step 3: The `Multi` pipeline
+
+**Objective**: Build Multi pipeline: stock validation, order insert, line items merge, payment, audit — one step fails, all roll back atomically.
 
 ```elixir
 defmodule EctoMultiDeep.Orders.PlaceOrder do
@@ -363,6 +369,8 @@ end
 
 ### Step 4: Migrations and tests
 
+**Objective**: Assert Multi atomicity: inject midstream failures, verify zero order/payment/audit rows persist on rollback.
+
 ```elixir
 defmodule EctoMultiDeep.Repo.Migrations.CreateTables do
   use Ecto.Migration
@@ -480,6 +488,24 @@ IO.puts("avg: #{time_us / 10_000} µs/op")
 
 Target: operation should complete in the low-microsecond range on modern hardware; deviations by >2× indicate a regression worth investigating.
 
+## Deep Dive
+
+Ecto queries compile to SQL, but the translation is not always obvious. Complex preload patterns spawn subqueries for each association level—a naive nested preload can explode into hundreds of queries. Window functions and CTEs (Common Table Expressions) exist in Ecto but require raw fragments, making the boundary between Elixir and SQL explicit. For high-throughput systems, consider schemaless queries and streaming to defer memory allocation; loading 1M records as `Ecto.Repo.all/2` marshals everything into memory. Multi-tenancy via row-level database policies is cleaner than application-level filtering and leverages PostgreSQL's built-in enforcement. Zero-downtime migrations require careful orchestration: add columns before code that uses them, remove columns after code stops referencing them. Lock contention on hot rows kills throughput—use FOR UPDATE in transactions and understand when Ecto's optimistic locking is sufficient.
+## Advanced Considerations
+
+Advanced Ecto usage at scale requires understanding transaction semantics, locking strategies, and query performance under concurrent load. Ecto transactions are database transactions, not application-level transactions; they don't isolate against application-level concurrency issues. Using `:serializable` isolation level prevents anomalies but significantly impacts throughput. The choice between row-level locking with `for_update()` and optimistic locking with version columns affects both concurrency and latency. Deadlocks are not failures in Ecto; they're expected outcomes that require retry logic and careful key ordering to minimize.
+
+Preload optimization is subtle — using `preload` for related data prevents N+1 queries but can create large intermediate result sets that exceed memory limits. Pagination with preloads requires careful consideration of whether to paginate before or after preloading related data. Custom types and schemaless queries provide flexibility but bypass Ecto's validation layer, creating opportunities for subtle bugs where invalid data sneaks into your database. The interaction between Ecto's change tracking and ETS caching can create stale data issues if not carefully managed across process boundaries.
+
+Zero-downtime migrations require a different mental model than traditional migration scripts. Adding a column is fast; backfilling millions of rows is slow and can lock tables. Deploying code that expects the new column before the migration completes causes failures. Implement feature flags and dual-write patterns for truly zero-downtime deployments. Full-text search with PostgreSQL's tsearch requires careful index maintenance and stop-word configuration; performance characteristics change dramatically with language-specific settings and custom dictionaries.
+
+
+## Deep Dive: Ecto Patterns and Production Implications
+
+Ecto queries are composable, built up incrementally with pipes. Testing queries requires understanding that a query is lazy—until you call Repo.all, Repo.one, or Repo.update_all, no SQL is executed. This allows for property-based testing of query builders without hitting the database. Production bugs in complex queries often stem from incorrect scoping or ambiguous joins.
+
+---
+
 ## Trade-offs and production gotchas
 
 **1. Don't put slow I/O inside the transaction**
@@ -547,3 +573,13 @@ One statement instead of N.
 - [Hex.pm source — `Hexpm.Accounts.User`](https://github.com/hexpm/hexpm) — real Multi pipelines in production.
 - [Postgres: Transaction Isolation](https://www.postgresql.org/docs/current/transaction-iso.html) — understand what your Multi actually commits.
 - [Saša Jurić: "Towards Maintainable Elixir"](https://www.theerlangelist.com/article/spawn_or_not) — context functions returning Multis.
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

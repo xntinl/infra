@@ -157,6 +157,8 @@ just that a function was called. Fakes become executable specifications.
 
 ### Step 1: `mix.exs`
 
+**Objective**: Isolate Mox to `:test` scope and add `test/support` to compile paths to prevent mock code from leaking into production binaries.
+
 ```elixir
 defmodule Notify.MixProject do
   use Mix.Project
@@ -182,6 +184,8 @@ end
 
 ### Step 2: Behaviour
 
+**Objective**: Define sealed behaviour contract with typed reasons so Mox validates call signatures and pattern-matching on errors becomes exhaustive.
+
 ```elixir
 # lib/notify/channel.ex
 defmodule Notify.Channel do
@@ -193,6 +197,8 @@ end
 ```
 
 ### Step 3: Channel implementations
+
+**Objective**: Create concrete behaviour-implementing modules so Application.fetch_env/2 injects production or mock implementations without dispatcher code changes.
 
 ```elixir
 # lib/notify/channels/email.ex
@@ -232,6 +238,8 @@ end
 
 ### Step 4: Dispatcher
 
+**Objective**: Look up channel implementations at runtime via Application env so each test gets injected mocks without code rewrites or module recompilation.
+
 ```elixir
 # lib/notify/dispatcher.ex
 defmodule Notify.Dispatcher do
@@ -258,6 +266,8 @@ end
 
 ### Step 5: Worker that spawns tasks (needs global mode in tests)
 
+**Objective**: Spawn detached Task processes so private-mode Mox allowance breaks, forcing tests to switch to global registry mode for unsupervised pids.
+
 ```elixir
 # lib/notify/worker.ex
 defmodule Notify.Worker do
@@ -282,6 +292,8 @@ end
 ```
 
 ### Step 6: Mocks and fakes
+
+**Objective**: Generate mocks via Mox.defmock and implement behaviour-backed fakes so stub_with/2 collapses repetitive expect/3 calls into reusable baselines.
 
 ```elixir
 # test/support/mocks.ex
@@ -310,6 +322,8 @@ end
 
 ### Step 7: test_helper and config
 
+**Objective**: Configure Application env to point to mocks in tests and production modules in prod so dispatcher swaps channel implementations via configuration, not code edits.
+
 ```elixir
 # test/test_helper.exs
 Application.put_env(:notify, :channels, %{
@@ -336,6 +350,8 @@ config :notify, :channels, %{
 
 ### Step 8: Private-mode tests (fast, async)
 
+**Objective**: Write async tests with per-process mock registry so multiple tests parallelize without expectations bleeding across test pids.
+
 ```elixir
 # test/notify/dispatcher_private_test.exs
 defmodule Notify.DispatcherPrivateTest do
@@ -345,24 +361,28 @@ defmodule Notify.DispatcherPrivateTest do
   setup :verify_on_exit!
   setup :set_mox_from_context
 
-  test "dispatches to all channels concurrently via expects" do
-    msg = %{id: "1", to: "user@example.com", body: "hi"}
+  describe "Notify.DispatcherPrivate" do
+    test "dispatches to all channels concurrently via expects" do
+      msg = %{id: "1", to: "user@example.com", body: "hi"}
 
-    expect(Notify.EmailMock, :send, fn %{channel: :email}, _ -> {:ok, "e_1"} end)
-    expect(Notify.SmsMock, :send, fn %{channel: :sms}, _ -> {:ok, "s_1"} end)
-    expect(Notify.PushMock, :send, fn %{channel: :push}, _ -> {:ok, "p_1"} end)
-    expect(Notify.SlackMock, :send, fn %{channel: :slack}, _ -> {:ok, "sl_1"} end)
-    expect(Notify.WebhookMock, :send, fn %{channel: :webhook}, _ -> {:ok, "w_1"} end)
+      expect(Notify.EmailMock, :send, fn %{channel: :email}, _ -> {:ok, "e_1"} end)
+      expect(Notify.SmsMock, :send, fn %{channel: :sms}, _ -> {:ok, "s_1"} end)
+      expect(Notify.PushMock, :send, fn %{channel: :push}, _ -> {:ok, "p_1"} end)
+      expect(Notify.SlackMock, :send, fn %{channel: :slack}, _ -> {:ok, "sl_1"} end)
+      expect(Notify.WebhookMock, :send, fn %{channel: :webhook}, _ -> {:ok, "w_1"} end)
 
-    result = Notify.Dispatcher.dispatch(msg, [:email, :sms, :push, :slack, :webhook])
+      result = Notify.Dispatcher.dispatch(msg, [:email, :sms, :push, :slack, :webhook])
 
-    assert result[:email] == {:ok, "e_1"}
-    assert result[:webhook] == {:ok, "w_1"}
+      assert result[:email] == {:ok, "e_1"}
+      assert result[:webhook] == {:ok, "w_1"}
+    end
   end
 end
 ```
 
 ### Step 9: stub_with tests (less boilerplate)
+
+**Objective**: Use stub_with/2 with fake modules to eliminate per-test expect boilerplate while expect/3 overrides specific edge-case interactions.
 
 ```elixir
 # test/notify/dispatcher_stub_with_test.exs
@@ -380,30 +400,34 @@ defmodule Notify.DispatcherStubWithTest do
     :ok
   end
 
-  test "happy path with the successful fake" do
-    msg = %{id: "abc", to: "x@y", body: "hello"}
-    result = Notify.Dispatcher.dispatch(msg, [:email, :sms, :push, :slack, :webhook])
-    for {ch, r} <- result, do: assert({:ok, _} = r)
-    assert result[:email] == {:ok, "email_abc"}
-  end
+  describe "Notify.DispatcherStubWith" do
+    test "happy path with the successful fake" do
+      msg = %{id: "abc", to: "x@y", body: "hello"}
+      result = Notify.Dispatcher.dispatch(msg, [:email, :sms, :push, :slack, :webhook])
+      for {ch, r} <- result, do: assert({:ok, _} = r)
+      assert result[:email] == {:ok, "email_abc"}
+    end
 
-  test "stub_with returns :empty_recipient when fake detects it" do
-    msg = %{id: "z", to: "", body: "hello"}
-    result = Notify.Dispatcher.dispatch(msg, [:email])
-    assert result[:email] == {:error, :empty_recipient}
-  end
+    test "stub_with returns :empty_recipient when fake detects it" do
+      msg = %{id: "z", to: "", body: "hello"}
+      result = Notify.Dispatcher.dispatch(msg, [:email])
+      assert result[:email] == {:error, :empty_recipient}
+    end
 
-  test "expect overrides stub_with for a single interaction" do
-    expect(Notify.EmailMock, :send, fn _, _ -> {:error, :bounced} end)
-    msg = %{id: "q", to: "x@y", body: "hi"}
-    result = Notify.Dispatcher.dispatch(msg, [:email, :sms])
-    assert result[:email] == {:error, :bounced}
-    assert result[:sms] == {:ok, "sms_q"}
+    test "expect overrides stub_with for a single interaction" do
+      expect(Notify.EmailMock, :send, fn _, _ -> {:error, :bounced} end)
+      msg = %{id: "q", to: "x@y", body: "hi"}
+      result = Notify.Dispatcher.dispatch(msg, [:email, :sms])
+      assert result[:email] == {:error, :bounced}
+      assert result[:sms] == {:ok, "sms_q"}
+    end
   end
 end
 ```
 
 ### Step 10: Global-mode tests (for detached workers)
+
+**Objective**: Switch to global mock registry with async: false so Task children inherit expectations without explicit allow/3, trading parallelism for coverage.
 
 ```elixir
 # test/notify/worker_global_test.exs
@@ -425,25 +449,29 @@ defmodule Notify.WorkerGlobalTest do
     {:ok, worker: name}
   end
 
-  test "detached Task sees stubs via global mode", %{worker: w} do
-    # In private mode, Task.start is not an allowed pid — this would crash.
-    # In global mode, the Task reads the same mock registry and passes.
-    parent = self()
-    test_mock = Notify.EmailMock
+  describe "Notify.WorkerGlobal" do
+    test "detached Task sees stubs via global mode", %{worker: w} do
+      # In private mode, Task.start is not an allowed pid — this would crash.
+      # In global mode, the Task reads the same mock registry and passes.
+      parent = self()
+      test_mock = Notify.EmailMock
 
-    expect(test_mock, :send, fn msg, _ ->
-      send(parent, {:seen, msg.id})
-      {:ok, "ok"}
-    end)
+      expect(test_mock, :send, fn msg, _ ->
+        send(parent, {:seen, msg.id})
+        {:ok, "ok"}
+      end)
 
-    Notify.Worker.enqueue(w, %{id: "bg1", to: "x@y", body: "b"}, [:email])
+      Notify.Worker.enqueue(w, %{id: "bg1", to: "x@y", body: "b"}, [:email])
 
-    assert_receive {:seen, "bg1"}, 1_000
+      assert_receive {:seen, "bg1"}, 1_000
+    end
   end
 end
 ```
 
 ### Step 11: Run
+
+**Objective**: Execute with --trace flag to observe private-mode tests parallelizing while global tests serialize, proving the Mox dispatch mode semantics.
 
 ```bash
 mix test --trace
@@ -468,6 +496,20 @@ IO.puts("avg: #{time_us / 10_000} µs/op")
 ```
 
 Target: operation should complete in the low-microsecond range on modern hardware; deviations by >2× indicate a regression worth investigating.
+
+## Deep Dive: Mox Patterns and Production Implications
+
+Testing through explicit behavior contracts requires careful design of expectations. In production systems with many mocked dependencies, the cost of maintaining contracts grows with each new adapter or integration point. The key insight is that Mox's private-mode isolation prevents test pollution only when all pids involved are accounted for—the moment you spawn unowned processes (Tasks, Oban workers, Broadway pipelines), you must switch to global mode, trading parallelism for simplicity. Understanding when to reach for expect/3 vs stub_with/2 vs global mode separates brittle test suites from maintainable ones. A senior engineer recognizes that mocking boundaries—not implementation details—pays dividends over time.
+
+## Advanced Considerations
+
+Production testing strategies require careful attention to resource management and test isolation across multiple concurrent test processes. In large codebases, tests can consume significant memory and CPU resources, especially when using concurrent testing without proper synchronization and cleanup. The BEAM scheduler's preemptive nature means test processes may interfere with each other if shared resources aren't properly isolated at the process boundary. Pay careful attention to how Ecto's sandbox mode interacts with your supervision tree — if you have GenServers that hold state across tests, the sandbox rollback mechanism may leave phantom processes in your monitoring systems that continue consuming resources until forced cleanup occurs.
+
+When scaling tests to production-grade test suites, consider the cost of stub verification and the memory overhead of generated test cases. Each property-based test invocation can create thousands of synthetic test cases, potentially causing garbage collection pressure that's invisible during local testing but becomes critical in CI/CD pipelines running long test suites continuously. The interaction between concurrent tests and ETS tables (often used in caches and registry patterns) requires explicit `inherited: true` options to prevent unexpected sharing between test processes, which can cause mysterious failures when tests run in different orders or under load.
+
+For distributed testing scenarios using tools like `Peer`, network simulation can mask real latency issues and failure modes. Test timeouts that work locally may fail in CI due to scheduler contention and GC pauses. Always include substantial buffers for timeout values and monitor actual execution times under load. The coordination between multiple test nodes requires careful cleanup — a failure in test coordination can leave zombie processes consuming resources indefinitely. Implement proper telemetry hooks within your test helpers to diagnose production-like scenarios and capture performance characteristics.
+
+---
 
 ## Trade-offs and production gotchas
 
@@ -533,3 +575,13 @@ Keep global tests small; push coverage of fine-grained behaviour into private-mo
 - [Testing Elixir (book)](https://pragprog.com/titles/lmelixir/testing-elixir/) — ch. 6
 - [Mox source code](https://github.com/dashbitco/mox/blob/main/lib/mox.ex) — `dispatch_mode` logic
 - ["Use mocks cautiously" — Chris Keathley](https://keathley.io/blog/mocking.html)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

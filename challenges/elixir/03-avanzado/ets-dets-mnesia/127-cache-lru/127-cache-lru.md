@@ -1,8 +1,6 @@
 # LRU Cache on ETS with a Doubly-Linked List
 
 **Project**: `lru_cache` — bounded LRU cache with O(1) eviction.
-**Difficulty**: ★★★★☆
-**Estimated time**: 3–6 hours
 
 ---
 
@@ -40,6 +38,12 @@ lru_cache/
         ├── lru_test.exs
         └── naive_lru_test.exs
 ```
+
+---
+
+## Why ETS-backed LRU and not GenServer-backed
+
+A GenServer serializes all reads through one process. An ETS-backed LRU lets readers touch the table directly and only serializes the eviction step, which runs on a timer or at the high-watermark.
 
 ---
 
@@ -119,9 +123,35 @@ at the end.
 
 ---
 
+## Design decisions
+
+**Option A — bounded map inside a GenServer**
+- Pros: single-process semantics are easy to reason about.
+- Cons: every read is a message pass; GenServer becomes the bottleneck.
+
+**Option B — ETS + usage-tracking table for LRU eviction** (chosen)
+- Pros: reads are concurrent and fast; eviction runs asynchronously.
+- Cons: LRU order maintenance costs a write on every read; bounded by the eviction policy's accuracy.
+
+→ Chose **B** because cache reads dominate writes; a message-pass per read is an obvious loss.
+
+---
+
 ## Implementation
 
 ### Step 1: `mix.exs`
+
+**Objective**: Declare the project, dependencies, and OTP application in `mix.exs`.
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
 
 ```elixir
 defmodule LruCache.MixProject do
@@ -141,6 +171,8 @@ end
 
 ### Step 2: `lib/lru_cache/application.ex`
 
+**Objective**: Define the OTP application and supervision tree in `lib/lru_cache/application.ex`.
+
 ```elixir
 defmodule LruCache.Application do
   @moduledoc false
@@ -155,6 +187,8 @@ end
 ```
 
 ### Step 3: `lib/lru_cache/lru.ex`
+
+**Objective**: Implement the module in `lib/lru_cache/lru.ex`.
 
 ```elixir
 defmodule LruCache.LRU do
@@ -352,6 +386,8 @@ end
 
 ### Step 4: `lib/lru_cache/naive_lru.ex`
 
+**Objective**: Implement the module in `lib/lru_cache/naive_lru.ex`.
+
 ```elixir
 defmodule LruCache.NaiveLRU do
   @moduledoc """
@@ -407,6 +443,8 @@ end
 
 ### Step 5: `test/lru_cache/lru_test.exs`
 
+**Objective**: Write tests in `test/lru_cache/lru_test.exs` covering behavior and edge cases.
+
 ```elixir
 defmodule LruCache.LRUTest do
   use ExUnit.Case, async: false
@@ -421,59 +459,63 @@ defmodule LruCache.LRUTest do
     :ok
   end
 
-  test "put/get round-trip" do
-    LRU.put(:a, 1)
-    assert {:ok, 1} = LRU.get(:a)
-  end
+  describe "LruCache.LRU" do
+    test "put/get round-trip" do
+      LRU.put(:a, 1)
+      assert {:ok, 1} = LRU.get(:a)
+    end
 
-  test "miss returns :miss" do
-    assert :miss = LRU.get(:ghost)
-  end
+    test "miss returns :miss" do
+      assert :miss = LRU.get(:ghost)
+    end
 
-  test "LRU eviction order" do
-    LRU.put(:a, 1)
-    LRU.put(:b, 2)
-    LRU.put(:c, 3)
-    LRU.get(:a)   # now MRU
-    LRU.put(:d, 4) # should evict :b (LRU)
+    test "LRU eviction order" do
+      LRU.put(:a, 1)
+      LRU.put(:b, 2)
+      LRU.put(:c, 3)
+      LRU.get(:a)   # now MRU
+      LRU.put(:d, 4) # should evict :b (LRU)
 
-    assert :miss = LRU.get(:b)
-    assert {:ok, 1} = LRU.get(:a)
-    assert {:ok, 3} = LRU.get(:c)
-    assert {:ok, 4} = LRU.get(:d)
-  end
+      assert :miss = LRU.get(:b)
+      assert {:ok, 1} = LRU.get(:a)
+      assert {:ok, 3} = LRU.get(:c)
+      assert {:ok, 4} = LRU.get(:d)
+    end
 
-  test "updating existing key refreshes recency without size change" do
-    LRU.put(:a, 1)
-    LRU.put(:b, 2)
-    LRU.put(:c, 3)
-    LRU.put(:a, 99)    # :a becomes MRU, still size 3
-    LRU.put(:d, 4)     # should evict :b
+    test "updating existing key refreshes recency without size change" do
+      LRU.put(:a, 1)
+      LRU.put(:b, 2)
+      LRU.put(:c, 3)
+      LRU.put(:a, 99)    # :a becomes MRU, still size 3
+      LRU.put(:d, 4)     # should evict :b
 
-    assert LRU.size() == 3
-    assert :miss = LRU.get(:b)
-    assert {:ok, 99} = LRU.get(:a)
-  end
+      assert LRU.size() == 3
+      assert :miss = LRU.get(:b)
+      assert {:ok, 99} = LRU.get(:a)
+    end
 
-  test "to_list_mru/0 returns entries head-first" do
-    LRU.put(:a, 1)
-    LRU.put(:b, 2)
-    LRU.put(:c, 3)
-    assert [{:c, 3}, {:b, 2}, {:a, 1}] = LRU.to_list_mru()
-  end
+    test "to_list_mru/0 returns entries head-first" do
+      LRU.put(:a, 1)
+      LRU.put(:b, 2)
+      LRU.put(:c, 3)
+      assert [{:c, 3}, {:b, 2}, {:a, 1}] = LRU.to_list_mru()
+    end
 
-  test "delete/1 removes the entry and fixes the links" do
-    LRU.put(:a, 1)
-    LRU.put(:b, 2)
-    LRU.put(:c, 3)
-    LRU.delete(:b)
-    assert LRU.size() == 2
-    assert [{:c, 3}, {:a, 1}] = LRU.to_list_mru()
+    test "delete/1 removes the entry and fixes the links" do
+      LRU.put(:a, 1)
+      LRU.put(:b, 2)
+      LRU.put(:c, 3)
+      LRU.delete(:b)
+      assert LRU.size() == 2
+      assert [{:c, 3}, {:a, 1}] = LRU.to_list_mru()
+    end
   end
 end
 ```
 
 ### Step 6: Benchmark
+
+**Objective**: Benchmark the implementation to measure throughput and latency.
 
 ```elixir
 # bench/lru_bench.exs
@@ -510,6 +552,28 @@ Representative results at capacity=10_000 (M1, OTP 26):
 
 The gap widens drastically at capacity=100_000 — `Enum.reject` in the
 naive version becomes dominant. ETS-LRU remains O(1).
+
+### Why this works
+
+The cache stores `{key, value, inserted_at}` in one ETS table and a usage timestamp in a second. Reads update the usage timestamp (cheap `update_counter`). Eviction periodically scans by timestamp and removes the oldest entries until under the size limit.
+
+---
+
+## Deep Dive
+
+ETS (Erlang Term Storage) is RAM-only and process-linked; table destruction triggers if the owner crashes, causing silent data loss in careless designs. Match specifications (match_specs) are micro-programs that filter/transform data at the C layer, orders of magnitude faster than fetching all records and filtering in Elixir. Mnesia adds disk persistence and replication but introduces transaction overhead and deadlock potential; dirty operations bypass locks for speed but sacrifice consistency guarantees. For caching, named tables (public by design) are globally visible but require careful name management; consider ETS sharding (multiple small tables) to reduce lock contention on hot keys. DETS (Disk ETS) persists to disk but is single-process bottleneck and slower than a real database. At scale, prefer ETS for in-process state and Mnesia/PostgreSQL for shared, persistent data.
+## Advanced Considerations
+
+ETS and DETS performance characteristics change dramatically based on access patterns and table types. Ordered sets provide range queries but slower access than hash tables; set types don't support duplicate keys while bags do. The `heir` option for ETS tables is essential for fault tolerance — when a table owner crashes, the heir process can take ownership and prevent data loss. Without it, the table is lost immediately. Mnesia replicates entire tables across nodes; choosing which nodes should have replicas and whether they're RAM or disk replicas affects both consistency guarantees and network traffic during cluster operations.
+
+DETS persistence comes with significant performance implications — writes are synchronous to disk by default, creating latency spikes. Using `sync: false` improves throughput but risks data loss on crashes. The maximum DETS table size is limited by available memory and the file system; planning capacity requires understanding your growth patterns. Mnesia's transaction system provides ACID guarantees, but dirty operations bypass these guarantees for performance. Understanding when to use dirty reads versus transactional reads significantly impacts both correctness and latency.
+
+Debugging ETS and DETS issues is challenging because problems often emerge under load when many processes contend for the same table. Table memory fragmentation is invisible to code but can exhaust memory. Using match specs instead of iteration over large tables can dramatically improve performance but requires careful construction. The interaction between ETS, replication, and distributed systems creates subtle consistency issues — a node with a stale ETS replica can serve incorrect data during network partitions. Always monitor table sizes and replication status with structured logging.
+
+
+## Deep Dive: Etsdets Patterns and Production Implications
+
+ETS tables are in-memory, non-distributed key-value stores with tunable semantics (ordered_set, duplicate_bag). Under concurrent read/write load, ETS table semantics matter: bag semantics allow fast appends but slow deletes; ordered_set allows range queries but slower inserts. Testing ETS behavior under concurrent load is non-trivial; single-threaded tests miss lock contention. Production ETS tables often fail under load due to concurrency assumptions that quiet tests don't exercise.
 
 ---
 
@@ -586,6 +650,25 @@ The 3-4 ETS writes per `put` dominate the constant factor. Profiling shows:
 `write_concurrency: true` on `:lru_table` does NOT help here because a
 single GenServer is doing all writes — there is no inter-process
 contention to amortize.
+
+---
+
+## Benchmark
+
+```elixir
+# :timer.tc / Benchee measurement sketch
+{time_us, _} = :timer.tc(fn -> :ok end)
+IO.puts("elapsed: #{time_us} us")
+```
+
+Target: cache hit under 2 us; miss path dominated by the loader, not the cache.
+
+---
+
+## Reflection
+
+- Updating the usage timestamp on every read is itself a write. At what read rate does that write become the bottleneck, and what do you do?
+- True LRU is expensive. How close to LRU can you get with a sampling-based eviction, and when is that close enough?
 
 ---
 

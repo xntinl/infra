@@ -2,9 +2,6 @@
 
 **Project**: `ast_surgeon` — a toolkit that rewrites Elixir source code at compile time by walking and transforming the AST (Abstract Syntax Tree).
 
-**Difficulty**: ★★★★☆
-**Estimated time**: 4–6 hours
-
 ---
 
 ## Project context
@@ -36,6 +33,12 @@ ast_surgeon/
 │       └── transforms_test.exs
 └── mix.exs
 ```
+
+---
+
+## Why AST manipulation and not string building
+
+String-built code loses all Elixir's scoping, macro hygiene, and source-location info. AST code keeps each node anchored to an original source location, so a broken macro points at the user's line, not at a generated blob.
 
 ---
 
@@ -98,9 +101,25 @@ user-authored code (not post-expansion), this is usually fine — document it.
 
 ---
 
+## Design decisions
+
+**Option A — build code by string concatenation and `Code.eval_string/1`**
+- Pros: feels like templating; trivial to prototype.
+- Cons: no scope safety, horrific error messages, injection-adjacent in every sense.
+
+**Option B — operate directly on the AST with `quote` / `unquote`** (chosen)
+- Pros: hygienic by default, compile-time errors point to the right line, survives refactors.
+- Cons: requires understanding the three-element tuple shape and special forms.
+
+→ Chose **B** because `Code.eval_string/1` is a dead end for production macros; the AST is the only path that scales.
+
+---
+
 ## Implementation
 
 ### Step 1: `mix.exs`
+
+**Objective**: Declare telemetry and benchee so AST rewrite transformation and tracing harness compile idempotently.
 
 ```elixir
 defmodule AstSurgeon.MixProject do
@@ -118,7 +137,28 @@ defmodule AstSurgeon.MixProject do
 end
 ```
 
+### Dependencies (mix.exs)
+
+```elixir
+```elixir
+defmodule AstSurgeon.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :ast_surgeon, version: "0.1.0", elixir: "~> 1.16", deps: deps()]
+  end
+
+  def application, do: [extra_applications: [:logger, :telemetry]]
+
+  defp deps do
+    [{:telemetry, "~> 1.2"}, {:benchee, "~> 1.3", only: :dev}]
+  end
+end
+```
+
 ### Step 2: `lib/ast_surgeon/traced_http.ex` — the runtime target
+
+**Objective**: Emit telemetry events pre/post so rewritten HTTP call sites have observable latency and error context.
 
 ```elixir
 defmodule AstSurgeon.TracedHTTP do
@@ -154,6 +194,8 @@ end
 ```
 
 ### Step 3: `lib/ast_surgeon/transforms.ex`
+
+**Objective**: Compose pure postwalk-friendly transforms: HTTPoison alias redirection and constant folding optimizations.
 
 ```elixir
 defmodule AstSurgeon.Transforms do
@@ -193,6 +235,8 @@ end
 ```
 
 ### Step 4: `lib/ast_surgeon/rewriter.ex`
+
+**Objective**: Orchestrate postwalk composition and define deftraced DSL so HTTP calls rewrite transparently at compile time.
 
 ```elixir
 defmodule AstSurgeon.Rewriter do
@@ -243,6 +287,8 @@ end
 ```
 
 ### Step 5: Tests
+
+**Objective**: Assert AST node substitution succeeds, telemetry payload matches context, and nested calls receive rewrites.
 
 ```elixir
 defmodule AstSurgeon.TransformsTest do
@@ -312,6 +358,35 @@ defmodule AstSurgeon.RewriterTest do
 end
 ```
 
+### Why this works
+
+`quote` reifies an expression into an AST tuple tree without evaluating it. `unquote` injects a runtime value into that tree during compilation. The result is a plain AST the compiler treats identically to hand-written source.
+
+---
+
+
+## Key Concepts: AST Manipulation and Code Generation
+
+Macros receive the AST (Abstract Syntax Tree) of their arguments as quoted expressions, transform them, and return new code to be injected into the caller's context. `quote` captures code as a data structure; `unquote` breaks the quote to insert dynamic values. `quote do ... end` returns a quoted form; you can manipulate it with pattern matching, then return it for the compiler to expand.
+
+The power: macros can generate repetitive boilerplate automatically. The danger: they're hard to debug (the error occurs at compile time, not at the point of use), and they can create confusing code. A rule of thumb: write your code imperatively first, then extract the pattern into a macro. For simple code generation, consider a function that returns quoted code instead of a macro—it's easier to understand and test.
+
+
+## Advanced Considerations: Macro Hygiene and Compile-Time Validation
+
+Macros execute at compile time, walking the AST and returning new AST. That power is easy to abuse: a macro that generates variables can shadow outer scope bindings, or a quote block that references variables directly can fail if the macro is used in a context where those variables don't exist. The `unquote` mechanism is the escape hatch, but misusing it leads to hard-to-debug compile errors.
+
+Macro hygiene is about capturing intent correctly. A `defmacro` that takes `:my_option` and uses it directly might match an unrelated `:my_option` from the caller's scope. The idiomatic pattern is to use `unquote` for values that should be "from the outside" and keep AST nodes quoted for safety. The `quote` block's binding of `var!` and `binding!` provides escape valves for the rare case when shadowing is intentional.
+
+Compile-time validation unlocks errors that would otherwise surface at runtime. A macro can call functions to validate input, generate code conditionally, or fail the build with `IO.warn`. Schema libraries like `Ecto` and `Ash` use macros to define fields at compile time, so runtime queries are guaranteed type-safe. The cost is cognitive load: developers must reason about both the code as written and the code generated.
+
+---
+
+
+## Deep Dive: Metaprogramming Patterns and Production Implications
+
+Metaprogramming (macros, AST manipulation) requires testing at compile time and runtime. The challenge is that macro tests often involve parsing and expanding code, which couples tests to compiler internals. Production bugs in macros can corrupt entire modules; testing macros rigorously is non-negotiable.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -322,14 +397,14 @@ per compile. Combine transforms into a single walk when possible.
 
 **2. Macro debugging is slippery.** `IO.inspect` inside a macro prints at compile time,
 not runtime. Use `Macro.to_string/1` to see generated source, and
-`Macro.expand_once/2` to step expansion manually. See exercise 141.
+`Macro.expand_once/2` to step expansion manually..
 
 **3. Hygiene surprises.** Variables you introduce inside the quoted output carry the
 macro's context, not the caller's. If you need the caller to see them, use `var!/1` and
 document it.
 
 **4. `@before_compile` runs once per module.** State accumulated across multiple macro
-invocations lives in module attributes. Accumulator attributes (exercise 133) are the
+invocations lives in module attributes. Accumulator attributes are the
 right tool.
 
 **5. AST rewriting across abstraction boundaries is brittle.** If your user writes
@@ -370,6 +445,13 @@ Benchee.run(%{
 ```
 
 Expect ~1–3 ms for 1k-node ASTs on modern hardware. Compile time only — zero runtime cost.
+
+---
+
+## Reflection
+
+- Your macro needs to introduce a helper function the user did not ask for. How do you name it so it does not collide with user code, without relying on user trust?
+- A macro works in your test module but breaks when a user aliases one of its symbols. What did you do wrong, and what does the fix look like?
 
 ---
 

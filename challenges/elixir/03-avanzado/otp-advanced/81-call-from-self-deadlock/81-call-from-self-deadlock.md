@@ -1,8 +1,6 @@
 # `GenServer.call` to Self: The Canonical Deadlock
 
 **Project**: `deadlock_demo` — reproducing, detecting, and avoiding the self-call deadlock.
-**Difficulty**: ★★★★☆
-**Estimated time**: 3–4 hours
 
 ---
 
@@ -10,6 +8,16 @@
 
 You inherit `OrderState`, a `GenServer` that manages in-memory state for
 orders in flight. The previous engineer added a convenience function:
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
 
 ```elixir
 def update_and_notify(order_id, changes) do
@@ -170,9 +178,25 @@ This is the cleanest fix when applicable — it also improves testability.
 
 ---
 
+## Design decisions
+
+**Option A — keep the nested `GenServer.call` and add a higher call timeout**
+- Pros: no code change beyond a config tweak.
+- Cons: does not fix anything — it still deadlocks; the timeout just makes the failure slower to surface.
+
+**Option B — use `handle_continue` (or extract pure logic into a sibling module)** (chosen)
+- Pros: removes the self-call entirely; `handle_continue` piggybacks on the same callback pass so ordering is preserved; pure logic extracted into a module is the fastest option.
+- Cons: requires reshaping the callback; split modules lose the "single GenServer owns everything" intuition some teams like.
+
+→ Chose **B** because the self-call is an architectural smell that no runtime flag can paper over.
+
+---
+
 ## Implementation
 
 ### Step 1: `mix.exs`
+
+**Objective**: Build stdlib-only so deadlock reproduction is pure OTP, no library masking message-loop semantics.
 
 ```elixir
 defmodule DeadlockDemo.MixProject do
@@ -183,6 +207,8 @@ end
 ```
 
 ### Step 2: `lib/deadlock_demo/deadlocking.ex`
+
+**Objective**: Expose self-call deadlock so callback sync-messaging self() proves mailbox never drains.
 
 ```elixir
 defmodule DeadlockDemo.Deadlocking do
@@ -215,6 +241,8 @@ end
 ```
 
 ### Step 3: `lib/deadlock_demo/with_continue.ex`
+
+**Objective**: Use handle_continue/2 so post-callback step runs atomically with state return, replaces self-call.
 
 ```elixir
 defmodule DeadlockDemo.WithContinue do
@@ -249,6 +277,8 @@ end
 
 ### Step 4: `lib/deadlock_demo/with_info.ex`
 
+**Objective**: Enqueue via send(self(), _) so mailbox reprocesses as plain info, unblocking callback.
+
 ```elixir
 defmodule DeadlockDemo.WithInfo do
   @moduledoc "Fix using `send(self(), _)` — pre-OTP-21 idiom."
@@ -280,6 +310,8 @@ end
 
 ### Step 5: `lib/deadlock_demo/with_cast.ex`
 
+**Objective**: Replace self-call with GenServer.cast(self(), _) to avoid sync round-trip deadlock when no reply needed.
+
 ```elixir
 defmodule DeadlockDemo.WithCast do
   @moduledoc "Fix using `GenServer.cast` — when no reply is needed."
@@ -309,6 +341,8 @@ end
 ```
 
 ### Step 6: `lib/deadlock_demo/split_module.ex`
+
+**Objective**: Extract mutation to pure function so server reduces to thin dispatch, almost always correct cure.
 
 ```elixir
 defmodule DeadlockDemo.OrderLogic do
@@ -346,6 +380,8 @@ end
 ```
 
 ### Step 7: `test/deadlock_demo/deadlock_demo_test.exs`
+
+**Objective**: Pin deadlock with bounded Task.yield and assert all fixes converge same state, regressions fail loudly.
 
 ```elixir
 defmodule DeadlockDemoTest do
@@ -391,6 +427,23 @@ defmodule DeadlockDemoTest do
   end
 end
 ```
+
+---
+
+## Advanced Considerations: Supervision and Hot Code Upgrade Patterns
+
+The OTP supervision tree is the backbone of Elixir's fault tolerance. A DynamicSupervisor can spawn workers on demand and track them, but if a worker crashes before it's supervised, messages to it drop silently. Equally, a `:temporary` worker that crashes is restarted zero times — useful for one-off tasks, but requires the caller to handle crashes. `:transient` restarts on non-normal exits; `:permanent` always restarts.
+
+`handle_continue` callbacks and `:hibernate` reduce memory overhead in long-lived processes. After initializing, a GenServer can return `{:noreply, state, {:continue, :do_work}}` to defer expensive work past the `init/1` call, keeping the supervisor's synchronous startup fast. Hibernation moves a process's heap to disk, freeing RAM at the cost of latency when the process receives its next message.
+
+Hot code upgrades via `sys:replace_state/2` or `:sys.replace_state/3` allow changing code without restarting the VM, but only if state structure is forward- and backward-compatible. In practice, code changes that alter state shape (adding or removing fields) require a migration function. The `:code.purge/1` and `:code.load_file/1` cycle reloads the module, but old pids still run old code until they return to the scheduler. Design for graceful degradation: code that cannot upgrade hot should acknowledge that in docs and operational runbooks.
+
+---
+
+
+## Deep Dive: Otp Patterns and Production Implications
+
+OTP primitives (GenServer, Supervisor, Application) are tested through their public interfaces, not by inspecting internal state. This discipline forces correct design: if you can't test a behavior without peeking into the server's state, the behavior is not public. Production systems with tight integration tests on GenServer internals are fragile and hard to refactor.
 
 ---
 
@@ -440,9 +493,13 @@ cause for hours. Learn to spot: caller pid == target pid.
 fix is architectural: split the responsibility into two servers and
 call from A to B. Do not paper over with `cast`.
 
+### Why this works
+
+A `GenServer.call` synchronously waits for a reply, but the target process is the same process issuing the call — there is no one to run the callback that would produce the reply. `handle_continue` hands control back to the GenServer loop between callbacks, which is exactly the window the replacement needed. Extracting pure logic into a module removes the problem at the source: if there is no self-directed message, there is no deadlock surface.
+
 ---
 
-## Performance notes
+## Benchmark
 
 The fixes have different costs:
 
@@ -456,6 +513,15 @@ The fixes have different costs:
 For 1 M self-triggered operations the split-module approach is roughly
 2× faster than the continue-based one on an M2 laptop. If you have the
 choice, extract the logic.
+
+Target: split-module approach within 2× of a raw function call; `handle_continue` within 3× of split-module.
+
+---
+
+## Reflection
+
+1. Your team keeps introducing self-calls during refactors. Would you add a dialyzer rule, a runtime guard in `handle_call` that checks `caller == self()`, or a code-review lint? Which has the lowest false-positive rate in practice?
+2. When the self-call is transactional (you genuinely need ordering guarantees across two operations), which of the four fixes preserves that semantics, and which silently changes observable behaviour under load?
 
 ---
 

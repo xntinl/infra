@@ -31,6 +31,15 @@ compr_advanced/
 
 ---
 
+### Dependencies (`mix.exs`)
+
+```elixir
+def deps do
+  {error},
+  {exunit},
+  {ok},
+end
+```
 ## Core concepts
 
 ### 1. Multiple generators = cartesian product
@@ -103,12 +112,18 @@ not the generator input.
 
 ### Step 1: Create the project
 
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
+
 ```bash
 mix new compr_advanced
 cd compr_advanced
 ```
 
 ### Step 2: `lib/compr_advanced.ex`
+
+**Objective**: Implement `compr_advanced.ex` — the lazy operator whose resource and memory profile only becomes visible when the stream is actually run.
+
 
 ```elixir
 defmodule ComprAdvanced do
@@ -188,6 +203,9 @@ end
 
 ### Step 3: `test/compr_advanced_test.exs`
 
+**Objective**: Write `compr_advanced_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+
 ```elixir
 defmodule ComprAdvancedTest do
   use ExUnit.Case, async: true
@@ -240,6 +258,9 @@ end
 
 ### Step 4: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -251,6 +272,14 @@ mix test
 ---
 
 <!-- benchmark N/A: syntactic-sugar topic; the underlying reduce has the same perf as an explicit pipeline -->
+
+
+## Key Concepts: Comprehension vs. Explicit Pipeline Clarity
+
+Comprehensions (list, map, keyword, for) are syntactic sugar for nested `Enum.map/Enum.filter` calls. `for x <- list, y <- other, x > y, do: {x, y}` is identical to `Enum.flat_map(list, fn x -> Enum.filter(other, fn y -> x > y end) |> Enum.map(fn y -> {x, y} end) end)`, but reads left-to-right like imperative code. The sugar is powerful when you have 2–3 levels of nesting; beyond that, explicit pipelines become clearer.
+
+Comprehensions also support `:into` to collect results into a different structure (e.g., `for x <- list, into: %{}, do: {x, x * 2}`), and can generate lists, maps, or any `Collectable`. Use comprehensions for simple transformations; switch to explicit `Enum` for complex logic or when you need intermediate naming.
+
 
 ## Trade-offs and production gotchas
 
@@ -300,3 +329,20 @@ a list result is often faster in practice because it uses bulk insert.
 - ["Comprehensions" — Elixir getting started](https://hexdocs.pm/elixir/comprehensions.html)
 - [`Collectable` protocol](https://hexdocs.pm/elixir/Collectable.html) — what `:into` targets
 - [José Valim — "Comprehensions in Elixir"](https://elixir-lang.org/blog/2015/12/10/keynote-and-elixir-1-2/) — original design notes on the generator-filter-into model
+
+
+## Deep Dive
+
+Streams are lazy, composable data pipelines that process one element at a time without materializing intermediate collections. This is fundamentally different from Enum, which materializes the entire dataset before the next operation.
+
+**Lazy evaluation semantics:**
+Stream operations return a `%Stream{}` struct containing a function. The actual computation is deferred until consumed by a terminal operation (`.run()`, `Enum.to_list()`, etc.). This allows streams to:
+- Chain indefinite sequences (e.g., `Stream.iterate(0, &(&1 + 1))`)
+- Transform without memory bloat (e.g., processing multi-gigabyte files)
+- Compose reusable pipelines as first-class values
+
+**Resource lifecycle in streams:**
+Streams wrapping resources (`Stream.resource/3`) must define cleanup functions. A stream created from a file remains "open" (in terms of the lambda) until the consumer finishes or errors. If the consumer crashes or stops early, the cleanup function still runs — critical for proper file/socket/port management.
+
+**Backpressure and demand:**
+Unlike streams in other languages, Elixir's synchronous streams don't inherently implement backpressure. Backpressure is demand-based: the consumer pulls data at its own pace. `GenStage` and `Flow` add explicit backpressure — the producer waits for the consumer to request more elements. This is why benchmarking matters: a naive stream consumer can overwhelm memory if the pipeline produces faster than it consumes.

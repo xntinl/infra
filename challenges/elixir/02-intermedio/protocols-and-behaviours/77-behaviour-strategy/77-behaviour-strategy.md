@@ -12,7 +12,7 @@
 Strategy is the GoF pattern for "same problem, multiple algorithms". In a
 checkout flow you might compute order totals with a flat price, tiered
 volume discount, or a percentage-off promotion. The choice is per-order,
-not per-environment, so the adapter-at-config-time approach from exercise
+not per-environment, so the adapter-at-config-time approach
 76 doesn't fit — the strategy is a runtime parameter.
 
 A `@behaviour` still works: define the contract, implement each strategy,
@@ -54,7 +54,7 @@ difference is internal: how the number is computed.
 PricingStrategy.calculate(PricingStrategy.Tiered, 50, tiers: [...])
 ```
 
-Compare with the Adapter pattern (exercise 76), where the module is read
+Compare with the Adapter pattern, where the module is read
 from `Application.get_env/2`. Strategy is runtime-chosen; Adapter is
 config-chosen.
 
@@ -72,9 +72,24 @@ testable and swappable.
 
 ---
 
+### Dependencies (`mix.exs`)
+
+```elixir
+def deps do
+  [
+    {error},
+    {exunit},
+    {invalid},
+    {ok},
+  ]
+end
+```
 ## Implementation
 
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
 
 ```bash
 mix new pricing_strategy
@@ -82,6 +97,9 @@ cd pricing_strategy
 ```
 
 ### Step 2: `lib/pricing_strategy.ex`
+
+**Objective**: Implement `pricing_strategy.ex` — polymorphism via dispatch on the data's type (protocol) or via an explicit contract (behaviour).
+
 
 ```elixir
 defmodule PricingStrategy do
@@ -110,6 +128,9 @@ end
 
 ### Step 3: `lib/pricing_strategy/flat.ex`
 
+**Objective**: Implement `flat.ex` — polymorphism via dispatch on the data's type (protocol) or via an explicit contract (behaviour).
+
+
 ```elixir
 defmodule PricingStrategy.Flat do
   @moduledoc """
@@ -133,6 +154,9 @@ end
 ```
 
 ### Step 4: `lib/pricing_strategy/tiered.ex`
+
+**Objective**: Implement `tiered.ex` — polymorphism via dispatch on the data's type (protocol) or via an explicit contract (behaviour).
+
 
 ```elixir
 defmodule PricingStrategy.Tiered do
@@ -177,6 +201,9 @@ end
 
 ### Step 5: `lib/pricing_strategy/discount.ex`
 
+**Objective**: Implement `discount.ex` — polymorphism via dispatch on the data's type (protocol) or via an explicit contract (behaviour).
+
+
 ```elixir
 defmodule PricingStrategy.Discount do
   @moduledoc """
@@ -216,6 +243,9 @@ end
 ```
 
 ### Step 6: `test/pricing_strategy_test.exs`
+
+**Objective**: Write `pricing_strategy_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
 
 ```elixir
 defmodule PricingStrategyTest do
@@ -297,6 +327,9 @@ end
 
 ### Step 7: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -339,3 +372,17 @@ algorithms have distinct shapes and likely continue to diverge.
 - [`Module.add_behaviour/3` and behaviours](https://hexdocs.pm/elixir/Module.html)
 - ["Programming Elixir 1.6" — Strategy via behaviours](https://pragprog.com/titles/elixir16/programming-elixir-1-6/)
 - ["Design Patterns in Elixir" — João Britto blog](https://blog.appsignal.com/2019/09/10/design-patterns-in-elixir.html)
+
+
+## Key Concepts
+
+Protocols and behaviors are Elixir's mechanism for ad-hoc and static polymorphism. They solve different problems and are often confused.
+
+**Protocols:**
+Dispatch based on the type/struct of the first argument at runtime. A protocol defines a contract (e.g., `Enumerable`); any type can implement it by adding a corresponding implementation block. Protocols excel when you control neither the type nor the caller — e.g., a library that needs to iterate any collection. The fallback is `:any` — if no specific implementation exists, the `:any` handler is tried. This enables "optional" protocol implementations.
+
+**Behaviours:**
+Static polymorphism enforced at compile time. A module implements a behavior by defining callbacks (functions). Behaviors are about contracts between modules, not types. Use when you need multiple implementations of the same interface and the caller chooses which to use (e.g., different database adapters, different strategies). Callbacks are checked at compile time — missing a required callback is a compiler error.
+
+**Architectural patterns:**
+Behaviors excel in plugin systems (user defines modules conforming to the behavior). Protocols excel in type-driven dispatch (any type can conform). Mix both: a behavior can require that its callbacks operate on types that implement a protocol. Example: `MyAdapter` behavior requiring callbacks that work with `Enumerable` types.

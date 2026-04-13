@@ -91,18 +91,23 @@ Feature flag decided at build?   ──▶ compile_env/2 (and recompile to toggl
 
 ## Implementation
 
-### Dependencies (`mix.exs`)
+### Dependencies (mix.exs)
 
 ```elixir
 defp deps do
   [
-    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+    # Standard library: no external dependencies required
   ]
 end
 ```
 
 
+
+
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
 
 ```bash
 mix new env_vs_compile
@@ -111,6 +116,9 @@ mkdir -p config
 ```
 
 ### Step 2: `config/config.exs` and `config/runtime.exs`
+
+**Objective**: Provide `config/config.exs` and `config/runtime.exs` — these are the supporting fixtures the main module depends on to make its concept demonstrable.
+
 
 ```elixir
 # config/config.exs
@@ -133,6 +141,9 @@ config :env_vs_compile,
 ```
 
 ### Step 3: `lib/env_vs_compile.ex`
+
+**Objective**: Implement `env_vs_compile.ex` — release-time behavior that depends on application env resolution and runtime boot semantics.
+
 
 ```elixir
 defmodule EnvVsCompile do
@@ -185,6 +196,9 @@ end
 
 ### Step 4: `test/env_vs_compile_test.exs`
 
+**Objective**: Write `env_vs_compile_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+
 ```elixir
 defmodule EnvVsCompileTest do
   use ExUnit.Case, async: false
@@ -215,6 +229,9 @@ end
 
 ### Step 5: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -225,6 +242,21 @@ mix test
 
 The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
 
+
+
+## Key Concepts
+
+`Application.compile_env/2` reads config evaluated during `mix compile`, producing constants in binaries. `Application.get_env/2` reads config loaded when the app starts—from files, env vars, or providers. Compile-time is optimal for library configuration; runtime is essential for deployment-specific values. The mistake: using compile-time config for secrets (bakes them into beam files, visible in source) or for values that change per environment (forces recompilation). Production deployments use runtime config exclusively for secrets and deployment variables. Understanding this boundary is load-bearing: misusing compile-time config leaks secrets into releases.
+
+---
+
+## Deep Dive: Compile-Time vs Runtime Configuration Boundaries
+
+A release is a static artifact: code and compile-time config are baked in. Runtime config must be provided at boot via environment variables, config files, or config providers. Simple rule: if a value changes between dev and prod, it goes in `config/runtime.exs`, not `config/config.exs`.
+
+Footgun: putting config in compile-time files and assuming environment variables work at runtime. Releases ignore env vars unless `config/runtime.exs` explicitly reads them. If you need env vars, fetch them in `config/runtime.exs` and store in application state.
+
+For distributed systems, config providers (modules loading config from Consul, S3, etc.) are powerful but complex. Start with environment variables and `config/runtime.exs`; only reach for providers if you need dynamic reloading without downtime or multi-tenant config switching. Premature provider complexity is a mistake.
 
 ## Benchmark
 

@@ -123,6 +123,8 @@ up everyone else.
 
 ### Step 1: Dependencies
 
+**Objective**: Pin `absinthe_phoenix` + `phoenix_pubsub` so the subscription registry speaks the same protocol as Phoenix channels.
+
 ```elixir
 defp deps do
   [
@@ -139,6 +141,8 @@ end
 ```
 
 ### Step 2: Application supervision tree
+
+**Objective**: Start PubSub before Endpoint before `Absinthe.Subscription` so channel broadcasts have a registry to publish into at boot.
 
 ```elixir
 # lib/absinthe_subscriptions/application.ex
@@ -162,6 +166,8 @@ The order matters: `PubSub` before `Endpoint` before `Absinthe.Subscription`. Th
 supervisor crashes on startup otherwise.
 
 ### Step 3: Endpoint
+
+**Objective**: Mix `use Absinthe.Phoenix.Endpoint` in so `broadcast/3` satisfies the `Absinthe.Subscription.PubSub` behaviour automatically.
 
 ```elixir
 # lib/absinthe_subscriptions/endpoint.ex
@@ -187,6 +193,8 @@ end
 
 ### Step 4: UserSocket
 
+**Objective**: Stash `viewer_id` in socket context via `put_options/2` so every subscription resolver can authorize without a DB roundtrip.
+
 ```elixir
 # lib/absinthe_subscriptions/socket.ex
 defmodule AbsintheSubscriptions.UserSocket do
@@ -206,6 +214,8 @@ end
 ```
 
 ### Step 5: Schema with subscription root
+
+**Objective**: Define `subscription :comment_added` with per-article topics and emit via mutation middleware so publish is colocated with the write path.
 
 ```elixir
 # lib/absinthe_subscriptions/graphql/types/comment_types.ex
@@ -282,6 +292,8 @@ end
 
 ### Step 6: Comment schema
 
+**Objective**: Validate `body` length 1..5000 in the changeset so malformed inputs fail at the boundary before ever reaching subscribers.
+
 ```elixir
 # lib/absinthe_subscriptions/blog/comment.ex
 defmodule AbsintheSubscriptions.Blog.Comment do
@@ -305,6 +317,8 @@ end
 
 ### Step 7: Subscription integration test
 
+**Objective**: Drive a real socket with `push_doc` and assert `subscription:data` fires for the matching topic and stays silent for a non-matching one.
+
 ```elixir
 # test/absinthe_subscriptions/subscription_test.exs
 defmodule AbsintheSubscriptions.SubscriptionTest do
@@ -320,38 +334,40 @@ defmodule AbsintheSubscriptions.SubscriptionTest do
     {:ok, socket: socket}
   end
 
-  test "a subscribed client receives a payload on createComment", %{socket: socket} do
-    subscription = """
-    subscription ($id: ID!) {
-      commentAdded(articleId: $id) { id body articleId }
-    }
-    """
+  describe "AbsintheSubscriptions.Subscription" do
+    test "a subscribed client receives a payload on createComment", %{socket: socket} do
+      subscription = """
+      subscription ($id: ID!) {
+        commentAdded(articleId: $id) { id body articleId }
+      }
+      """
 
-    ref = push_doc(socket, subscription, variables: %{"id" => "42"})
-    assert_reply ref, :ok, %{subscriptionId: _sub_id}
+      ref = push_doc(socket, subscription, variables: %{"id" => "42"})
+      assert_reply ref, :ok, %{subscriptionId: _sub_id}
 
-    # Create a comment via mutation.
-    mutation = """
-    mutation ($input: CreateCommentInput!) {
-      createComment(input: $input) { id }
-    }
-    """
-    push_doc(socket, mutation, variables: %{"input" => %{"articleId" => "42", "body" => "first!"}})
+      # Create a comment via mutation.
+      mutation = """
+      mutation ($input: CreateCommentInput!) {
+        createComment(input: $input) { id }
+      }
+      """
+      push_doc(socket, mutation, variables: %{"input" => %{"articleId" => "42", "body" => "first!"}})
 
-    assert_push "subscription:data", %{result: %{data: %{"commentAdded" => payload}}}
-    assert payload["body"] == "first!"
-    assert payload["articleId"] == "42"
-  end
+      assert_push "subscription:data", %{result: %{data: %{"commentAdded" => payload}}}
+      assert payload["body"] == "first!"
+      assert payload["articleId"] == "42"
+    end
 
-  test "clients subscribed to a different article do not get the push", %{socket: socket} do
-    push_doc(socket, "subscription ($id: ID!) { commentAdded(articleId: $id) { id } }",
-             variables: %{"id" => "99"})
+    test "clients subscribed to a different article do not get the push", %{socket: socket} do
+      push_doc(socket, "subscription ($id: ID!) { commentAdded(articleId: $id) { id } }",
+               variables: %{"id" => "99"})
 
-    push_doc(socket, """
-      mutation { createComment(input: {articleId: "42", body: "x"}) { id } }
-    """)
+      push_doc(socket, """
+        mutation { createComment(input: {articleId: "42", body: "x"}) { id } }
+      """)
 
-    refute_push "subscription:data", _, 100
+      refute_push "subscription:data", _, 100
+    end
   end
 end
 ```
@@ -374,6 +390,50 @@ IO.puts("avg: #{time_us / 10_000} µs/op")
 ```
 
 Target: operation should complete in the low-microsecond range on modern hardware; deviations by >2× indicate a regression worth investigating.
+
+## Deep Dive: Query Complexity and N+1 Prevention Patterns
+
+GraphQL's flexibility is a double-edged sword. A query like `{ users { posts { comments { author { email } } } } }`
+becomes a DDoS vector if unchecked: a resolver that loads each post's comments naively yields 1000 database 
+queries for a 100-user query.
+
+**Three strategies to prevent N+1**:
+1. **Dataloader batching** (Absinthe-native): Queue fields in phase 1 (`load/3`), flush in phase 2 (`run/1`).
+   Single database call per level. Works across HTTP boundaries via custom sources.
+2. **Ecto select/5 eager loading** (preload): Best when schema relationships are known at resolver definition time.
+   Fine-grained control; requires discipline in your types.
+3. **Complexity analysis** (persisted queries): Assign a "weight" to each field (users=2, posts=5, comments=10).
+   Reject queries exceeding a threshold BEFORE execution. Prevents runaway queries entirely.
+
+**Production gotcha**: Complexity analysis doesn't prevent slow queries — it prevents expensive queries.
+A query that hits 50,000 database rows but under the complexity limit still runs. Combine with database 
+query timeouts and active monitoring.
+
+**Subscription patterns** (real-time): Subscriptions over PubSub break traditional Dataloader batching 
+because events arrive asynchronously. Use a separate resolver that doesn't call the loader; instead, 
+publish (source) and subscribe (sink) directly. This keeps subscriptions cheap and doesn't starve 
+the dataloader queue.
+
+**Field-level authorization**: Dataloader sources can enforce per-user visibility rules at load time, 
+not in the resolver. This is cleaner than filtering after the fact and reduces unnecessary database 
+queries for unauthorized fields.
+
+---
+
+## Advanced Considerations
+
+API implementations at scale require careful consideration of request handling, error responses, and the interaction between multiple clients with different performance expectations. The distinction between public APIs and internal APIs affects error reporting granularity, versioning strategies, and backwards compatibility guarantees fundamentally. Versioning APIs through headers, paths, or query parameters each have trade-offs in terms of maintenance burden, client complexity, and developer experience across multiple client versions. When deprecating API endpoints, the migration window and support period must balance client migration costs with infrastructure maintenance costs and team capacity constraints.
+
+GraphQL adds complexity around query costs, depth limits, and the interaction between nested resolvers and N+1 query problems. A deeply nested GraphQL query can trigger hundreds of database queries if not carefully managed with proper preloading and query analysis. Implementing query cost analysis prevents malicious or poorly-written queries from starving resources and degrading service for other clients. The caching layer becomes more complex with GraphQL because the same data may be accessed through multiple query paths, each with different caching semantics and TTL requirements that must be carefully coordinated at the application level.
+
+Error handling and status codes require careful design to balance information disclosure with security concerns. Too much detail in error messages helps attackers; too little detail frustrates legitimate users. Implement structured error responses with specific error codes that clients can use to handle different failure scenarios intelligently and retry appropriately. Rate limiting, circuit breakers, and backpressure mechanisms prevent API overload but require careful configuration based on expected traffic patterns and SLA requirements.
+
+
+## Deep Dive: Apis Patterns and Production Implications
+
+API testing requires testing schema validation, error messages, pagination, and rate limiting—not just happy paths. The mistake is testing only the happy path and assuming error handling works. Production APIs with weak error handling become support nightmares.
+
+---
 
 ## Trade-offs and production gotchas
 
@@ -451,3 +511,13 @@ a horizontal shard: route clients by `article_id % N` to N distinct backends.
 - [Chris McCord — "Real-time Phoenix" (PragProg, 2021)](https://pragprog.com/titles/cmphx/real-time-phoenix/)
 - [Dashbit — How Phoenix channels scale](https://dashbit.co/blog/how-we-scaled-phoenix)
 - [GraphQL subscription spec (graphql-ws protocol)](https://github.com/enisdenjo/graphql-ws/blob/master/PROTOCOL.md)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

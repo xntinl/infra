@@ -81,6 +81,8 @@ defp elixirc_paths(_),     do: ["lib"]
 
 ### Step 1: domain type
 
+**Objective**: Represent money as integer cents + ISO currency so shrinking finds minimal failure counterexamples without float rounding artifacts.
+
 ```elixir
 # lib/pricing_engine/money.ex
 defmodule PricingEngine.Money do
@@ -109,6 +111,8 @@ end
 
 ### Step 2: splitter with a deliberate invariant
 
+**Objective**: Implement largest-remainder split so sum-preservation invariant holds under property shrinking across arbitrary split counts.
+
 ```elixir
 # lib/pricing_engine/splitter.ex
 defmodule PricingEngine.Splitter do
@@ -134,6 +138,8 @@ end
 ```
 
 ### Step 3: custom generators (the load-bearing module)
+
+**Objective**: Build domain generators via bind/2 composition so shrinking preserves the dependency DAG; avoid Enum.random which breaks shrinking.
 
 ```elixir
 # test/support/generators.ex
@@ -187,6 +193,8 @@ end
 ```
 
 ### Step 4: properties
+
+**Objective**: Assert algebraic properties (commutativity, associativity, cardinality) so StreamData generates 100+ inputs per property to hunt rounding bugs.
 
 ```elixir
 # test/pricing_engine/money_property_test.exs
@@ -300,6 +308,21 @@ IO.puts("property suite took #{time_us} microseconds")
 Target: ~100ms for all 7 properties combined. If a property takes > 1s with 100 runs, the
 generator is too large and should be bounded (smaller `cents` range or smaller `split_factor`).
 
+## Deep Dive: Streaming Patterns and Production Implications
+
+Stream-based pipelines in Elixir achieve backpressure and composability by deferring computation until consumption. Unlike eager list operations that allocate all intermediate structures, Streams are lazy chains that produce one element at a time, reducing memory footprint and enabling infinite sequences. The BEAM scheduler yields between Stream operations, allowing multiple concurrent pipelines to interleave fairly. At scale (processing millions of rows or events), the difference between eager and lazy evaluation becomes the difference between consistent latency and garbage collection pauses. Production systems benefit most when Streams are composed at library boundaries, not scattered across the codebase.
+
+---
+
+## Advanced Considerations
+
+Production testing strategies require careful attention to resource management and test isolation across multiple concurrent test processes. In large codebases, tests can consume significant memory and CPU resources, especially when using concurrent testing without proper synchronization and cleanup. The BEAM scheduler's preemptive nature means test processes may interfere with each other if shared resources aren't properly isolated at the process boundary. Pay careful attention to how Ecto's sandbox mode interacts with your supervision tree — if you have GenServers that hold state across tests, the sandbox rollback mechanism may leave phantom processes in your monitoring systems that continue consuming resources until forced cleanup occurs.
+
+When scaling tests to production-grade test suites, consider the cost of stub verification and the memory overhead of generated test cases. Each property-based test invocation can create thousands of synthetic test cases, potentially causing garbage collection pressure that's invisible during local testing but becomes critical in CI/CD pipelines running long test suites continuously. The interaction between concurrent tests and ETS tables (often used in caches and registry patterns) requires explicit `inherited: true` options to prevent unexpected sharing between test processes, which can cause mysterious failures when tests run in different orders or under load.
+
+For distributed testing scenarios using tools like `Peer`, network simulation can mask real latency issues and failure modes. Test timeouts that work locally may fail in CI due to scheduler contention and GC pauses. Always include substantial buffers for timeout values and monitor actual execution times under load. The coordination between multiple test nodes requires careful cleanup — a failure in test coordination can leave zombie processes consuming resources indefinitely. Implement proper telemetry hooks within your test helpers to diagnose production-like scenarios and capture performance characteristics.
+
+
 ## Trade-offs and production gotchas
 
 **1. Using `Enum.random/1` inside a property**
@@ -337,3 +360,13 @@ the final counterexample is still minimal?
 - [`ExUnitProperties`](https://hexdocs.pm/stream_data/ExUnitProperties.html)
 - [Dashbit: writing property tests](https://dashbit.co/blog/property-based-testing-with-ex-unit)
 - [Fred Hebert — PropEr Testing](https://propertesting.com/) — language-agnostic background on shrinking
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

@@ -78,6 +78,17 @@ A lookup table is better when rules are truly tabular (role -> resource set). Bu
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### `lib/role_permission_matcher.ex`
 
 ```elixir
@@ -314,6 +325,32 @@ mix test
 
 The approach chosen above keeps the core logic **pure, pattern-matchable, and testable**. Each step is a small, named transformation with an explicit return shape, so adding a new case means adding a new clause — not editing a branching block. Failures are data (`{:error, reason}`), not control-flow, which keeps the hot path linear and the error path explicit.
 
+
+
+---
+## Key Concepts
+
+### 1. Guards Refine Patterns Without Extra Clauses
+
+```elixir
+case payment do
+  %{amount: a} when a > 0 -> process(payment)
+  %{amount: a} when a <= 0 -> reject(payment)
+  _ -> {:error, :invalid}
+end
+```
+
+Guards let one pattern match multiple branches. Without guards, you'd write the same pattern twice.
+
+### 2. Guard Limitations
+
+Guards are restricted to deterministic, side-effect-free operations. You cannot call custom functions (except guards you define yourself). This restriction keeps pattern matching fast and predictable.
+
+### 3. Complex Guards Are a Code Smell
+
+If your guard becomes long or complex, consider extracting to a helper function or using a separate clause. Readability trumps cleverness.
+
+---
 ## Benchmark
 
 ```elixir

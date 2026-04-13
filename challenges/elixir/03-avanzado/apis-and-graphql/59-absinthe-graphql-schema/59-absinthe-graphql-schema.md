@@ -82,6 +82,8 @@ The chosen approach stays inside the BEAM, uses idiomatic OTP primitives, and ke
 
 ### Step 1: `mix.exs` — add Absinthe dependencies
 
+**Objective**: Pin Absinthe, absinthe_plug, and absinthe_phoenix so HTTP transport, schema DSL, and subscriptions share one compatible version set.
+
 ```elixir
 defp deps do
   [
@@ -94,6 +96,8 @@ end
 ```
 
 ### Step 2: `lib/api_gateway/service_store.ex`
+
+**Objective**: Back the registry with an Agent keyed by service name so resolvers read and mutate state via a single serialization point, not ad-hoc ETS races.
 
 This Agent-backed store provides the data layer for the GraphQL resolvers.
 
@@ -136,6 +140,8 @@ end
 
 ### Step 3: `lib/api_gateway/graphql/types/scalars.ex`
 
+**Objective**: Define a `:datetime` scalar with ISO 8601 parse/serialize so the wire format is canonical and invalid strings fail at validation, not in resolvers.
+
 ```elixir
 defmodule ApiGateway.GraphQL.Types.Scalars do
   @moduledoc """
@@ -162,6 +168,8 @@ end
 ```
 
 ### Step 4: `lib/api_gateway/graphql/types/service.ex`
+
+**Objective**: Group object, input, queries, mutations, and subscriptions for `service` in one notation module so the contract reads top-to-bottom per entity.
 
 ```elixir
 defmodule ApiGateway.GraphQL.Types.Service do
@@ -231,6 +239,8 @@ end
 
 ### Step 5: `lib/api_gateway/graphql/resolvers/service.ex`
 
+**Objective**: Convert atom-keyed Absinthe inputs to string keys at the resolver boundary so the store stays ignorant of GraphQL's key conventions.
+
 ```elixir
 defmodule ApiGateway.GraphQL.Resolvers.Service do
   @moduledoc """
@@ -289,6 +299,8 @@ end
 
 ### Step 6: `lib/api_gateway/graphql/schema.ex`
 
+**Objective**: Compose the root schema via `import_fields` so per-entity modules plug in without touching the root, keeping schema growth linear in domains.
+
 ```elixir
 defmodule ApiGateway.GraphQL.Schema do
   @moduledoc """
@@ -315,6 +327,8 @@ end
 ```
 
 ### Step 7: Given tests — must pass without modification
+
+**Objective**: Exercise list, get, register, deregister, and unknown-service paths through `Absinthe.run/3` so resolver wiring is proven end-to-end.
 
 ```elixir
 # test/api_gateway/graphql_schema_test.exs
@@ -361,50 +375,54 @@ defmodule ApiGateway.GraphQL.SchemaTest do
   }
   """
 
-  test "lists registered services" do
-    ApiGateway.ServiceStore.register(%{"name" => "payments", "url" => "http://payments:4001"})
+  describe "ApiGateway.GraphQL.Schema" do
+    test "lists registered services" do
+      ApiGateway.ServiceStore.register(%{"name" => "payments", "url" => "http://payments:4001"})
 
-    assert {:ok, %{data: %{"services" => services}}} =
-             Absinthe.run(@list_query, Schema)
+      assert {:ok, %{data: %{"services" => services}}} =
+               Absinthe.run(@list_query, Schema)
 
-    assert length(services) == 1
-    assert hd(services)["name"] == "payments"
-  end
+      assert length(services) == 1
+      assert hd(services)["name"] == "payments"
+    end
 
-  test "returns error for unknown service" do
-    assert {:ok, %{data: %{"service" => nil}, errors: [error]}} =
-             Absinthe.run(@get_query, Schema, variables: %{"name" => "ghost"})
+    test "returns error for unknown service" do
+      assert {:ok, %{data: %{"service" => nil}, errors: [error]}} =
+               Absinthe.run(@get_query, Schema, variables: %{"name" => "ghost"})
 
-    assert error.message =~ "not found"
-  end
+      assert error.message =~ "not found"
+    end
 
-  test "registers a service via mutation" do
-    assert {:ok, %{data: %{"registerService" => svc}}} =
-             Absinthe.run(@register_mutation, Schema,
-               variables: %{"input" => %{"name" => "geo", "url" => "http://geo:4002"}}
-             )
+    test "registers a service via mutation" do
+      assert {:ok, %{data: %{"registerService" => svc}}} =
+               Absinthe.run(@register_mutation, Schema,
+                 variables: %{"input" => %{"name" => "geo", "url" => "http://geo:4002"}}
+               )
 
-    assert svc["name"] == "geo"
-    assert ApiGateway.ServiceStore.get("geo") != nil
-  end
+      assert svc["name"] == "geo"
+      assert ApiGateway.ServiceStore.get("geo") != nil
+    end
 
-  test "deregisters a service via mutation" do
-    ApiGateway.ServiceStore.register(%{"name" => "cache", "url" => "http://cache:4003"})
+    test "deregisters a service via mutation" do
+      ApiGateway.ServiceStore.register(%{"name" => "cache", "url" => "http://cache:4003"})
 
-    assert {:ok, %{data: %{"deregisterService" => true}}} =
-             Absinthe.run(@deregister_mutation, Schema, variables: %{"name" => "cache"})
+      assert {:ok, %{data: %{"deregisterService" => true}}} =
+               Absinthe.run(@deregister_mutation, Schema, variables: %{"name" => "cache"})
 
-    assert ApiGateway.ServiceStore.get("cache") == nil
-  end
+      assert ApiGateway.ServiceStore.get("cache") == nil
+    end
 
-  test "deregister returns error for unknown service" do
-    assert {:ok, %{errors: [_]}} =
-             Absinthe.run(@deregister_mutation, Schema, variables: %{"name" => "ghost"})
+    test "deregister returns error for unknown service" do
+      assert {:ok, %{errors: [_]}} =
+               Absinthe.run(@deregister_mutation, Schema, variables: %{"name" => "ghost"})
+    end
   end
 end
 ```
 
 ### Step 8: Run the tests
+
+**Objective**: Run `mix test --trace` on the schema suite so failures surface with explicit test names, not buried in a batched report.
 
 ```bash
 mix test test/api_gateway/graphql_schema_test.exs --trace
@@ -416,6 +434,44 @@ mix test test/api_gateway/graphql_schema_test.exs --trace
 ### Why this works
 
 The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
+
+## Deep Dive: Query Complexity and N+1 Prevention Patterns
+
+GraphQL's flexibility is a double-edged sword. A query like `{ users { posts { comments { author { email } } } } }`
+becomes a DDoS vector if unchecked: a resolver that loads each post's comments naively yields 1000 database 
+queries for a 100-user query.
+
+**Three strategies to prevent N+1**:
+1. **Dataloader batching** (Absinthe-native): Queue fields in phase 1 (`load/3`), flush in phase 2 (`run/1`).
+   Single database call per level. Works across HTTP boundaries via custom sources.
+2. **Ecto select/5 eager loading** (preload): Best when schema relationships are known at resolver definition time.
+   Fine-grained control; requires discipline in your types.
+3. **Complexity analysis** (persisted queries): Assign a "weight" to each field (users=2, posts=5, comments=10).
+   Reject queries exceeding a threshold BEFORE execution. Prevents runaway queries entirely.
+
+**Production gotcha**: Complexity analysis doesn't prevent slow queries — it prevents expensive queries.
+A query that hits 50,000 database rows but under the complexity limit still runs. Combine with database 
+query timeouts and active monitoring.
+
+**Subscription patterns** (real-time): Subscriptions over PubSub break traditional Dataloader batching 
+because events arrive asynchronously. Use a separate resolver that doesn't call the loader; instead, 
+publish (source) and subscribe (sink) directly. This keeps subscriptions cheap and doesn't starve 
+the dataloader queue.
+
+**Field-level authorization**: Dataloader sources can enforce per-user visibility rules at load time, 
+not in the resolver. This is cleaner than filtering after the fact and reduces unnecessary database 
+queries for unauthorized fields.
+
+---
+
+## Advanced Considerations
+
+API implementations at scale require careful consideration of request handling, error responses, and the interaction between multiple clients with different performance expectations. The distinction between public APIs and internal APIs affects error reporting granularity, versioning strategies, and backwards compatibility guarantees fundamentally. Versioning APIs through headers, paths, or query parameters each have trade-offs in terms of maintenance burden, client complexity, and developer experience across multiple client versions. When deprecating API endpoints, the migration window and support period must balance client migration costs with infrastructure maintenance costs and team capacity constraints.
+
+GraphQL adds complexity around query costs, depth limits, and the interaction between nested resolvers and N+1 query problems. A deeply nested GraphQL query can trigger hundreds of database queries if not carefully managed with proper preloading and query analysis. Implementing query cost analysis prevents malicious or poorly-written queries from starving resources and degrading service for other clients. The caching layer becomes more complex with GraphQL because the same data may be accessed through multiple query paths, each with different caching semantics and TTL requirements that must be carefully coordinated at the application level.
+
+Error handling and status codes require careful design to balance information disclosure with security concerns. Too much detail in error messages helps attackers; too little detail frustrates legitimate users. Implement structured error responses with specific error codes that clients can use to handle different failure scenarios intelligently and retry appropriately. Rate limiting, circuit breakers, and backpressure mechanisms prevent API overload but require careful configuration based on expected traffic patterns and SLA requirements.
+
 
 ## Trade-off analysis
 
@@ -471,3 +527,13 @@ Target: operation should complete in the low-microsecond range on modern hardwar
 - [Absinthe.Schema.Notation](https://hexdocs.pm/absinthe/Absinthe.Schema.Notation.html) — `object`, `input_object`, `field`, `arg`
 - [Absinthe subscriptions](https://hexdocs.pm/absinthe/subscriptions.html) — WebSocket-based real-time updates
 - [GraphQL spec](https://spec.graphql.org/) — understand why partial responses and the `errors` array exist
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

@@ -2,14 +2,11 @@
 
 **Project**: `telemetry_spans` — wraps a piece of work with `:telemetry.span/3` so a single function call emits the `:start` / `:stop` / `:exception` trio that every tracing backend expects.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2 hours
-
 ---
 
 ## Project context
 
-If exercise 28 taught you to attach a handler, this one teaches you how
+Once you know how to attach a handler, this one teaches you how
 work-spanning libraries (Ecto, Phoenix, Finch, Oban) actually emit their
 events: with `:telemetry.span/3`. A span is the canonical shape of
 "something started, something happened, something ended (or blew up)".
@@ -102,9 +99,37 @@ It *almost* works. But:
 
 ---
 
+## Design decisions
+
+**Option A — hand-rolled `:telemetry.execute/3` pair for `:start` and `:stop`**
+- Pros: explicit, no extra abstraction, works with any version of `:telemetry`.
+- Cons: on exception no `:stop` is emitted (orphan start); easy to mis-key `duration`; breaks OpenTelemetry auto-instrumentation that looks for the canonical trio.
+
+**Option B — wrap work in `:telemetry.span/3` (chosen)**
+- Pros: one call emits the canonical `:start` / `:stop` / `:exception` trio, re-raises transparently, correct `duration` in native units, and is what every tracing backend auto-discovers.
+- Cons: requires callers to express work as a 0-arity function; the `{result, extra_metadata}` return shape is non-obvious the first time you see it.
+
+→ Chose **B** because the whole point of this exercise is to produce the shape real tracing tools consume, and hand-rolled code gets the exception path wrong.
+
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"ecto", "~> 1.0"},
+    {:"phoenix", "~> 1.0"},
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
 
 ```bash
 mix new telemetry_spans
@@ -122,6 +147,9 @@ end
 Run `mix deps.get`.
 
 ### Step 2: `lib/telemetry_spans.ex`
+
+**Objective**: Implement `telemetry_spans.ex` — the integration seam where external protocol semantics meet Elixir domain code.
+
 
 ```elixir
 defmodule TelemetrySpans do
@@ -156,6 +184,9 @@ end
 ```
 
 ### Step 3: `test/telemetry_spans_test.exs`
+
+**Objective**: Write `telemetry_spans_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
 
 ```elixir
 defmodule TelemetrySpansTest do
@@ -268,11 +299,29 @@ end
 
 ### Step 4: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
 
 ---
+
+
+## Key Concepts
+
+Telemetry spans pair `:start` and `:stop` events, measuring operation duration. A span might be a database query, HTTP request, or custom business operation. The `:start` event initializes a measurement; the `:stop` event reports duration and outcomes. Spans enable distributed tracing when coordinated across services—each service emits spans, a collector stitches them into call graphs. This is how you answer "why is this request slow?"—trace the spans and see where time was spent. Telemetry spans are the foundation of production observability; every significant operation should emit them. Tools like Jaeger and DataDog ingest telemetry spans for visualization.
+
+---
+
+## Deep Dive: Instrumentation as a First-Class Concern
+
+Telemetry separates the *production of observability data* from *consumption*. Your code emits events (spans, metrics, logs); handlers subscribe and decide what to do (send to Prometheus, publish to a log aggregator, forward to APM). This decoupling prevents your code from being coupled to specific monitoring backends.
+
+In production, emit events at system boundaries (HTTP ingress/egress, database queries, external API calls) and at decision points (circuit breaker opens, backpressure detected, cascade failure started). Avoid emitting from hot loops unless you've profiled—telemetry handlers run synchronously and can impact latency.
+
+A common mistake: emitting too much (every database query) when you should sample (1 in 100). Sampling must be early—decide at the system boundary, not in the handler. Also, telemetry is *not* structured logging: use telemetry for metrics and distributed tracing, use Logger for operational logs.
 
 ## Trade-offs and production gotchas
 
@@ -318,6 +367,14 @@ span the *outer* batch, not each iteration. Metric aggregation handles
 the rest.
 
 ---
+
+## Benchmark
+
+<!-- benchmark N/A: integration/configuration exercise -->
+
+## Reflection
+
+- If a handler attached to `[:my_app, :work, :stop]` takes 50 ms to run, how does that change the meaning of the `duration` measurement the *next* span reports, and what does it tell you about where to put I/O in your observability pipeline?
 
 ## Resources
 

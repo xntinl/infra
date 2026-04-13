@@ -67,6 +67,8 @@ Without middleware, every mutation needs a guard clause. Add 10 mutations and yo
 
 ### Step 1: `mix.exs`
 
+**Objective**: Declare project dependencies and configure the Mix build.
+
 ```elixir
 defp deps do
   [
@@ -79,6 +81,8 @@ end
 ```
 
 ### Step 2: `lib/api_gateway/service_store.ex`
+
+**Objective**: Back the registry with an Agent keyed by name so register/deregister stay serialized and list views see consistent snapshots.
 
 ```elixir
 defmodule ApiGateway.ServiceStore do
@@ -118,6 +122,8 @@ end
 ```
 
 ### Step 3: `lib/api_gateway/graphql/loader.ex`
+
+**Objective**: Batch HTTP health checks via Dataloader.KV and Task.async_stream so 50 services trigger one concurrent wave, not 50 serial calls.
 
 ```elixir
 defmodule ApiGateway.GraphQL.Loader do
@@ -166,6 +172,8 @@ end
 
 ### Step 4: `lib/api_gateway/graphql/middleware/authenticate.ex`
 
+**Objective**: Gate mutation resolution behind current_client context so register/deregister require caller authentication without per-resolver duplication.
+
 ```elixir
 defmodule ApiGateway.GraphQL.Middleware.Authenticate do
   @moduledoc """
@@ -192,6 +200,8 @@ end
 
 ### Step 5: `lib/api_gateway/graphql/middleware/handle_errors.ex`
 
+**Objective**: Normalize error tuples (string/exception) into Absinthe-compliant maps with code extensions so clients parse errors uniformly.
+
 ```elixir
 defmodule ApiGateway.GraphQL.Middleware.HandleErrors do
   @moduledoc """
@@ -216,6 +226,8 @@ end
 ```
 
 ### Step 6: `lib/api_gateway/graphql/types/service.ex`
+
+**Objective**: Define :service object with status field using DataLoader so the health check batch key enrolls all services without per-field HTTP loops.
 
 ```elixir
 defmodule ApiGateway.GraphQL.Types.Service do
@@ -285,6 +297,8 @@ end
 
 ### Step 7: `lib/api_gateway/graphql/resolvers/service.ex`
 
+**Objective**: Implement list/get/register/deregister resolvers as pure functions so Absinthe composes them with middleware and DataLoader transparently.
+
 ```elixir
 defmodule ApiGateway.GraphQL.Resolvers.Service do
   @moduledoc """
@@ -330,6 +344,8 @@ end
 ```
 
 ### Step 8: `lib/api_gateway/graphql/schema.ex`
+
+**Objective**: Compose schema with Dataloader plugin and middleware/3 so auth gates mutations and batches flush between resolution phases.
 
 ```elixir
 defmodule ApiGateway.GraphQL.Schema do
@@ -388,6 +404,8 @@ The `middleware/3` callback is invoked at schema compilation time for every fiel
 
 ### Step 9: Given tests — must pass without modification
 
+**Objective**: Drive GraphQL execution with and without current_client context so mutation auth and query open access are proven end-to-end.
+
 ```elixir
 # test/api_gateway/graphql_auth_test.exs
 defmodule ApiGateway.GraphQL.AuthTest do
@@ -414,55 +432,59 @@ defmodule ApiGateway.GraphQL.AuthTest do
   }
   """
 
-  test "mutation without auth returns authentication error" do
-    assert {:ok, result} =
-             Absinthe.run(@register_mutation, Schema,
-               variables: %{"input" => %{"name" => "x", "url" => "http://x"}},
-               context: %{}
-             )
+  describe "ApiGateway.GraphQL.Auth" do
+    test "mutation without auth returns authentication error" do
+      assert {:ok, result} =
+               Absinthe.run(@register_mutation, Schema,
+                 variables: %{"input" => %{"name" => "x", "url" => "http://x"}},
+                 context: %{}
+               )
 
-    assert [error] = result.errors
-    assert error.message =~ "authentication"
-  end
+      assert [error] = result.errors
+      assert error.message =~ "authentication"
+    end
 
-  test "mutation with valid client succeeds" do
-    assert {:ok, result} =
-             Absinthe.run(@register_mutation, Schema,
-               variables: %{"input" => %{"name" => "payments", "url" => "http://payments:4001"}},
-               context: %{current_client: "dashboard"}
-             )
+    test "mutation with valid client succeeds" do
+      assert {:ok, result} =
+               Absinthe.run(@register_mutation, Schema,
+                 variables: %{"input" => %{"name" => "payments", "url" => "http://payments:4001"}},
+                 context: %{current_client: "dashboard"}
+               )
 
-    refute Map.has_key?(result, :errors)
-    assert result.data["registerService"]["name"] == "payments"
-  end
+      refute Map.has_key?(result, :errors)
+      assert result.data["registerService"]["name"] == "payments"
+    end
 
-  test "deregister without auth returns authentication error" do
-    ApiGateway.ServiceStore.register(%{"name" => "geo", "url" => "http://geo:4002"})
+    test "deregister without auth returns authentication error" do
+      ApiGateway.ServiceStore.register(%{"name" => "geo", "url" => "http://geo:4002"})
 
-    assert {:ok, result} =
-             Absinthe.run(@deregister_mutation, Schema,
-               variables: %{"name" => "geo"},
-               context: %{}
-             )
+      assert {:ok, result} =
+               Absinthe.run(@deregister_mutation, Schema,
+                 variables: %{"name" => "geo"},
+                 context: %{}
+               )
 
-    assert [error] = result.errors
-    assert error.message =~ "authentication"
-    # The service must still exist — the mutation was rejected
-    assert ApiGateway.ServiceStore.get("geo") != nil
-  end
+      assert [error] = result.errors
+      assert error.message =~ "authentication"
+      # The service must still exist — the mutation was rejected
+      assert ApiGateway.ServiceStore.get("geo") != nil
+    end
 
-  test "queries do not require auth" do
-    ApiGateway.ServiceStore.register(%{"name" => "cache", "url" => "http://cache:4003"})
+    test "queries do not require auth" do
+      ApiGateway.ServiceStore.register(%{"name" => "cache", "url" => "http://cache:4003"})
 
-    assert {:ok, %{data: %{"services" => services}}} =
-             Absinthe.run("query { services { name } }", Schema, context: %{})
+      assert {:ok, %{data: %{"services" => services}}} =
+               Absinthe.run("query { services { name } }", Schema, context: %{})
 
-    assert length(services) == 1
+      assert length(services) == 1
+    end
   end
 end
 ```
 
 ### Step 10: Run the tests
+
+**Objective**: Execute mix test to confirm auth guards mutations, queries remain open, and service lifecycle operations succeed end-to-end.
 
 ```bash
 mix test test/api_gateway/graphql_auth_test.exs --trace
@@ -474,6 +496,44 @@ mix test test/api_gateway/graphql_auth_test.exs --trace
 ### Why this works
 
 The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
+
+## Deep Dive: Query Complexity and N+1 Prevention Patterns
+
+GraphQL's flexibility is a double-edged sword. A query like `{ users { posts { comments { author { email } } } } }`
+becomes a DDoS vector if unchecked: a resolver that loads each post's comments naively yields 1000 database 
+queries for a 100-user query.
+
+**Three strategies to prevent N+1**:
+1. **Dataloader batching** (Absinthe-native): Queue fields in phase 1 (`load/3`), flush in phase 2 (`run/1`).
+   Single database call per level. Works across HTTP boundaries via custom sources.
+2. **Ecto select/5 eager loading** (preload): Best when schema relationships are known at resolver definition time.
+   Fine-grained control; requires discipline in your types.
+3. **Complexity analysis** (persisted queries): Assign a "weight" to each field (users=2, posts=5, comments=10).
+   Reject queries exceeding a threshold BEFORE execution. Prevents runaway queries entirely.
+
+**Production gotcha**: Complexity analysis doesn't prevent slow queries — it prevents expensive queries.
+A query that hits 50,000 database rows but under the complexity limit still runs. Combine with database 
+query timeouts and active monitoring.
+
+**Subscription patterns** (real-time): Subscriptions over PubSub break traditional Dataloader batching 
+because events arrive asynchronously. Use a separate resolver that doesn't call the loader; instead, 
+publish (source) and subscribe (sink) directly. This keeps subscriptions cheap and doesn't starve 
+the dataloader queue.
+
+**Field-level authorization**: Dataloader sources can enforce per-user visibility rules at load time, 
+not in the resolver. This is cleaner than filtering after the fact and reduces unnecessary database 
+queries for unauthorized fields.
+
+---
+
+## Advanced Considerations
+
+API implementations at scale require careful consideration of request handling, error responses, and the interaction between multiple clients with different performance expectations. The distinction between public APIs and internal APIs affects error reporting granularity, versioning strategies, and backwards compatibility guarantees fundamentally. Versioning APIs through headers, paths, or query parameters each have trade-offs in terms of maintenance burden, client complexity, and developer experience across multiple client versions. When deprecating API endpoints, the migration window and support period must balance client migration costs with infrastructure maintenance costs and team capacity constraints.
+
+GraphQL adds complexity around query costs, depth limits, and the interaction between nested resolvers and N+1 query problems. A deeply nested GraphQL query can trigger hundreds of database queries if not carefully managed with proper preloading and query analysis. Implementing query cost analysis prevents malicious or poorly-written queries from starving resources and degrading service for other clients. The caching layer becomes more complex with GraphQL because the same data may be accessed through multiple query paths, each with different caching semantics and TTL requirements that must be carefully coordinated at the application level.
+
+Error handling and status codes require careful design to balance information disclosure with security concerns. Too much detail in error messages helps attackers; too little detail frustrates legitimate users. Implement structured error responses with specific error codes that clients can use to handle different failure scenarios intelligently and retry appropriately. Rate limiting, circuit breakers, and backpressure mechanisms prevent API overload but require careful configuration based on expected traffic patterns and SLA requirements.
+
 
 ## Trade-off analysis
 
@@ -527,3 +587,13 @@ Target: operation should complete in the low-microsecond range on modern hardwar
 - [Dataloader](https://hexdocs.pm/dataloader) — KV and Ecto sources, batching semantics
 - [Absinthe.Middleware.Dataloader plugin](https://hexdocs.pm/absinthe/Absinthe.Middleware.Dataloader.html) — why `plugins/0` matters
 - [Absinthe Resolution Helpers](https://hexdocs.pm/absinthe/Absinthe.Resolution.Helpers.html) — `on_load/2` for deferred resolution
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

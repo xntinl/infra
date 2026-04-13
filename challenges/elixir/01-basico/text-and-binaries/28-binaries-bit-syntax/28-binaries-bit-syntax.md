@@ -66,7 +66,21 @@ Both problems are classic bit syntax exercises.
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"jason", "~> 1.0"},
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: PNG headers are fixed layout (8 bytes); IHDR is a named chunk — binary matching validates struct before parsing.
 
 ```bash
 mix new packet_parser
@@ -74,6 +88,8 @@ cd packet_parser
 ```
 
 ### Step 2: `mix.exs`
+
+**Objective**: Boilerplate; focus on how module organization separates PNG header from frame buffer logic.
 
 ```elixir
 defmodule PacketParser.MixProject do
@@ -98,6 +114,8 @@ end
 No external dependencies — bit syntax is built into the language.
 
 ### Step 3: `lib/packet_parser/png.ex`
+
+**Objective**: PNG width/height are 32-bit big-endian; failing to check bounds on IHDR before reading body loses all diagnostics.
 
 ```elixir
 defmodule PacketParser.PNG do
@@ -179,6 +197,8 @@ end
 
 ### Step 4: `lib/packet_parser/frame.ex`
 
+**Objective**: Length-prefixed streams allow clients to buffer variable payloads; split reads across multiple socket calls.
+
 ```elixir
 defmodule PacketParser.Frame do
   @moduledoc """
@@ -249,6 +269,8 @@ end
 
 ### Step 5: Tests — `test/packet_parser/png_test.exs`
 
+**Objective**: Test magic bytes first (failing fast) and impossible dimensions (width=0); invalid PNG halts early.
+
 ```elixir
 defmodule PacketParser.PNGTest do
   use ExUnit.Case, async: true
@@ -293,6 +315,8 @@ end
 ```
 
 ### Step 6: Tests — `test/packet_parser/frame_test.exs`
+
+**Objective**: Test incomplete frames, exact boundaries, and multi-frame buffers; frames are the real case in practice.
 
 ```elixir
 defmodule PacketParser.FrameTest do
@@ -341,6 +365,8 @@ end
 
 ### Step 7: Run and verify
 
+**Objective**: --warnings-as-errors forces exhaustive matches on frame types; missing a case in production is catastrophic.
+
 ```bash
 mix test --trace
 mix compile --warnings-as-errors
@@ -351,6 +377,19 @@ check the `size` modifier — mixing bits and bytes is the most common mistake h
 
 ---
 
+
+## Key Concepts
+
+### 1. `::binary` Matches the Remainder
+`::binary` is greedy—it takes everything remaining. Useful for splitting off a prefix and keeping the rest.
+
+### 2. Type Specifiers Control Interpretation
+The specifier changes how bytes are interpreted. For UTF-8 strings, use `::utf8`. For raw bytes, use `::integer` or no specifier.
+
+### 3. Bit Syntax Compiles Efficiently
+Pattern matching on binaries compiles to optimized bytecode. It's faster than manual slicing. Always prefer bit syntax for binary protocols.
+
+---
 ## Trade-off analysis
 
 | Aspect                    | Bit syntax (this approach) | Third-party parser library | Manual `:binary` module |

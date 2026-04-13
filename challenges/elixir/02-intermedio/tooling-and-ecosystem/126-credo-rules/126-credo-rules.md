@@ -126,9 +126,22 @@ one of the three and you leak that layer into code review.
 
 ---
 
+### Dependencies (`mix.exs`)
+
+```elixir
+def deps do
+  [
+    {credo},
+    {exunit},
+  ]
+end
+```
 ## Implementation
 
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
 
 ```bash
 mix new credo_setup
@@ -155,6 +168,9 @@ mix credo gen.config
 This writes `.credo.exs` with every default — the best base to tweak from.
 
 ### Step 2: Edit `.credo.exs` — curated recommendations
+
+**Objective**: Edit `.credo.exs` — curated recommendations, exposing code whose shape is chosen to exercise the tool's capabilities, not to solve a domain problem.
+
 
 Keep the generated structure; adjust the `checks:` section like this
 (partial; keep the other checks as generated):
@@ -194,6 +210,9 @@ Keep the generated structure; adjust the `checks:` section like this
 ```
 
 ### Step 3: Write the custom check — `lib/my_checks/todo_with_author.ex`
+
+**Objective**: Write the custom check — `lib/my_checks/todo_with_author.ex`.
+
 
 ```elixir
 defmodule MyChecks.TodoWithAuthor do
@@ -248,6 +267,9 @@ end
 
 ### Step 4: Deliberately add a "bad" line — `lib/credo_setup.ex`
 
+**Objective**: Deliberately add a "bad" line — `lib/credo_setup.ex`.
+
+
 ```elixir
 defmodule CredoSetup do
   @moduledoc """
@@ -266,6 +288,9 @@ end
 
 ### Step 5: `test/credo_setup_test.exs`
 
+**Objective**: Write `credo_setup_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+
 ```elixir
 defmodule CredoSetupTest do
   use ExUnit.Case, async: true
@@ -279,6 +304,9 @@ end
 
 ### Step 6: Add a `mix check` alias
 
+**Objective**: Add a `mix check` alias.
+
+
 `mix.exs`:
 
 ```elixir
@@ -290,6 +318,9 @@ end
 ```
 
 ### Step 7: Run
+
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
 
 ```bash
 mix deps.get
@@ -382,3 +413,20 @@ for anything beyond line-level rules.
 - ["Writing a custom check"](https://hexdocs.pm/credo/custom_checks.html) — AST walkers, params, explanations
 - [`Credo.Check`](https://hexdocs.pm/credo/Credo.Check.html) — the behaviour
 - [`Credo.SourceFile`](https://hexdocs.pm/credo/Credo.SourceFile.html) — access to text and AST
+
+
+## Deep Dive
+
+Elixir's tooling ecosystem extends beyond the language into DevOps, profiling, and observability. Understanding each tool's role prevents misuse and false optimizations.
+
+**Mix tasks and releases:**
+Custom mix tasks (`mix myapp.setup`, `mix myapp.migrate`) encapsulate operational knowledge. Tasks run in the host environment (not the compiled app), so they're ideal for setup, teardown, or scripting. Releases, built with `mix release`, create self-contained OTP applications deployable without Elixir installed. They're immutable: no source code changes after release — all config comes from environment variables or runtime files.
+
+**Debugging and profiling tools:**
+- `:observer` (GUI): real-time process tree, metrics, and port inspection
+- `Recon`: production-safe introspection (stable even under high load)
+- `:eprof`: function-level timing; lower overhead than `:fprof`
+- `:fprof`: detailed trace analysis; use only in staging
+
+**Profiling approaches:**
+Ceiling profiling (e.g., "which modules consume CPU?") is cheap; go there first with `perf` or `eprof`. Floor profiling (e.g., "which lines in this function are slow?") is expensive; reserve for specific functions. In production, prefer metrics (Prometheus, New Relic) over profiling — continuous profiling has overhead. Store profiling data for post-mortem analysis, not real-time dashboards.

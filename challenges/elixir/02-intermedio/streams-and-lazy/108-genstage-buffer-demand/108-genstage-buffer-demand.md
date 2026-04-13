@@ -9,6 +9,21 @@ control overflow behavior.
 
 ---
 
+### Dependencies (`mix.exs`)
+
+```elixir
+def deps do
+  {consumer},
+  {emit},
+  {exunit},
+  {gen_stage},
+  {genstage},
+  {noreply},
+  {ok},
+  {producer},
+  {received},
+end
+```
 ## Project context
 
 GenStage is demand-driven by default, so a Producer only emits what was
@@ -41,8 +56,8 @@ buffer_demand/
 
 ### 1. Push vs pull producers
 
-A *pull* producer computes events in `handle_demand/2` — exercise 27's
-counter. A *push* producer receives events from outside (via `cast`, raw
+A *pull* producer computes events in `handle_demand/2` — like a simple
+counter producer. A *push* producer receives events from outside (via `cast`, raw
 `send`, a port) and calls `GenStage.reply/2` or returns events from
 `handle_cast/2`. The buffer exists so push events can arrive faster than
 demand briefly without losing data.
@@ -92,6 +107,9 @@ Consumer just sees a gap. Always instrument your producer with
 
 ### Step 1: Create the project
 
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
+
 ```bash
 mix new buffer_demand --sup
 cd buffer_demand
@@ -106,6 +124,9 @@ defp deps, do: [{:gen_stage, "~> 1.2"}]
 Then `mix deps.get`.
 
 ### Step 2: `lib/buffer_demand/push_producer.ex`
+
+**Objective**: Implement `push_producer.ex` — the lazy operator whose resource and memory profile only becomes visible when the stream is actually run.
+
 
 ```elixir
 defmodule BufferDemand.PushProducer do
@@ -156,6 +177,9 @@ end
 
 ### Step 3: `lib/buffer_demand/slow_consumer.ex`
 
+**Objective**: Implement `slow_consumer.ex` — the lazy operator whose resource and memory profile only becomes visible when the stream is actually run.
+
+
 ```elixir
 defmodule BufferDemand.SlowConsumer do
   @moduledoc """
@@ -186,6 +210,9 @@ end
 
 ### Step 4: `lib/buffer_demand.ex`
 
+**Objective**: Implement `buffer_demand.ex` — the lazy operator whose resource and memory profile only becomes visible when the stream is actually run.
+
+
 ```elixir
 defmodule BufferDemand do
   @moduledoc "Starts a push producer and slow consumer pair."
@@ -204,6 +231,9 @@ end
 ```
 
 ### Step 5: `test/buffer_demand_test.exs`
+
+**Objective**: Write `buffer_demand_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
 
 ```elixir
 defmodule BufferDemandTest do
@@ -283,6 +313,9 @@ end
 
 ### Step 6: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -337,3 +370,20 @@ buffer will save you — you'll just delay the inevitable overflow by
 - [`Broadway`](https://hexdocs.pm/broadway/Broadway.html) — built-in back-pressure, acknowledgements, and dead-letter handling
 - [`:telemetry`](https://hexdocs.pm/telemetry/) — for instrumenting drop counters
 - José Valim — [Elixir Forum thread on GenStage buffer semantics](https://elixirforum.com/t/gen-stage-buffer-options/) (several long-form discussions)
+
+
+## Deep Dive
+
+Streams are lazy, composable data pipelines that process one element at a time without materializing intermediate collections. This is fundamentally different from Enum, which materializes the entire dataset before the next operation.
+
+**Lazy evaluation semantics:**
+Stream operations return a `%Stream{}` struct containing a function. The actual computation is deferred until consumed by a terminal operation (`.run()`, `Enum.to_list()`, etc.). This allows streams to:
+- Chain indefinite sequences (e.g., `Stream.iterate(0, &(&1 + 1))`)
+- Transform without memory bloat (e.g., processing multi-gigabyte files)
+- Compose reusable pipelines as first-class values
+
+**Resource lifecycle in streams:**
+Streams wrapping resources (`Stream.resource/3`) must define cleanup functions. A stream created from a file remains "open" (in terms of the lambda) until the consumer finishes or errors. If the consumer crashes or stops early, the cleanup function still runs — critical for proper file/socket/port management.
+
+**Backpressure and demand:**
+Unlike streams in other languages, Elixir's synchronous streams don't inherently implement backpressure. Backpressure is demand-based: the consumer pulls data at its own pace. `GenStage` and `Flow` add explicit backpressure — the producer waits for the consumer to request more elements. This is why benchmarking matters: a naive stream consumer can overwhelm memory if the pipeline produces faster than it consumes.

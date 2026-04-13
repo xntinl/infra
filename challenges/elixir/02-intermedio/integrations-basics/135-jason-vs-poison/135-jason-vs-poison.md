@@ -6,9 +6,6 @@
 `JsonCompare` module abstracting behind a behaviour, and documents why the
 Elixir community moved off Poison as the default.
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 1–2 hours
-
 ---
 
 ## Project context
@@ -72,7 +69,7 @@ If your struct needs to be serializable by both, derive both.
 ### 3. Performance — why Jason won
 
 Jason uses binary pattern matching directly on the input (the same
-technique powering NimbleParsec — see exercise 136), avoiding intermediate
+technique powering NimbleParsec), avoiding intermediate
 lists and minimizing allocations. Poison's pipeline is more dynamic. On
 typical JSON blobs (API payloads, tens of KB), Jason is roughly 2–3×
 faster on decode and 1.5–2× faster on encode. We'll verify with Benchee.
@@ -90,9 +87,40 @@ faster on decode and 1.5–2× faster on encode. We'll verify with Benchee.
 
 ---
 
+## Design decisions
+
+**Option A — call `Jason` or `Poison` directly at every call site**
+- Pros: zero abstraction, easiest to grep for; fewest indirections when debugging.
+- Cons: migrations require touching every call site; mixed-library codebases end up with inconsistent error shapes; hard to A/B the two libraries.
+
+**Option B — an `Adapter` behaviour with per-library implementations and a facade (chosen)**
+- Pros: swap libraries via `Application.get_env`; benchmarks run against the same API; tests can inject a stub encoder; migration is a one-line config change.
+- Cons: one more module to navigate; the behaviour adds a veneer that can hide library-specific options (streaming, custom encoders).
+
+→ Chose **B** because the whole point of the exercise is comparing libraries under one contract, and abstracting at the boundary is a cheap, widely-used pattern.
+
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"ecto", "~> 1.0"},
+    {:"jason", "~> 1.0"},
+    {:"phoenix", "~> 1.0"},
+    {:"plug", "~> 1.0"},
+    {:"poison", "~> 1.0"},
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
 
 ```bash
 mix new json_compare
@@ -112,6 +140,9 @@ end
 ```
 
 ### Step 2: Behaviour + two adapters
+
+**Objective**: Behaviour + two adapters.
+
 
 `lib/json_compare/adapter.ex`:
 
@@ -162,6 +193,9 @@ end
 
 ### Step 3: Top-level module
 
+**Objective**: Provide Top-level module — these are the supporting fixtures the main module depends on to make its concept demonstrable.
+
+
 `lib/json_compare.ex`:
 
 ```elixir
@@ -180,6 +214,9 @@ end
 ```
 
 ### Step 4: Tests
+
+**Objective**: Tests.
+
 
 `test/json_compare_test.exs`:
 
@@ -216,6 +253,9 @@ end
 ```
 
 ### Step 5: Benchmark
+
+**Objective**: Benchmark.
+
 
 `bench/encode_decode.exs`:
 
@@ -254,6 +294,20 @@ see Jason ~2–3× faster on decode and faster on encode, with less memory.
 
 ---
 
+## Key Concepts
+
+Jason and Poison are JSON libraries—Jason is newer, faster, and the modern standard. Both parse JSON strings to Elixir maps and encode maps back to JSON strings. Jason has stricter defaults (rejects invalid UTF-8), better error messages, and faster encoding. Jason is a Rust binary (NIF), so it's compiled; Poison is pure Elixir. Poison is older but still works; new projects should use Jason. The API is nearly identical, so switching is straightforward. Jason is now the community standard and included in most Phoenix projects.
+
+---
+
+## Deep Dive: Library Selection and Ecosystem Momentum
+
+Choosing between Jason and Poison is not just a performance question—it's about ecosystem alignment. Jason is the de facto standard in Phoenix, Ecto, Req, and most actively maintained libraries. New projects should default to Jason unless you have a specific reason not to (e.g., an old codebase already using Poison). The migration path is simple: the APIs are nearly identical, so swapping the dependency name in `mix.exs` and recompiling usually works.
+
+The performance advantage of Jason (2–3× on decode) comes from its approach: binary pattern matching directly on input, minimizing intermediate allocations. For typical JSON payloads (API responses, tens of KB), this matters. For small JSON blobs or infrequent operations, the difference is negligible. However, in high-throughput systems (millions of requests per day), the cumulative effect of faster decode is measurable.
+
+One often-overlooked detail: the encoding protocol. Both libraries define a protocol for custom serialization, but they're incompatible. If you're migrating or maintaining a codebase with both libraries, either derive both or commit to one. Library selection is a form of technical debt—standardizing early saves migration pain later when you want to drop the deprecated library.""",
+
 ## Trade-offs and production gotchas
 
 **1. `keys: :atoms` is a footgun**
@@ -288,6 +342,20 @@ it — both work. Migrate only when Poison becomes a blocker (e.g.,
 a dependency needs `Jason.Encoder`).
 
 ---
+
+## Benchmark
+
+Benchee-based comparison lives in `bench/encode_decode.exs`. Expected signal on a modern laptop:
+
+- `Jason.decode` ≈ 2–3× faster than `Poison.decode` on typical API payloads.
+- `Jason.encode` ≈ 1.5–2× faster than `Poison.encode`.
+- Memory pressure lower for Jason due to binary-pattern-match decoding.
+
+Run with `mix run bench/encode_decode.exs`.
+
+## Reflection
+
+- If OTP 27's stdlib `:json` module is ~15% slower than Jason on decode but ships with Erlang, at what project size does "one less dependency" outweigh the performance gap — and does the answer change for a library you publish to hex.pm versus a closed-source service?
 
 ## Resources
 

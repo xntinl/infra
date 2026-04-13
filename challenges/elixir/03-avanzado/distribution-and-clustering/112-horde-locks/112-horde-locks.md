@@ -182,6 +182,8 @@ as recovery time. Never use infinite-TTL locks in production.
 
 ### Step 1: Mix deps
 
+**Objective**: Pin `:horde` plus `:libcluster` so the lock registry uses delta-CRDT replication and auto-joins the BEAM mesh.
+
 ```elixir
 defp deps do
   [
@@ -192,6 +194,8 @@ end
 ```
 
 ### Step 2: Application supervisor
+
+**Objective**: Boot `Cluster.Supervisor`, the Horde unique-keys registry, and the lease dynamic supervisor in one `:one_for_one` tree.
 
 ```elixir
 defmodule HordeDistributedLocks.Application do
@@ -221,6 +225,8 @@ end
 
 ### Step 3: Clock helper
 
+**Objective**: Centralize `System.system_time/1` behind one module so tests can override now-ms without patching every call site.
+
 ```elixir
 defmodule HordeDistributedLocks.Clock do
   @moduledoc "Wrapper around system time — one place to stub in tests."
@@ -231,6 +237,8 @@ end
 ```
 
 ### Step 4: LeaseHolder — the process that owns the lock
+
+**Objective**: Model the lease as a GenServer that registers the key in Horde and ties its lifetime to a monitored caller with auto-renew.
 
 ```elixir
 defmodule HordeDistributedLocks.LeaseHolder do
@@ -339,6 +347,8 @@ end
 ```
 
 ### Step 5: Public Lock API
+
+**Objective**: Expose `acquire/release/with_lock` that hands callers a fencing token so stale holders can be rejected by downstream writers.
 
 ```elixir
 defmodule HordeDistributedLocks.Lock do
@@ -458,6 +468,8 @@ end
 
 ### Step 6: Tests (single-node)
 
+**Objective**: Cover mutual exclusion, caller-death release, and fencing-token monotonicity on one node before multi-node scenarios run.
+
 ```elixir
 defmodule HordeDistributedLocks.LockTest do
   use ExUnit.Case, async: false
@@ -469,92 +481,94 @@ defmodule HordeDistributedLocks.LockTest do
     :ok
   end
 
-  test "acquire returns :ok for a free key" do
-    assert {:ok, handle} = Lock.acquire(:free_key, ttl_ms: 5_000)
-    assert is_pid(handle)
-    assert Process.alive?(handle)
-    Lock.release(handle)
-  end
-
-  test "acquire twice returns :held_by" do
-    {:ok, h1} = Lock.acquire(:contended, ttl_ms: 5_000)
-    assert {:error, :held_by, ^h1} = Lock.acquire(:contended, ttl_ms: 5_000)
-    Lock.release(h1)
-  end
-
-  test "release allows re-acquire" do
-    {:ok, h1} = Lock.acquire(:cycle, ttl_ms: 5_000)
-    Lock.release(h1)
-    # Give Horde a moment to propagate the unregister
-    Process.sleep(50)
-    assert {:ok, h2} = Lock.acquire(:cycle, ttl_ms: 5_000)
-    Lock.release(h2)
-  end
-
-  test "fencing tokens are strictly increasing" do
-    {:ok, h1} = Lock.acquire(:fence, ttl_ms: 5_000)
-    {:ok, t1} = Lock.fencing_token(h1)
-    Lock.release(h1)
-    Process.sleep(50)
-
-    {:ok, h2} = Lock.acquire(:fence, ttl_ms: 5_000)
-    {:ok, t2} = Lock.fencing_token(h2)
-    Lock.release(h2)
-
-    assert t2 > t1
-  end
-
-  test "acquire_with_timeout blocks up to wait_ms" do
-    {:ok, h1} = Lock.acquire(:blocking, ttl_ms: 10_000)
-
-    t0 = System.monotonic_time(:millisecond)
-    result = Lock.acquire_with_timeout(:blocking, ttl_ms: 10_000, wait_ms: 300)
-    elapsed = System.monotonic_time(:millisecond) - t0
-
-    assert {:error, :timeout} = result
-    assert elapsed >= 300
-    assert elapsed < 600
-
-    Lock.release(h1)
-  end
-
-  test "with_lock/3 runs fun and releases on success" do
-    assert {:ok, 42} =
-             Lock.with_lock(:wl, [ttl_ms: 5_000, wait_ms: 100], fn _token -> 42 end)
-  end
-
-  test "with_lock/3 releases on exception" do
-    assert_raise RuntimeError, "oops", fn ->
-      Lock.with_lock(:wl_ex, [ttl_ms: 5_000, wait_ms: 100], fn _token ->
-        raise "oops"
-      end)
+  describe "HordeDistributedLocks.Lock" do
+    test "acquire returns :ok for a free key" do
+      assert {:ok, handle} = Lock.acquire(:free_key, ttl_ms: 5_000)
+      assert is_pid(handle)
+      assert Process.alive?(handle)
+      Lock.release(handle)
     end
 
-    # Lock is free again
-    Process.sleep(50)
-    assert {:ok, h} = Lock.acquire(:wl_ex, ttl_ms: 5_000)
-    Lock.release(h)
-  end
+    test "acquire twice returns :held_by" do
+      {:ok, h1} = Lock.acquire(:contended, ttl_ms: 5_000)
+      assert {:error, :held_by, ^h1} = Lock.acquire(:contended, ttl_ms: 5_000)
+      Lock.release(h1)
+    end
 
-  test "caller death releases the lock" do
-    parent = self()
+    test "release allows re-acquire" do
+      {:ok, h1} = Lock.acquire(:cycle, ttl_ms: 5_000)
+      Lock.release(h1)
+      # Give Horde a moment to propagate the unregister
+      Process.sleep(50)
+      assert {:ok, h2} = Lock.acquire(:cycle, ttl_ms: 5_000)
+      Lock.release(h2)
+    end
 
-    child =
-      spawn(fn ->
-        {:ok, _} = Lock.acquire(:auto_release, ttl_ms: 10_000)
-        send(parent, :acquired)
-        receive do
-          :stop -> :ok
-        end
-      end)
+    test "fencing tokens are strictly increasing" do
+      {:ok, h1} = Lock.acquire(:fence, ttl_ms: 5_000)
+      {:ok, t1} = Lock.fencing_token(h1)
+      Lock.release(h1)
+      Process.sleep(50)
 
-    assert_receive :acquired, 1_000
+      {:ok, h2} = Lock.acquire(:fence, ttl_ms: 5_000)
+      {:ok, t2} = Lock.fencing_token(h2)
+      Lock.release(h2)
 
-    Process.exit(child, :kill)
-    Process.sleep(100)
+      assert t2 > t1
+    end
 
-    assert {:ok, h} = Lock.acquire(:auto_release, ttl_ms: 5_000)
-    Lock.release(h)
+    test "acquire_with_timeout blocks up to wait_ms" do
+      {:ok, h1} = Lock.acquire(:blocking, ttl_ms: 10_000)
+
+      t0 = System.monotonic_time(:millisecond)
+      result = Lock.acquire_with_timeout(:blocking, ttl_ms: 10_000, wait_ms: 300)
+      elapsed = System.monotonic_time(:millisecond) - t0
+
+      assert {:error, :timeout} = result
+      assert elapsed >= 300
+      assert elapsed < 600
+
+      Lock.release(h1)
+    end
+
+    test "with_lock/3 runs fun and releases on success" do
+      assert {:ok, 42} =
+               Lock.with_lock(:wl, [ttl_ms: 5_000, wait_ms: 100], fn _token -> 42 end)
+    end
+
+    test "with_lock/3 releases on exception" do
+      assert_raise RuntimeError, "oops", fn ->
+        Lock.with_lock(:wl_ex, [ttl_ms: 5_000, wait_ms: 100], fn _token ->
+          raise "oops"
+        end)
+      end
+
+      # Lock is free again
+      Process.sleep(50)
+      assert {:ok, h} = Lock.acquire(:wl_ex, ttl_ms: 5_000)
+      Lock.release(h)
+    end
+
+    test "caller death releases the lock" do
+      parent = self()
+
+      child =
+        spawn(fn ->
+          {:ok, _} = Lock.acquire(:auto_release, ttl_ms: 10_000)
+          send(parent, :acquired)
+          receive do
+            :stop -> :ok
+          end
+        end)
+
+      assert_receive :acquired, 1_000
+
+      Process.exit(child, :kill)
+      Process.sleep(100)
+
+      assert {:ok, h} = Lock.acquire(:auto_release, ttl_ms: 5_000)
+      Lock.release(h)
+    end
   end
 end
 ```
@@ -565,6 +579,24 @@ end
 ### Why this works
 
 The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
+
+## Deep Dive
+
+Distributed Erlang relies on a heartbeat mechanism (net_kernel tick) to detect node failure, but the network is fundamentally asynchronous—split-brain scenarios are inevitable. A partitioned cluster may have two sets of nodes, each believing the other is dead. Libraries like Horde and Phoenix.PubSub solve this with quorum-aware consensus, but they add latency and complexity. At scale, choose your consistency model explicitly: eventual consistency (via Redis PubSub) is faster but allows temporary divergence; strong consistency (via Horde DLM or distributed transactions) is slower but guarantees atomicity. For global registries, the order of operations matters—registering a process before its monitor is live creates race conditions. In multi-region setups, latency between nodes compounds these issues; consider regional clusters with a lightweight coordinator rather than a fully meshed topology.
+## Advanced Considerations
+
+Distributed Elixir systems require careful consideration of network partitions, consistent hashing for distributed state, and the interaction between clustering libraries and node discovery mechanisms. Network partitions are not rare edge cases; they happen regularly in cloud deployments due to maintenance windows and infrastructure issues. A system that works perfectly during local testing but fails under network partitions indicates insufficient failure handling throughout the codebase. Split-brain scenarios where multiple network partitions lead to different cluster views require explicit recovery mechanisms that are often business-specific and context-dependent.
+
+Horde and distributed registries provide eventual consistency guarantees, but "eventual" can mean minutes during network partitions. Applications must handle the case where the same name is registered on multiple nodes simultaneously without coordination. Consistent hashing for distributed services requires understanding rebalancing costs — a single node failure can cause significant key redistribution and thundering herd problems if not carefully managed. The cost of distributed consensus using algorithms like Raft is high; choose it only when consistency is more important than availability and can afford the performance cost.
+
+Global state replication across nodes creates synchronization challenges at scale. Choosing between replicating everywhere versus replicating to specific nodes affects both consistency latency and network bandwidth utilization fundamentally. Node monitoring and heartbeat mechanisms require careful timeout tuning — too aggressive and you get false positives during network hiccups; too conservative and you don't detect actual failures quickly enough for recovery. The EPMD (Erlang Port Mapper Daemon) is a critical component that can become a bottleneck in large clusters and requires careful capacity planning.
+
+
+## Deep Dive: Cluster Patterns and Production Implications
+
+Clustering distributes computation across nodes using Erlang's distribution protocol. Testing clusters requires simulating node failures, network partitions, and message delays—challenges that single-node tests don't expose. Production clusters fail in ways that cluster tests reveal: nodes can become isolated (stuck), messages can be reordered, and consensus is expensive.
+
+---
 
 ## Trade-offs and production gotchas
 
@@ -655,3 +687,13 @@ Design contract: locks are coarse — don't put them on the hot path of a reques
 - [`:global.trans/4` docs](https://www.erlang.org/doc/man/global.html#trans-4) — BEAM-native alternative
 - [delta_crdt hex package](https://hexdocs.pm/delta_crdt/) — what Horde uses under the hood
 - [Derek Kraan — "Building a distributed system with Horde"](https://derekkraan.com/blog/2020/06/01/announcing-horde-0-8/) — author's blog
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

@@ -115,12 +115,18 @@ end
 
 ### Step 1: Create the project
 
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
+
 ```bash
 mix new proxy_gs
 cd proxy_gs
 ```
 
 ### Step 2: `lib/proxy_gs/backend.ex`
+
+**Objective**: Implement `backend.ex` — the GenServer callback shape that determines blocking vs fire-and-forget semantics and state invariants.
+
 
 ```elixir
 defmodule ProxyGs.Backend do
@@ -149,6 +155,9 @@ end
 ```
 
 ### Step 3: `lib/proxy_gs.ex`
+
+**Objective**: Implement `proxy_gs.ex` — the GenServer callback shape that determines blocking vs fire-and-forget semantics and state invariants.
+
 
 ```elixir
 defmodule ProxyGs do
@@ -227,6 +236,9 @@ end
 
 ### Step 4: `test/proxy_gs_test.exs`
 
+**Objective**: Write `proxy_gs_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+
 ```elixir
 defmodule ProxyGsTest do
   use ExUnit.Case, async: true
@@ -294,6 +306,9 @@ end
 
 ### Step 5: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -320,7 +335,7 @@ assuming the proxy is free.
 **2. `Enum.filter` on timestamps is O(n) per request**
 Fine for small caps (tens per window). For large caps (thousands),
 replace with a ring buffer of counters per sub-bucket or with
-`:counters` + a self-scheduled tick that rotates buckets (exercise 38).
+`:counters` + a self-scheduled tick that rotates buckets.
 Don't carry a list of 10k timestamps per request.
 
 **3. `GenServer.call` to the backend blocks the proxy**
@@ -364,3 +379,17 @@ proxies are for single-node, single-quota gatekeeping.
 - [`Finch` — HTTP client with pool-based gatekeeping](https://hexdocs.pm/finch/)
 - [Alex Koutmos, "Rate limiting in Elixir"](https://akoutmos.com/) — practical deep dive
 - [`:counters` — lock-free counters for hot paths](https://www.erlang.org/doc/man/counters.html)
+
+
+## Advanced Considerations
+
+GenServer is the foundation of stateful concurrent systems in Elixir. Advanced patterns emerge from understanding the synchronous/asynchronous nature of callbacks and state evolution.
+
+**State evolution and message handling:**
+A GenServer's state is private, evolving only through synchronous (`handle_call`) or asynchronous (`handle_cast`) message handlers. The key insight: `handle_call` blocks the caller until the handler returns; `handle_cast` is fire-and-forget. Use `call` for operations requiring acknowledgment or returning results; use `cast` for notifications. Mixing them incorrectly leads to deadlocks (caller waiting forever) or lost updates (state changed before caller knows).
+
+**Advanced reply patterns:**
+The tuple `{:reply, reply, state}` is the standard, but you can split reply and state persistence. Use `:noreply` in `handle_call` if you need to send the reply later (e.g., after an async operation). The `:hibernate` flag tells the VM to garbage-collect the process and switch to a lightweight state — useful for long-lived processes that spend time idle.
+
+**Debugging and observability:**
+`format_status/2` controls how a GenServer appears in `:observer` and logs. It's critical for large state structures (hide sensitive fields, summarize collections). In production, comprehensive logging in callbacks (not just errors) reveals timing issues, message flow anomalies, and resource leaks before they become critical.

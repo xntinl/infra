@@ -126,7 +126,21 @@ Your numbers will vary. Run the benchmark.
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
 
 ```bash
 mix new ets_benchmark
@@ -144,6 +158,9 @@ end
 Then `mix deps.get`.
 
 ### Step 2: `lib/ets_benchmark.ex`
+
+**Objective**: Implement `ets_benchmark.ex` — the access pattern that exposes the trade-off between ETS concurrency flags, match specs, and lookup cost.
+
 
 ```elixir
 defmodule EtsBenchmark do
@@ -203,6 +220,9 @@ end
 
 ### Step 3: `bench/lookup_bench.exs`
 
+**Objective**: Implement `lookup_bench.exs` — the access pattern that exposes the trade-off between ETS concurrency flags, match specs, and lookup cost.
+
+
 ```elixir
 # Run with: mix run bench/lookup_bench.exs
 
@@ -235,6 +255,9 @@ end
 ```
 
 ### Step 4: `test/ets_benchmark_test.exs`
+
+**Objective**: Write `ets_benchmark_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
 
 ```elixir
 defmodule EtsBenchmarkTest do
@@ -299,6 +322,9 @@ end
 
 ### Step 5: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 mix run bench/lookup_bench.exs
@@ -316,6 +342,15 @@ doesn't make it flaky.
 
 ---
 
+
+## Deep Dive: ETS Concurrency Trade-Offs and Operation Atomicity
+
+ETS (Erlang Term Storage) is mutable, shared, in-process state—antithetical to Elixir's immutability. But it's required for specific cases: large shared datasets, fast lookups under contention, atomic counters across processes. Trade-off: operations aren't composable (no atomic multi-table updates without extra bookkeeping), and debugging is harder because mutations are invisible in code.
+
+Use ETS when: (1) true sharing between processes, (2) data is large (megabytes), (3) sub-millisecond latency required. Use GenServer when: (1) single process owns state, (2) dataset is small, (3) complex transition logic.
+
+Most common mistake: using ETS to work around GenServer bottlenecks without profiling. Profile usually shows either handler logic is expensive (move it out) or contention from N processes calling it. ETS solves contention via sharding: split state across tables/processes indexed by key. Always profile before choosing ETS.
+
 ## Benchmark
 
 The whole exercise **is** the benchmark. Target numbers (hardware-dependent,
@@ -332,6 +367,12 @@ N = 10_000
   map:      ~40 ns/lookup
   ets:      ~400 ns/lookup
 ```
+
+---
+
+## Key Concepts
+
+ETS lookups are O(1) hashtable operations, orders of magnitude faster than message passing to a GenServer. Benchmarking reveals the difference: `ets:lookup/2` on an uncontended table is microseconds; `GenServer.call/2` is tens of microseconds. For high-frequency operations (rate limiting, cache hits), this difference is load-bearing—a 10x speedup can be the difference between handling 10k or 100k requests per second. The trade-off: ETS operations are atomic but not transactional; no rollback support. GenServer-backed state can implement custom logic and invariants. Use ETS for simple, fast state (caches, metrics); use GenServer when you need complex orchestration or transaction semantics. Profiling your bottleneck is the first step: if lookups dominate, ETS wins; if logic does, GenServer is clearer.
 
 ---
 

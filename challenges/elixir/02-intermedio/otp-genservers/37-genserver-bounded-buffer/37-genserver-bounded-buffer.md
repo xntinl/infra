@@ -108,12 +108,18 @@ end
 
 ### Step 1: Create the project
 
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
+
 ```bash
 mix new bounded_buffer_gs
 cd bounded_buffer_gs
 ```
 
 ### Step 2: `lib/bounded_buffer_gs.ex`
+
+**Objective**: Implement `bounded_buffer_gs.ex` — the GenServer callback shape that determines blocking vs fire-and-forget semantics and state invariants.
+
 
 ```elixir
 defmodule BoundedBufferGs do
@@ -204,6 +210,9 @@ end
 
 ### Step 3: `test/bounded_buffer_gs_test.exs`
 
+**Objective**: Write `bounded_buffer_gs_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+
 ```elixir
 defmodule BoundedBufferGsTest do
   use ExUnit.Case, async: true
@@ -271,6 +280,9 @@ end
 
 ### Step 4: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -280,6 +292,14 @@ mix test
 ### Why this works
 
 The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+
+## Key Concepts: Back-Pressure and Flow Control in GenServer
+
+A bounded buffer enforces a maximum queue depth: when the buffer is full, callers either block (via `call`) or are rate-limited. This prevents memory unbounded growth when producers outrun consumers. Implementing this in a GenServer requires returning `{:noreply, new_state}` from `handle_cast` and only letting the client know when the buffer has space (via a separate callback or channel).
+
+The trade-off: bounded buffers add complexity (tracking pending callers, managing waitlists) but prevent cascading failures in overloaded systems. Without bounds, a fast upstream data source can crash the GenServer's process heap. GenStage and Flow solve this more elegantly via explicit demand-based backpressure, but a GenServer with a manual bounded buffer is sometimes the right tool for simple point-to-point scenarios.
 
 
 ## Benchmark

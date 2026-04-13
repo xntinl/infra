@@ -1,8 +1,6 @@
 # DynamicSupervisor with Queue-Driven Autoscaling
 
 **Project**: `autoscale_sup` — a DynamicSupervisor that grows and shrinks worker count based on backlog depth.
-**Difficulty**: ★★★★☆
-**Estimated time**: 3–6 hours
 
 ---
 
@@ -120,9 +118,35 @@ Asymmetry is intentional: scale up fast, scale down slow.
 
 ---
 
+## Design decisions
+
+**Option A — static pool sized for peak load**
+- Pros: simple; zero moving parts; throughput predictable.
+- Cons: wastes memory at idle; under-provisions anyway when peak exceeds estimate.
+
+**Option B — DynamicSupervisor + scaler watching queue head age** (chosen)
+- Pros: zero workers at idle; expands on burst; cooldown and hysteresis dampen oscillation.
+- Cons: scaler is a new component to reason about; draining requires explicit worker contract; `max_children` must be set to prevent runaway.
+
+→ Chose **B** because the workload is bursty with long idle intervals, and the static pool's wasted memory is a concrete cost visible in every deploy.
+
+---
+
 ## Implementation
 
 ### Step 1: `mix.exs`
+
+**Objective**: Pull in `:telemetry` so scaling decisions and worker latency emit structured events instead of ad-hoc logs.
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
 
 ```elixir
 defmodule AutoscaleSup.MixProject do
@@ -151,6 +175,8 @@ end
 
 ### Step 2: `lib/autoscale_sup/application.ex`
 
+**Objective**: Order `Queue → WorkerSup → Scaler` under `:rest_for_one` so a scaler crash cannot leave orphan workers pulling from a dead queue.
+
 ```elixir
 defmodule AutoscaleSup.Application do
   @moduledoc false
@@ -170,6 +196,8 @@ end
 ```
 
 ### Step 3: `lib/autoscale_sup/queue.ex`
+
+**Objective**: Expose `head_age_ms/0` as the scaling signal — depth alone lies when jobs are long, head age measures real backpressure.
 
 ```elixir
 defmodule AutoscaleSup.Queue do
@@ -232,6 +260,8 @@ end
 
 ### Step 4: `lib/autoscale_sup/worker_sup.ex`
 
+**Objective**: Implement the module in `lib/autoscale_sup/worker_sup.ex`.
+
 ```elixir
 defmodule AutoscaleSup.WorkerSup do
   use DynamicSupervisor
@@ -260,6 +290,8 @@ end
 ```
 
 ### Step 5: `lib/autoscale_sup/worker.ex`
+
+**Objective**: Implement the module in `lib/autoscale_sup/worker.ex`.
 
 ```elixir
 defmodule AutoscaleSup.Worker do
@@ -324,6 +356,8 @@ end
 ```
 
 ### Step 6: `lib/autoscale_sup/scaler.ex`
+
+**Objective**: Implement the module in `lib/autoscale_sup/scaler.ex`.
 
 ```elixir
 defmodule AutoscaleSup.Scaler do
@@ -437,6 +471,8 @@ end
 
 ### Step 7: `test/scaler_test.exs`
 
+**Objective**: Write tests in `test/scaler_test.exs` covering behavior and edge cases.
+
 ```elixir
 defmodule AutoscaleSup.ScalerTest do
   use ExUnit.Case, async: false
@@ -448,56 +484,62 @@ defmodule AutoscaleSup.ScalerTest do
     :ok
   end
 
-  test "scaler stays at min when queue is idle" do
-    Process.sleep(600)
-    assert WorkerSup.active_count() == 0
-  end
+  describe "AutoscaleSup.Scaler" do
+    test "scaler stays at min when queue is idle" do
+      Process.sleep(600)
+      assert WorkerSup.active_count() == 0
+    end
 
-  test "scaler grows workers under burst" do
-    for i <- 1..200, do: Queue.enqueue({:sleep, 10})
-    # allow a few ticks
-    Process.sleep(1_200)
-    assert WorkerSup.active_count() >= 4
-    # and the queue drains
-    Process.sleep(3_000)
-    assert Queue.depth() == 0
-  end
+    test "scaler grows workers under burst" do
+      for i <- 1..200, do: Queue.enqueue({:sleep, 10})
+      # allow a few ticks
+      Process.sleep(1_200)
+      assert WorkerSup.active_count() >= 4
+      # and the queue drains
+      Process.sleep(3_000)
+      assert Queue.depth() == 0
+    end
 
-  test "snapshot exposes live state" do
-    snap = Scaler.snapshot()
-    assert is_integer(snap.workers)
-    assert is_integer(snap.depth)
+    test "snapshot exposes live state" do
+      snap = Scaler.snapshot()
+      assert is_integer(snap.workers)
+      assert is_integer(snap.depth)
+    end
   end
 end
 ```
 
 ### Step 8: `test/integration_test.exs`
 
+**Objective**: Write tests in `test/integration_test.exs` covering behavior and edge cases.
+
 ```elixir
 defmodule AutoscaleSup.IntegrationTest do
   use ExUnit.Case, async: false
 
-  test "p95 latency under 1s for 2000-job burst" do
-    ref = make_ref()
-    test_pid = self()
+  describe "AutoscaleSup.Integration" do
+    test "p95 latency under 1s for 2000-job burst" do
+      ref = make_ref()
+      test_pid = self()
 
-    :telemetry.attach_many(
-      "latency-probe-#{inspect(ref)}",
-      [[:autoscale_sup, :worker, :processed]],
-      fn _event, measurements, _meta, _ ->
-        send(test_pid, {ref, measurements.latency_ms})
-      end,
-      nil
-    )
+      :telemetry.attach_many(
+        "latency-probe-#{inspect(ref)}",
+        [[:autoscale_sup, :worker, :processed]],
+        fn _event, measurements, _meta, _ ->
+          send(test_pid, {ref, measurements.latency_ms})
+        end,
+        nil
+      )
 
-    for _ <- 1..2_000, do: AutoscaleSup.Queue.enqueue({:sleep, 5})
+      for _ <- 1..2_000, do: AutoscaleSup.Queue.enqueue({:sleep, 5})
 
-    latencies = collect(ref, 2_000, [])
-    :telemetry.detach("latency-probe-#{inspect(ref)}")
+      latencies = collect(ref, 2_000, [])
+      :telemetry.detach("latency-probe-#{inspect(ref)}")
 
-    sorted = Enum.sort(latencies)
-    p95 = Enum.at(sorted, div(length(sorted) * 95, 100))
-    assert p95 < 1_000, "p95 was #{p95} ms"
+      sorted = Enum.sort(latencies)
+      p95 = Enum.at(sorted, div(length(sorted) * 95, 100))
+      assert p95 < 1_000, "p95 was #{p95} ms"
+    end
   end
 
   defp collect(_ref, 0, acc), do: acc
@@ -513,6 +555,8 @@ end
 ```
 
 ### Step 9: `bench/burst_bench.exs`
+
+**Objective**: Implement the script in `bench/burst_bench.exs`.
 
 ```elixir
 Benchee.run(
@@ -543,6 +587,23 @@ defmodule B do
   end
 end
 ```
+
+---
+
+## Advanced Considerations: Partitioned Supervisors and Custom Restart Strategies
+
+A standard Supervisor is a single process managing a static tree. For thousands of children, a single supervisor becomes a bottleneck: all supervisor callbacks run on one process, and supervisor restart logic is sequential. PartitionSupervisor (OTP 25+) spawns N independent supervisors, each managing a subset of children. Hashing the child ID determines which partition supervises it, distributing load and enabling horizontal scaling.
+
+Custom restart strategies (via `Supervisor.init/2` callback) allow logic beyond the defaults. A strategy might prioritize restarting dependent services in a specific order, or apply backoff based on restart frequency. The downside is complexity: custom logic is harder to test and reason about, and mistakes cascade. Start with defaults and profile before adding custom behavior.
+
+Selective restart via `:rest_for_one` or `:one_for_all` affects failure isolation. `:one_for_all` restarts all children when one fails (simulating a total system failure), which can be necessary for consistency but is expensive. `:rest_for_one` restarts the failed child and any started after it, balancing isolation and dependencies. Understanding which strategy fits your architecture prevents cascading failures and unnecessary restarts.
+
+---
+
+
+## Deep Dive: Property Patterns and Production Implications
+
+Property-based testing inverts the testing mindset: instead of writing examples, you state invariants (properties) and let a generator find counterexamples. StreamData's shrinking capability is its superpower—when a property fails on a 10,000-element list, the framework reduces it to the minimal list that still fails, cutting debugging time from hours to minutes. The trade-off is that properties require rigorous thinking about domain constraints, and not every invariant is worth expressing as a property. Teams that adopt property testing often find bugs in specifications themselves, not just implementations.
 
 ---
 
@@ -584,6 +645,10 @@ and has zero scaler overhead. If your jobs are sub-millisecond and CPU-bound,
 a `Task.async_stream` with `max_concurrency: System.schedulers_online()` beats
 process-per-job because you skip process-create/destroy overhead.
 
+### Why this works
+
+The scaler watches a scaling signal (queue head age) that directly correlates with SLA, not an indirect proxy like CPU. Asymmetric cooldowns make scale-up fast and scale-down slow, which matches the incident-cost asymmetry: under-provisioning hurts users, over-provisioning wastes money. Workers drain cooperatively by finishing the current job before exiting, so the scaler never has to choose between latency and correctness.
+
 ---
 
 ## Benchmark
@@ -598,6 +663,15 @@ Expected numbers on a modern 8-core laptop:
 
 Run `mix run bench/burst_bench.exs` to reproduce. If your numbers are 3x worse, verify
 the telemetry handler is not doing synchronous I/O.
+
+Target: p95 ≤ 1 s for a 2k-job burst with peak workers ≤ 50; zero workers between bursts.
+
+---
+
+## Reflection
+
+1. Your workload shifts to steady 500 jobs/s instead of bursty. Which scaling signal would you use now — head age, EMA of depth, or arrival rate — and why does the bursty-regime choice stop working?
+2. The scaler itself becomes a bottleneck at 10k workers/s churn. Do you partition with `PartitionSupervisor`, run multiple scalers, or change the scheduling signal to reduce churn? Compare the operational complexity of each.
 
 ---
 

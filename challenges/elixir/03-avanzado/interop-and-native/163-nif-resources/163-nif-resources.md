@@ -121,6 +121,8 @@ An ETS table holding a resource keeps the resource alive forever. Common mistake
 
 ### Step 1: `native/nif_resources_nif/Cargo.toml`
 
+**Objective**: Declare parking_lot dep so RwLock skips poison semantics, allowing concurrent reads without NIF panic recovery overhead.
+
 ```toml
 [package]
 name = "nif_resources_nif"
@@ -137,6 +139,8 @@ parking_lot = "0.12"
 ```
 
 ### Step 2: `native/nif_resources_nif/src/lib.rs`
+
+**Objective**: Register opaque ResourceArc<Store> so BEAM refcounts the backing HashMap across processes and avoids GC race conditions.
 
 ```rust
 use parking_lot::RwLock;
@@ -197,6 +201,18 @@ rustler::init!(
 
 ### Step 3: `lib/nif_resources/native.ex`
 
+**Objective**: Provide opaque resource type so callers never inspect or serialize the backing BEAM reference directly.
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
+
 ```elixir
 defmodule NifResources.Native do
   @moduledoc "Raw NIF surface — prefer `NifResources.Store` for application code."
@@ -226,6 +242,8 @@ end
 ```
 
 ### Step 4: `lib/nif_resources/store.ex`
+
+**Objective**: Normalize raw NIF atoms to typed tuples so application code never pattern-matches on foreign NIF result shapes.
 
 ```elixir
 defmodule NifResources.Store do
@@ -262,6 +280,8 @@ end
 
 ### Step 5: `mix.exs`
 
+**Objective**: Configure Rustler crates for release mode so optimized dylib rebuilds automatically when Rust sources change.
+
 ```elixir
 defmodule NifResources.MixProject do
   use Mix.Project
@@ -282,65 +302,69 @@ end
 
 ### Step 6: `test/nif_resources_test.exs`
 
+**Objective**: Verify resource opaqueness, cross-process reference identity, concurrent write safety, and GC-driven resource cleanup.
+
 ```elixir
 defmodule NifResourcesTest do
   use ExUnit.Case, async: true
   alias NifResources.Store
 
-  test "basic CRUD" do
-    s = Store.new()
-    assert Store.size(s) == 0
-    :ok = Store.put(s, "a", "1")
-    :ok = Store.put(s, "b", "2")
-    assert Store.size(s) == 2
-    assert {:ok, "1"} = Store.fetch(s, "a")
-    assert :error = Store.fetch(s, "missing")
-    assert Store.delete(s, "a")
-    refute Store.delete(s, "a")
-    assert Store.size(s) == 1
-  end
-
-  test "resource is opaque reference" do
-    s = Store.new()
-    assert is_reference(s)
-  end
-
-  test "resource survives sending across processes" do
-    s = Store.new()
-    Store.put(s, "shared", "yes")
-    parent = self()
-    spawn(fn -> send(parent, Store.fetch(s, "shared")) end)
-    assert_receive {:ok, "yes"}, 500
-  end
-
-  test "concurrent writes from many processes" do
-    s = Store.new()
-
-    tasks =
-      for i <- 1..200 do
-        Task.async(fn -> Store.put(s, "k#{i}", "v#{i}") end)
-      end
-
-    Enum.each(tasks, &Task.await/1)
-    assert Store.size(s) == 200
-  end
-
-  test "drop runs when the last reference is GCd" do
-    # Capture process memory, create & drop many stores, confirm no leak
-    :erlang.garbage_collect()
-    before = :erlang.memory(:total)
-
-    for _ <- 1..1_000 do
+  describe "NifResources" do
+    test "basic CRUD" do
       s = Store.new()
-      for j <- 1..100, do: Store.put(s, "k#{j}", "v#{j}")
-      # s goes out of scope here
+      assert Store.size(s) == 0
+      :ok = Store.put(s, "a", "1")
+      :ok = Store.put(s, "b", "2")
+      assert Store.size(s) == 2
+      assert {:ok, "1"} = Store.fetch(s, "a")
+      assert :error = Store.fetch(s, "missing")
+      assert Store.delete(s, "a")
+      refute Store.delete(s, "a")
+      assert Store.size(s) == 1
     end
 
-    :erlang.garbage_collect()
-    after_ = :erlang.memory(:total)
+    test "resource is opaque reference" do
+      s = Store.new()
+      assert is_reference(s)
+    end
 
-    # Rough sanity — must not grow by more than a few MB
-    assert after_ - before < 10_000_000
+    test "resource survives sending across processes" do
+      s = Store.new()
+      Store.put(s, "shared", "yes")
+      parent = self()
+      spawn(fn -> send(parent, Store.fetch(s, "shared")) end)
+      assert_receive {:ok, "yes"}, 500
+    end
+
+    test "concurrent writes from many processes" do
+      s = Store.new()
+
+      tasks =
+        for i <- 1..200 do
+          Task.async(fn -> Store.put(s, "k#{i}", "v#{i}") end)
+        end
+
+      Enum.each(tasks, &Task.await/1)
+      assert Store.size(s) == 200
+    end
+
+    test "drop runs when the last reference is GCd" do
+      # Capture process memory, create & drop many stores, confirm no leak
+      :erlang.garbage_collect()
+      before = :erlang.memory(:total)
+
+      for _ <- 1..1_000 do
+        s = Store.new()
+        for j <- 1..100, do: Store.put(s, "k#{j}", "v#{j}")
+        # s goes out of scope here
+      end
+
+      :erlang.garbage_collect()
+      after_ = :erlang.memory(:total)
+
+      # Rough sanity — must not grow by more than a few MB
+      assert after_ - before < 10_000_000
+    end
   end
 end
 ```
@@ -351,6 +375,24 @@ end
 ### Why this works
 
 The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
+
+## Advanced Considerations: Resource Lifecycle and GC Interaction
+
+NIF resources are opaque handles — the Rust struct lives off-heap, pointed to by a small BEAM term. When the term is garbage collected, the resource's drop function fires. This design is elegant but has subtle pitfalls. First, **GC delay**: if a resource allocates 100 MB and goes out of scope, it doesn't immediately free memory. It only frees when the GC cycle runs, which may be seconds later on a lightly-loaded system. In a tight loop creating many resources, you can exhaust memory before GC kicks in — the fix is explicit `erlang:garbage_collect/0` or using `spawn_link` per-batch.
+
+**Shared mutable state** inside resources is dangerous. A resource wrapping a `Mutex<HashMap>` is thread-safe in Rust, but Elixir processes are single-threaded. If two processes hold the same resource handle, concurrent NIF calls lock under the mutex — acceptable. But if you're storing the resource in an ETS table and expecting isolated reads, you're wrong: ETS is a global shared structure, and two processes reading from the same row trigger concurrent NIF execution. The resource must be truly concurrent-safe (atomics, Arc<DashMap>) or you need a GenServer wrapper per-resource.
+
+**Resource type identity** is checked by pointer, not by module. If you export a resource as a term and a client passes it back, Rustler validates the type via the stored vtable pointer. But if your NIF library is reloaded (hot code upgrade), the old resource type's pointer changes. A client holding an old resource term will fail with "resource type mismatch" if passed to the new code. Architecturally, hot upgrades of NIF modules are rare; use stable resource types or manually version them.
+
+**Memory accounting** is opaque to the BEAM. If a resource allocates 500 MB internally (e.g., a HashMap holding indices), `erlang:memory(total)` doesn't include it — only the small term itself. This breaks assumptions about memory limits and GC pressure heuristics. Tools like `recon_alloc` can help, but the safest approach is to cap resource allocations in the Elixir layer via a rate-limited pool.
+
+---
+
+## Deep Dive: Interop Patterns and Production Implications
+
+Interop with native code (NIFs, ports, C extensions) introduces failure modes that pure Elixir code doesn't have: segfaults, memory leaks, deadlocks with the Erlang emulator. Testing interop requires separate test suites for the native layer and integration tests that exercise the boundary.
+
+---
 
 ## Trade-offs and production gotchas
 

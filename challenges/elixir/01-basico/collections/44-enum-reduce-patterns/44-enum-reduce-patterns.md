@@ -80,7 +80,20 @@ Chose **B** because the aggregate shape (`count`, `sum`, `avg`) never needs the 
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### Step 1 — Create the project
+
+**Objective**: Build minimal library so reducer lives alone and accumulator-shape decisions are isolated from framework noise.
 
 ```bash
 mix new event_aggregator
@@ -88,6 +101,8 @@ cd event_aggregator
 ```
 
 ### Step 2 — `lib/event_aggregator.ex`
+
+**Objective**: Build counters/revenue/early-exit as single-pass reduce to avoid double-walk cost of group_by+map.
 
 ```elixir
 defmodule EventAggregator do
@@ -162,6 +177,8 @@ end
 
 ### Step 3 — `test/event_aggregator_test.exs`
 
+**Objective**: Prove `reduce_while` truly halts by feeding a million-event tail that must never be inspected when N is satisfied.
+
 ```elixir
 defmodule EventAggregatorTest do
   use ExUnit.Case, async: true
@@ -220,6 +237,8 @@ end
 
 ### Step 4 — Run the tests
 
+**Objective**: Confirm the early-halt test finishes under the reduce-all budget, proving the accumulator shape is the hot path.
+
 ```bash
 mix test
 ```
@@ -232,6 +251,28 @@ All 6 tests should pass.
 
 ---
 
+
+
+---
+## Key Concepts
+
+### 1. `reduce` is the Universal Aggregator
+
+Every aggregation (sum, count, group, partition) can be built with `reduce`. It's the most powerful Enum function because it composes any operation.
+
+```elixir
+Enum.reduce([1, 2, 3], 0, fn x, acc -> acc + x end)  # sum
+```
+
+### 2. Accumulator Must Include All State
+
+If you need to track multiple pieces of information while reducing, put them in the accumulator (a tuple or map). At the end, extract what you need.
+
+### 3. `reduce` is Linear, Not Composable
+
+While powerful, `reduce` does not compose well with pipes—you must write the accumulator logic inline. Use higher-level functions (`map`, `filter`, `group_by`) when available for readability.
+
+---
 ## Benchmark
 
 ```elixir

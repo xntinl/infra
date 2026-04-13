@@ -128,8 +128,97 @@ defp deps do
 end
 ```
 
+### Dependencies (mix.exs)
+
+```elixir
+```elixir
+Task.Supervisor.start_child(MyTaskSup, fun, restart: :transient)
+```
+
+**Important**: a `:transient` task that crashes is restarted with the SAME function closure. If the crash was deterministic (bad input), you restart forever until the supervisor's budget kills the subtree. Always combine `:transient` with idempotent work and an explicit max-retry guard.
+
+### 3. `async_stream_nolink` for bounded concurrency
+
+```elixir
+Task.Supervisor.async_stream_nolink(
+  MyTaskSup,
+  items,
+  fn item -> enrich(item) end,
+  max_concurrency: 16,
+  timeout: 5_000,
+  on_timeout: :kill_task,
+  ordered: false
+)
+```
+
+Key points:
+
+- `max_concurrency` caps in-flight tasks — backpressure is automatic.
+- `on_timeout: :kill_task` produces `{:exit, :timeout}` in the stream instead of propagating the exit.
+- `ordered: false` yields results in completion order (higher throughput when jobs have variable latency).
+- Uses the supervisor's pool — monitored, NOT linked to the caller.
+
+### 4. Draining on shutdown
+
+`Task.Supervisor` inherits from `DynamicSupervisor`. When its parent terminates it:
+
+```
+parent sends :shutdown
+  ↓
+Task.Supervisor sends :shutdown to each child Task
+  ↓
+each Task has `shutdown` ms to exit (default 5000)
+  ↓
+if still alive → :brutal_kill
+```
+
+Configure with `shutdown:` on the child spec. For webhook jobs that must not be killed mid-transaction, set `shutdown: 30_000` and wrap DB work in a transaction that commits atomically.
+
+### 5. Observability
+
+```elixir
+DynamicSupervisor.count_children(MyTaskSup)
+# => %{active: 12, specs: 12, supervisors: 0, workers: 12}
+```
+
+`active` is the in-flight task count — emit it as a gauge metric.
+
+---
+
+## Why `Task.Supervisor` and not Oban
+
+Oban persists jobs to Postgres: survives VM restarts, supports retries with backoff, has a UI. It is the correct tool when durability crosses process boundaries. The workloads here — verifying a signature, writing a row, emitting an event — are in-flight within one VM lifetime. Paying for a DB round-trip per job is wasteful. `Task.Supervisor` is the OTP-native answer: zero dependencies, in-memory, integrates with Supervisor drain semantics. The cost is that a hard VM crash loses in-flight work; for idempotent webhooks whose producer retries on timeout, that cost is acceptable.
+
+---
+
+## Design decisions
+
+**Option A — `Task.async/await` in the HTTP handler**
+- Pros: trivial; result flows back; zero supervision overhead.
+- Cons: task is linked to the request; request timeout kills the task mid-transaction; request crash kills idempotent work that already succeeded.
+
+**Option B — `Task.Supervisor.start_child` with `:transient` + max-attempts guard** (chosen)
+- Pros: decoupled lifecycle; supervisor-visible retry on crash; observable via `count_children/1`; participates in graceful shutdown drain.
+- Cons: must engineer idempotency and an explicit attempt counter to avoid infinite retries on deterministic crashes.
+
+→ Chose **B** because the incidents described ("request timeout kills mid-DB-commit", "handler crash loses idempotent progress") are direct consequences of linked lifecycle — and the Supervisor's observability is needed for deploy-time drain.
+
+---
+
+## Implementation
+
+### Dependencies (`mix.exs`)
+
+```elixir
+defp deps do
+  []
+end
+```
+
 
 ### Step 1: Application
+
+**Objective**: Boot Task.Supervisor so webhooks run decoupled from HTTP lifecycle without killing idempotent in-flight work on request crash.
 
 ```elixir
 # lib/task_sup_dynamic/application.ex
@@ -149,6 +238,8 @@ end
 ```
 
 ### Step 2: Webhook processor with `:transient` retry and max attempts
+
+**Objective**: Use :transient restart with explicit max_attempts guard so transient DB blips retry once but deterministic errors don't loop forever.
 
 ```elixir
 # lib/task_sup_dynamic/webhook_processor.ex
@@ -219,6 +310,8 @@ end
 
 ### Step 3: Batch enricher with `async_stream_nolink`
 
+**Objective**: Use async_stream_nolink with max_concurrency so failing items yield {:exit, reason} without cascading to other items or caller.
+
 ```elixir
 # lib/task_sup_dynamic/batch_enricher.ex
 defmodule TaskSupDynamic.BatchEnricher do
@@ -257,6 +350,8 @@ end
 
 ### Step 4: Tests
 
+**Objective**: Add tests that cover the expected behavior and edge cases.
+
 ```elixir
 # test/task_sup_dynamic/webhook_processor_test.exs
 defmodule TaskSupDynamic.WebhookProcessorTest do
@@ -264,28 +359,30 @@ defmodule TaskSupDynamic.WebhookProcessorTest do
 
   alias TaskSupDynamic.WebhookProcessor
 
-  test "happy path completes and is not restarted" do
-    {:ok, pid} = WebhookProcessor.enqueue(%{id: "wh-1", payload: %{"ok" => true}})
-    ref = Process.monitor(pid)
-    assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 1_000
-  end
-
-  test "transient failure is retried by the supervisor" do
-    id = "wh-retry-#{System.unique_integer()}"
-    {:ok, pid} = WebhookProcessor.enqueue(%{id: id, payload: %{"id" => id, "fail_once" => true}})
-    ref = Process.monitor(pid)
-    assert_receive {:DOWN, ^ref, :process, _, _reason}, 2_000
-  end
-
-  test "in_flight reports active tasks" do
-    before = WebhookProcessor.in_flight()
-
-    for i <- 1..5 do
-      WebhookProcessor.enqueue(%{id: "wh-#{i}", payload: %{"slow" => 200}})
+  describe "TaskSupDynamic.WebhookProcessor" do
+    test "happy path completes and is not restarted" do
+      {:ok, pid} = WebhookProcessor.enqueue(%{id: "wh-1", payload: %{"ok" => true}})
+      ref = Process.monitor(pid)
+      assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 1_000
     end
 
-    Process.sleep(50)
-    assert WebhookProcessor.in_flight() >= before
+    test "transient failure is retried by the supervisor" do
+      id = "wh-retry-#{System.unique_integer()}"
+      {:ok, pid} = WebhookProcessor.enqueue(%{id: id, payload: %{"id" => id, "fail_once" => true}})
+      ref = Process.monitor(pid)
+      assert_receive {:DOWN, ^ref, :process, _, _reason}, 2_000
+    end
+
+    test "in_flight reports active tasks" do
+      before = WebhookProcessor.in_flight()
+
+      for i <- 1..5 do
+        WebhookProcessor.enqueue(%{id: "wh-#{i}", payload: %{"slow" => 200}})
+      end
+
+      Process.sleep(50)
+      assert WebhookProcessor.in_flight() >= before
+    end
   end
 end
 ```
@@ -297,28 +394,30 @@ defmodule TaskSupDynamic.BatchEnricherTest do
 
   alias TaskSupDynamic.BatchEnricher
 
-  test "enriches all records successfully" do
-    records = for i <- 1..20, do: %{"i" => i}
-    results = BatchEnricher.enrich_all(records, max_concurrency: 4)
-    assert length(results) == 20
-    assert Enum.all?(results, &match?({:ok, %{"enriched" => true}}, &1))
-  end
+  describe "TaskSupDynamic.BatchEnricher" do
+    test "enriches all records successfully" do
+      records = for i <- 1..20, do: %{"i" => i}
+      results = BatchEnricher.enrich_all(records, max_concurrency: 4)
+      assert length(results) == 20
+      assert Enum.all?(results, &match?({:ok, %{"enriched" => true}}, &1))
+    end
 
-  test "one failing record does not kill the batch" do
-    records = [%{"i" => 1}, %{"fail" => true}, %{"i" => 3}]
-    results = BatchEnricher.enrich_all(records, max_concurrency: 2)
+    test "one failing record does not kill the batch" do
+      records = [%{"i" => 1}, %{"fail" => true}, %{"i" => 3}]
+      results = BatchEnricher.enrich_all(records, max_concurrency: 2)
 
-    assert length(results) == 3
-    assert Enum.count(results, &match?({:exit, _}, &1)) == 1
-    assert Enum.count(results, &match?({:ok, _}, &1)) == 2
-  end
+      assert length(results) == 3
+      assert Enum.count(results, &match?({:exit, _}, &1)) == 1
+      assert Enum.count(results, &match?({:ok, _}, &1)) == 2
+    end
 
-  test "timeout produces :kill_task exit, not a raise" do
-    records = [%{"slow" => 5_000}, %{"slow" => 10}]
-    results = BatchEnricher.enrich_all(records, max_concurrency: 2)
+    test "timeout produces :kill_task exit, not a raise" do
+      records = [%{"slow" => 5_000}, %{"slow" => 10}]
+      results = BatchEnricher.enrich_all(records, max_concurrency: 2)
 
-    assert Enum.any?(results, &match?({:exit, :timeout}, &1))
-    assert Enum.any?(results, &match?({:ok, _}, &1))
+      assert Enum.any?(results, &match?({:exit, :timeout}, &1))
+      assert Enum.any?(results, &match?({:ok, _}, &1))
+    end
   end
 end
 ```
@@ -326,6 +425,23 @@ end
 ### Why this works
 
 `start_child` monitors (not links) the task, so the HTTP handler crashing leaves the task running. `restart: :transient` gives retry-on-crash while skipping `exit(:normal)` (the attempt-cap escape hatch). `shutdown: 30_000` gives the supervisor 30 s to drain during deploy, matching DB commit windows. For batch fan-out, `async_stream_nolink` with `on_timeout: :kill_task` turns a stuck task into a `{:exit, :timeout}` tuple rather than propagating the exit to the parent — partial results survive individual failures.
+
+---
+
+## Advanced Considerations: Partitioned Supervisors and Custom Restart Strategies
+
+A standard Supervisor is a single process managing a static tree. For thousands of children, a single supervisor becomes a bottleneck: all supervisor callbacks run on one process, and supervisor restart logic is sequential. PartitionSupervisor (OTP 25+) spawns N independent supervisors, each managing a subset of children. Hashing the child ID determines which partition supervises it, distributing load and enabling horizontal scaling.
+
+Custom restart strategies (via `Supervisor.init/2` callback) allow logic beyond the defaults. A strategy might prioritize restarting dependent services in a specific order, or apply backoff based on restart frequency. The downside is complexity: custom logic is harder to test and reason about, and mistakes cascade. Start with defaults and profile before adding custom behavior.
+
+Selective restart via `:rest_for_one` or `:one_for_all` affects failure isolation. `:one_for_all` restarts all children when one fails (simulating a total system failure), which can be necessary for consistency but is expensive. `:rest_for_one` restarts the failed child and any started after it, balancing isolation and dependencies. Understanding which strategy fits your architecture prevents cascading failures and unnecessary restarts.
+
+---
+
+
+## Deep Dive: Supervisor Patterns and Production Implications
+
+Supervisor trees define fault tolerance at the application level. Testing supervisor restart strategies (one_for_one, rest_for_one, one_for_all) requires reasoning about side effects of crashes across multiple children. The insight is that your test should verify not just that a child restarts, but that dependent state (ETS tables, connections, message queues) is properly initialized after restart. Production incidents often involve restart loops under load—a supervisor that works fine in quiet tests can spin wildly when children fail faster than they recover.
 
 ---
 

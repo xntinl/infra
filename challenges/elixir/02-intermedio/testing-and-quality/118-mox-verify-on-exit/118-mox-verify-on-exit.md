@@ -4,9 +4,6 @@
 `WeatherClient` behaviour, tested with Mox so network calls never happen
 in tests.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -39,6 +36,16 @@ mox_demo/
 │   └── test_helper.exs
 └── mix.exs
 ```
+
+---
+
+## Why Mox and not monkey-patching libraries
+
+Librerías como `:meck` reemplazan módulos en runtime — rompen tests
+paralelos, filtran entre módulos, producen "pasa en dev, falla en
+prod". Mox impone disciplina: mocks deben implementar un behaviour,
+se configuran vía application env, y se integran con ExUnit para
+detectar expectations no cumplidas.
 
 ---
 
@@ -93,9 +100,41 @@ descendants, allowing async tests.
 
 ---
 
+## Design decisions
+
+**Option A — Inyectar dependencia como argumento en cada función**
+- Pros: Explícito; sin config global.
+- Cons: Boilerplate en cada call site; rompe la API pública.
+
+**Option B — Resolver vía `Application.fetch_env/2`** (elegida)
+- Pros: API pública intacta; test swap vía config es trivial.
+- Cons: Config global es estado compartido; debe configurarse en
+  `test.exs` explícitamente.
+
+→ Elegida **B** porque la dependencia es implementación privada; los
+tests acceden vía la misma indirección que prod.
+
+---
+
+### Dependencies (`mix.exs`)
+
+```elixir
+def deps do
+  [
+    {config},
+    {error},
+    {exunit},
+    {mox},
+    {ok},
+  ]
+end
+```
 ## Implementation
 
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
 
 ```bash
 mix new mox_demo
@@ -112,6 +151,9 @@ end
 
 ### Step 2: `lib/weather_client.ex` — the behaviour
 
+**Objective**: Edit `weather_client.ex` — the behaviour, exposing the subject under test — shaped specifically to make the testing technique of this lab observable.
+
+
 ```elixir
 defmodule WeatherClient do
   @moduledoc "Contract for a weather data provider."
@@ -124,6 +166,9 @@ end
 ```
 
 ### Step 3: `lib/weather_client_http.ex` — production impl (stub)
+
+**Objective**: Edit `weather_client_http.ex` — production impl (stub), exposing the subject under test — shaped specifically to make the testing technique of this lab observable.
+
 
 ```elixir
 defmodule WeatherClientHTTP do
@@ -139,6 +184,9 @@ end
 ```
 
 ### Step 4: `lib/weather_reporter.ex` — the code under test
+
+**Objective**: Edit `weather_reporter.ex` — the code under test, exposing the subject under test — shaped specifically to make the testing technique of this lab observable.
+
 
 ```elixir
 defmodule WeatherReporter do
@@ -162,6 +210,9 @@ end
 
 ### Step 5: `config/test.exs`
 
+**Objective**: Implement `test.exs` — the subject under test — shaped specifically to make the testing technique of this lab observable.
+
+
 ```elixir
 import Config
 
@@ -169,6 +220,9 @@ config :mox_demo, :weather_client, WeatherClientMock
 ```
 
 ### Step 6: `test/test_helper.exs`
+
+**Objective**: Implement `test_helper.exs` — the subject under test — shaped specifically to make the testing technique of this lab observable.
+
 
 ```elixir
 # Defines WeatherClientMock that implements the WeatherClient behaviour.
@@ -178,6 +232,9 @@ ExUnit.start()
 ```
 
 ### Step 7: `test/weather_reporter_test.exs`
+
+**Objective**: Write `weather_reporter_test.exs` exercising the exact ExUnit feature under study — assertions should fail loudly if the technique is misused.
+
 
 ```elixir
 defmodule WeatherReporterTest do
@@ -234,9 +291,29 @@ end
 
 ### Step 8: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
+
+### Why this works
+
+`Mox.defmock/2` crea un módulo que implementa el behaviour.
+`expect/3` registra una expectation en un ETS owned por el test
+process (vía `set_mox_from_context`); cuando el código llama al
+mock, Mox busca en ese ETS y ejecuta el fn definido.
+`verify_on_exit!` se registra como `on_exit` callback y falla el
+test si alguna expectation no se consumió.
+
+---
+
+## Benchmark
+
+<!-- benchmark N/A: Mox es infraestructura de test. Overhead por
+llamada (~10µs por ETS lookup) es despreciable. Si Mox aparece en un
+profile de producción, hay un bug de configuración. -->
 
 ---
 
@@ -271,9 +348,37 @@ wrap it in an adapter and mock the adapter.
 
 ---
 
+## Reflection
+
+- Tu módulo `WeatherReporter` depende de `WeatherClient`,
+  `MetricsClient` y `CacheClient`. Si mockeás los tres en cada test,
+  ¿qué estás testeando realmente? Formulá una regla sobre cuántos
+  mocks son demasiados en un solo test.
+- El equipo decide "cada external IO boundary debe tener un
+  behaviour + Mox mock". Tres meses después hay 40 behaviours con
+  una única implementación de producción cada uno. ¿Paga la
+  disciplina o revertir a llamar directo en app code y mockear solo
+  en librerías?
+
+---
+
 ## Resources
 
 - [Mox — HexDocs](https://hexdocs.pm/mox/Mox.html)
 - [José Valim — "Mocks and explicit contracts"](https://dashbit.co/blog/mocks-and-explicit-contracts) — the design philosophy behind Mox
 - [`@behaviour` — Elixir reference](https://hexdocs.pm/elixir/typespecs.html#behaviours)
 - [Chris Keathley — "Testing GenServers with Mox"](https://keathley.io/blog/)
+
+
+## Key Concepts
+
+ExUnit testing in Elixir balances speed, isolation, and readability. The framework provides fixtures, setup hooks, and async mode to achieve both performance and determinism.
+
+**ExUnit patterns and fixtures:**
+`setup_all` runs once per module (module-scoped state); `setup` runs before each test. Returning `{:ok, map}` injects variables into the test context. For side-effectful setup (e.g., starting supervised processes), use `start_supervised` — it automatically stops the process when the test ends, ensuring cleanup.
+
+**Async safety and isolation:**
+Tests with `async: true` run in parallel, but they must be isolated. Shared resources (database, ETS tables, Registry) require careful locking. A common pattern: `setup :set_myflag` — a private setup that configures a unique state for that test. Avoid global state unless protected by locks.
+
+**Mocking trade-offs:**
+Libraries like `Mox` provide compile-time mock modules that behave like real modules but with controlled behavior. The benefit: you catch missing function implementations at test time. The trade-off: mocks don't catch runtime errors (e.g., a real function that crashes). For critical paths, complement mocks with integration tests against real dependencies. Dependency injection (passing modules as arguments) is more testable than direct calls.

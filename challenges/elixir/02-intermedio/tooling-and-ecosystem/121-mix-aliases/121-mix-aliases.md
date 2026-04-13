@@ -108,9 +108,23 @@ box to everything above it.
 
 ---
 
+### Dependencies (`mix.exs`)
+
+```elixir
+def deps do
+  [
+    {credo},
+    {exunit},
+    {mix},
+  ]
+end
+```
 ## Implementation
 
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
 
 ```bash
 mix new aliases_demo
@@ -118,6 +132,9 @@ cd aliases_demo
 ```
 
 ### Step 2: `mix.exs` — four representative aliases
+
+**Objective**: Edit `mix.exs` — four representative aliases, exposing code whose shape is chosen to exercise the tool's capabilities, not to solve a domain problem.
+
 
 ```elixir
 defmodule AliasesDemo.MixProject do
@@ -174,6 +191,9 @@ end
 
 ### Step 3: Trivial `lib/aliases_demo.ex`
 
+**Objective**: Trivial `lib/aliases_demo.ex`.
+
+
 ```elixir
 defmodule AliasesDemo do
   @moduledoc """
@@ -188,6 +208,9 @@ end
 
 ### Step 4: `test/aliases_demo_test.exs`
 
+**Objective**: Write `aliases_demo_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+
 ```elixir
 defmodule AliasesDemoTest do
   use ExUnit.Case, async: true
@@ -199,6 +222,9 @@ end
 ```
 
 ### Step 5: Exercise the aliases
+
+**Objective**: Exercise the aliases.
+
 
 ```bash
 # Fresh bootstrap
@@ -295,3 +321,20 @@ operations, write a release module (`lib/my_app/release.ex`).
 - [`mix cmd`](https://hexdocs.pm/mix/Mix.Tasks.Cmd.html) — running shell commands inside an alias
 - [Elixir's own `mix.exs`](https://github.com/elixir-lang/elixir/blob/main/mix.exs) — real-world aliases at scale
 - [Phoenix-generated `mix.exs` aliases](https://hexdocs.pm/phoenix/up_and_running.html) — the standard `setup` and `assets.*` aliases
+
+
+## Deep Dive
+
+Elixir's tooling ecosystem extends beyond the language into DevOps, profiling, and observability. Understanding each tool's role prevents misuse and false optimizations.
+
+**Mix tasks and releases:**
+Custom mix tasks (`mix myapp.setup`, `mix myapp.migrate`) encapsulate operational knowledge. Tasks run in the host environment (not the compiled app), so they're ideal for setup, teardown, or scripting. Releases, built with `mix release`, create self-contained OTP applications deployable without Elixir installed. They're immutable: no source code changes after release — all config comes from environment variables or runtime files.
+
+**Debugging and profiling tools:**
+- `:observer` (GUI): real-time process tree, metrics, and port inspection
+- `Recon`: production-safe introspection (stable even under high load)
+- `:eprof`: function-level timing; lower overhead than `:fprof`
+- `:fprof`: detailed trace analysis; use only in staging
+
+**Profiling approaches:**
+Ceiling profiling (e.g., "which modules consume CPU?") is cheap; go there first with `perf` or `eprof`. Floor profiling (e.g., "which lines in this function are slow?") is expensive; reserve for specific functions. In production, prefer metrics (Prometheus, New Relic) over profiling — continuous profiling has overhead. Store profiling data for post-mortem analysis, not real-time dashboards.

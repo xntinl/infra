@@ -81,6 +81,8 @@ ExUnit shuts down automatically.
 
 ### Step 1: workers (deliberately simple)
 
+**Objective**: Ship three minimal GenServers — one `:permanent`, one `:transient`, one inert — so each restart strategy has a deterministic target to crash and observe.
+
 ```elixir
 # lib/payment_gateway/payment_client.ex
 defmodule PaymentGateway.PaymentClient do
@@ -129,6 +131,8 @@ end
 
 ### Step 2: the supervisor
 
+**Objective**: Configure `:one_for_one` with `max_restarts: 3, max_seconds: 5` so restart intensity is a tested policy, not an accidental default.
+
 ```elixir
 # lib/payment_gateway/supervisor.ex
 defmodule PaymentGateway.Supervisor do
@@ -158,6 +162,8 @@ end
 ```
 
 ### Step 3: the tests
+
+**Objective**: Use `Process.monitor` plus `assert_receive {:DOWN, ...}` so restart semantics are asserted deterministically without `Process.sleep` guesswork.
 
 ```elixir
 # test/payment_gateway/supervisor_test.exs
@@ -288,6 +294,21 @@ IO.puts("supervisor suite #{t / 1000}ms")
 
 Target: 5 tests in under 500ms.
 
+## Deep Dive: Supervisor Patterns and Production Implications
+
+Supervisor trees define fault tolerance at the application level. Testing supervisor restart strategies (one_for_one, rest_for_one, one_for_all) requires reasoning about side effects of crashes across multiple children. The insight is that your test should verify not just that a child restarts, but that dependent state (ETS tables, connections, message queues) is properly initialized after restart. Production incidents often involve restart loops under load—a supervisor that works fine in quiet tests can spin wildly when children fail faster than they recover.
+
+---
+
+## Advanced Considerations
+
+Production testing strategies require careful attention to resource management and test isolation across multiple concurrent test processes. In large codebases, tests can consume significant memory and CPU resources, especially when using concurrent testing without proper synchronization and cleanup. The BEAM scheduler's preemptive nature means test processes may interfere with each other if shared resources aren't properly isolated at the process boundary. Pay careful attention to how Ecto's sandbox mode interacts with your supervision tree — if you have GenServers that hold state across tests, the sandbox rollback mechanism may leave phantom processes in your monitoring systems that continue consuming resources until forced cleanup occurs.
+
+When scaling tests to production-grade test suites, consider the cost of stub verification and the memory overhead of generated test cases. Each property-based test invocation can create thousands of synthetic test cases, potentially causing garbage collection pressure that's invisible during local testing but becomes critical in CI/CD pipelines running long test suites continuously. The interaction between concurrent tests and ETS tables (often used in caches and registry patterns) requires explicit `inherited: true` options to prevent unexpected sharing between test processes, which can cause mysterious failures when tests run in different orders or under load.
+
+For distributed testing scenarios using tools like `Peer`, network simulation can mask real latency issues and failure modes. Test timeouts that work locally may fail in CI due to scheduler contention and GC pauses. Always include substantial buffers for timeout values and monitor actual execution times under load. The coordination between multiple test nodes requires careful cleanup — a failure in test coordination can leave zombie processes consuming resources indefinitely. Implement proper telemetry hooks within your test helpers to diagnose production-like scenarios and capture performance characteristics.
+
+
 ## Trade-offs and production gotchas
 
 **1. `async: true` with globally registered names**
@@ -330,3 +351,13 @@ the 4th crash? Read the OTP docs on restart intensity to confirm your answer.
 - [Restart strategy and intensity — Erlang docs](https://www.erlang.org/doc/system/sup_princ.html#supervision-principles)
 - [`Process.monitor/1`](https://hexdocs.pm/elixir/Process.html#monitor/1)
 - [`start_supervised!/1`](https://hexdocs.pm/ex_unit/ExUnit.Callbacks.html#start_supervised!/1)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

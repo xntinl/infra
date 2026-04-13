@@ -3,9 +3,6 @@
 **Project**: `exunit_basics` — a minimal `Calculator` module and a thorough
 test suite that exercises the core ExUnit primitives.
 
-**Difficulty**: ★★☆☆☆
-**Estimated time**: 1–2 hours
-
 ---
 
 ## Project context
@@ -30,6 +27,16 @@ exunit_basics/
 │   └── test_helper.exs
 └── mix.exs
 ```
+
+---
+
+## Why ExUnit primitives and not a BDD framework
+
+ExUnit cubre 95% de los casos con cuatro primitivas (`test`, `assert`,
+`describe`, `setup`) sin dependencias ni DSL extra. Un framework BDD
+agrega vocabulario y ceremonia que se paga en cada test. Para la
+mayoría de suites, ExUnit sin adornos es más rápido de escribir y
+más claro.
 
 ---
 
@@ -63,9 +70,39 @@ the diff, and the file/line. You almost never need `assert_equal` or
 
 ---
 
+## Design decisions
+
+**Option A — `setup` en cada `describe` con helpers locales**
+- Pros: Cada bloque autónomo.
+- Cons: Duplicación cuando varios `describe` necesitan el mismo
+  fixture.
+
+**Option B — `setup` a nivel módulo + override por `describe`** (elegida)
+- Pros: Fixtures comunes en un lugar; overrides específicos donde
+  importa.
+- Cons: Lector debe mirar dos niveles.
+
+→ Elegida **B** elimina duplicación sin sacrificar aislamiento.
+
+---
+
+### Dependencies (`mix.exs`)
+
+```elixir
+def deps do
+  [
+    {error},
+    {exunit},
+    {ok},
+  ]
+end
+```
 ## Implementation
 
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
 
 ```bash
 mix new exunit_basics
@@ -73,6 +110,9 @@ cd exunit_basics
 ```
 
 ### Step 2: `lib/calculator.ex`
+
+**Objective**: Implement `calculator.ex` — the subject under test — shaped specifically to make the testing technique of this lab observable.
+
 
 ```elixir
 defmodule Calculator do
@@ -102,6 +142,9 @@ end
 ```
 
 ### Step 3: `test/calculator_test.exs`
+
+**Objective**: Write `calculator_test.exs` exercising the exact ExUnit feature under study — assertions should fail loudly if the technique is misused.
+
 
 ```elixir
 defmodule CalculatorTest do
@@ -169,11 +212,30 @@ end
 
 ### Step 4: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 mix test --trace   # shows every test name as it runs
 mix test test/calculator_test.exs:45  # run only the test at line 45
 ```
+
+### Why this works
+
+`test/2` define una función que ExUnit detecta por macro. `setup/1`
+registra un callback que corre antes de cada test en su propio
+proceso, y su return se mergea en el context map. `describe/2` solo
+agrupa — el aislamiento viene de que cada test corre en su propio
+proceso, con `async: true` permitiendo paralelismo entre módulos.
+
+---
+
+## Benchmark
+
+<!-- benchmark N/A: el overhead de ExUnit por test está dominado por
+el setup del usuario (IO, creación de procesos). El framework en sí
+agrega <100µs por test. Un microbenchmark del framework no aporta. -->
 
 ---
 
@@ -186,7 +248,7 @@ The race condition *will* show up eventually on CI.
 
 **2. `setup` runs per test, `setup_all` runs once per module**
 `setup_all` is for expensive one-time fixtures (seeding a read-only DB).
-Anything mutable belongs in `setup` to keep tests isolated. See exercise 110.
+Anything mutable belongs in `setup` to keep tests isolated.
 
 **3. `describe` doesn't nest**
 Elixir intentionally does not allow nested `describe` blocks. If you feel
@@ -205,9 +267,35 @@ Test behavior, not plumbing.
 
 ---
 
+## Reflection
+
+- Tu suite tiene 200 tests y corre en 8s. Descubrís que 60% del
+  tiempo está en `setup` con fixtures pesados. ¿Cómo decidís qué
+  mover a `setup_all` sin romper `async: true`? Formulá una
+  checklist de invariantes.
+- Un test falla intermitentemente solo en CI. Sospechás race
+  condition con `async: true`. ¿Qué señales mirás primero en el test
+  y en el código bajo test para confirmar?
+
+---
+
 ## Resources
 
 - [`ExUnit` — HexDocs](https://hexdocs.pm/ex_unit/ExUnit.html)
 - [`ExUnit.Case` — HexDocs](https://hexdocs.pm/ex_unit/ExUnit.Case.html)
 - [`ExUnit.Callbacks` (setup/setup_all) — HexDocs](https://hexdocs.pm/ex_unit/ExUnit.Callbacks.html)
 - ["Testing" — Elixir getting started guide](https://hexdocs.pm/elixir/introduction-to-mix.html#running-tests)
+
+
+## Key Concepts
+
+ExUnit testing in Elixir balances speed, isolation, and readability. The framework provides fixtures, setup hooks, and async mode to achieve both performance and determinism.
+
+**ExUnit patterns and fixtures:**
+`setup_all` runs once per module (module-scoped state); `setup` runs before each test. Returning `{:ok, map}` injects variables into the test context. For side-effectful setup (e.g., starting supervised processes), use `start_supervised` — it automatically stops the process when the test ends, ensuring cleanup.
+
+**Async safety and isolation:**
+Tests with `async: true` run in parallel, but they must be isolated. Shared resources (database, ETS tables, Registry) require careful locking. A common pattern: `setup :set_myflag` — a private setup that configures a unique state for that test. Avoid global state unless protected by locks.
+
+**Mocking trade-offs:**
+Libraries like `Mox` provide compile-time mock modules that behave like real modules but with controlled behavior. The benefit: you catch missing function implementations at test time. The trade-off: mocks don't catch runtime errors (e.g., a real function that crashes). For critical paths, complement mocks with integration tests against real dependencies. Dependency injection (passing modules as arguments) is more testable than direct calls.

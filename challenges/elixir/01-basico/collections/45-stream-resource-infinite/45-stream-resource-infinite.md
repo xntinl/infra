@@ -73,7 +73,20 @@ Chose **B** because the semantics we need — open once, yield as data arrives, 
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### Step 1 — Create the project
+
+**Objective**: Build single module so start/next/after callbacks are side-by-side and resource lifecycle is linear and proven.
 
 ```bash
 mix new log_tailer
@@ -81,6 +94,8 @@ cd log_tailer
 ```
 
 ### Step 2 — `lib/log_tailer.ex`
+
+**Objective**: Contrast stateless Stream.unfold with resource-backed Stream.resource so guaranteed cleanup vs pure lazy is clear.
 
 ```elixir
 defmodule LogTailer do
@@ -144,6 +159,8 @@ end
 
 ### Step 3 — `test/log_tailer_test.exs`
 
+**Objective**: Force `Enum.take` on an infinite fib stream and an appended-to file to prove laziness and `after_fun` cleanup both fire.
+
 ```elixir
 defmodule LogTailerTest do
   use ExUnit.Case, async: true
@@ -192,6 +209,8 @@ end
 
 ### Step 4 — Run the tests
 
+**Objective**: Confirm the infinite-sequence test actually terminates, proving the terminal operation drives demand rather than the stream.
+
 ```bash
 mix test
 ```
@@ -204,6 +223,19 @@ All 4 tests should pass.
 
 ---
 
+
+## Key Concepts
+
+### 1. Streams Are Lazy—Transformations Don't Execute Until Consumed
+Each transformation is queued but not executed. Only when you call `Enum.to_list()` or `Enum.each()` do they execute.
+
+### 2. Infinite Streams Are Possible
+An infinite sequence that only produces needed elements. This is impossible with lists. Streams enable lazy computation.
+
+### 3. Memory Efficiency at Scale
+For a file with 1 billion lines, `Stream.map` processes one line at a time, not loading the entire file into memory.
+
+---
 ## Benchmark
 
 ```elixir

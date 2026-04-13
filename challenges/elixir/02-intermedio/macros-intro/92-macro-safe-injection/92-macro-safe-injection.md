@@ -2,9 +2,6 @@
 
 **Project**: `safe_inject` — contrast two ways of threading runtime values into a `quote` block: inline `unquote/1` vs `quote bind_quoted: [...]`, and show concretely why the second form is safer.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -37,6 +34,16 @@ safe_inject/
 │   └── safe_inject_test.exs
 └── mix.exs
 ```
+
+---
+
+## Why `bind_quoted` and not disciplined `unquote`
+
+La disciplina falla. En un macro con veinte líneas y cuatro
+`unquote(expr)`, un revisor no puede ver la duplicación.
+`bind_quoted` mueve la decisión de "acordate de bindear" a "el
+compilador lo bindea por vos una vez". Es la corrección estructural;
+la alternativa es una convención perpetuamente frágil.
 
 ---
 
@@ -95,9 +102,41 @@ access to the caller's variables. Use `bind_quoted` for *values* and
 
 ---
 
+## Design decisions
+
+**Option A — Mantener `unquote(expr)` y documentar "llamar una vez"**
+- Pros: Cero API agregada; pura convención.
+- Cons: Convenciones se degradan; bugs silenciosos sobreviven a
+  producción.
+
+**Option B — Default `bind_quoted` para valores, `unquote` para code
+blocks del usuario** (elegida)
+- Pros: Garantía estructural de evaluación única; binding hygienic.
+- Cons: Un poco más de tipeo.
+
+→ Elegida **B** porque el failure mode de `unquote` es catastrófico y
+silencioso; keystrokes extra por seguridad estructural es el default
+correcto.
+
+---
+
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
 
 ```bash
 mix new safe_inject
@@ -105,6 +144,9 @@ cd safe_inject
 ```
 
 ### Step 2: `lib/safe_inject.ex`
+
+**Objective**: Implement `safe_inject.ex` — AST manipulation that runs at compile time — making the macro's hygiene and unquoting choices observable.
+
 
 ```elixir
 defmodule SafeInject do
@@ -149,6 +191,9 @@ end
 > caller's expression **exactly once** and share the result.
 
 ### Step 3: `test/safe_inject_test.exs`
+
+**Objective**: Write `safe_inject_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
 
 ```elixir
 defmodule SafeInjectTest do
@@ -215,6 +260,9 @@ end
 
 ### Step 4: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -229,6 +277,52 @@ iex> Macro.expand(a, __ENV__) |> Macro.to_string() |> IO.puts
 
 You'll see `IO.puts("hi")` appear twice in the expansion — proof of the
 duplicate-evaluation bug baked into the unsafe form.
+
+### Why this works
+
+`bind_quoted: [value: expr]` instruye al compilador a emitir
+`value = expr` como primera instrucción del bloque generado, con
+`value` como variable hygienic. Cada referencia a `value` dentro del
+bloque usa ese único binding. En contraste, `unquote(expr)` splicea
+el AST verbatim, así que N ocurrencias = N evaluaciones en runtime.
+
+---
+
+
+## Deep Dive: State Management and Message Handling Patterns
+
+Understanding state transitions is central to reliable OTP systems. Every `handle_call` or `handle_cast` receives current state and returns new state—immutability forces explicit reasoning. This prevents entire classes of bugs: missing state updates are immediately visible.
+
+Key insight: separate pure logic (state → new state) from side effects (logging, external calls). Move pure logic to private helpers; use handlers for orchestration. This makes servers testable—test pure functions independently.
+
+In production, monitor state size and mutation frequency. Unbounded growth is a memory leak; excessive mutations signal hot spots needing optimization. Always profile before reaching for performance solutions like ETS.
+
+## Benchmark
+
+```elixir
+require SafeInject
+
+heavy = fn -> Enum.reduce(1..10_000, 0, &(&1 + &2)) end
+
+{unsafe, _} =
+  :timer.tc(fn ->
+    ExUnit.CaptureIO.capture_io(fn ->
+      Enum.each(1..1_000, fn _ -> SafeInject.log_twice_unsafe(heavy.()) end)
+    end)
+  end)
+
+{safe, _} =
+  :timer.tc(fn ->
+    ExUnit.CaptureIO.capture_io(fn ->
+      Enum.each(1..1_000, fn _ -> SafeInject.log_twice_safe(heavy.()) end)
+    end)
+  end)
+
+IO.puts("unsafe: #{unsafe}µs, safe: #{safe}µs")
+```
+
+Target esperado: unsafe ~1.8x–2x más lenta que safe cuando el
+argumento tiene costo no trivial.
 
 ---
 
@@ -269,6 +363,17 @@ the caller's context* — e.g., the `do:` block of an `if`-like macro. A
 `do:` block needs to see the caller's variables and run at the call site;
 `bind_quoted` would freeze it to whatever it evaluates to at expansion
 time (which is usually nothing useful).
+
+---
+
+## Reflection
+
+- Encontrás un macro legacy con seis `unquote(expr)` y el ticket dice
+  "loguea el doble en producción". ¿Cómo reproducís el bug sin tocar
+  producción, y qué test agregás al CI para que esta clase no vuelva?
+- Un macro necesita inyectar un PID (no es literal AST). No podés usar
+  `bind_quoted` ni `unquote`. ¿Cómo reestructurás la API para que el
+  PID llegue al runtime?
 
 ---
 

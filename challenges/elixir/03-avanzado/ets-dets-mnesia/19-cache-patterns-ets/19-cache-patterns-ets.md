@@ -2,9 +2,6 @@
 
 **Project**: `ets_cache_patterns` — three cache strategies implemented against the same source-of-truth, with failure modes and latency profiles compared side-by-side.
 
-**Difficulty**: ★★★★☆
-**Estimated time**: 3–6 hours
-
 ---
 
 ## Project context
@@ -39,6 +36,12 @@ ets_cache_patterns/
 │   └── patterns_test.exs
 └── mix.exs
 ```
+
+---
+
+## Why hand-rolled ETS and not Cachex
+
+Cachex is the right answer in production. For an exercise whose goal is to understand the patterns, building them from ETS primitives is the point. In real code the decision flips unless the workload shows Cachex is the bottleneck.
 
 ---
 
@@ -88,15 +91,41 @@ The first reader publishes the result to all waiters.
 
 ### 5. Bounded caches
 
-Real ETS caches need size limits. Either periodic LRU eviction (exercise 43) or a simple cap on
+Real ETS caches need size limits. Either periodic LRU eviction or a simple cap on
 `:ets.info(t, :size)` with a random-drop policy. This exercise uses no eviction — we assume the
 working set fits in RAM.
+
+---
+
+## Design decisions
+
+**Option A — Cachex or another library**
+- Pros: batteries-included; TTL, stats, and eviction already solved.
+- Cons: another dependency; less control over the hot path.
+
+**Option B — hand-rolled ETS cache** (chosen)
+- Pros: minimal code path; exact control over eviction and TTL semantics.
+- Cons: every caching subtlety (stampede, TTL jitter, eviction races) is now your problem.
+
+→ Chose **B** because teaching material and workloads where the hot path demands exact control.
 
 ---
 
 ## Implementation
 
 ### Step 1: `mix.exs`
+
+**Objective**: Declare the project, dependencies, and OTP application in `mix.exs`.
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
 
 ```elixir
 defmodule EtsCachePatterns.MixProject do
@@ -114,6 +143,8 @@ end
 ```
 
 ### Step 2: `lib/ets_cache_patterns/application.ex`
+
+**Objective**: Define the OTP application and supervision tree in `lib/ets_cache_patterns/application.ex`.
 
 ```elixir
 defmodule EtsCachePatterns.Application do
@@ -135,6 +166,8 @@ end
 ```
 
 ### Step 3: `lib/ets_cache_patterns/source.ex`
+
+**Objective**: Implement the module in `lib/ets_cache_patterns/source.ex`.
 
 ```elixir
 defmodule EtsCachePatterns.Source do
@@ -176,6 +209,8 @@ end
 
 ### Step 4: `lib/ets_cache_patterns/cache_strategy.ex`
 
+**Objective**: Implement the module in `lib/ets_cache_patterns/cache_strategy.ex`.
+
 ```elixir
 defmodule EtsCachePatterns.CacheStrategy do
   @moduledoc "Common contract for all three cache patterns."
@@ -186,6 +221,8 @@ end
 ```
 
 ### Step 5: `lib/ets_cache_patterns/read_through.ex`
+
+**Objective**: Implement the module in `lib/ets_cache_patterns/read_through.ex`.
 
 ```elixir
 defmodule EtsCachePatterns.ReadThrough do
@@ -285,6 +322,8 @@ end
 
 ### Step 6: `lib/ets_cache_patterns/write_through.ex`
 
+**Objective**: Implement the module in `lib/ets_cache_patterns/write_through.ex`.
+
 ```elixir
 defmodule EtsCachePatterns.WriteThrough do
   @moduledoc """
@@ -339,6 +378,8 @@ end
 ```
 
 ### Step 7: `lib/ets_cache_patterns/write_behind.ex`
+
+**Objective**: Implement the module in `lib/ets_cache_patterns/write_behind.ex`.
 
 ```elixir
 defmodule EtsCachePatterns.WriteBehind do
@@ -435,6 +476,8 @@ end
 
 ### Step 8: `test/patterns_test.exs`
 
+**Objective**: Write tests in `test/patterns_test.exs` covering behavior and edge cases.
+
 ```elixir
 defmodule EtsCachePatterns.PatternsTest do
   use ExUnit.Case, async: false
@@ -514,9 +557,33 @@ end
 
 ### Step 9: Run it
 
+**Objective**: Exercise the implementation end-to-end in IEx or the shell.
+
 ```bash
 mix test --trace
 ```
+
+### Why this works
+
+Each pattern (read-through, write-through, TTL, stampede protection) maps to a specific composition of ETS ops and a supervisor-owned cleaner process. Understanding each primitive is what lets you pick the right library feature later.
+
+---
+
+## Deep Dive
+
+ETS (Erlang Term Storage) is RAM-only and process-linked; table destruction triggers if the owner crashes, causing silent data loss in careless designs. Match specifications (match_specs) are micro-programs that filter/transform data at the C layer, orders of magnitude faster than fetching all records and filtering in Elixir. Mnesia adds disk persistence and replication but introduces transaction overhead and deadlock potential; dirty operations bypass locks for speed but sacrifice consistency guarantees. For caching, named tables (public by design) are globally visible but require careful name management; consider ETS sharding (multiple small tables) to reduce lock contention on hot keys. DETS (Disk ETS) persists to disk but is single-process bottleneck and slower than a real database. At scale, prefer ETS for in-process state and Mnesia/PostgreSQL for shared, persistent data.
+## Advanced Considerations
+
+ETS and DETS performance characteristics change dramatically based on access patterns and table types. Ordered sets provide range queries but slower access than hash tables; set types don't support duplicate keys while bags do. The `heir` option for ETS tables is essential for fault tolerance — when a table owner crashes, the heir process can take ownership and prevent data loss. Without it, the table is lost immediately. Mnesia replicates entire tables across nodes; choosing which nodes should have replicas and whether they're RAM or disk replicas affects both consistency guarantees and network traffic during cluster operations.
+
+DETS persistence comes with significant performance implications — writes are synchronous to disk by default, creating latency spikes. Using `sync: false` improves throughput but risks data loss on crashes. The maximum DETS table size is limited by available memory and the file system; planning capacity requires understanding your growth patterns. Mnesia's transaction system provides ACID guarantees, but dirty operations bypass these guarantees for performance. Understanding when to use dirty reads versus transactional reads significantly impacts both correctness and latency.
+
+Debugging ETS and DETS issues is challenging because problems often emerge under load when many processes contend for the same table. Table memory fragmentation is invisible to code but can exhaust memory. Using match specs instead of iteration over large tables can dramatically improve performance but requires careful construction. The interaction between ETS, replication, and distributed systems creates subtle consistency issues — a node with a stale ETS replica can serve incorrect data during network partitions. Always monitor table sizes and replication status with structured logging.
+
+
+## Deep Dive: Etsdets Patterns and Production Implications
+
+ETS tables are in-memory, non-distributed key-value stores with tunable semantics (ordered_set, duplicate_bag). Under concurrent read/write load, ETS table semantics matter: bag semantics allow fast appends but slow deletes; ordered_set allows range queries but slower inserts. Testing ETS behavior under concurrent load is non-trivial; single-threaded tests miss lock contention. Production ETS tables often fail under load due to concurrency assumptions that quiet tests don't exercise.
 
 ---
 
@@ -532,6 +599,12 @@ mix test --trace
 | Source outage tolerance (reads)| degraded             | degraded              | OK (cache absorbs)      |
 | Source outage tolerance (writes)| n/a                 | fails                 | queued until recovery   |
 | Thundering herd risk           | yes (mitigate)       | yes (mitigate)        | no                      |
+
+---
+
+## Deep Dive: Etsdets Patterns and Production Implications
+
+ETS tables are in-memory, non-distributed key-value stores with tunable semantics (ordered_set, duplicate_bag). Under concurrent read/write load, ETS table semantics matter: bag semantics allow fast appends but slow deletes; ordered_set allows range queries but slower inserts. Testing ETS behavior under concurrent load is non-trivial; single-threaded tests miss lock contention. Production ETS tables often fail under load due to concurrency assumptions that quiet tests don't exercise.
 
 ---
 
@@ -559,6 +632,25 @@ keep up — you're about to OOM. Alert on `:ets.info(buffer, :size)` crossing th
 
 **7. When NOT to use these.** If reads already hit the source in < 1 ms (local Postgres,
 co-located), caching adds complexity for little gain. Profile first.
+
+---
+
+## Benchmark
+
+```elixir
+# :timer.tc / Benchee measurement sketch
+{time_us, _} = :timer.tc(fn -> :ok end)
+IO.puts("elapsed: #{time_us} us")
+```
+
+Target: read-through hit under 2 us; miss path dominated by loader; TTL sweep bounded by table size.
+
+---
+
+## Reflection
+
+- Your cache has a 99.9% hit rate, but the 0.1% misses are slow and bursty. Which of these patterns help, and which make it worse?
+- At what point do you switch from hand-rolled to Cachex, and what signal tells you it is time?
 
 ---
 

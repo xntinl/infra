@@ -5,9 +5,6 @@ exposes typed `get_user/1` and `create_user/1` functions against a fake JSON
 API, with retries on transient failures and full test coverage using
 `Req.Test` stubs (no network).
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -82,9 +79,39 @@ other. Source: [Req.Test docs](https://hexdocs.pm/req/Req.Test.html).
 
 ---
 
+## Design decisions
+
+**Option A — use `HTTPoison` + `Bypass` + manual `Jason.encode!/decode!`**
+- Pros: battle-tested, every legacy Elixir codebase already uses it, straightforward mental model.
+- Cons: every call site repeats JSON plumbing; tests need a real HTTP port; no built-in retries; error shape tied to `HTTPoison.Error` struct.
+
+**Option B — use `Req` with `Req.Test` stubs (chosen)**
+- Pros: JSON, retries, redirects, decompression automatic; tests never hit the network; maintained by core team; pluggable steps for auth and logging.
+- Cons: newer API — fewer Stack Overflow answers; abstraction leaks when you need fine Finch-level control; depends on the ecosystem having adopted Req.
+
+→ Chose **B** because for modern JSON REST calls the boilerplate removed outweighs the risk, and `Req.Test` makes the test story strictly better than Bypass.
+
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"httpoison", "~> 1.0"},
+    {:"jason", "~> 1.0"},
+    {:"plug", "~> 1.0"},
+    {:"poison", "~> 1.0"},
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
 
 ```bash
 mix new req_client
@@ -103,6 +130,9 @@ end
 ```
 
 ### Step 2: Config
+
+**Objective**: Config.
+
 
 `config/config.exs`:
 
@@ -129,6 +159,9 @@ config :req_client,
 ```
 
 ### Step 3: `lib/req_client.ex`
+
+**Objective**: Implement `req_client.ex` — the integration seam where external protocol semantics meet Elixir domain code.
+
 
 ```elixir
 defmodule ReqClient do
@@ -183,6 +216,9 @@ end
 ```
 
 ### Step 4: `test/req_client_test.exs`
+
+**Objective**: Write `req_client_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
 
 ```elixir
 defmodule ReqClientTest do
@@ -247,11 +283,26 @@ mix test
 
 ---
 
+
+## Key Concepts
+
+External integrations in Elixir split across multiple patterns: Ecto for relational databases with changesets and migrations; Telemetry for metrics and observability; HTTP libraries like Req or Finch for REST APIs; and specialized parsers like Jason, NimbleCSV, and NimbleParsec for data formats. Choosing the right tool avoids the trap of one library solving everything poorly.
+
+Ecto is the de facto standard for databases because changesets encode validation before queries, migrations manage schema evolution, and the Repo pattern separates query logic from business logic. Migrations are version-controlled SQL, ensuring reproducible deployments. For integrating external services, Req is the modern HTTP client with built-in retry, redirect, and error handling policies.
+
+Telemetry decouples metrics collection from application code: you emit events and let listeners subscribe. This separation keeps business logic clean and metrics infrastructure pluggable. Use metrics, not print statements, in production.
+
+## Key Concepts
+
+Req is the modern HTTP client library for Elixir—simple, composable, and with sensible defaults. `Req.get!(url)` fetches a URL; response is a struct with `:status`, `:body`, `:headers`. Req uses middleware for extensibility: request middleware runs before the HTTP call (add auth, logging), response middleware runs after (retry, redirect). This is elegant compared to older libraries where options proliferate. Req is relatively young; libraries may still prefer HTTPoison. For new code, Req is the right choice.
+
+---
+
 ## Trade-offs and production gotchas
 
 **1. `Req` is an abstraction over adapters — know the layers**
 Req sits on top of either `Finch` (default) or a `Plug` (for tests). If you
-need very fine-grained pool tuning, go straight to Finch (see exercise 134).
+need very fine-grained pool tuning, go straight to Finch.
 For 95% of service-to-service calls, Req's defaults are right.
 
 **2. `retry: :safe_transient` excludes POST**
@@ -278,6 +329,14 @@ If you need non-HTTP protocols (gRPC, WebSocket) or direct streaming control
 for the typical JSON REST call, not every possible wire protocol.
 
 ---
+
+## Benchmark
+
+<!-- benchmark N/A: integration/configuration exercise -->
+
+## Reflection
+
+- `retry: :safe_transient` deliberately excludes POST. For a webhook endpoint that guarantees idempotency via a client-supplied key, is the safer default to override with `retry: :transient` at every call site, or to add an idempotency step once and leave the default alone — and who owns that decision in your architecture?
 
 ## Resources
 

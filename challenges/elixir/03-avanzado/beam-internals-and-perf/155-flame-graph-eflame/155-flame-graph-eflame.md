@@ -168,6 +168,8 @@ work is non-trivial and you need the composite picture.
 
 ### Step 1: `mix.exs`
 
+**Objective**: Pin `{:eflame, github: "Vagabond/eflame"}` since the trace-based profiler has no Hex release.
+
 ```elixir
 defmodule EflameDemo.MixProject do
   use Mix.Project
@@ -188,6 +190,8 @@ end
 
 ### Step 2: Vendor the FlameGraph scripts
 
+**Objective**: Vendor Brendan Gregg's `stackcollapse-elixir.pl` under `scripts/` to fold eflame output into SVG.
+
 From `brendangregg/FlameGraph` clone `stackcollapse-elixir.pl` (or use
 eflame's built-in). Place in `scripts/`. The final command looks like:
 
@@ -196,6 +200,8 @@ eflame's built-in). Place in `scripts/`. The final command looks like:
 ```
 
 ### Step 3: `lib/eflame_demo/pipeline.ex`
+
+**Objective**: Build a pipeline whose `resize/1` hides `length/1` inside a reduce, creating an O(n²) hotspot to expose.
 
 A deliberately sub-optimal pipeline you will improve after seeing the graph.
 
@@ -253,6 +259,8 @@ bytes runs in ~2.5 seconds on the naive version.
 
 ### Step 4: `lib/eflame_demo/profiler.ex`
 
+**Objective**: Wrap `:eflame.apply/4` to emit `.bare` stacks and fold them into `.folded` frequencies for FlameGraph.
+
 ```elixir
 defmodule EflameDemo.Profiler do
   @moduledoc """
@@ -302,6 +310,8 @@ end
 
 ### Step 5: `test/eflame_demo/profiler_test.exs`
 
+**Objective**: Assert the folded file contains `resize` frames and numeric sample counts, tagged `:eflame` so CI opts in.
+
 ```elixir
 defmodule EflameDemo.ProfilerTest do
   use ExUnit.Case, async: false
@@ -309,22 +319,25 @@ defmodule EflameDemo.ProfilerTest do
   alias EflameDemo.{Pipeline, Profiler}
 
   @tag :eflame
-  test "profiling the naive pipeline produces a folded stack file" do
-    image = :crypto.strong_rand_bytes(4_096)
 
-    {:ok, folded} =
-      Profiler.profile(:pipeline_naive, fn ->
-        Pipeline.run(image)
-      end)
+  describe "EflameDemo.Profiler" do
+    test "profiling the naive pipeline produces a folded stack file" do
+      image = :crypto.strong_rand_bytes(4_096)
 
-    assert File.exists?(folded)
-    content = File.read!(folded)
+      {:ok, folded} =
+        Profiler.profile(:pipeline_naive, fn ->
+          Pipeline.run(image)
+        end)
 
-    # Must contain at least one resize frame — that's where we spend time
-    assert content =~ "resize"
+      assert File.exists?(folded)
+      content = File.read!(folded)
 
-    # Sample count > 0 (some lines end with " <n>\n")
-    assert String.match?(content, ~r/ \d+$/m)
+      # Must contain at least one resize frame — that's where we spend time
+      assert content =~ "resize"
+
+      # Sample count > 0 (some lines end with " <n>\n")
+      assert String.match?(content, ~r/ \d+$/m)
+    end
   end
 end
 ```
@@ -332,6 +345,8 @@ end
 Tag with `:eflame` so CI can skip these unless opted in — they take seconds.
 
 ### Step 6: Render the SVG
+
+**Objective**: Pipe the folded stacks through `flamegraph.pl` and visually confirm `erlang:length/1` towers dominate `resize`.
 
 ```bash
 # Fold if not already
@@ -344,6 +359,8 @@ the reduce, a narrow-but-tall tower of `erlang:length/1` frames — that's
 the accidental O(n²).
 
 ### Step 7: Fix and re-profile
+
+**Objective**: Replace `length(acc)` with an accumulated index so `resize/1` collapses from O(n²) to O(n) in the next profile.
 
 Rewrite `resize/1` to stream without measuring list length:
 
@@ -366,6 +383,46 @@ Re-run the profiler. The `resize` column shrinks to ~8% of the graph.
 ### Why this works
 
 The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
+
+## Deep Dive: BEAM Scheduler Tuning and Memory Profiling in Production
+
+The BEAM scheduler is not "magic" — it's a preemptive work-stealing scheduler that divides CPU time 
+into reductions (bytecode instructions). Understanding scheduler tuning is critical when you suspect 
+latency spikes in production.
+
+**Key concepts**:
+- **Reductions budget**: By default, a process gets ~2000 reductions before yielding to another process.
+  Heavy CPU work (binary matching, list recursion) can exhaust the budget and cause tail latency.
+- **Dirty schedulers**: If a process does CPU-intensive work (crypto, compression, numerical), it blocks 
+  the main scheduler. Use dirty NIFs or `spawn_opt(..., [{:fullsweep_after, 0}])` for GC tuning.
+- **Heap tuning per process**: `Process.flag(:min_heap_size, ...)` reserves heap upfront, reducing GC 
+  pauses. Measure; don't guess.
+
+**Memory profiling workflow**:
+1. Run `recon:memory/0` in iex; identify top 10 memory consumers by type (atoms, binaries, ets).
+2. If binaries dominate, check for refc binary leaks (binary held by process that should have been freed).
+3. Use `eprof` or `fprof` for function-level CPU attribution; `recon:proc_window/3` for process memory trends.
+
+**Production pattern**: Deploy with `+K true` (async IO), `-env ERL_MAX_PORTS 65536` (port limit), 
+`+T 9` (async threads). Measure GC time with `erlang:statistics(garbage_collection)` — if >5% of uptime, 
+tune heap or reduce allocation pressure. Never assume defaults are optimal for YOUR workload.
+
+---
+
+## Advanced Considerations
+
+Understanding BEAM internals at production scale requires deep knowledge of scheduler behavior, memory models, and garbage collection dynamics. The soft real-time guarantees of BEAM only hold under specific conditions — high system load, uneven process distribution across schedulers, or GC pressure can break predictable latency completely. Monitor `erlang:statistics(run_queue)` in production to catch scheduler saturation before it degrades latency significantly. The difference between immediate, offheap, and continuous GC garbage collection strategies can significantly impact tail latencies in systems with millions of messages per second and sustained memory pressure.
+
+Process reductions and the reduction counter affect scheduler fairness fundamentally. A process that runs for extended periods without yielding can starve other processes, even though the scheduler treats it fairly by reduction count per scheduling interval. This is especially critical in pipelines processing large data structures or performing recursive computations where yielding points are infrequent and difficult to predict. The BEAM's preemption model is deterministic per reduction, making performance testing reproducible but sometimes hiding race conditions that only manifest under specific load patterns and GC interactions.
+
+The interaction between ETS, Mnesia, and process message queues creates subtle bottlenecks in distributed systems. ETS reads don't block other processes, but writes require acquiring locks; understanding when your workload transitions from read-heavy to write-heavy is crucial for capacity planning. Port drivers and NIFs bypass the BEAM scheduler entirely, which can lead to unexpected priority inversions if not carefully managed. Always profile with `eprof` and `fprof` in realistic production-like environments before deployment to catch performance surprises.
+
+
+## Deep Dive: Otp Patterns and Production Implications
+
+OTP primitives (GenServer, Supervisor, Application) are tested through their public interfaces, not by inspecting internal state. This discipline forces correct design: if you can't test a behavior without peeking into the server's state, the behavior is not public. Production systems with tight integration tests on GenServer internals are fragile and hard to refactor.
+
+---
 
 ## Trade-offs and production gotchas
 
@@ -433,3 +490,13 @@ writing them.
 - [Ferd's profiling guide](https://ferd.ca/) — multi-part series on Erlang profiling
 - [`:fprof` reference](https://www.erlang.org/doc/man/fprof.html) — alternative exact profiler
 - [José Valim — benchmarking Elixir code](https://elixir-lang.org/blog/) — complementary with Benchee
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

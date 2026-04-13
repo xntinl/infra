@@ -84,7 +84,29 @@ defmodule EventsBus.MixProject do
 end
 ```
 
+### Dependencies (mix.exs)
+
+```elixir
+```elixir
+defmodule EventsBus.MixProject do
+  use Mix.Project
+  def project, do: [app: :events_bus, version: "0.1.0", elixir: "~> 1.16", deps: deps()]
+  def application, do: [mod: {EventsBus.Application, []}, extra_applications: [:logger]]
+
+  defp deps do
+    [
+      {:phoenix, "~> 1.7.14"},
+      {:phoenix_pubsub, "~> 2.1"},
+      {:jason, "~> 1.4"},
+      {:benchee, "~> 1.3", only: :dev}
+    ]
+  end
+end
+```
+
 ### Step 1: Application — `lib/events_bus/application.ex`
+
+**Objective**: Start `Phoenix.PubSub` with the `PG2` adapter and a per-scheduler pool so cluster fan-out survives a node restart independently of consumers.
 
 ```elixir
 defmodule EventsBus.Application do
@@ -105,6 +127,8 @@ end
 ```
 
 ### Step 2: Listener GenServer — `lib/events_bus/listener.ex`
+
+**Objective**: Subscribe inside `init/1` so the process is guaranteed to receive every message published after `start_link/1` returns.
 
 ```elixir
 defmodule EventsBus.Listener do
@@ -131,6 +155,8 @@ end
 ```
 
 ### Step 3: Cache invalidator — `lib/events_bus/cache_invalidator.ex`
+
+**Objective**: Split cluster-wide `broadcast/3` from `local_broadcast/3` so node-bound UI pushes skip PG2 gossip and cache invalidations still fan out everywhere.
 
 ```elixir
 defmodule EventsBus.CacheInvalidator do
@@ -243,6 +269,23 @@ Benchee.run(
 ```
 
 **Expected (single node, 1k subs)**: `local_broadcast` ~250µs, `broadcast` ~400µs. With a second node in the cluster, `broadcast` adds one RTT (typically 100–300µs intra-rack).
+
+## Advanced Considerations: LiveView Real-Time Patterns and Pubsub Scale
+
+LiveView bridges the browser and BEAM via WebSocket, allowing server-side renders to push incremental DOM diffs to the client. A LiveView process is long-lived, receiving events (clicks, form submissions) and broadcasting updates. For real-time features (collaborative editing, live notifications), LiveView processes subscribe to PubSub topics and receive broadcast messages.
+
+Phoenix.PubSub partitions topics across a pool of processes, allowing horizontal scaling. By default, `:local` mode uses in-memory ETS; `:redis` mode distributes across nodes via Redis. At scale (thousands of concurrent LiveViews), topic fanout can bottleneck: broadcasting to a million subscribers means delivering one million messages. The BEAM handles this, but the network cost matters on multi-node deployments.
+
+`Presence` module tracks which users are viewing which pages, syncing state via PubSub. A presence join/leave is broadcast to all nodes, allowing real-time "who's online" updates. Under partition, presence state can diverge; the library uses unique presence keys to detect and reconcile. Operationally, watching presence on every page load can amplify server load if users are flaky (mobile networks, browser reloads). Consider presence only for features where it's user-facing (collaborative editors, live sports scoreboards).
+
+---
+
+
+## Deep Dive: Phoenix Patterns and Production Implications
+
+Phoenix's conn struct represents an HTTP request/response in flight, accumulating transformations through middleware and handler code. Testing a Phoenix endpoint end-to-end (not just the controller) catches middleware order bugs, header mismatches, and plug composition issues. The trade-off is that full integration tests are slower and harder to parallelize than unit tests. Production bugs in auth, CORS, or session handling are often due to middleware assumptions that live tests reveal.
+
+---
 
 ## Trade-offs and production gotchas
 

@@ -142,7 +142,43 @@ defmodule GeoKernel.MixProject do
 end
 ```
 
+### Dependencies (mix.exs)
+
+```elixir
+```elixir
+defmodule GeoKernel.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :geo_kernel,
+      version: "0.1.0",
+      elixir: "~> 1.17",
+      compilers: [:rustler] ++ Mix.compilers(),
+      rustler_crates: [
+        geo_kernel_nif: [
+          path: "native/geo_kernel_nif",
+          mode: if(Mix.env() == :prod, do: :release, else: :debug)
+        ]
+      ],
+      deps: deps()
+    ]
+  end
+
+  def application, do: [extra_applications: [:logger], mod: {GeoKernel.Application, []}]
+
+  defp deps do
+    [
+      {:rustler, "~> 0.34"},
+      {:benchee, "~> 1.3", only: :dev}
+    ]
+  end
+end
+```
+
 ### Step 1: Rust crate manifest (`native/geo_kernel_nif/Cargo.toml`)
+
+**Objective**: Declare cdylib target so `cargo build --release` with LTO produces LLVM-vectorized haversine distances.
 
 ```toml
 [package]
@@ -159,6 +195,8 @@ rustler = "0.34"
 ```
 
 ### Step 2: The NIF (`native/geo_kernel_nif/src/lib.rs`)
+
+**Objective**: Zero-copy decode tuples via NifTuple derive so haversine loop skips atom boxing per coordinate.
 
 ```rust
 use rustler::{Atom, Error, NifResult, NifTuple};
@@ -211,6 +249,8 @@ rustler::init!("Elixir.GeoKernel.NIF", [haversine_batch, point_in_bbox]);
 
 ### Step 3: Elixir wrapper (`lib/geo_kernel/nif.ex`)
 
+**Objective**: Keep pure stubs so testable logic lives above and NIF symbol resolution happens lazily on first call.
+
 ```elixir
 defmodule GeoKernel.NIF do
   @moduledoc """
@@ -226,6 +266,8 @@ end
 ```
 
 ### Step 4: Application supervision (`lib/geo_kernel/application.ex`)
+
+**Objective**: Minimize supervision since NIF is stateless and lazy-loads on first function reference.
 
 ```elixir
 defmodule GeoKernel.Application do
@@ -316,6 +358,23 @@ Benchee.run(
 **Expected result on M1/Ryzen 7**: NIF version runs in **< 2ms**, Elixir version in **> 40ms**.
 A speedup of 20x is the signal Rustler is paying off. If speedup < 5x, the bottleneck is
 somewhere else (likely list decoding).
+
+## Advanced Considerations: NIF Isolation and Scheduler Integration
+
+NIF calls run atomically on a scheduler thread, blocking all other processes on that scheduler until the function returns. For operations exceeding ~1 millisecond, this starvation becomes visible: heartbeat processes delay, ETS owner replies hang, supervision timeouts fire. The BEAM's dirty scheduler pool (8 CPU + 10 IO by default) isolates long NIFs from the main scheduler ring, but they're still a finite resource.
+
+Understanding scheduler capacity is critical. Each dirty CPU scheduler can run ~1,000 100-microsecond operations per second, or ~5 100-millisecond operations. Beyond that, callers queue. A GenServer pool capping concurrency and applying backpressure prevents cascade failures: if the dirty pool saturates, reject new work immediately instead of queuing unboundedly.
+
+Resource management inside NIFs differs from pure Elixir. A `Binary<'a>` is a borrow tied to the NIF call; it cannot escape to threads or be stored in resources. An `OwnedBinary` allocation isn't visible to BEAM's garbage collector, so memory limits must be enforced in the Elixir layer. Hybrid architectures (Port processes for I/O, NIFs for CPU work) offer better observability and failure isolation than trying to do everything in a single NIF crate.
+
+---
+
+
+## Deep Dive: Interop Patterns and Production Implications
+
+Interop with native code (NIFs, ports, C extensions) introduces failure modes that pure Elixir code doesn't have: segfaults, memory leaks, deadlocks with the Erlang emulator. Testing interop requires separate test suites for the native layer and integration tests that exercise the boundary.
+
+---
 
 ## Trade-offs and production gotchas
 

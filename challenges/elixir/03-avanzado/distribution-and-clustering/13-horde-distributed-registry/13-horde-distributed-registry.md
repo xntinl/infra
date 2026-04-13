@@ -117,12 +117,16 @@ When Horde redistributes a process, by default it **terminates** the old pid (re
 
 ### Step 1: Create the project
 
+**Objective**: Bootstrap supervised app so Horde.Registry and DynamicSupervisor delta-CRDT processes start during boot."""
+
 ```bash
 mix new horde_registry_demo --sup
 cd horde_registry_demo
 ```
 
 ### Step 2: `mix.exs`
+
+**Objective**: Pin Horde and libcluster so delta-CRDT gossip and topology discovery coordinate at startup."""
 
 ```elixir
 defmodule HordeRegistryDemo.MixProject do
@@ -147,6 +151,8 @@ end
 
 ### Step 3: `config/config.exs`
 
+**Objective**: Configure Epmd topology discovery so libcluster fills Horde.Cluster.members/1 before registry gossip starts."""
+
 ```elixir
 import Config
 
@@ -166,6 +172,8 @@ config :libcluster,
 ```
 
 ### Step 4: `lib/horde_registry_demo/application.ex`
+
+**Objective**: Start Cluster.Supervisor before Horde processes so libcluster establishes peer list for CRDT gossip."""
 
 ```elixir
 defmodule HordeRegistryDemo.Application do
@@ -190,6 +198,8 @@ end
 
 ### Step 5: `lib/horde_registry_demo/horde/registry.ex`
 
+**Objective**: Configure Horde.Registry with :auto members so delta-CRDT gossip converges names without majority quorum."""
+
 ```elixir
 defmodule HordeRegistryDemo.Horde.Registry do
   @moduledoc "Thin wrapper that starts `Horde.Registry` with our process name."
@@ -205,6 +215,8 @@ end
 ```
 
 ### Step 6: `lib/horde_registry_demo/horde/dynamic_supervisor.ex`
+
+**Objective**: Use UniformDistribution + active redistribution so processes rebalance via consistent hashing on nodeup/nodedown."""
 
 ```elixir
 defmodule HordeRegistryDemo.Horde.DynamicSupervisor do
@@ -231,6 +243,8 @@ end
 ```
 
 ### Step 7: `lib/horde_registry_demo/node_observer.ex`
+
+**Objective**: Trap :net_kernel.monitor_nodes and push to Horde.Cluster.set_members so CRDT mirrors BEAM topology."""
 
 ```elixir
 defmodule HordeRegistryDemo.NodeObserver do
@@ -283,6 +297,8 @@ end
 ```
 
 ### Step 8: `lib/horde_registry_demo/document_session.ex`
+
+**Objective**: Use {:via, Horde.Registry, ...} so GenServer.call transparently routes to correct node via CRDT."""
 
 ```elixir
 defmodule HordeRegistryDemo.DocumentSession do
@@ -359,6 +375,8 @@ end
 
 ### Step 9: `lib/horde_registry_demo/session_router.ex`
 
+**Objective**: Provide facade for start_session/stop_session so callers hide Horde.DynamicSupervisor naming details."""
+
 ```elixir
 defmodule HordeRegistryDemo.SessionRouter do
   @moduledoc "Public entry point to start and talk to DocumentSessions."
@@ -388,6 +406,8 @@ end
 
 ### Step 10: Tests
 
+**Objective**: Assert :already_started idempotency and :not_found routing so CRDT session lookup is deterministic."""
+
 ```elixir
 # test/horde_registry_demo/session_router_test.exs
 defmodule HordeRegistryDemo.SessionRouterTest do
@@ -407,28 +427,30 @@ defmodule HordeRegistryDemo.SessionRouterTest do
     :ok
   end
 
-  test "starts a session and routes an edit" do
-    {:ok, _pid} = SessionRouter.start_session("doc_42")
-    edit = %{op: :insert, pos: 0, text: "Hello"}
+  describe "HordeRegistryDemo.SessionRouter" do
+    test "starts a session and routes an edit" do
+      {:ok, _pid} = SessionRouter.start_session("doc_42")
+      edit = %{op: :insert, pos: 0, text: "Hello"}
 
-    assert {:ok, 1} = DocumentSession.send_edit("doc_42", edit)
-    assert {:ok, [^edit]} = DocumentSession.snapshot("doc_42")
-  end
+      assert {:ok, 1} = DocumentSession.send_edit("doc_42", edit)
+      assert {:ok, [^edit]} = DocumentSession.snapshot("doc_42")
+    end
 
-  test "starting the same doc twice returns already_started" do
-    {:ok, pid} = SessionRouter.start_session("doc_dup")
-    assert {:error, {:already_started, ^pid}} = SessionRouter.start_session("doc_dup")
-  end
+    test "starting the same doc twice returns already_started" do
+      {:ok, pid} = SessionRouter.start_session("doc_dup")
+      assert {:error, {:already_started, ^pid}} = SessionRouter.start_session("doc_dup")
+    end
 
-  test "missing session returns :not_found" do
-    assert DocumentSession.send_edit("ghost", %{op: :noop, pos: 0, text: ""}) == {:error, :not_found}
-  end
+    test "missing session returns :not_found" do
+      assert DocumentSession.send_edit("ghost", %{op: :noop, pos: 0, text: ""}) == {:error, :not_found}
+    end
 
-  test "count_sessions reflects live children" do
-    before = SessionRouter.count_sessions()
-    {:ok, _} = SessionRouter.start_session("doc_count_a")
-    {:ok, _} = SessionRouter.start_session("doc_count_b")
-    assert SessionRouter.count_sessions() == before + 2
+    test "count_sessions reflects live children" do
+      before = SessionRouter.count_sessions()
+      {:ok, _} = SessionRouter.start_session("doc_count_a")
+      {:ok, _} = SessionRouter.start_session("doc_count_b")
+      assert SessionRouter.count_sessions() == before + 2
+    end
   end
 end
 ```
@@ -440,6 +462,8 @@ elixir --name test@127.0.0.1 --cookie devcluster -S mix test
 ```
 
 ### Step 11: Kill-a-node experiment
+
+**Objective**: Create 3k sessions across 3 nodes; kill node2 and watch CRDT rebalance children without manual intervention."""
 
 Run three nodes (via libcluster topology in `config.exs`). On `node1`:
 
@@ -473,6 +497,24 @@ The ~1 000 sessions that were on `node2` have been restarted on the survivors (w
 ### Why this works
 
 The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
+
+## Deep Dive
+
+Distributed Erlang relies on a heartbeat mechanism (net_kernel tick) to detect node failure, but the network is fundamentally asynchronous—split-brain scenarios are inevitable. A partitioned cluster may have two sets of nodes, each believing the other is dead. Libraries like Horde and Phoenix.PubSub solve this with quorum-aware consensus, but they add latency and complexity. At scale, choose your consistency model explicitly: eventual consistency (via Redis PubSub) is faster but allows temporary divergence; strong consistency (via Horde DLM or distributed transactions) is slower but guarantees atomicity. For global registries, the order of operations matters—registering a process before its monitor is live creates race conditions. In multi-region setups, latency between nodes compounds these issues; consider regional clusters with a lightweight coordinator rather than a fully meshed topology.
+## Advanced Considerations
+
+Distributed Elixir systems require careful consideration of network partitions, consistent hashing for distributed state, and the interaction between clustering libraries and node discovery mechanisms. Network partitions are not rare edge cases; they happen regularly in cloud deployments due to maintenance windows and infrastructure issues. A system that works perfectly during local testing but fails under network partitions indicates insufficient failure handling throughout the codebase. Split-brain scenarios where multiple network partitions lead to different cluster views require explicit recovery mechanisms that are often business-specific and context-dependent.
+
+Horde and distributed registries provide eventual consistency guarantees, but "eventual" can mean minutes during network partitions. Applications must handle the case where the same name is registered on multiple nodes simultaneously without coordination. Consistent hashing for distributed services requires understanding rebalancing costs — a single node failure can cause significant key redistribution and thundering herd problems if not carefully managed. The cost of distributed consensus using algorithms like Raft is high; choose it only when consistency is more important than availability and can afford the performance cost.
+
+Global state replication across nodes creates synchronization challenges at scale. Choosing between replicating everywhere versus replicating to specific nodes affects both consistency latency and network bandwidth utilization fundamentally. Node monitoring and heartbeat mechanisms require careful timeout tuning — too aggressive and you get false positives during network hiccups; too conservative and you don't detect actual failures quickly enough for recovery. The EPMD (Erlang Port Mapper Daemon) is a critical component that can become a bottleneck in large clusters and requires careful capacity planning.
+
+
+## Deep Dive: Distributed Patterns and Production Implications
+
+Distributed testing with Peer spawns multiple Erlang nodes in separate BEAM instances, allowing you to test actual node failure, network partitions, and message delays. This is essential for OTP applications but adds latency and complexity. The key insight is that distributed tests reveal assumptions about network reliability that single-node tests cannot—timeouts, partial failures, and split-brain scenarios are invisible to local tests.
+
+---
 
 ## Trade-offs and production gotchas
 
@@ -537,3 +579,13 @@ Horde is ~20× faster than `:global` here, and scales linearly with cluster size
 - [libcluster on HexDocs](https://hexdocs.pm/libcluster) — topology discovery strategies
 - [Dashbit blog — "Exploring Horde"](https://dashbit.co/blog/elixir-clustering-with-horde) — production patterns
 - [Discord Engineering — distributed Elixir presence](https://discord.com/blog/how-discord-stores-billions-of-messages) — CRDT at scale
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

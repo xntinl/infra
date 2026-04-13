@@ -96,6 +96,17 @@ rules_engine/
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### `lib/rules_engine.ex`
 
 ```elixir
@@ -535,6 +546,24 @@ mix test --trace
 
 ---
 
+
+
+---
+## Key Concepts
+
+### 1. Anonymous Functions Capture by Reference, Not by Value
+
+When you rebind a variable that a closure references, the closure sees the new binding. This can be surprising if you expect value capture. Closures capture the variable binding itself, not the value at creation time.
+
+### 2. Closures Are First-Class Values
+
+You can return a closure from a function, store it in a variable, pass it to other functions. This is the foundation of higher-order programming. Building factory functions (functions that return functions) is a powerful pattern.
+
+### 3. Pattern Matching Works in Anonymous Functions
+
+Anonymous functions can have multiple clauses separated by newlines without commas. Each clause is a separate pattern. This makes them more powerful than single-clause lambdas in other languages.
+
+---
 ## Anonymous functions vs named functions
 
 ```elixir

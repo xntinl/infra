@@ -1,8 +1,6 @@
 # Implementing an OTP Special Process from Scratch
 
 **Project**: `special_process` — a fully OTP-compliant worker without `gen_server`, `gen_statem`, or any wrapper behaviour.
-**Difficulty**: ★★★★☆
-**Estimated time**: 4–6 hours
 
 ---
 
@@ -86,6 +84,16 @@ your process becomes unobservable under load.
 OTP's `:sys.handle_system_msg/6` delegates back to your module through a
 fixed callback surface. You must export:
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
+
 ```elixir
 def system_continue(parent, debug, state)    # resume the loop after a sys call
 def system_terminate(reason, parent, debug, state)  # exit with reason
@@ -126,9 +134,25 @@ same way `gen_server` is.
 
 ---
 
+## Design decisions
+
+**Option A — `GenServer` with custom `handle_info` for the unusual messages**
+- Pros: zero boilerplate; SASL integration free; standard supervisor plumbing.
+- Cons: you inherit `gen_server`'s dispatch cost on the hot path; you cannot change the receive shape.
+
+**Option B — hand-rolled special process via `:proc_lib` + `:sys`** (chosen)
+- Pros: full control over the receive loop and priority; sys/debug hooks you opt into explicitly; ~25 % less per-message overhead.
+- Cons: you must implement sys callbacks, debug event plumbing, and child spec by hand; easy to get wrong.
+
+→ Chose **B** because the pedagogical point is showing exactly what `gen_server` abstracts away. In production, justify this only when you have measured the `gen_server` overhead and it matters.
+
+---
+
 ## Implementation
 
 ### Step 1: `mix.exs`
+
+**Objective**: Build stdlib-only so hand-rolled :proc_lib process judged strictly against OTP, no library shim.
 
 ```elixir
 defmodule SpecialProcess.MixProject do
@@ -149,6 +173,8 @@ end
 ```
 
 ### Step 2: `lib/special_process/counter.ex`
+
+**Objective**: Hand-roll :proc_lib special process so :system dispatch via :sys.handle_system_msg/6 earns OTP citizenship sans GenServer.
 
 ```elixir
 defmodule SpecialProcess.Counter do
@@ -251,6 +277,8 @@ end
 
 ### Step 3: `lib/special_process/counter_supervisor.ex`
 
+**Objective**: Supervise hand-rolled process with standard child_spec so :proc_lib worker indistinguishable from GenServer child.
+
 ```elixir
 defmodule SpecialProcess.CounterSupervisor do
   @moduledoc """
@@ -282,6 +310,8 @@ end
 
 ### Step 4: `lib/special_process/application.ex`
 
+**Objective**: Wire empty root supervisor so tests drive CounterSupervisor directly, subject isolated from boot order.
+
 ```elixir
 defmodule SpecialProcess.Application do
   @moduledoc false
@@ -295,6 +325,8 @@ end
 ```
 
 ### Step 5: `test/special_process/counter_test.exs`
+
+**Objective**: Exercise via :sys.get_state, :sys.replace_state, supervised shutdown so special process honors all OTP interactions GenServer would.
 
 ```elixir
 defmodule SpecialProcess.CounterTest do
@@ -373,6 +405,23 @@ end
 
 ---
 
+## Advanced Considerations: Supervision and Hot Code Upgrade Patterns
+
+The OTP supervision tree is the backbone of Elixir's fault tolerance. A DynamicSupervisor can spawn workers on demand and track them, but if a worker crashes before it's supervised, messages to it drop silently. Equally, a `:temporary` worker that crashes is restarted zero times — useful for one-off tasks, but requires the caller to handle crashes. `:transient` restarts on non-normal exits; `:permanent` always restarts.
+
+`handle_continue` callbacks and `:hibernate` reduce memory overhead in long-lived processes. After initializing, a GenServer can return `{:noreply, state, {:continue, :do_work}}` to defer expensive work past the `init/1` call, keeping the supervisor's synchronous startup fast. Hibernation moves a process's heap to disk, freeing RAM at the cost of latency when the process receives its next message.
+
+Hot code upgrades via `sys:replace_state/2` or `:sys.replace_state/3` allow changing code without restarting the VM, but only if state structure is forward- and backward-compatible. In practice, code changes that alter state shape (adding or removing fields) require a migration function. The `:code.purge/1` and `:code.load_file/1` cycle reloads the module, but old pids still run old code until they return to the scheduler. Design for graceful degradation: code that cannot upgrade hot should acknowledge that in docs and operational runbooks.
+
+---
+
+
+## Deep Dive: Otp Patterns and Production Implications
+
+OTP primitives (GenServer, Supervisor, Application) are tested through their public interfaces, not by inspecting internal state. This discipline forces correct design: if you can't test a behavior without peeking into the server's state, the behavior is not public. Production systems with tight integration tests on GenServer internals are fragile and hard to refactor.
+
+---
+
 ## Trade-offs and production gotchas
 
 **1. You reimplement error reporting.** `gen_server` logs a nice report
@@ -417,9 +466,13 @@ loops, selective-receive priority queues), or (c) you are building a
 reusable OTP behaviour library. Everything else is a maintenance tax
 for no benefit.
 
+### Why this works
+
+Every message the process cares about flows through one explicit receive clause, so the loop's dispatch cost is a single pattern match instead of `gen_server`'s layered callback resolution. System messages (`:sys`) are handled in a dedicated branch that defers to `:sys.handle_system_msg/6`, which is what makes the process behave like any other OTP citizen to observer, sys, and supervisors. Debug event plumbing is opt-in so the fast path stays fast.
+
 ---
 
-## Performance notes
+## Benchmark
 
 A simple echo benchmark: 1 million messages, measuring total ms.
 
@@ -452,6 +505,15 @@ A ~25 % improvement per message. At 10 k messages/s this is invisible
 (~3 ms/s of CPU). At 1 M messages/s on a single process, you save a
 300 ms/s CPU budget. That is typically the threshold at which a rewrite
 pays for itself.
+
+Target: per-call latency ≤ 1 µs on modern hardware; ≥ 20 % improvement vs equivalent `gen_server` baseline.
+
+---
+
+## Reflection
+
+1. At what call rate does the 0.3 µs/message saving justify the maintenance burden of a hand-rolled special process over `gen_server`? Express the answer as a function of team size and test-suite coverage, not just CPU.
+2. Your hand-rolled process must now support `code_change/3` for a rolling upgrade. Which piece of the sys plumbing do you add first — the behaviour change in `system_code_change/4` or the state shape migration — and what test guards against a partial upgrade leaking stale state?
 
 ---
 

@@ -97,18 +97,23 @@ effect immediately — no restart required.
 
 ## Implementation
 
-### Dependencies (`mix.exs`)
+### Dependencies (mix.exs)
 
 ```elixir
 defp deps do
   [
-    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+    # Standard library: no external dependencies required
   ]
 end
 ```
 
 
+
+
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
 
 ```bash
 mix new app_env_runtime --sup
@@ -117,6 +122,9 @@ mkdir -p config
 ```
 
 ### Step 2: `config/config.exs` and `config/runtime.exs`
+
+**Objective**: Provide `config/config.exs` and `config/runtime.exs` — these are the supporting fixtures the main module depends on to make its concept demonstrable.
+
 
 ```elixir
 # config/config.exs
@@ -141,6 +149,9 @@ config :app_env_runtime,
 ```
 
 ### Step 3: `lib/app_env_runtime/config.ex`
+
+**Objective**: Implement `config.ex` — release-time behavior that depends on application env resolution and runtime boot semantics.
+
 
 ```elixir
 defmodule AppEnvRuntime.Config do
@@ -186,6 +197,9 @@ end
 
 ### Step 4: `lib/app_env_runtime/application.ex`
 
+**Objective**: Wire `application.ex` to start the OTP application callback so BEAM starts/stops the supervision tree through the proper application controller lifecycle.
+
+
 ```elixir
 defmodule AppEnvRuntime.Application do
   @moduledoc false
@@ -205,6 +219,9 @@ end
 ```
 
 ### Step 5: `test/app_env_runtime_test.exs`
+
+**Objective**: Write `app_env_runtime_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
 
 ```elixir
 defmodule AppEnvRuntimeTest do
@@ -247,6 +264,9 @@ end
 
 ### Step 6: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 APP_ENDPOINT=https://prod.example.com iex -S mix
@@ -258,6 +278,21 @@ APP_ENDPOINT=https://prod.example.com iex -S mix
 
 The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
 
+
+
+## Key Concepts
+
+Application environment is OTP's pattern for configuration state. `Application.put_env/3` and `Application.get_env/2` manage a per-application key-value store, readable from any process without passing state. Use app env for configuration values set at boot (read-only after that), never for mutable state. Mutable state belongs in GenServers, ETS, or other process structures. If two processes write conflicting values to app env, the last write wins silently—no transaction or conflict detection. Relying on app env for cache state or session data is a footgun. Using it for immutable configuration (database URL, pool size, feature flags) is idiomatic and efficient—reading app env is a hashtable lookup, not a message send.
+
+---
+
+## Deep Dive: Compile-Time vs Runtime Configuration Boundaries
+
+A release is a static artifact: code and compile-time config are baked in. Runtime config must be provided at boot via environment variables, config files, or config providers. Simple rule: if a value changes between dev and prod, it goes in `config/runtime.exs`, not `config/config.exs`.
+
+Footgun: putting config in compile-time files and assuming environment variables work at runtime. Releases ignore env vars unless `config/runtime.exs` explicitly reads them. If you need env vars, fetch them in `config/runtime.exs` and store in application state.
+
+For distributed systems, config providers (modules loading config from Consul, S3, etc.) are powerful but complex. Start with environment variables and `config/runtime.exs`; only reach for providers if you need dynamic reloading without downtime or multi-tenant config switching. Premature provider complexity is a mistake.
 
 ## Benchmark
 

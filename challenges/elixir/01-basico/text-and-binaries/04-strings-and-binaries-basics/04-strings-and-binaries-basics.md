@@ -66,6 +66,17 @@ log_parser/
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### `lib/log_parser.ex`
 
 ```elixir
@@ -457,6 +468,24 @@ mix test --trace
 
 ---
 
+
+
+---
+## Key Concepts
+
+### 1. Strings Are UTF-8 Binaries, Not Char Arrays
+
+Strings are sequences of bytes—UTF-8 encoded text. `byte_size/1` returns bytes; `String.length/1` returns graphemes (user-perceived characters). For UTF-8 where "café" has 4 characters but 5 bytes, this distinction matters. For regex and splitting, byte boundaries matter.
+
+### 2. Binaries Are Byte Sequences, Strings Are Text
+
+A binary is just a list of bytes. A string is a binary with UTF-8 encoding. When you match on a binary pattern `<<first::8, rest::binary>>`, you extract bytes, not characters. For text processing, use `String` functions. For binary protocols, use pattern matching.
+
+### 3. Pattern Matching on Binaries Requires Thinking in Bytes
+
+Without the `::utf8` specifier, you match single bytes, which breaks multi-byte UTF-8 characters like é. Understanding UTF-8 byte sequences is critical and a common source of bugs.
+
+---
 ## Strings vs binaries vs charlists
 
 | Type | Internal | Example | Use when |

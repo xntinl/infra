@@ -78,6 +78,8 @@ Chosen: **Option B**.
 
 ### Step 1: async-safe process cache
 
+**Objective**: Store state in the process dictionary so every test gets a fresh scope for free — no names, no cleanup, no races.
+
 ```elixir
 # lib/cache_layer/process_cache.ex
 defmodule CacheLayer.ProcessCache do
@@ -93,6 +95,8 @@ end
 ```
 
 ### Step 2: Agent cache — name must be parameterized
+
+**Objective**: Force callers to pass `:name` so two async tests cannot collide on a singleton `__MODULE__` registration.
 
 ```elixir
 # lib/cache_layer/agent_cache.ex
@@ -111,6 +115,8 @@ end
 ```
 
 ### Step 3: ETS cache — table name must be parameterized
+
+**Objective**: Accept a table name per caller so `:named_table` ETS becomes safe under concurrent tests instead of a global shared region.
 
 ```elixir
 # lib/cache_layer/ets_cache.ex
@@ -144,6 +150,8 @@ end
 ```
 
 ### Step 4: async-safe tests — the right patterns
+
+**Objective**: Derive unique names from `context.test` + `System.unique_integer` and scope lifetime with `start_supervised!` so async parallelism stays safe.
 
 ```elixir
 # test/cache_layer/process_cache_test.exs
@@ -225,6 +233,8 @@ end
 
 ### Step 5: the anti-pattern — for reference, DO NOT ship
 
+**Objective**: Expose the hardcoded-name failure mode so readers recognize `:already_started` as a signature of async race, not a flake.
+
 ```elixir
 # Illustrative only — DO NOT actually add this test; it is async-unsafe.
 #
@@ -267,6 +277,21 @@ mix test --trace
 Target: the three modules should complete in a wall clock close to the slowest single
 module (parallel), not the sum (serial). Compare `mix test --max-cases 1` vs default.
 
+## Deep Dive: Async Patterns and Production Implications
+
+Async tests parallelize at the process level, with each test running in its own process mailbox. The consequence is that shared mutable state (Mox registry, ETS tables, Application.put_env) becomes a race condition if tests modify it concurrently. The solution is process-isolated state: Mox's private mode, Ecto.Sandbox, and tags like `@tag :global`. The discipline required to write correct async tests surfaces hidden race conditions in the system under test.
+
+---
+
+## Advanced Considerations
+
+Production testing strategies require careful attention to resource management and test isolation across multiple concurrent test processes. In large codebases, tests can consume significant memory and CPU resources, especially when using concurrent testing without proper synchronization and cleanup. The BEAM scheduler's preemptive nature means test processes may interfere with each other if shared resources aren't properly isolated at the process boundary. Pay careful attention to how Ecto's sandbox mode interacts with your supervision tree — if you have GenServers that hold state across tests, the sandbox rollback mechanism may leave phantom processes in your monitoring systems that continue consuming resources until forced cleanup occurs.
+
+When scaling tests to production-grade test suites, consider the cost of stub verification and the memory overhead of generated test cases. Each property-based test invocation can create thousands of synthetic test cases, potentially causing garbage collection pressure that's invisible during local testing but becomes critical in CI/CD pipelines running long test suites continuously. The interaction between concurrent tests and ETS tables (often used in caches and registry patterns) requires explicit `inherited: true` options to prevent unexpected sharing between test processes, which can cause mysterious failures when tests run in different orders or under load.
+
+For distributed testing scenarios using tools like `Peer`, network simulation can mask real latency issues and failure modes. Test timeouts that work locally may fail in CI due to scheduler contention and GC pauses. Always include substantial buffers for timeout values and monitor actual execution times under load. The coordination between multiple test nodes requires careful cleanup — a failure in test coordination can leave zombie processes consuming resources indefinitely. Implement proper telemetry hooks within your test helpers to diagnose production-like scenarios and capture performance characteristics.
+
+
 ## Trade-offs and production gotchas
 
 **1. Hardcoded `:name` in child spec**
@@ -308,3 +333,13 @@ dictionary use from abusive hidden state?
 - [`System.unique_integer/1`](https://hexdocs.pm/elixir/System.html#unique_integer/1)
 - [`start_supervised!/1`](https://hexdocs.pm/ex_unit/ExUnit.Callbacks.html#start_supervised!/1)
 - [Elixir forum — common async pitfalls](https://elixirforum.com/t/async-true-pitfalls/)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

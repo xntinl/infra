@@ -2,9 +2,6 @@
 
 **Project**: `validation_dsl` — a library that lets users declare validation rules in a `validate do ... end` block; rules are verified at compile time and executed as ordinary fast code at runtime.
 
-**Difficulty**: ★★★★☆
-**Estimated time**: 4–6 hours
-
 ---
 
 ## Project context
@@ -18,6 +15,16 @@ unknown validators) only discovered at runtime.
 You decide to build a small internal DSL, `ValidationDSL`, modeled after Ecto's
 `changeset/2` but standalone and with stronger compile-time guarantees: unknown
 validators cause a **compile error**, not a runtime `FunctionClauseError`. Users write:
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
 
 ```elixir
 defmodule User.Signup do
@@ -48,6 +55,12 @@ validation_dsl/
 │   └── validation_dsl_test.exs
 └── mix.exs
 ```
+
+---
+
+## Why DSL and not config maps
+
+Config maps push the error to the first runtime call, which may be in production. A DSL gives the compiler a chance to refuse bad shapes before the module loads.
 
 ---
 
@@ -99,9 +112,25 @@ makes compiled DSLs faster than reflective ones.
 
 ---
 
+## Design decisions
+
+**Option A — plain module functions that take config maps**
+- Pros: no macro machinery; callers can build config at runtime.
+- Cons: no declarative feel; validation runs on every call.
+
+**Option B — macro-based DSL with compile-time validation** (chosen)
+- Pros: reads like a spec; errors surface at compile; zero runtime overhead.
+- Cons: macro layer to teach and maintain.
+
+→ Chose **B** because the DSL describes shape, not behavior; compile time is where shape errors belong.
+
+---
+
 ## Implementation
 
 ### Step 1: `lib/validation_dsl/validators.ex`
+
+**Objective**: Define pure atom-keyed validators (required, type, min) as pattern-matched heads for compiler dispatch zero cost.
 
 ```elixir
 defmodule ValidationDSL.Validators do
@@ -141,6 +170,8 @@ end
 ```
 
 ### Step 2: `lib/validation_dsl/compiler.ex`
+
+**Objective**: Unroll field declarations into straight-line validator chains at compile time; raise CompileError on unknown keys.
 
 ```elixir
 defmodule ValidationDSL.Compiler do
@@ -229,6 +260,8 @@ end
 
 ### Step 3: `lib/validation_dsl/dsl.ex`
 
+**Objective**: Wire accumulator attributes and @before_compile callback so DSL blocks generate validate/1 statically.
+
 ```elixir
 defmodule ValidationDSL do
   @moduledoc """
@@ -276,6 +309,8 @@ end
 ```
 
 ### Step 4: Tests
+
+**Objective**: Assert per-validator error payloads, confirm CompileError on unknown validator keys and empty blocks.
 
 ```elixir
 defmodule ValidationDSLTest do
@@ -353,6 +388,35 @@ defmodule ValidationDSLTest do
 end
 ```
 
+### Why this works
+
+Each DSL macro accumulates declarations into module attributes. `@before_compile` assembles those declarations into emitted `def` clauses and struct definitions. The DSL is thin; the heavy lifting is data-to-AST.
+
+---
+
+
+## Key Concepts: Domain-Specific Languages via Macros
+
+A DSL (Domain-Specific Language) is a specialized language tailored to a problem. In Elixir, you build DSLs using macros. For example, a test framework might define `test "name" do ... end`, a query builder might define `from(u in User) |> where(u.age > 18)`, or a router might define `get("/path", to: Controller.action)`. Under the hood, macros parse the DSL syntax and transform it into standard Elixir code.
+
+Building a DSL requires nesting macros (e.g., `test` calls a macro that sets up context for inner code blocks) and careful hygiene (avoiding variable name collisions between the macro definition and the caller's scope). The benefit: domain experts can read and write code in natural domain terms. The cost: learning and maintaining the macro implementation.
+
+
+## Advanced Considerations: Macro Hygiene and Compile-Time Validation
+
+Macros execute at compile time, walking the AST and returning new AST. That power is easy to abuse: a macro that generates variables can shadow outer scope bindings, or a quote block that references variables directly can fail if the macro is used in a context where those variables don't exist. The `unquote` mechanism is the escape hatch, but misusing it leads to hard-to-debug compile errors.
+
+Macro hygiene is about capturing intent correctly. A `defmacro` that takes `:my_option` and uses it directly might match an unrelated `:my_option` from the caller's scope. The idiomatic pattern is to use `unquote` for values that should be "from the outside" and keep AST nodes quoted for safety. The `quote` block's binding of `var!` and `binding!` provides escape valves for the rare case when shadowing is intentional.
+
+Compile-time validation unlocks errors that would otherwise surface at runtime. A macro can call functions to validate input, generate code conditionally, or fail the build with `IO.warn`. Schema libraries like `Ecto` and `Ash` use macros to define fields at compile time, so runtime queries are guaranteed type-safe. The cost is cognitive load: developers must reason about both the code as written and the code generated.
+
+---
+
+
+## Deep Dive: Metaprogramming Patterns and Production Implications
+
+Metaprogramming (macros, AST manipulation) requires testing at compile time and runtime. The challenge is that macro tests often involve parsing and expanding code, which couples tests to compiler internals. Production bugs in macros can corrupt entire modules; testing macros rigorously is non-negotiable.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -403,6 +467,13 @@ Benchee.run(%{
 
 Expect the compiled DSL to be ~5–10× faster than a runtime-interpreted alternative
 on the same rule set.
+
+---
+
+## Reflection
+
+- Your DSL lets users express 80% of what they want. How do you make the escape hatch to raw Elixir painless without making the DSL itself leaky?
+- If two teams build parallel DSLs for similar domains, is unifying them worth the churn? What is the cheapest signal that says yes?
 
 ---
 

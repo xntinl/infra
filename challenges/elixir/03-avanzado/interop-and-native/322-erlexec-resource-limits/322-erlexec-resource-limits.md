@@ -95,6 +95,16 @@ recovery.
 
 ### Dependencies (`mix.exs`)
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
+
 ```elixir
 defmodule MlSandbox.MixProject do
   use Mix.Project
@@ -122,6 +132,8 @@ end
 
 ### Step 1: Supervisor
 
+**Objective**: Boot sandbox manager so untrusted script execution stays resource-controlled and monitorable.
+
 ```elixir
 defmodule MlSandbox.Application do
   use Application
@@ -137,6 +149,8 @@ end
 ```
 
 ### Step 2: The sandbox (`lib/ml_sandbox/sandbox.ex`)
+
+**Objective**: Enforce CPU/memory/time limits via erlexec and prlimit so untrusted scripts cannot exhaust resources.
 
 ```elixir
 defmodule MlSandbox.Sandbox do
@@ -427,6 +441,23 @@ Benchee.run(
 **Expected**: each spawn costs ~8ms (erlexec broker round-trip + prlimit setup + fork/exec).
 For a real Python interpreter startup you add another 40–80ms. Do not call `Sandbox.run`
 inside a tight loop; batch work inside the subprocess.
+
+## Advanced Considerations: NIF Isolation and Scheduler Integration
+
+NIF calls run atomically on a scheduler thread, blocking all other processes on that scheduler until the function returns. For operations exceeding ~1 millisecond, this starvation becomes visible: heartbeat processes delay, ETS owner replies hang, supervision timeouts fire. The BEAM's dirty scheduler pool (8 CPU + 10 IO by default) isolates long NIFs from the main scheduler ring, but they're still a finite resource.
+
+Understanding scheduler capacity is critical. Each dirty CPU scheduler can run ~1,000 100-microsecond operations per second, or ~5 100-millisecond operations. Beyond that, callers queue. A GenServer pool capping concurrency and applying backpressure prevents cascade failures: if the dirty pool saturates, reject new work immediately instead of queuing unboundedly.
+
+Resource management inside NIFs differs from pure Elixir. A `Binary<'a>` is a borrow tied to the NIF call; it cannot escape to threads or be stored in resources. An `OwnedBinary` allocation isn't visible to BEAM's garbage collector, so memory limits must be enforced in the Elixir layer. Hybrid architectures (Port processes for I/O, NIFs for CPU work) offer better observability and failure isolation than trying to do everything in a single NIF crate.
+
+---
+
+
+## Deep Dive: Interop Patterns and Production Implications
+
+Interop with native code (NIFs, ports, C extensions) introduces failure modes that pure Elixir code doesn't have: segfaults, memory leaks, deadlocks with the Erlang emulator. Testing interop requires separate test suites for the native layer and integration tests that exercise the boundary.
+
+---
 
 ## Trade-offs and production gotchas
 

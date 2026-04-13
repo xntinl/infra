@@ -2,10 +2,6 @@
 
 **Project**: `retry_fsm` — a retry state machine (`idle → trying → backoff → failed`) that implements exponential backoff with jitter using `:gen_statem` state timeouts.
 
-**Difficulty**: ★★★★☆
-
-**Estimated time**: 4–5 hours
-
 ---
 
 ## Project context
@@ -75,6 +71,16 @@ Jitter is not optional. Without jitter, thousands of workers that failed at the 
 
 ### 3. `:state_timeout` as the backoff timer
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
+
 ```elixir
 def backoff(:state_timeout, :retry, data), do: {:next_state, :trying, ...}
 ```
@@ -95,9 +101,25 @@ Emit `[:retry_fsm, :attempt]`, `[:retry_fsm, :backoff]`, `[:retry_fsm, :failed]`
 
 ---
 
+## Design decisions
+
+**Option A — `GenServer` with `Process.send_after/3` refs**
+- Pros: one behaviour the team already knows; no new dependency.
+- Cons: manual cancel on every transition; easy to leak stale `:retry` messages if a shutdown race fires the timer after the cancel.
+
+**Option B — `:gen_statem` with `:state_timeout`** (chosen)
+- Pros: state timeouts are cancelled atomically on state change; explicit states model the retry lifecycle; `:next_event` keeps internal drive deterministic.
+- Cons: extra behaviour to learn; slightly more ceremony than a plain loop.
+
+→ Chose **B** because the timer-vs-state invariant is the whole bug surface of retry code, and `:gen_statem` eliminates it by construction.
+
+---
+
 ## Implementation
 
 ### Step 1: `mix.exs`
+
+**Objective**: Pin :telemetry only so retry telemetry decouples from sink choice via stable interface.
 
 ```elixir
 defmodule RetryFsm.MixProject do
@@ -114,6 +136,8 @@ end
 ```
 
 ### Step 2: `lib/retry_fsm/worker.ex`
+
+**Objective**: Implement :gen_statem so :state_timeout cancels atomically on transition, eliminating stale-timer race bugs.
 
 ```elixir
 defmodule RetryFsm.Worker do
@@ -249,6 +273,8 @@ end
 
 ### Step 3: `lib/retry_fsm/application.ex`
 
+**Objective**: Wire empty root supervisor so workers spawn on-demand, matching per-job FSM lifecycle.
+
 ```elixir
 defmodule RetryFsm.Application do
   use Application
@@ -261,6 +287,8 @@ end
 ```
 
 ### Step 4: `test/retry_fsm/worker_test.exs`
+
+**Objective**: Drive FSM via deterministic flaky function so attempts/backoff/terminal state verify without wall-clock waits.
 
 ```elixir
 defmodule RetryFsm.WorkerTest do
@@ -278,59 +306,82 @@ defmodule RetryFsm.WorkerTest do
     end
   end
 
-  test "success from idle transitions to :idle with reset counter" do
-    {:ok, pid} = Worker.start_link(do_work: fn -> {:ok, 42} end)
-    :ok = Worker.attempt(pid)
-    Process.sleep(30)
-    {state, data} = Worker.current(pid)
-    assert state == :idle
-    assert data.attempts == 0
-    assert data.last_success == 42
-  end
+  describe "RetryFsm.Worker" do
+    test "success from idle transitions to :idle with reset counter" do
+      {:ok, pid} = Worker.start_link(do_work: fn -> {:ok, 42} end)
+      :ok = Worker.attempt(pid)
+      Process.sleep(30)
+      {state, data} = Worker.current(pid)
+      assert state == :idle
+      assert data.attempts == 0
+      assert data.last_success == 42
+    end
 
-  test "failure below max transitions to :backoff" do
-    {:ok, pid} = Worker.start_link(do_work: fn -> {:error, :boom} end)
-    :ok = Worker.attempt(pid)
-    Process.sleep(30)
-    {state, data} = Worker.current(pid)
-    assert state == :backoff
-    assert data.attempts == 1
-  end
+    test "failure below max transitions to :backoff" do
+      {:ok, pid} = Worker.start_link(do_work: fn -> {:error, :boom} end)
+      :ok = Worker.attempt(pid)
+      Process.sleep(30)
+      {state, data} = Worker.current(pid)
+      assert state == :backoff
+      assert data.attempts == 1
+    end
 
-  test "eventual success within max attempts resets" do
-    {:ok, pid} = Worker.start_link(do_work: counting_flaky(2))
-    :ok = Worker.attempt(pid)
-    # Wait long enough for: attempt1(fail) + backoff + attempt2(fail) + backoff + attempt3(ok)
-    Process.sleep(2_000)
-    {state, data} = Worker.current(pid)
-    assert state == :idle
-    assert data.attempts == 0
-    assert data.last_success == 2
-  end
+    test "eventual success within max attempts resets" do
+      {:ok, pid} = Worker.start_link(do_work: counting_flaky(2))
+      :ok = Worker.attempt(pid)
+      # Wait long enough for: attempt1(fail) + backoff + attempt2(fail) + backoff + attempt3(ok)
+      Process.sleep(2_000)
+      {state, data} = Worker.current(pid)
+      assert state == :idle
+      assert data.attempts == 0
+      assert data.last_success == 2
+    end
 
-  test "max attempts reached transitions to :failed" do
-    {:ok, pid} = Worker.start_link(do_work: fn -> {:error, :always} end)
-    :ok = Worker.attempt(pid)
-    # Sum of backoffs up to 5 attempts: roughly 100+200+400+800+1600 ~ 3.1 s with jitter
-    Process.sleep(6_000)
-    {state, data} = Worker.current(pid)
-    assert state == :failed
-    assert data.attempts == 5
-  end
+    test "max attempts reached transitions to :failed" do
+      {:ok, pid} = Worker.start_link(do_work: fn -> {:error, :always} end)
+      :ok = Worker.attempt(pid)
+      # Sum of backoffs up to 5 attempts: roughly 100+200+400+800+1600 ~ 3.1 s with jitter
+      Process.sleep(6_000)
+      {state, data} = Worker.current(pid)
+      assert state == :failed
+      assert data.attempts == 5
+    end
 
-  test "attempt on :failed resets and retries" do
-    {:ok, pid} = Worker.start_link(do_work: fn -> {:error, :always} end)
-    Worker.attempt(pid)
-    Process.sleep(6_000)
-    assert {:failed, _} = Worker.current(pid)
+    test "attempt on :failed resets and retries" do
+      {:ok, pid} = Worker.start_link(do_work: fn -> {:error, :always} end)
+      Worker.attempt(pid)
+      Process.sleep(6_000)
+      assert {:failed, _} = Worker.current(pid)
 
-    :ok = Worker.attempt(pid)
-    Process.sleep(20)
-    {state, _} = Worker.current(pid)
-    assert state in [:trying, :backoff]
+      :ok = Worker.attempt(pid)
+      Process.sleep(20)
+      {state, _} = Worker.current(pid)
+      assert state in [:trying, :backoff]
+    end
   end
 end
 ```
+
+### Why this works
+
+`:state_timeout` is tied to the state, not the process: the moment the FSM leaves `:backoff` the timer is cancelled automatically, so no stale `:retry` event can fire from a cancelled backoff window. Exponential growth with jitter converts a synchronized failure cohort into a time-spread arrival distribution, which is what actually protects the upstream during recovery. Terminating in `:failed` instead of crashing lets the supervisor treat "exhausted retries" as policy, not as a fault.
+
+---
+
+## Advanced Considerations: Supervision and Hot Code Upgrade Patterns
+
+The OTP supervision tree is the backbone of Elixir's fault tolerance. A DynamicSupervisor can spawn workers on demand and track them, but if a worker crashes before it's supervised, messages to it drop silently. Equally, a `:temporary` worker that crashes is restarted zero times — useful for one-off tasks, but requires the caller to handle crashes. `:transient` restarts on non-normal exits; `:permanent` always restarts.
+
+`handle_continue` callbacks and `:hibernate` reduce memory overhead in long-lived processes. After initializing, a GenServer can return `{:noreply, state, {:continue, :do_work}}` to defer expensive work past the `init/1` call, keeping the supervisor's synchronous startup fast. Hibernation moves a process's heap to disk, freeing RAM at the cost of latency when the process receives its next message.
+
+Hot code upgrades via `sys:replace_state/2` or `:sys.replace_state/3` allow changing code without restarting the VM, but only if state structure is forward- and backward-compatible. In practice, code changes that alter state shape (adding or removing fields) require a migration function. The `:code.purge/1` and `:code.load_file/1` cycle reloads the module, but old pids still run old code until they return to the scheduler. Design for graceful degradation: code that cannot upgrade hot should acknowledge that in docs and operational runbooks.
+
+---
+
+
+## Deep Dive: Otp Patterns and Production Implications
+
+OTP primitives (GenServer, Supervisor, Application) are tested through their public interfaces, not by inspecting internal state. This discipline forces correct design: if you can't test a behavior without peeking into the server's state, the behavior is not public. Production systems with tight integration tests on GenServer internals are fragile and hard to refactor.
 
 ---
 
@@ -365,6 +416,15 @@ Simulating 1,000 workers against a mock that fails 70% of the time:
 | mean time-to-success             | 1,850 ms       | 1,880 ms            |
 
 Jitter barely shifts mean latency but drops the p99 burst density by ~3×. That is the anti-thundering-herd win quantified.
+
+Target: p99 retry-burst density ≤ 300 req/s under 1k workers with a 70%-fail mock; jitter overhead on mean latency < 5%.
+
+---
+
+## Reflection
+
+1. If 10% of your retries end in `:failed` but the upstream recovers within 30 s, is the `max_attempts` cap too tight, the ceiling too low, or the jitter window wrong? Which telemetry signal tells you which knob to turn?
+2. You now need to retry across node restarts (the FSM state must survive a crash of the worker). Do you persist per-attempt state to disk on every transition, move the counter to an external store like ETS owned by a supervisor, or accept that restart resets the counter? Justify in terms of idempotency of the underlying operation.
 
 ---
 

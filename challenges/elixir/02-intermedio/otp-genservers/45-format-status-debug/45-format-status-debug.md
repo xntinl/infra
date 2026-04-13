@@ -118,12 +118,18 @@ end
 
 ### Step 1: Create the project
 
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
+
 ```bash
 mix new format_status_gs
 cd format_status_gs
 ```
 
 ### Step 2: `lib/format_status_gs.ex`
+
+**Objective**: Implement `format_status_gs.ex` — the GenServer callback shape that determines blocking vs fire-and-forget semantics and state invariants.
+
 
 ```elixir
 defmodule FormatStatusGs do
@@ -203,6 +209,9 @@ end
 
 ### Step 3: `test/format_status_gs_test.exs`
 
+**Objective**: Write `format_status_gs_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+
 ```elixir
 defmodule FormatStatusGsTest do
   use ExUnit.Case, async: true
@@ -257,6 +266,9 @@ end
 ```
 
 ### Step 4: Run
+
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
 
 ```bash
 mix test
@@ -322,3 +334,17 @@ noise for no gain. Add it where there is something to protect.
 - [`GenServer.format_status/2` — legacy callback](https://hexdocs.pm/elixir/GenServer.html#c:format_status/2)
 - [`:sys` module — Erlang debug tools](https://www.erlang.org/doc/man/sys.html)
 - [`Inspect` protocol — redact at inspect-time](https://hexdocs.pm/elixir/Inspect.html)
+
+
+## Advanced Considerations
+
+GenServer is the foundation of stateful concurrent systems in Elixir. Advanced patterns emerge from understanding the synchronous/asynchronous nature of callbacks and state evolution.
+
+**State evolution and message handling:**
+A GenServer's state is private, evolving only through synchronous (`handle_call`) or asynchronous (`handle_cast`) message handlers. The key insight: `handle_call` blocks the caller until the handler returns; `handle_cast` is fire-and-forget. Use `call` for operations requiring acknowledgment or returning results; use `cast` for notifications. Mixing them incorrectly leads to deadlocks (caller waiting forever) or lost updates (state changed before caller knows).
+
+**Advanced reply patterns:**
+The tuple `{:reply, reply, state}` is the standard, but you can split reply and state persistence. Use `:noreply` in `handle_call` if you need to send the reply later (e.g., after an async operation). The `:hibernate` flag tells the VM to garbage-collect the process and switch to a lightweight state — useful for long-lived processes that spend time idle.
+
+**Debugging and observability:**
+`format_status/2` controls how a GenServer appears in `:observer` and logs. It's critical for large state structures (hide sensitive fields, summarize collections). In production, comprehensive logging in callbacks (not just errors) reveals timing issues, message flow anomalies, and resource leaks before they become critical.

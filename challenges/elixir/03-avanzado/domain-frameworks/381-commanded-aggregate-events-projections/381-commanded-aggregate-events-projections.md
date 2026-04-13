@@ -92,6 +92,8 @@ end
 
 ### Step 1: Commanded application
 
+**Objective**: Implement: Commanded application.
+
 ```elixir
 defmodule ShoppingCartEs.CommandedApp do
   use Commanded.Application,
@@ -110,6 +112,8 @@ end
 ```
 
 ### Step 2: Commands and events
+
+**Objective**: Define imperative Commands and immutable Events as plain structs enforcing schema via @enforce_keys.
 
 ```elixir
 defmodule ShoppingCartEs.Cart.Commands do
@@ -148,6 +152,8 @@ end
 ```
 
 ### Step 3: Aggregate
+
+**Objective**: Code execute/2 for command validation and apply/2 for event replay—both side-effect-free state machines.
 
 ```elixir
 defmodule ShoppingCartEs.Cart.Aggregate do
@@ -222,6 +228,8 @@ end
 
 ### Step 4: Router
 
+**Objective**: Register command types with the router and set aggregate identity/lifespan policy for command dispatch.
+
 ```elixir
 defmodule ShoppingCartEs.Router do
   use Commanded.Commands.Router
@@ -248,6 +256,8 @@ end
 ```
 
 ### Step 5: Projection
+
+**Objective**: Implement: Projection.
 
 ```elixir
 defmodule ShoppingCartEs.Projections.CartSummaryProjector do
@@ -306,6 +316,8 @@ end
 
 ### Step 6: Migration
 
+**Objective**: Define the database migration: Migration.
+
 ```elixir
 defmodule ShoppingCartEs.Repo.Migrations.CreateCartSummaries do
   use Ecto.Migration
@@ -323,6 +335,8 @@ end
 ```
 
 ### Step 7: Config
+
+**Objective**: Configure the runtime wiring for: Config.
 
 ```elixir
 # config/config.exs
@@ -460,6 +474,24 @@ Benchee.run(
 
 Target on a single-node setup: p50 < 2ms per command including event store append. Above 10ms usually points at an un-pooled event store connection or Postgres fsync on every append.
 
+## Deep Dive
+
+Specialized frameworks like Ash (business logic), Commanded (event sourcing), and Nx (numerical computing) abstract away common infrastructure but impose architectural constraints. Ash's declarative resource definitions simplify authorization and querying at the cost of reduced flexibility—deeply nested association policies can degrade query performance. Commanded's event store and aggregate roots enforce event sourcing discipline, making audit trails and temporal queries natural, but require careful snapshot strategy to avoid replaying years of events. Nx brings numerical computing to Elixir, but JIT compilation and lazy evaluation introduce latency; production models benefit from ahead-of-time compilation for inference. For IoT (Nerves), firmware updates must be atomic and resumable—OTA rollback on failure is non-negotiable. Choose frameworks that align with your scaling assumptions: Ash scales horizontally via read replicas; Commanded scales via sharding; Nx scales via distributed training.
+## Advanced Considerations
+
+Framework choices like Ash, Commanded, and Nerves create significant architectural constraints that are difficult to change later. Ash's powerful query builder and declarative approach simplify common patterns but can be opaque when debugging complex permission logic or custom filters at scale. Event sourcing with Commanded is powerful for audit trails but creates a different mental model for state management — replaying events to derive current state has CPU and latency costs that aren't apparent in traditional CRUD systems.
+
+Nerves requires understanding the full embedded system stack — from bootloader configuration to over-the-air update mechanisms. A Nerves system that works on your development board may fail in production due to hardware variations, network conditions, or power supply issues. NX's numerical computing is powerful but requires understanding GPU acceleration trade-offs and memory management for large datasets. Livebook provides interactive development but shouldn't be used for production deployments without careful containerization and resource isolation.
+
+The integration between these frameworks and traditional BEAM patterns (supervisors, processes, GenServers) requires careful design. A Commanded projection that rebuilds state from the event log can consume all available CPU, starving other services. NX autograd computations can create unexpected memory usage if not carefully managed. Nerves systems are memory-constrained; performance assumptions from desktop Elixir don't hold. Always prototype these frameworks in realistic environments before committing to them in production systems to validate assumptions.
+
+
+## Deep Dive: Domain Patterns and Production Implications
+
+Domain-specific frameworks enforce module dependencies and architectural boundaries. Testing domain isolation ensures that constraints are maintained as the codebase grows. Production systems without boundary enforcement often become monolithic and hard to test.
+
+---
+
 ## Trade-offs and production gotchas
 
 **1. Event schema is forever**
@@ -487,3 +519,13 @@ The projection is eventually consistent and may lag by seconds on a busy node. I
 - [commanded_eventstore_adapter](https://hexdocs.pm/commanded_eventstore_adapter/)
 - [EventStore](https://hexdocs.pm/eventstore/)
 - [Ben Smith — Commanded author blog](https://10consulting.com/)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

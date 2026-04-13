@@ -1,8 +1,6 @@
 # Umbrella Boot Order and Application Dependencies
 
 **Project**: `umbrella_boot` — a three-application umbrella where boot order is load-bearing.
-**Difficulty**: ★★★★☆
-**Estimated time**: 3–6 hours
 
 ---
 
@@ -129,6 +127,16 @@ In a release, `mix release` writes a `sys.config` and a boot script. The order i
 boot script is the resolved topological sort of your dependency DAG. You can influence
 it with the `:applications` key of `release` in `mix.exs`:
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
+
 ```elixir
 releases: [
   umbrella_boot: [
@@ -153,9 +161,25 @@ and a cache owner crash means losing the table. Permanent it is.
 
 ---
 
+## Design decisions
+
+**Option A — single application with nested supervisors for boot ordering**
+- Pros: no umbrella overhead; one mix project to build.
+- Cons: you hand-roll application-level ordering; `Application.ensure_all_started/1` guarantees do not apply; teams coupled on build and dep graph.
+
+**Option B — umbrella with `:applications` dependency declarations** (chosen)
+- Pros: OTP's application controller guarantees boot order from the DAG; each app has its own dialyzer/test/release lifecycle; teams can work in parallel.
+- Cons: more mix projects; slower CI unless you cache per-app artefacts; dev-only vs prod-only deps need explicit gating.
+
+→ Chose **B** because boot order is a correctness invariant, and letting OTP enforce it from declared dependencies is cheaper than re-implementing the sequencing in code.
+
+---
+
 ## Implementation
 
 ### Step 1: Root `mix.exs`
+
+**Objective**: Declare the umbrella with `apps_path:` so each child app has its own lifecycle and `mix release` sorts them by dep DAG.
 
 ```elixir
 defmodule UmbrellaBoot.MixProject do
@@ -191,6 +215,8 @@ end
 
 ### Step 2: `apps/core/mix.exs`
 
+**Objective**: Core has zero umbrella deps — it must boot first so downstream apps can trust its ETS cache exists.
+
 ```elixir
 defmodule Core.MixProject do
   use Mix.Project
@@ -220,6 +246,8 @@ end
 
 ### Step 3: `apps/core/lib/core/application.ex`
 
+**Objective**: Start `Core.Cache` under a plain `:one_for_one` — the ETS table owner is the only process that matters here.
+
 ```elixir
 defmodule Core.Application do
   @moduledoc false
@@ -237,6 +265,8 @@ end
 ```
 
 ### Step 4: `apps/core/lib/core/cache.ex`
+
+**Objective**: Make one GenServer the sole ETS owner so a crash takes the table with it and restart repopulates from source.
 
 ```elixir
 defmodule Core.Cache do
@@ -277,6 +307,8 @@ end
 
 ### Step 5: `apps/infra/mix.exs`
 
+**Objective**: Declare `{:core, in_umbrella: true}` so Mix infers Infra boots after Core — avoid hand-rolling `:applications`.
+
 ```elixir
 defmodule Infra.MixProject do
   use Mix.Project
@@ -308,6 +340,8 @@ end
 
 ### Step 6: `apps/infra/lib/infra/application.ex`
 
+**Objective**: Use `:rest_for_one` so HttpPool restarts when Repo dies — its config was derived from a stale Repo session.
+
 ```elixir
 defmodule Infra.Application do
   @moduledoc false
@@ -328,6 +362,8 @@ end
 ```
 
 ### Step 7: `apps/infra/lib/infra/repo.ex`
+
+**Objective**: Simulate boot latency in `init/1` so downstream pool code visibly fails if declared `:applications` order is wrong.
 
 ```elixir
 defmodule Infra.Repo do
@@ -356,6 +392,8 @@ end
 
 ### Step 8: `apps/infra/lib/infra/http_pool.ex`
 
+**Objective**: Block `init/1` on `Repo.ready?` so boot-order bugs crash at startup, not under the first production request.
+
 ```elixir
 defmodule Infra.HttpPool do
   @moduledoc """
@@ -382,6 +420,8 @@ end
 ```
 
 ### Step 9: `apps/web/mix.exs`
+
+**Objective**: Depend on both `:core` and `:infra` so OTP's DAG boots `web` last — no manual `:applications` override needed.
 
 ```elixir
 defmodule Web.MixProject do
@@ -415,6 +455,8 @@ end
 
 ### Step 10: `apps/web/lib/web/application.ex`
 
+**Objective**: Keep `web` minimal — it only supervises `Endpoint`; dependency readiness is delegated to the `:applications` DAG.
+
 ```elixir
 defmodule Web.Application do
   @moduledoc false
@@ -432,6 +474,8 @@ end
 ```
 
 ### Step 11: `apps/web/lib/web/endpoint.ex`
+
+**Objective**: Assert `:core` and `:infra` are running in `init/1` so a misdeclared `:applications` list crashes at boot, not under traffic.
 
 ```elixir
 defmodule Web.Endpoint do
@@ -470,31 +514,52 @@ end
 
 ### Step 12: `apps/web/test/boot_order_test.exs`
 
+**Objective**: Freeze the boot DAG as executable assertions so reorderings of `:applications` fail CI instead of production.
+
 ```elixir
 defmodule Web.BootOrderTest do
   use ExUnit.Case, async: false
 
-  test "all three umbrella apps are running" do
-    running = Application.started_applications() |> Enum.map(&elem(&1, 0))
-    assert :core in running
-    assert :infra in running
-    assert :web in running
-  end
+  describe "Web.BootOrder" do
+    test "all three umbrella apps are running" do
+      running = Application.started_applications() |> Enum.map(&elem(&1, 0))
+      assert :core in running
+      assert :infra in running
+      assert :web in running
+    end
 
-  test "web can serve a request end-to-end through core and infra" do
-    assert {:ok, %{path: "/health"}} = Web.Endpoint.request("/health")
-    assert {:ok, :served} = Core.Cache.get("/health")
-  end
+    test "web can serve a request end-to-end through core and infra" do
+      assert {:ok, %{path: "/health"}} = Web.Endpoint.request("/health")
+      assert {:ok, :served} = Core.Cache.get("/health")
+    end
 
-  test "boot order is infra before web in the running app list" do
-    started = Application.started_applications() |> Enum.map(&elem(&1, 0))
-    infra_idx = Enum.find_index(started, &(&1 == :infra))
-    web_idx = Enum.find_index(started, &(&1 == :web))
-    # started_applications is reverse-chronological
-    assert web_idx < infra_idx
+    test "boot order is infra before web in the running app list" do
+      started = Application.started_applications() |> Enum.map(&elem(&1, 0))
+      infra_idx = Enum.find_index(started, &(&1 == :infra))
+      web_idx = Enum.find_index(started, &(&1 == :web))
+      # started_applications is reverse-chronological
+      assert web_idx < infra_idx
+    end
   end
 end
 ```
+
+---
+
+## Advanced Considerations: Partitioned Supervisors and Custom Restart Strategies
+
+A standard Supervisor is a single process managing a static tree. For thousands of children, a single supervisor becomes a bottleneck: all supervisor callbacks run on one process, and supervisor restart logic is sequential. PartitionSupervisor (OTP 25+) spawns N independent supervisors, each managing a subset of children. Hashing the child ID determines which partition supervises it, distributing load and enabling horizontal scaling.
+
+Custom restart strategies (via `Supervisor.init/2` callback) allow logic beyond the defaults. A strategy might prioritize restarting dependent services in a specific order, or apply backoff based on restart frequency. The downside is complexity: custom logic is harder to test and reason about, and mistakes cascade. Start with defaults and profile before adding custom behavior.
+
+Selective restart via `:rest_for_one` or `:one_for_all` affects failure isolation. `:one_for_all` restarts all children when one fails (simulating a total system failure), which can be necessary for consistency but is expensive. `:rest_for_one` restarts the failed child and any started after it, balancing isolation and dependencies. Understanding which strategy fits your architecture prevents cascading failures and unnecessary restarts.
+
+---
+
+
+## Deep Dive: Property Patterns and Production Implications
+
+Property-based testing inverts the testing mindset: instead of writing examples, you state invariants (properties) and let a generator find counterexamples. StreamData's shrinking capability is its superpower—when a property fails on a 10,000-element list, the framework reduces it to the minimal list that still fails, cutting debugging time from hours to minutes. The trade-off is that properties require rigorous thinking about domain constraints, and not every invariant is worth expressing as a property. Teams that adopt property testing often find bugs in specifications themselves, not just implementations.
 
 ---
 
@@ -539,7 +604,13 @@ namespaces. Umbrellas pay their cost (CI, dialyzer, dep resolution) only when yo
 
 ---
 
-## Performance notes
+### Why this works
+
+`:applications` in each app's `mix.exs` describes the DAG; the OTP application controller refuses to start an app whose dependencies have not finished booting. That turns a runtime ordering concern into a declarative one, and makes "forgot to declare the dependency" a boot-time error instead of a flaky integration test.
+
+---
+
+## Benchmark
 
 The assertion in `Web.Endpoint.init/1` adds < 100µs to boot. `Application.started_applications/0`
 is an ETS lookup inside `:application_controller`. It is safe to call hundreds of times.
@@ -547,6 +618,15 @@ is an ETS lookup inside `:application_controller`. It is safe to call hundreds o
 For deeper verification, replace the boot_order_test with a release-level smoke test:
 `_build/prod/rel/umbrella_boot/bin/umbrella_boot eval "Web.Endpoint.request(\"/ping\")"`
 and measure total boot-to-first-request latency. On a cold JIT, expect 1.5–2.5s.
+
+Target: boot-to-first-request ≤ 2.5 s on a cold JIT for a three-app umbrella; per-app `init/1` ≤ 200 ms unless work is deferred via `handle_continue`.
+
+---
+
+## Reflection
+
+1. Your `infra` app's `init/1` does a 5 s schema migration. Do you block boot on it, move it to a `handle_continue`, or split it into a separate application with its own lifecycle? Which option gives ops the clearest "ready" signal?
+2. A new application `analytics` depends on `core` but must boot *after* `web`. OTP's DAG does not express "after web". What is the minimum change — reorder the release, move `analytics` behind a start phase, or make `web` signal readiness — that correctly captures the intent?
 
 ---
 

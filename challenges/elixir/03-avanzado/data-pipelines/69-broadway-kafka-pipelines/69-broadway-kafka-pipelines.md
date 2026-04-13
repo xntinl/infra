@@ -135,6 +135,8 @@ Always ack after the downstream side-effect is durable.
 
 ### Step 1: Project and deps
 
+**Objective**: Pin `{:broadway_kafka, "~> 0.4"}` so partition-assignment callbacks and offset-commit-on-ack semantics stay frozen.
+
 ```bash
 mix new broadway_kafka --sup
 ```
@@ -150,6 +152,8 @@ end
 ```
 
 ### Step 2: Pipeline
+
+**Objective**: Commit offsets only after warehouse upsert returns `:ok` — guarantees at-least-once delivery tied to downstream durability.
 
 ```elixir
 defmodule BroadwayKafka.Pipeline do
@@ -224,6 +228,8 @@ end
 
 ### Step 3: Normaliser and warehouse (fakes for test)
 
+**Objective**: Validate JSON shape before batching so malformed events fail fast into the DLQ instead of polluting warehouse upserts.
+
 ```elixir
 defmodule BroadwayKafka.Normaliser do
   @spec normalise(binary()) :: {:ok, map()} | {:error, term()}
@@ -248,6 +254,8 @@ end
 ```
 
 ### Step 4: Telemetry — lag and throughput
+
+**Objective**: Implement: Telemetry — lag and throughput.
 
 ```elixir
 defmodule BroadwayKafka.Telemetry do
@@ -284,6 +292,8 @@ end
 ```
 
 ### Step 5: Tests with a stub producer
+
+**Objective**: Provide tests that exercise: Tests with a stub producer.
 
 Broadway ships `Broadway.DummyProducer` which is useful for handler tests.
 For end-to-end Kafka, use an embedded broker (e.g. `:brod_demo` or
@@ -323,16 +333,18 @@ defmodule BroadwayKafka.PipelineTest do
     :ok
   end
 
-  test "valid event routes to warehouse batcher" do
-    payload = ~s({"customer_id":"c1","event":"login","ts":1})
-    ref = Broadway.test_message(StubPipeline, payload)
-    assert_receive {:ack, ^ref, [%Message{batcher: :warehouse}], []}, 2_000
-  end
+  describe "BroadwayKafka.Pipeline" do
+    test "valid event routes to warehouse batcher" do
+      payload = ~s({"customer_id":"c1","event":"login","ts":1})
+      ref = Broadway.test_message(StubPipeline, payload)
+      assert_receive {:ack, ^ref, [%Message{batcher: :warehouse}], []}, 2_000
+    end
 
-  test "invalid event fails with :missing_fields" do
-    payload = ~s({"customer_id":"c1"})
-    ref = Broadway.test_message(StubPipeline, payload)
-    assert_receive {:ack, ^ref, [], [%Message{status: {:failed, :missing_fields}}]}, 2_000
+    test "invalid event fails with :missing_fields" do
+      payload = ~s({"customer_id":"c1"})
+      ref = Broadway.test_message(StubPipeline, payload)
+      assert_receive {:ack, ^ref, [], [%Message{status: {:failed, :missing_fields}}]}, 2_000
+    end
   end
 end
 ```
@@ -355,6 +367,24 @@ IO.puts("avg: #{time_us / 10_000} µs/op")
 ```
 
 Target: operation should complete in the low-microsecond range on modern hardware; deviations by >2× indicate a regression worth investigating.
+
+## Deep Dive
+
+Data pipelines in Elixir leverage the Actor model to coordinate work across producer, consumer, and batcher stages. GenStage provides the foundation—a demand-driven backpressure mechanism that prevents memory bloat when producers exceed consumer capacity. Broadway abstracts this further, handling subscriptions, acknowledgments, and error propagation automatically. Understanding pipeline topology is critical at scale: a misconfigured batcher can serialize work and kill throughput; conversely, excessive partitioning fragments state and increases GC pressure. In production systems, always measure latency and memory per stage—Broadway's metrics integration with Telemetry makes this traceable. Consider exactly-once delivery semantics early; most pipelines require idempotency keys or deduplication at the consumer boundary. For high-volume Kafka scenarios, partition alignment (matching Broadway partitions to Kafka partitions) is essential to avoid rebalancing storms.
+## Advanced Considerations
+
+Data pipeline implementations at scale require careful consideration of backpressure, memory buffering, and failure recovery semantics. Broadway and Genstage provide demand-driven processing, but understanding the exact flow of backpressure through your pipeline is essential to avoid either starving producers or overwhelming buffers. The interaction between batcher timeouts and consumer demand can create unexpected latencies when tuples are held waiting for either a size threshold or time threshold to be reached. In systems processing millions of events, even a 100ms batch timeout can impact end-to-end latency dramatically.
+
+Idempotency and exactly-once semantics are not automatic — they require architectural decisions about checkpointing and deduplication strategies. Writing checkpoints too frequently becomes a bottleneck; writing them too infrequently means lost progress on failure and potential duplicates. The choice between in-process ETS-based deduplication versus external stores (Redis, database) changes your failure recovery story fundamentally. Broadway's acknowledgment system is flexible but requires explicit design; missing acknowledgments can cause data loss or duplicates in production environments where failures are common.
+
+When handling external systems (databases, message queues, APIs), transient failures and circuit-breaker patterns become essential. A single slow downstream service can cause backpressure to ripple through your entire pipeline catastrophically. Consider implementing bulkhead patterns where certain pipeline stages have isolated pools of workers to prevent cascading failures. For ETL pipelines combining Ecto with streaming, managing database connection pools and transaction contexts requires careful coordination to prevent connection exhaustion.
+
+
+## Deep Dive: Streaming Patterns and Production Implications
+
+Stream-based pipelines in Elixir achieve backpressure and composability by deferring computation until consumption. Unlike eager list operations that allocate all intermediate structures, Streams are lazy chains that produce one element at a time, reducing memory footprint and enabling infinite sequences. The BEAM scheduler yields between Stream operations, allowing multiple concurrent pipelines to interleave fairly. At scale (processing millions of rows or events), the difference between eager and lazy evaluation becomes the difference between consistent latency and garbage collection pauses. Production systems benefit most when Streams are composed at library boundaries, not scattered across the codebase.
+
+---
 
 ## Trade-offs and production gotchas
 
@@ -428,3 +458,13 @@ Telemetry.Metrics.last_value("kafka.consumer.lag",
 - [Concurrent Data Processing in Elixir — Svilen Gospodinov](https://pragprog.com/titles/sgdpelixir/concurrent-data-processing-in-elixir/)
 - [BroadwayKafka source](https://github.com/dashbitco/broadway_kafka/blob/main/lib/broadway_kafka/producer.ex)
 - [Telemetry + Prometheus — `telemetry_metrics_prometheus`](https://hexdocs.pm/telemetry_metrics_prometheus/)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

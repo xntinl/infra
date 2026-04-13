@@ -106,6 +106,8 @@ defp elixirc_paths(_),     do: ["lib"]
 
 ### Step 1: the custom plug
 
+**Objective**: Halt requests missing `x-client-id` and assign the identity downstream so auth fails fast before the controller allocates state.
+
 ```elixir
 # lib/orders_api/web/plugs/require_client_id.ex
 defmodule OrdersApiWeb.Plugs.RequireClientId do
@@ -131,6 +133,8 @@ end
 ```
 
 ### Step 2: the controller
+
+**Objective**: Split valid, invalid, and domain-error paths into distinct `create/2` heads so integration tests assert exact status codes per branch.
 
 ```elixir
 # lib/orders_api/web/controllers/order_controller.ex
@@ -163,6 +167,8 @@ end
 
 ### Step 3: ConnCase
 
+**Objective**: Combine per-test sandbox ownership and `build_conn/0` so controller tests stay async while sharing a single template.
+
 ```elixir
 # test/support/conn_case.ex
 defmodule OrdersApiWeb.ConnCase do
@@ -189,6 +195,8 @@ end
 ```
 
 ### Step 4: controller integration tests
+
+**Objective**: Dispatch through the full endpoint pipeline with `json_response/2` so auth, validation, and success paths are asserted as HTTP contract, not internals.
 
 ```elixir
 # test/orders_api_web/controllers/order_controller_test.exs
@@ -260,6 +268,8 @@ end
 
 ### Step 5: plug-only tests using Plug.Test
 
+**Objective**: Exercise the plug with `Plug.Test.conn/3` in isolation so halt/assign behaviour is proven without routing noise.
+
 ```elixir
 # test/orders_api_web/plugs/require_client_id_test.exs
 defmodule OrdersApiWeb.Plugs.RequireClientIdTest do
@@ -324,6 +334,21 @@ Benchee.run(%{
 
 Target: < 1ms/op.
 
+## Deep Dive: Phoenix Patterns and Production Implications
+
+Phoenix's conn struct represents an HTTP request/response in flight, accumulating transformations through middleware and handler code. Testing a Phoenix endpoint end-to-end (not just the controller) catches middleware order bugs, header mismatches, and plug composition issues. The trade-off is that full integration tests are slower and harder to parallelize than unit tests. Production bugs in auth, CORS, or session handling are often due to middleware assumptions that live tests reveal.
+
+---
+
+## Advanced Considerations
+
+Production testing strategies require careful attention to resource management and test isolation across multiple concurrent test processes. In large codebases, tests can consume significant memory and CPU resources, especially when using concurrent testing without proper synchronization and cleanup. The BEAM scheduler's preemptive nature means test processes may interfere with each other if shared resources aren't properly isolated at the process boundary. Pay careful attention to how Ecto's sandbox mode interacts with your supervision tree — if you have GenServers that hold state across tests, the sandbox rollback mechanism may leave phantom processes in your monitoring systems that continue consuming resources until forced cleanup occurs.
+
+When scaling tests to production-grade test suites, consider the cost of stub verification and the memory overhead of generated test cases. Each property-based test invocation can create thousands of synthetic test cases, potentially causing garbage collection pressure that's invisible during local testing but becomes critical in CI/CD pipelines running long test suites continuously. The interaction between concurrent tests and ETS tables (often used in caches and registry patterns) requires explicit `inherited: true` options to prevent unexpected sharing between test processes, which can cause mysterious failures when tests run in different orders or under load.
+
+For distributed testing scenarios using tools like `Peer`, network simulation can mask real latency issues and failure modes. Test timeouts that work locally may fail in CI due to scheduler contention and GC pauses. Always include substantial buffers for timeout values and monitor actual execution times under load. The coordination between multiple test nodes requires careful cleanup — a failure in test coordination can leave zombie processes consuming resources indefinitely. Implement proper telemetry hooks within your test helpers to diagnose production-like scenarios and capture performance characteristics.
+
+
 ## Trade-offs and production gotchas
 
 **1. Building conn inside test body without `setup`**
@@ -364,3 +389,13 @@ close the gap?
 - [`Plug.Test`](https://hexdocs.pm/plug/Plug.Test.html)
 - [Phoenix testing guide](https://hexdocs.pm/phoenix/testing.html)
 - [Phoenix `json_response/2`](https://hexdocs.pm/phoenix/Phoenix.ConnTest.html#json_response/2)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

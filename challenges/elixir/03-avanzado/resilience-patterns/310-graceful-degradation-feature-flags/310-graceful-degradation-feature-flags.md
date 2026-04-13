@@ -48,6 +48,16 @@ Flag checks are on the hot path of every checkout. `:ets.lookup/2` with `read_co
 ```
 
 ### 2. `with_feature/3` — degradation at the call site
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
+
 ```elixir
 with_feature :fraud_scoring, fallback: :allow do
   FraudAPI.score(request)
@@ -85,6 +95,8 @@ end
 
 ### Step 1: Application
 
+**Objective**: Boot flags module under supervisor so ETS table lifetime is managed and outlives individual GenServer restarts during failover.
+
 ```elixir
 defmodule CheckoutDegrader.Application do
   use Application
@@ -98,6 +110,8 @@ end
 ```
 
 ### Step 2: Flags (`lib/checkout_degrader/flags.ex`)
+
+**Objective**: Serialize flag mutations through GenServer but read from :public ETS so enabled?/1 executes lock-free without touching mailbox on hot path.
 
 ```elixir
 defmodule CheckoutDegrader.Flags do
@@ -164,6 +178,8 @@ end
 ```
 
 ### Step 3: Example use (`lib/checkout_degrader/checkout.ex`)
+
+**Objective**: Use with_feature macro to disable fraud/analytics on outage so core purchase path survives upstream degradation without waiting on timeouts.
 
 ```elixir
 defmodule CheckoutDegrader.Checkout do
@@ -303,6 +319,23 @@ IO.puts("avg: #{t / 1_000_000} µs per check")
 ```
 
 Expected: ~0.2µs (200ns) per check.
+
+## Advanced Considerations: Circuit Breakers and Bulkheads in Production
+
+A circuit breaker monitors downstream service health and rejects new requests when failures exceed a threshold, failing fast instead of queuing indefinitely. States: `:closed` (normal), `:open` (fast-fail), `:half_open` (testing recovery). A timeout-based pattern monitors; once requests succeed again, the circuit closes. Half-open tests with a single request; if it succeeds, all requests resume.
+
+Bulkheads isolate resource pools so one slow endpoint doesn't starve others. A GenServer pool with a bounded queue (e.g., `:queue.len(state) >= 100`) can return `{:error, :overloaded}` immediately, preventing queue buildup. Combined with exponential backoff on the client (caller retries with increasing delays), this creates a natural circuit breaker behavior without explicit state.
+
+Graceful degradation means serving stale data or reduced functionality when a service is slow. A cached value with a 5-minute TTL is acceptable for many reads; serve it if the live source is timing out. Feature flags allow disabling expensive operations at runtime. Cascading timeout windows (outer service times out after 5s, inner calls must complete in 3s) prevent unbounded waiting. The cost is complexity: tracking degradation modes, testing failure scenarios, and ensuring data consistency under partial failures.
+
+---
+
+
+## Deep Dive: Resilience Patterns and Production Implications
+
+Resilience patterns (circuit breakers, timeouts, retries) are easy to implement but hard to test. The insight is that resilience patterns must be tested under failure: timeouts matter only when calls actually take time, retries matter only when transient failures occur. Production systems with untested resilience patterns often fail gracefully in test and catastrophically in production.
+
+---
 
 ## Trade-offs and production gotchas
 

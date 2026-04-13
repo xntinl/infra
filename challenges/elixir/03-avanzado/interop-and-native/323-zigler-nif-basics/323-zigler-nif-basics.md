@@ -55,6 +55,16 @@ For larger Zig codebases, Zigler also supports importing external `.zig` files.
 
 ### 1. The `~Z` sigil
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
+
 ```elixir
 ~Z"""
 pub fn add(a: i64, b: i64) i64 {
@@ -125,6 +135,8 @@ Zigler requires the Zig compiler on `$PATH`. Version is pinned by Zigler; check
 
 ### Step 1: The Zig module (`lib/crypto_primitives/zig.ex`)
 
+**Objective**: Inline constant-time crypto ops in Zig so MAC, XOR, and HKDF never leak timing side-channels to callers.
+
 ```elixir
 defmodule CryptoPrimitives.Zig do
   @moduledoc """
@@ -184,6 +196,8 @@ end
 ```
 
 ### Step 2: Application (`lib/crypto_primitives/application.ex`)
+
+**Objective**: Minimal supervisor so stateless NIF loads during OTP boot without managing processes.
 
 ```elixir
 defmodule CryptoPrimitives.Application do
@@ -319,6 +333,23 @@ Benchee.run(
 **Expected**: `ct_equal` < 100ns (less than any `GenServer.call` round trip), `xor_bytes`
 for 1KB < 1µs, HKDF-Expand for 32 bytes output < 3µs. If numbers are > 10x higher,
 verify the release build (`mix compile --env prod` or `MIX_ENV=prod`).
+
+## Advanced Considerations: NIF Isolation and Scheduler Integration
+
+NIF calls run atomically on a scheduler thread, blocking all other processes on that scheduler until the function returns. For operations exceeding ~1 millisecond, this starvation becomes visible: heartbeat processes delay, ETS owner replies hang, supervision timeouts fire. The BEAM's dirty scheduler pool (8 CPU + 10 IO by default) isolates long NIFs from the main scheduler ring, but they're still a finite resource.
+
+Understanding scheduler capacity is critical. Each dirty CPU scheduler can run ~1,000 100-microsecond operations per second, or ~5 100-millisecond operations. Beyond that, callers queue. A GenServer pool capping concurrency and applying backpressure prevents cascade failures: if the dirty pool saturates, reject new work immediately instead of queuing unboundedly.
+
+Resource management inside NIFs differs from pure Elixir. A `Binary<'a>` is a borrow tied to the NIF call; it cannot escape to threads or be stored in resources. An `OwnedBinary` allocation isn't visible to BEAM's garbage collector, so memory limits must be enforced in the Elixir layer. Hybrid architectures (Port processes for I/O, NIFs for CPU work) offer better observability and failure isolation than trying to do everything in a single NIF crate.
+
+---
+
+
+## Deep Dive: Interop Patterns and Production Implications
+
+Interop with native code (NIFs, ports, C extensions) introduces failure modes that pure Elixir code doesn't have: segfaults, memory leaks, deadlocks with the Erlang emulator. Testing interop requires separate test suites for the native layer and integration tests that exercise the boundary.
+
+---
 
 ## Trade-offs and production gotchas
 

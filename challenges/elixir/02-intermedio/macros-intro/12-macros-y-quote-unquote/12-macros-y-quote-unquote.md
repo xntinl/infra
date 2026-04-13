@@ -2,9 +2,6 @@
 
 **Project**: `macro_basics` — a handful of tiny macros that show how Elixir code becomes data, how `quote` captures it, and how `unquote` splices runtime values back in.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 2–3 hours
-
 ---
 
 ## Project context
@@ -33,6 +30,18 @@ macro_basics/
 │   └── macro_basics_test.exs
 └── mix.exs
 ```
+
+---
+
+## Why macros and not higher-order functions
+
+Una función higher-order recibe **valores evaluados**. Un macro recibe
+**AST no evaluado**. Esa es la única distinción real: necesitás un
+macro cuando el feature depende del *código fuente mismo* — generar
+function heads, emitir assertions de compile-time, embeber el texto
+de la expresión en un log, o decidir dispatch basándose en la forma
+del AST. Cuando nada de eso aplica, una función es más barata y más
+fácil de testear.
 
 ---
 
@@ -82,13 +91,45 @@ end
 Variables introduced inside `quote` live in the macro's scope, not the
 caller's. That prevents accidental capture and makes macros composable. You
 *can* break hygiene with `var!/2` when you really need to — but you almost
-never should. See exercise 94 for the pitfalls.
+never should.
+
+---
+
+## Design decisions
+
+**Option A — Enseñar `defmacro` con un DSL "real" (routing, schema)**
+- Pros: Motivante; muestra el payoff.
+- Cons: Combina dos lecciones (manipulación de AST + diseño de
+  dominio); el lector se pierde.
+
+**Option B — Cuatro macros triviales, cada uno aislando un concepto** (elegida)
+- Pros: `ast_of`, `debug`, `times`, `defconst` — cada uno enseña una
+  mecánica (quoting, expand-time, block splicing, code generation).
+- Cons: Sin "wow moment".
+
+→ Elegida **B** porque el propósito es construir modelo mental.
 
 ---
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"ecto", "~> 1.0"},
+    {:"phoenix", "~> 1.0"},
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
 
 ```bash
 mix new macro_basics
@@ -96,6 +137,9 @@ cd macro_basics
 ```
 
 ### Step 2: `lib/macro_basics.ex`
+
+**Objective**: Implement `macro_basics.ex` — AST manipulation that runs at compile time — making the macro's hygiene and unquoting choices observable.
+
 
 ```elixir
 defmodule MacroBasics do
@@ -170,6 +214,9 @@ end
 
 ### Step 3: `test/macro_basics_test.exs`
 
+**Objective**: Write `macro_basics_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+
 ```elixir
 defmodule MacroBasicsTest do
   use ExUnit.Case, async: true
@@ -223,6 +270,9 @@ end
 
 ### Step 4: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -234,6 +284,43 @@ iex> quote do: 1 + 2
 iex> quote do: if true, do: :yes, else: :no
 iex> Macro.to_string(quote do: Enum.map([1,2,3], &(&1 * 2)))
 ```
+
+### Why this works
+
+`defmacro` es el hook del compilador para "función AST → AST". Cada
+macro demo usa una primitiva: `ast_of` devuelve un AST literal vía
+`Macro.escape/1`; `debug` llama `Macro.to_string/1` en expand-time;
+`times` splicea un bloque `do: ...` dentro de un loop generado;
+`defconst` usa `unquote` en posición de nombre de función. Todos
+desaparecen tras la expansión.
+
+---
+
+
+## Key Concepts: Quote/Unquote and Hygienic Macros
+
+`quote` captures code as a nested term (an AST). `unquote` escapes the quote to inject dynamic values. `defmacro add(a, b) do quote do unquote(a) + unquote(b) end end` generates code that adds two values at compile time. Without `unquote`, the macro would inject the literal variables `a` and `b`, not their values.
+
+Hygiene: Elixir's macros are hygienic by default—variables in the quote are scoped to the macro definition, not the caller's context. This prevents accidental name collisions. You can break hygiene with `var!/1` when needed (e.g., to intentionally inject a variable into the caller's scope), but most uses should maintain hygiene. The gotcha: understanding when to quote, when to unquote, and when to use `quote do ... end` vs. building the AST directly takes practice.
+
+
+## Benchmark
+
+<!-- benchmark N/A: tema conceptual. Los macros expanden a código
+equivalente al manual; microbenchmarks medirían `IO.puts` o `Enum.each`
+sin la capa macro. -->
+
+---
+
+## Key Concepts
+
+Macros are compile-time code generators using `quote` and `unquote`. `quote` captures Elixir code as abstract syntax trees (ASTs); `unquote` splices values into quoted code. A macro receives AST, transforms it, and returns new AST—the compiler then compiles the resulting code. This is powerful but requires careful reasoning: the code is manipulated as data at compile time, then executed at runtime. Common patterns: DSLs (test assertions that read like English), computed constants (expensive calculations at compile time), and error checking (validate inputs before compilation). The danger: misused macros make code unreadable. Use macros sparingly; prefer functions or protocols when possible.
+
+---
+
+## Key Concepts
+
+Macros are compile-time code generators using `quote` and `unquote`. `quote` captures Elixir code as abstract syntax trees (ASTs); `unquote` splices values into quoted code. A macro receives AST, transforms it, and returns new AST. This is powerful but requires careful reasoning: the code is manipulated as data at compile time, then executed at runtime. Common patterns: DSLs (test assertions that read like English), computed constants (expensive calculations at compile time), and error checking. The danger: misused macros make code unreadable. Use macros sparingly.
 
 ---
 
@@ -272,6 +359,18 @@ do the job. Libraries like Ecto and Phoenix use macros heavily, but they do
 so because they need to generate functions at compile time from user
 declarations — a job functions can't do. If your use case is "pass some
 logic around," use a function or a fun.
+
+---
+
+## Reflection
+
+- Mirás el AST de `quote do: 1 + 2 * 3` y el árbol no es plano —
+  refleja precedencia. ¿Cómo aprovecharías ese árbol si tuvieras que
+  escribir un macro de constant folding? Describí el algoritmo sin
+  implementarlo.
+- `defconst` genera funciones con `unquote(name)` en posición de
+  nombre. ¿Qué pasa si `name` no es atom sino string? Probalo en IEx,
+  leé el error y explicá qué valida Elixir al expandir `def <expr>()`.
 
 ---
 

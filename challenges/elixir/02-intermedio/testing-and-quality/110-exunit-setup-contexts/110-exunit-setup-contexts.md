@@ -115,9 +115,24 @@ seed names (immutable), `setup` starts the Agent (mutable).
 
 ---
 
+### Dependencies (`mix.exs`)
+
+```elixir
+def deps do
+  [
+    {agent},
+    {error},
+    {exunit},
+    {ok},
+  ]
+end
+```
 ## Implementation
 
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
 
 ```bash
 mix new setup_contexts
@@ -125,6 +140,9 @@ cd setup_contexts
 ```
 
 ### Step 2: `lib/user_repo.ex`
+
+**Objective**: Implement `user_repo.ex` — the subject under test — shaped specifically to make the testing technique of this lab observable.
+
 
 ```elixir
 defmodule UserRepo do
@@ -168,6 +186,9 @@ end
 ```
 
 ### Step 3: `test/user_repo_test.exs`
+
+**Objective**: Write `user_repo_test.exs` exercising the exact ExUnit feature under study — assertions should fail loudly if the technique is misused.
+
 
 ```elixir
 defmodule UserRepoTest do
@@ -252,6 +273,9 @@ end
 
 ### Step 4: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 mix test --only with_seed
@@ -268,6 +292,14 @@ parameterized without a DSL; `on_exit/1` guarantees cleanup regardless of
 pass/fail.
 
 ---
+
+
+## Key Concepts: Test Setup and Shared Context
+
+ExUnit's `setup` blocks run before each test, preparing fixtures (e.g., creating a GenServer, populating a database table). Return a map (e.g., `%{store: store}`), and the map is passed to the test as an argument.
+
+For async tests, each setup runs independently. For non-async tests, setup runs once before all tests in the module. Use `:ok` or `{:ok, map}` for normal setup; `:skip` to skip the test; `:error` to signal a setup failure that aborts the test. Gotcha: setup runs for every test, so slow setup makes the suite slow. Optimize with tagged tests (`@tag slow: true`) run separately.
+
 
 ## Benchmark
 
@@ -320,3 +352,17 @@ introduces test-order coupling. Use `setup` + `start_supervised!/1` instead.
 - [`ExUnit.Callbacks`](https://hexdocs.pm/ex_unit/ExUnit.Callbacks.html)
 - [`ExUnit.Case` — context, tags, `@describetag`](https://hexdocs.pm/ex_unit/ExUnit.Case.html)
 - ["Testing in Elixir: Fixtures and Factories" — Dashbit blog](https://dashbit.co/blog) — the Dashbit team's ongoing series on disciplined fixtures
+
+
+## Key Concepts
+
+ExUnit testing in Elixir balances speed, isolation, and readability. The framework provides fixtures, setup hooks, and async mode to achieve both performance and determinism.
+
+**ExUnit patterns and fixtures:**
+`setup_all` runs once per module (module-scoped state); `setup` runs before each test. Returning `{:ok, map}` injects variables into the test context. For side-effectful setup (e.g., starting supervised processes), use `start_supervised` — it automatically stops the process when the test ends, ensuring cleanup.
+
+**Async safety and isolation:**
+Tests with `async: true` run in parallel, but they must be isolated. Shared resources (database, ETS tables, Registry) require careful locking. A common pattern: `setup :set_myflag` — a private setup that configures a unique state for that test. Avoid global state unless protected by locks.
+
+**Mocking trade-offs:**
+Libraries like `Mox` provide compile-time mock modules that behave like real modules but with controlled behavior. The benefit: you catch missing function implementations at test time. The trade-off: mocks don't catch runtime errors (e.g., a real function that crashes). For critical paths, complement mocks with integration tests against real dependencies. Dependency injection (passing modules as arguments) is more testable than direct calls.

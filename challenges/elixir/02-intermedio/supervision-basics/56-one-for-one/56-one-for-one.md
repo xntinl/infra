@@ -49,7 +49,7 @@ one_for_one_demo/
          └── Counter :c  (value=7)   ← untouched, still value=7
 ```
 
-Compare to `:one_for_all` (exercise 57) where every sibling would also be
+Compare to `:one_for_all` where every sibling would also be
 restarted and lose state.
 
 ### 2. Independent state is the prerequisite
@@ -96,12 +96,18 @@ end
 
 ### Step 1: Create the project
 
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
+
 ```bash
 mix new one_for_one_demo
 cd one_for_one_demo
 ```
 
 ### Step 2: `lib/one_for_one_demo/counter.ex`
+
+**Objective**: Implement `counter.ex` — a worker whose crash behavior is the whole point — it exists so the supervisor strategy can be observed.
+
 
 ```elixir
 defmodule OneForOneDemo.Counter do
@@ -141,6 +147,9 @@ end
 
 ### Step 3: `lib/one_for_one_demo/supervisor.ex`
 
+**Objective**: Encode the restart policy in `supervisor.ex` — the supervisor strategy is the lesson; the children exist to make it observable.
+
+
 ```elixir
 defmodule OneForOneDemo.Supervisor do
   @moduledoc """
@@ -166,6 +175,9 @@ end
 ```
 
 ### Step 4: `test/one_for_one_demo_test.exs`
+
+**Objective**: Write `one_for_one_demo_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
 
 ```elixir
 defmodule OneForOneDemoTest do
@@ -227,6 +239,9 @@ end
 
 ### Step 5: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -236,6 +251,14 @@ mix test
 ### Why this works
 
 The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+
+
+## Key Concepts: Restart Strategy — One-for-One
+
+With `:one_for_one` restart strategy, when a child crashes, only that child is restarted. Other children are unaffected. This is the most common strategy for worker pools: if one worker dies, restart it, but don't touch the others.
+
+When NOT to use it: if multiple children depend on each other's state (e.g., a primary + backup), restarting only one breaks invariants. Use `:one_for_all` instead (restart all) or `:rest_for_one` (restart the failed child and all started after it).
 
 
 ## Benchmark
@@ -252,7 +275,7 @@ useless. Avoid this by looking up by name (`Process.whereis/1` or a
 **2. Restart intensity is global to the supervisor**
 `:one_for_one` doesn't mean "each child has its own restart budget". The
 budget is shared. One badly-behaved child can blow the whole tree's
-intensity limit. Exercise 59 covers the math.
+intensity limit.
 
 **3. Independent ≠ stateless**
 A counter has state; that's fine. What matters is that the state has no
@@ -268,7 +291,7 @@ budget.
 **5. When NOT to use `:one_for_one`**
 When siblings depend on each other: shared in-memory state, pipeline
 stages, or a parent-built lookup table that references pids. Use
-`:one_for_all` (exercise 57) or `:rest_for_one` (exercise 58) instead.
+`:one_for_all` or `:rest_for_one` instead.
 
 ---
 
@@ -282,3 +305,17 @@ stages, or a parent-built lookup table that references pids. Use
 - [`Supervisor` strategies](https://hexdocs.pm/elixir/Supervisor.html#module-strategies)
 - [Erlang `supervisor` — Restart strategies](https://www.erlang.org/doc/man/supervisor.html#restart-strategies)
 - [The Little Elixir & OTP Guidebook — Ch. 7 "Supervisors"](https://www.manning.com/books/the-little-elixir-and-otp-guidebook)
+
+
+## Advanced Considerations
+
+Supervision trees encode your application's fault tolerance strategy. The tree structure, restart policy, and shutdown semantics directly determine behavior during crashes, dependencies, and graceful shutdown.
+
+**Supervision tree design:**
+A well-designed tree mirrors data/message flow: dependencies point upward. If process A depends on process B, B should be higher in the tree (started first, shut down last). Supervisor strategies (`:one_for_one`, `:one_for_all`, `:rest_for_one`) define the scope of cascading restarts. `:one_for_one` isolates failures (each crash restarts only that child); `:one_for_all` is for tightly-coupled groups (e.g., a reader-writer pair).
+
+**Restart strategies and intensity:**
+`max_restarts: 3, max_seconds: 5` means "if 3+ restarts occur in 5 seconds, kill the supervisor." This circuit-breaker pattern prevents restart loops that consume resources. The key decision: should a crashing child take down the whole app (escalate to parent) or just itself? Transient/temporary children exit "cleanly" and don't trigger restarts — useful for request handlers.
+
+**Error propagation and shutdown ordering:**
+When a supervisor exits, it sends `:shutdown` to children in reverse start order (LIFO). Children have `shutdown: 5000` milliseconds to terminate gracefully before hard killing. Nested supervisors propagate this signal recursively. Understanding this order prevents resource leaks: a child waiting on another child's graceful shutdown will deadlock if not designed carefully.

@@ -116,9 +116,22 @@ adds the expression source to the output (a macro superpower).
 
 ---
 
+### Dependencies (`mix.exs`)
+
+```elixir
+def deps do
+  [
+    {exunit},
+    {iex},
+  ]
+end
+```
 ## Implementation
 
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
 
 ```bash
 mix new debug_tools
@@ -126,6 +139,9 @@ cd debug_tools
 ```
 
 ### Step 2: `lib/text_pipeline.ex`
+
+**Objective**: Implement `text_pipeline.ex` — code whose shape is chosen to exercise the tool's capabilities, not to solve a domain problem.
+
 
 ```elixir
 defmodule TextPipeline do
@@ -227,6 +243,9 @@ end
 
 ### Step 3: `test/text_pipeline_test.exs`
 
+**Objective**: Write `text_pipeline_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+
 ```elixir
 defmodule TextPipelineTest do
   use ExUnit.Case, async: true
@@ -268,6 +287,9 @@ end
 ```
 
 ### Step 4: Run and explore
+
+**Objective**: Run and explore.
+
 
 ```bash
 mix test
@@ -368,3 +390,20 @@ If you're debugging concurrency / scheduling, reach for tracing (`:dbg`,
 - [`IEx.pry/0`](https://hexdocs.pm/iex/IEx.html#pry/0) — source-level breakpoints
 - [`Inspect.Opts`](https://hexdocs.pm/elixir/Inspect.Opts.html) — every flag you can pass (`limit`, `printable_limit`, `pretty`, `structs`, `syntax_colors`, etc.)
 - ["Debugging" — the Elixir guide](https://hexdocs.pm/elixir/debugging.html) — official walkthrough of all three tools
+
+
+## Deep Dive
+
+Elixir's tooling ecosystem extends beyond the language into DevOps, profiling, and observability. Understanding each tool's role prevents misuse and false optimizations.
+
+**Mix tasks and releases:**
+Custom mix tasks (`mix myapp.setup`, `mix myapp.migrate`) encapsulate operational knowledge. Tasks run in the host environment (not the compiled app), so they're ideal for setup, teardown, or scripting. Releases, built with `mix release`, create self-contained OTP applications deployable without Elixir installed. They're immutable: no source code changes after release — all config comes from environment variables or runtime files.
+
+**Debugging and profiling tools:**
+- `:observer` (GUI): real-time process tree, metrics, and port inspection
+- `Recon`: production-safe introspection (stable even under high load)
+- `:eprof`: function-level timing; lower overhead than `:fprof`
+- `:fprof`: detailed trace analysis; use only in staging
+
+**Profiling approaches:**
+Ceiling profiling (e.g., "which modules consume CPU?") is cheap; go there first with `perf` or `eprof`. Floor profiling (e.g., "which lines in this function are slow?") is expensive; reserve for specific functions. In production, prefer metrics (Prometheus, New Relic) over profiling — continuous profiling has overhead. Store profiling data for post-mortem analysis, not real-time dashboards.

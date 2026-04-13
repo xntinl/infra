@@ -134,7 +134,22 @@ when the keyspace is dynamic.
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"phoenix", "~> 1.0"},
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
 
 ```bash
 mix new ets_counters_demo
@@ -142,6 +157,9 @@ cd ets_counters_demo
 ```
 
 ### Step 2: `lib/ets_counters_demo.ex`
+
+**Objective**: Implement `ets_counters_demo.ex` — the access pattern that exposes the trade-off between ETS concurrency flags, match specs, and lookup cost.
+
 
 ```elixir
 defmodule EtsCountersDemo do
@@ -227,6 +245,9 @@ end
 
 ### Step 3: `test/ets_counters_demo_test.exs`
 
+**Objective**: Write `ets_counters_demo_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+
 ```elixir
 defmodule EtsCountersDemoTest do
   use ExUnit.Case, async: true
@@ -295,6 +316,9 @@ end
 
 ### Step 4: Run
 
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+
 ```bash
 mix test
 ```
@@ -310,6 +334,15 @@ contention entirely for the write path, at the cost of slightly weaker
 read consistency.
 
 ---
+
+
+## Deep Dive: ETS Concurrency Trade-Offs and Operation Atomicity
+
+ETS (Erlang Term Storage) is mutable, shared, in-process state—antithetical to Elixir's immutability. But it's required for specific cases: large shared datasets, fast lookups under contention, atomic counters across processes. Trade-off: operations aren't composable (no atomic multi-table updates without extra bookkeeping), and debugging is harder because mutations are invisible in code.
+
+Use ETS when: (1) true sharing between processes, (2) data is large (megabytes), (3) sub-millisecond latency required. Use GenServer when: (1) single process owns state, (2) dataset is small, (3) complex transition logic.
+
+Most common mistake: using ETS to work around GenServer bottlenecks without profiling. Profile usually shows either handler logic is expensive (move it out) or contention from N processes calling it. ETS solves contention via sharding: split state across tables/processes indexed by key. Always profile before choosing ETS.
 
 ## Benchmark
 
@@ -336,6 +369,12 @@ IO.puts("ets update_counter: #{us_atomic}µs  :counters: #{us_counters}µs")
 Target esperado: `:counters` es típicamente 2–5× más rápido que
 `:ets.update_counter/3` bajo alta concurrencia (>32 writers). Sin
 contención, la diferencia es marginal (<10%).
+
+---
+
+## Key Concepts
+
+ETS counters are a common pattern for tracking metrics without serialization overhead. A table with one row per counter, updated atomically with `ets:update_counter/3`, avoids the message-passing cost of GenServer-based counters. This is how systems track request counts, error rates, or any monotonic metric that needs fast increments from many processes. The trade-off: counters are eventually consistent (reads might be slightly stale) but are orders of magnitude faster than sending messages. For a GenServer-based counter, each call requires a process context switch; ETS is direct memory access. Use them for telemetry and monitoring; avoid for precise transactional counts where lost updates are unacceptable. The difference is load-bearing: a high-frequency API might process 100k requests/second, making GenServer counters prohibitively slow.
 
 ---
 

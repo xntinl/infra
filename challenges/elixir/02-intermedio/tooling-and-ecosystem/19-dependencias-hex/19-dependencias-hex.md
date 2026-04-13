@@ -133,9 +133,32 @@ cheaper guarantee.
 
 ---
 
+### Dependencies (`mix.exs`)
+
+```elixir
+def deps do
+  [
+    {core},
+    {credo},
+    {error},
+    {ex_doc},
+    {exunit},
+    {hex},
+    {jason},
+    {mix},
+    {nimble_parsec},
+    {ok},
+    {shared},
+    {some_lib},
+  ]
+end
+```
 ## Implementation
 
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
 
 ```bash
 mix new deps_intro
@@ -143,6 +166,9 @@ cd deps_intro
 ```
 
 ### Step 2: `mix.exs` — declare a realistic mix of deps
+
+**Objective**: Edit `mix.exs` — declare a realistic mix of deps, exposing code whose shape is chosen to exercise the tool's capabilities, not to solve a domain problem.
+
 
 ```elixir
 defmodule DepsIntro.MixProject do
@@ -182,6 +208,9 @@ end
 
 ### Step 3: `lib/deps_intro.ex` — prove Jason works
 
+**Objective**: Edit `deps_intro.ex` — prove Jason works, exposing code whose shape is chosen to exercise the tool's capabilities, not to solve a domain problem.
+
+
 ```elixir
 defmodule DepsIntro do
   @moduledoc """
@@ -213,6 +242,9 @@ end
 
 ### Step 4: `test/deps_intro_test.exs`
 
+**Objective**: Write `deps_intro_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+
 ```elixir
 defmodule DepsIntroTest do
   use ExUnit.Case, async: true
@@ -230,6 +262,9 @@ end
 ```
 
 ### Step 5: Run through the commands
+
+**Objective**: Run through the commands.
+
 
 ```bash
 mix deps.get      # fetches Jason; creates mix.lock
@@ -335,3 +370,20 @@ maintainer's release cadence before adding.
 - [Hex.pm docs — "Publishing a package"](https://hex.pm/docs/publish)
 - [`mix hex.outdated`](https://hexdocs.pm/hex/Mix.Tasks.Hex.Outdated.html)
 - ["SemVer"](https://semver.org/) — the spec that Hex constraints are built on
+
+
+## Deep Dive
+
+Elixir's tooling ecosystem extends beyond the language into DevOps, profiling, and observability. Understanding each tool's role prevents misuse and false optimizations.
+
+**Mix tasks and releases:**
+Custom mix tasks (`mix myapp.setup`, `mix myapp.migrate`) encapsulate operational knowledge. Tasks run in the host environment (not the compiled app), so they're ideal for setup, teardown, or scripting. Releases, built with `mix release`, create self-contained OTP applications deployable without Elixir installed. They're immutable: no source code changes after release — all config comes from environment variables or runtime files.
+
+**Debugging and profiling tools:**
+- `:observer` (GUI): real-time process tree, metrics, and port inspection
+- `Recon`: production-safe introspection (stable even under high load)
+- `:eprof`: function-level timing; lower overhead than `:fprof`
+- `:fprof`: detailed trace analysis; use only in staging
+
+**Profiling approaches:**
+Ceiling profiling (e.g., "which modules consume CPU?") is cheap; go there first with `perf` or `eprof`. Floor profiling (e.g., "which lines in this function are slow?") is expensive; reserve for specific functions. In production, prefer metrics (Prometheus, New Relic) over profiling — continuous profiling has overhead. Store profiling data for post-mortem analysis, not real-time dashboards.

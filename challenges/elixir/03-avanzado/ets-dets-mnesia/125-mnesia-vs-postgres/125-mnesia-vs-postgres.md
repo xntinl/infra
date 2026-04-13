@@ -1,8 +1,6 @@
 # Mnesia vs Postgres — Honest Comparison and Benchmark
 
 **Project**: `mnesia_vs_postgres` — side-by-side implementation of the same store in both backends.
-**Difficulty**: ★★★★☆
-**Estimated time**: 3–6 hours
 
 ---
 
@@ -42,6 +40,12 @@ mnesia_vs_postgres/
         ├── mnesia_store_test.exs
         └── postgres_store_test.exs
 ```
+
+---
+
+## Why choosing Mnesia and not Postgres
+
+Postgres is the right answer for most workloads. Mnesia wins specifically when the dataset fits in cluster RAM, latency matters, and the team owns the BEAM cluster. Outside that envelope, Postgres is the default.
 
 ---
 
@@ -105,10 +109,54 @@ a willingness to pay the operational tax.
 
 ---
 
+## Design decisions
+
+**Option A — Postgres (external)**
+- Pros: SQL, mature tooling, operational knowledge widespread, excellent durability.
+- Cons: network hop on every query; schema outside code; replication requires care.
+
+**Option B — Mnesia (in-process, BEAM-native)** (chosen)
+- Pros: in-process reads, Elixir-native schema, replicates with the cluster.
+- Cons: tooling is sparse, SQL is missing, netsplit handling is the caller's job.
+
+→ Chose **B** because context-dependent; neither wins in the abstract, but the BEAM-native integration is decisive when the data set fits.
+
+---
+
 ## Implementation
 
 ### Step 1: `mix.exs`
 
+**Objective**: Declare the project, dependencies, and OTP application in `mix.exs`.
+
+```elixir
+defmodule MnesiaVsPostgres.MixProject do
+  use Mix.Project
+
+  def project do
+    [app: :mnesia_vs_postgres, version: "0.1.0", elixir: "~> 1.16", deps: deps()]
+  end
+
+  def application do
+    [
+      extra_applications: [:logger, :mnesia],
+      mod: {MnesiaVsPostgres.Application, []}
+    ]
+  end
+
+  defp deps do
+    [
+      {:ecto_sql, "~> 3.11"},
+      {:postgrex, "~> 0.17"},
+      {:benchee, "~> 1.3", only: :dev}
+    ]
+  end
+end
+```
+
+### Dependencies (mix.exs)
+
+```elixir
 ```elixir
 defmodule MnesiaVsPostgres.MixProject do
   use Mix.Project
@@ -136,6 +184,8 @@ end
 
 ### Step 2: `lib/mnesia_vs_postgres/store_behaviour.ex`
 
+**Objective**: Implement the module in `lib/mnesia_vs_postgres/store_behaviour.ex`.
+
 ```elixir
 defmodule MnesiaVsPostgres.StoreBehaviour do
   @moduledoc """
@@ -154,6 +204,8 @@ end
 ```
 
 ### Step 3: `lib/mnesia_vs_postgres/mnesia_store.ex`
+
+**Objective**: Implement the module in `lib/mnesia_vs_postgres/mnesia_store.ex`.
 
 ```elixir
 defmodule MnesiaVsPostgres.MnesiaStore do
@@ -217,6 +269,8 @@ end
 
 ### Step 4: `lib/mnesia_vs_postgres/repo.ex` and `user.ex`
 
+**Objective**: Implement lib/mnesia_vs_postgres/repo.ex and user.ex.
+
 ```elixir
 defmodule MnesiaVsPostgres.Repo do
   use Ecto.Repo, otp_app: :mnesia_vs_postgres, adapter: Ecto.Adapters.Postgres
@@ -244,6 +298,8 @@ end
 
 ### Step 5: `priv/repo/migrations/20260401000000_create_users.exs`
 
+**Objective**: Implement the script in `priv/repo/migrations/20260401000000_create_users.exs`.
+
 ```elixir
 defmodule MnesiaVsPostgres.Repo.Migrations.CreateUsers do
   use Ecto.Migration
@@ -262,6 +318,8 @@ end
 ```
 
 ### Step 6: `lib/mnesia_vs_postgres/postgres_store.ex`
+
+**Objective**: Implement the module in `lib/mnesia_vs_postgres/postgres_store.ex`.
 
 ```elixir
 defmodule MnesiaVsPostgres.PostgresStore do
@@ -305,6 +363,8 @@ end
 
 ### Step 7: `lib/mnesia_vs_postgres/application.ex`
 
+**Objective**: Define the OTP application and supervision tree in `lib/mnesia_vs_postgres/application.ex`.
+
 ```elixir
 defmodule MnesiaVsPostgres.Application do
   @moduledoc false
@@ -339,6 +399,8 @@ config :mnesia_vs_postgres, MnesiaVsPostgres.Repo,
 
 ### Step 8: Tests (shared structure)
 
+**Objective**: Write tests for (shared structure).
+
 ```elixir
 # test/mnesia_vs_postgres/mnesia_store_test.exs
 defmodule MnesiaVsPostgres.MnesiaStoreTest do
@@ -350,19 +412,21 @@ defmodule MnesiaVsPostgres.MnesiaStoreTest do
     :ok
   end
 
-  test "round-trip put/get" do
-    user = %{id: "u1", email: "a@b.c", tier: :pro}
-    assert :ok = MnesiaStore.put(user)
-    assert {:ok, ^user} = MnesiaStore.get("u1")
-  end
-
-  test "list_by_tier/1 uses the tier index" do
-    for i <- 1..50 do
-      MnesiaStore.put(%{id: "u#{i}", email: "e#{i}", tier: if(rem(i, 2) == 0, do: :free, else: :pro)})
+  describe "MnesiaVsPostgres.MnesiaStore" do
+    test "round-trip put/get" do
+      user = %{id: "u1", email: "a@b.c", tier: :pro}
+      assert :ok = MnesiaStore.put(user)
+      assert {:ok, ^user} = MnesiaStore.get("u1")
     end
 
-    pros = MnesiaStore.list_by_tier(:pro)
-    assert length(pros) == 25
+    test "list_by_tier/1 uses the tier index" do
+      for i <- 1..50 do
+        MnesiaStore.put(%{id: "u#{i}", email: "e#{i}", tier: if(rem(i, 2) == 0, do: :free, else: :pro)})
+      end
+
+      pros = MnesiaStore.list_by_tier(:pro)
+      assert length(pros) == 25
+    end
   end
 end
 ```
@@ -378,23 +442,27 @@ defmodule MnesiaVsPostgres.PostgresStoreTest do
     :ok
   end
 
-  test "round-trip put/get" do
-    user = %{id: "u1", email: "a@b.c", tier: :pro}
-    assert :ok = PostgresStore.put(user)
-    assert {:ok, ^user} = PostgresStore.get("u1")
-  end
-
-  test "list_by_tier/1 uses the tier index" do
-    for i <- 1..50 do
-      PostgresStore.put(%{id: "u#{i}", email: "e#{i}", tier: if(rem(i, 2) == 0, do: :free, else: :pro)})
+  describe "MnesiaVsPostgres.PostgresStore" do
+    test "round-trip put/get" do
+      user = %{id: "u1", email: "a@b.c", tier: :pro}
+      assert :ok = PostgresStore.put(user)
+      assert {:ok, ^user} = PostgresStore.get("u1")
     end
 
-    assert length(PostgresStore.list_by_tier(:pro)) == 25
+    test "list_by_tier/1 uses the tier index" do
+      for i <- 1..50 do
+        PostgresStore.put(%{id: "u#{i}", email: "e#{i}", tier: if(rem(i, 2) == 0, do: :free, else: :pro)})
+      end
+
+      assert length(PostgresStore.list_by_tier(:pro)) == 25
+    end
   end
 end
 ```
 
 ### Step 9: Benchmark
+
+**Objective**: Benchmark the implementation to measure throughput and latency.
 
 ```elixir
 # bench/compare_bench.exs
@@ -444,6 +512,28 @@ Observations:
 * Mnesia writes are ~3x faster locally.
 * Postgres wins on bulk queries (indexed list scan). Its planner and
   streaming protocol are hard to beat beyond a few hundred rows.
+
+### Why this works
+
+The decision hinges on four axes: data size, latency budget, team ops maturity, and whether SQL is load-bearing. Mnesia wins when all four favor it; Postgres is the safe default otherwise.
+
+---
+
+## Deep Dive
+
+ETS (Erlang Term Storage) is RAM-only and process-linked; table destruction triggers if the owner crashes, causing silent data loss in careless designs. Match specifications (match_specs) are micro-programs that filter/transform data at the C layer, orders of magnitude faster than fetching all records and filtering in Elixir. Mnesia adds disk persistence and replication but introduces transaction overhead and deadlock potential; dirty operations bypass locks for speed but sacrifice consistency guarantees. For caching, named tables (public by design) are globally visible but require careful name management; consider ETS sharding (multiple small tables) to reduce lock contention on hot keys. DETS (Disk ETS) persists to disk but is single-process bottleneck and slower than a real database. At scale, prefer ETS for in-process state and Mnesia/PostgreSQL for shared, persistent data.
+## Advanced Considerations
+
+ETS and DETS performance characteristics change dramatically based on access patterns and table types. Ordered sets provide range queries but slower access than hash tables; set types don't support duplicate keys while bags do. The `heir` option for ETS tables is essential for fault tolerance — when a table owner crashes, the heir process can take ownership and prevent data loss. Without it, the table is lost immediately. Mnesia replicates entire tables across nodes; choosing which nodes should have replicas and whether they're RAM or disk replicas affects both consistency guarantees and network traffic during cluster operations.
+
+DETS persistence comes with significant performance implications — writes are synchronous to disk by default, creating latency spikes. Using `sync: false` improves throughput but risks data loss on crashes. The maximum DETS table size is limited by available memory and the file system; planning capacity requires understanding your growth patterns. Mnesia's transaction system provides ACID guarantees, but dirty operations bypass these guarantees for performance. Understanding when to use dirty reads versus transactional reads significantly impacts both correctness and latency.
+
+Debugging ETS and DETS issues is challenging because problems often emerge under load when many processes contend for the same table. Table memory fragmentation is invisible to code but can exhaust memory. Using match specs instead of iteration over large tables can dramatically improve performance but requires careful construction. The interaction between ETS, replication, and distributed systems creates subtle consistency issues — a node with a stale ETS replica can serve incorrect data during network partitions. Always monitor table sizes and replication status with structured logging.
+
+
+## Deep Dive: Etsdets Patterns and Production Implications
+
+ETS tables are in-memory, non-distributed key-value stores with tunable semantics (ordered_set, duplicate_bag). Under concurrent read/write load, ETS table semantics matter: bag semantics allow fast appends but slow deletes; ordered_set allows range queries but slower inserts. Testing ETS behavior under concurrent load is non-trivial; single-threaded tests miss lock contention. Production ETS tables often fail under load due to concurrency assumptions that quiet tests don't exercise.
 
 ---
 
@@ -506,6 +596,25 @@ anything slow. Most "Postgres is slow" arguments vanish once the right
 index is in place and the query is inspected. Mnesia has no equivalent
 diagnostic tooling, which is itself a tradeoff — you cannot debug what
 you cannot inspect.
+
+---
+
+## Benchmark
+
+```elixir
+# :timer.tc / Benchee measurement sketch
+{time_us, _} = :timer.tc(fn -> :ok end)
+IO.puts("elapsed: #{time_us} us")
+```
+
+Target: Mnesia dirty read 1-3 us; Postgres query round-trip 100-500 us local, higher over network.
+
+---
+
+## Reflection
+
+- Your dataset is 2 TB and read-heavy. Does Mnesia fit, and what would have to be true operationally for you to still pick it?
+- A junior engineer picks Mnesia for a new service. What three questions would make them change their mind in most cases?
 
 ---
 

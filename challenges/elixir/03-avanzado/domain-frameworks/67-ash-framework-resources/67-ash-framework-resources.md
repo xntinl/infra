@@ -10,7 +10,7 @@ Your company runs a B2B SaaS subscription platform. The product catalog lives be
 
 [Ash Framework](https://hexdocs.pm/ash/) inverts the model: you declare a **resource** once, and everything else — migrations, CRUD actions, filters, relationships, pagination, policies, APIs — is derived. Think of it as "the Rails for domain-driven Elixir", with first-class support for CQRS patterns and runtime introspection.
 
-In this exercise you build the `Catalog` domain: `Product`, `Category`, `Price`, with attributes, custom validations, relationships, and Ash actions backed by [`AshPostgres`](https://hexdocs.pm/ash_postgres/). Extensions (JSON:API, GraphQL) come in exercise 68.
+In this exercise you build the `Catalog` domain: `Product`, `Category`, `Price`, with attributes, custom validations, relationships, and Ash actions backed by [`AshPostgres`](https://hexdocs.pm/ash_postgres/). Extensions (JSON:API, GraphQL) are covered separately.
 
 ```
 ash_resources/
@@ -113,6 +113,8 @@ end
 
 ### Step 1: `mix.exs`
 
+**Objective**: Add Ash, AshPostgres, and Ecto dependencies for domain-driven resource definitions.
+
 ```elixir
 defmodule AshResources.MixProject do
   use Mix.Project
@@ -139,6 +141,8 @@ end
 
 ### Step 2: Repo — `lib/ash_resources/repo.ex`
 
+**Objective**: Configure AshPostgres Repo with extensions and map it as the data layer for resources.
+
 ```elixir
 defmodule AshResources.Repo do
   use AshPostgres.Repo, otp_app: :ash_resources
@@ -150,6 +154,8 @@ end
 ```
 
 ### Step 3: Domain — `lib/ash_resources/catalog/catalog.ex`
+
+**Objective**: Group related resources and policies under a single Domain for cohesive business logic boundaries.
 
 A domain groups resources with cross-cutting concerns (APIs, policies).
 
@@ -166,6 +172,8 @@ end
 ```
 
 ### Step 4: Category resource — `lib/ash_resources/catalog/category.ex`
+
+**Objective**: Define attributes, relationships, identities, and domain-specific actions for the Category resource.
 
 ```elixir
 defmodule AshResources.Catalog.Category do
@@ -208,6 +216,8 @@ end
 ```
 
 ### Step 5: Product resource — `lib/ash_resources/catalog/product.ex`
+
+**Objective**: Define Product with enums, belongs_to Category, and lifecycle hooks for audit logging.
 
 ```elixir
 defmodule AshResources.Catalog.Product do
@@ -299,6 +309,8 @@ end
 
 ### Step 6: Price resource — `lib/ash_resources/catalog/price.ex`
 
+**Objective**: Implement: Price resource — `lib/ash_resources/catalog/price.ex`.
+
 ```elixir
 defmodule AshResources.Catalog.Price do
   use Ash.Resource,
@@ -343,6 +355,8 @@ end
 
 ### Step 7: Application and config
 
+**Objective**: Wire the supervision tree: Application and config.
+
 ```elixir
 # lib/ash_resources/application.ex
 defmodule AshResources.Application do
@@ -372,6 +386,8 @@ config :ash_resources, AshResources.Repo,
 
 ### Step 8: Generate migrations and run
 
+**Objective**: Define the database migration: Generate migrations and run.
+
 ```bash
 mix deps.get
 mix ash_postgres.generate_migrations --name initial_catalog
@@ -381,6 +397,8 @@ mix ash_postgres.migrate
 The `ash_postgres.generate_migrations` task inspects the resources and emits a matching Ecto migration. You review and commit it; Ash does not silently auto-apply schema changes.
 
 ### Step 9: Tests — `test/catalog_test.exs`
+
+**Objective**: Provide tests that exercise: Tests — `test/catalog_test.exs`.
 
 ```elixir
 defmodule AshResources.CatalogTest do
@@ -458,6 +476,14 @@ end
 
 The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
 
+
+## Key Concepts: Domain-Driven Design via Resource Definitions
+
+Ash is a declarative framework for building domain models and APIs. Instead of writing `Ecto.Schema` + module functions, you define a `Resource`—a DSL that specifies attributes, relationships, actions (create, read, update, delete, custom), validations, and policies all in one place. Ash generates the query logic, validations, and policies automatically.
+
+The key benefit is **consistency**: every resource has the same interface and behavior. Every action goes through the same policy checks. Relationships are resolved efficiently. The cost is learning curve: Ash is a framework, not a library. You're committing to its DSL and opinionated patterns. Suitable for large, domain-heavy projects; overkill for simple CRUD apps.
+
+
 ## Benchmark
 
 ```elixir
@@ -469,6 +495,21 @@ IO.puts("avg: #{time_us / 10_000} µs/op")
 ```
 
 Target: operation should complete in the low-microsecond range on modern hardware; deviations by >2× indicate a regression worth investigating.
+
+## Deep Dive: Domain Patterns and Production Implications
+
+Domain-specific frameworks enforce module dependencies and architectural boundaries. Testing domain isolation ensures that constraints are maintained as the codebase grows. Production systems without boundary enforcement often become monolithic and hard to test.
+
+---
+
+## Advanced Considerations
+
+Framework choices like Ash, Commanded, and Nerves create significant architectural constraints that are difficult to change later. Ash's powerful query builder and declarative approach simplify common patterns but can be opaque when debugging complex permission logic or custom filters at scale. Event sourcing with Commanded is powerful for audit trails but creates a different mental model for state management — replaying events to derive current state has CPU and latency costs that aren't apparent in traditional CRUD systems.
+
+Nerves requires understanding the full embedded system stack — from bootloader configuration to over-the-air update mechanisms. A Nerves system that works on your development board may fail in production due to hardware variations, network conditions, or power supply issues. NX's numerical computing is powerful but requires understanding GPU acceleration trade-offs and memory management for large datasets. Livebook provides interactive development but shouldn't be used for production deployments without careful containerization and resource isolation.
+
+The integration between these frameworks and traditional BEAM patterns (supervisors, processes, GenServers) requires careful design. A Commanded projection that rebuilds state from the event log can consume all available CPU, starving other services. NX autograd computations can create unexpected memory usage if not carefully managed. Nerves systems are memory-constrained; performance assumptions from desktop Elixir don't hold. Always prototype these frameworks in realistic environments before committing to them in production systems to validate assumptions.
+
 
 ## Trade-offs and production gotchas
 
@@ -533,3 +574,13 @@ For complex reads (policies + calculations + 5-level loads), expect Ash overhead
 - [Zach Daniel — "Why Ash?"](https://www.youtube.com/watch?v=2U3vQHXCF0s) — talk explaining the design goals
 - [Alembic — "Building SaaS with Ash Framework"](https://alembic.com.au/blog) — production case studies
 - [Ash Discord community](https://discord.gg/D7FNG2q) — active support channel
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

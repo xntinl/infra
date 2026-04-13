@@ -2,9 +2,6 @@
 
 **Project**: `drain_on_deploy` — full rolling-deploy drain: stop accepting, drain in-flight, SIGTERM handler, K8s preStop hook.
 
-**Difficulty**: ★★★★☆
-**Estimated time**: 4–6 hours
-
 ---
 
 ## Project context
@@ -110,9 +107,35 @@ If drain takes > 25s, K8s SIGKILLs you.
 
 ---
 
+## Design decisions
+
+**Option A — rely on supervisor shutdown timeouts alone**
+- Pros: zero new code; trust the tree.
+- Cons: the supervisor cannot tell K8s to stop routing new traffic; in-flight 502s during the TCP close race.
+
+**Option B — dual-flag readiness gate + SIGTERM handler + preStop hook** (chosen)
+- Pros: readiness flips before supervisors stop; K8s stops routing before the pod is killed; in-flight work finishes under a bounded window.
+- Cons: four moving parts (readiness flag, accepting flag, signal handler, preStop); test harness must simulate SIGTERM.
+
+→ Chose **B** because the 502-rate-during-deploy metric is the real acceptance criterion, and only explicit coordination between the pod and the cluster eliminates it.
+
+---
+
 ## Implementation
 
 ### Step 1: Application wiring
+
+**Objective**: Seed `persistent_term` gates up-front and register the signal handler so readiness flips atomically the instant SIGTERM arrives.
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
 
 ```elixir
 # lib/drain_on_deploy/application.ex
@@ -152,6 +175,8 @@ end
 
 ### Step 2: The gate
 
+**Objective**: Back the `ready?/0` and `accepting?/0` flags with `persistent_term` so hot-path reads are O(1) and branch-free.
+
 ```elixir
 # lib/drain_on_deploy/gate.ex
 defmodule DrainOnDeploy.Gate do
@@ -175,6 +200,8 @@ end
 ```
 
 ### Step 3: Signal handler
+
+**Objective**: Hook SIGTERM via `:erl_signal_server` and spawn `:init.stop/0` so the handler does not deadlock itself.
 
 ```elixir
 # lib/drain_on_deploy/signal_handler.ex
@@ -238,6 +265,8 @@ end
 ```
 
 ### Step 4: The request server
+
+**Objective**: Trap exits and drain in-flight replies against a deadline so SIGTERM never truncates responses mid-flight.
 
 ```elixir
 # lib/drain_on_deploy/request_server.ex
@@ -321,6 +350,8 @@ end
 
 ### Step 5: Readiness probe endpoint
 
+**Objective**: Expose a 200/503 probe bound to the gate so k8s removes the endpoint before SIGTERM reaches the BEAM.
+
 ```elixir
 # lib/drain_on_deploy/readiness.ex
 defmodule DrainOnDeploy.Readiness do
@@ -347,6 +378,8 @@ end
 ```
 
 ### Step 6: K8s manifest (reference)
+
+**Objective**: Pair `preStop sleep` with `terminationGracePeriodSeconds` so endpoint removal races ahead of the drain deadline.
 
 ```yaml
 # k8s/deployment.yaml
@@ -388,16 +421,20 @@ spec:
 
 ### Step 7: Tests
 
+**Objective**: Assert the gate flips under SIGTERM, new traffic is rejected with `:draining`, and in-flight work completes before the deadline.
+
 ```elixir
 # test/drain_on_deploy/signal_handler_test.exs
 defmodule DrainOnDeploy.SignalHandlerTest do
   use ExUnit.Case, async: false
 
-  test "installing the handler is idempotent" do
-    {:ok, _} = DrainOnDeploy.SignalHandler.install()
-    {:ok, _} = DrainOnDeploy.SignalHandler.install()
-    handlers = :gen_event.which_handlers(:erl_signal_server)
-    assert DrainOnDeploy.SignalHandler in handlers
+  describe "DrainOnDeploy.SignalHandler" do
+    test "installing the handler is idempotent" do
+      {:ok, _} = DrainOnDeploy.SignalHandler.install()
+      {:ok, _} = DrainOnDeploy.SignalHandler.install()
+      handlers = :gen_event.which_handlers(:erl_signal_server)
+      assert DrainOnDeploy.SignalHandler in handlers
+    end
   end
 end
 
@@ -413,43 +450,62 @@ defmodule DrainOnDeploy.DrainFlowTest do
     :ok
   end
 
-  test "ready and accepting by default" do
-    assert Gate.ready?()
-    assert Gate.accepting?()
-    assert {200, "ok"} = Readiness.probe()
-  end
+  describe "DrainOnDeploy.DrainFlow" do
+    test "ready and accepting by default" do
+      assert Gate.ready?()
+      assert Gate.accepting?()
+      assert {200, "ok"} = Readiness.probe()
+    end
 
-  test "start_drain flips both gates" do
-    Gate.start_drain()
-    refute Gate.ready?()
-    refute Gate.accepting?()
-    assert {503, "draining"} = Readiness.probe()
-  end
+    test "start_drain flips both gates" do
+      Gate.start_drain()
+      refute Gate.ready?()
+      refute Gate.accepting?()
+      assert {503, "draining"} = Readiness.probe()
+    end
 
-  test "requests rejected when not accepting" do
-    Gate.start_drain()
-    assert {:error, :draining} = RequestServer.handle_request(:ping)
-  end
+    test "requests rejected when not accepting" do
+      Gate.start_drain()
+      assert {:error, :draining} = RequestServer.handle_request(:ping)
+    end
 
-  test "in-flight requests complete during drain when terminate runs" do
-    # Kick off 3 concurrent requests.
-    tasks =
-      for i <- 1..3 do
-        Task.async(fn -> RequestServer.handle_request({:req, i}) end)
-      end
+    test "in-flight requests complete during drain when terminate runs" do
+      # Kick off 3 concurrent requests.
+      tasks =
+        for i <- 1..3 do
+          Task.async(fn -> RequestServer.handle_request({:req, i}) end)
+        end
 
-    Process.sleep(20)
+      Process.sleep(20)
 
-    pid = Process.whereis(RequestServer)
-    ref = Process.monitor(pid)
-    Process.exit(pid, :shutdown)
-    assert_receive {:DOWN, ^ref, :process, ^pid, :shutdown}, 25_000
+      pid = Process.whereis(RequestServer)
+      ref = Process.monitor(pid)
+      Process.exit(pid, :shutdown)
+      assert_receive {:DOWN, ^ref, :process, ^pid, :shutdown}, 25_000
 
-    results = Task.await_many(tasks, 25_000)
-    assert Enum.all?(results, &match?({:ok, _}, &1))
+      results = Task.await_many(tasks, 25_000)
+      assert Enum.all?(results, &match?({:ok, _}, &1))
+    end
   end
 end
 ```
+
+---
+
+## Advanced Considerations: Partitioned Supervisors and Custom Restart Strategies
+
+A standard Supervisor is a single process managing a static tree. For thousands of children, a single supervisor becomes a bottleneck: all supervisor callbacks run on one process, and supervisor restart logic is sequential. PartitionSupervisor (OTP 25+) spawns N independent supervisors, each managing a subset of children. Hashing the child ID determines which partition supervises it, distributing load and enabling horizontal scaling.
+
+Custom restart strategies (via `Supervisor.init/2` callback) allow logic beyond the defaults. A strategy might prioritize restarting dependent services in a specific order, or apply backoff based on restart frequency. The downside is complexity: custom logic is harder to test and reason about, and mistakes cascade. Start with defaults and profile before adding custom behavior.
+
+Selective restart via `:rest_for_one` or `:one_for_all` affects failure isolation. `:one_for_all` restarts all children when one fails (simulating a total system failure), which can be necessary for consistency but is expensive. `:rest_for_one` restarts the failed child and any started after it, balancing isolation and dependencies. Understanding which strategy fits your architecture prevents cascading failures and unnecessary restarts.
+
+---
+
+
+## Deep Dive: Property Patterns and Production Implications
+
+Property-based testing inverts the testing mindset: instead of writing examples, you state invariants (properties) and let a generator find counterexamples. StreamData's shrinking capability is its superpower—when a property fails on a 10,000-element list, the framework reduces it to the minimal list that still fails, cutting debugging time from hours to minutes. The trade-off is that properties require rigorous thinking about domain constraints, and not every invariant is worth expressing as a property. Teams that adopt property testing often find bugs in specifications themselves, not just implementations.
 
 ---
 
@@ -471,14 +527,27 @@ end
 
 **8. When NOT to use this.** For stateless workers with no in-flight obligations (pure cron-like jobs, cache warmers), drain is overkill. The complexity is warranted only when user-visible requests are in flight at shutdown time.
 
+### Why this works
+
+The dual-flag gate separates "stop passing readiness" from "stop accepting work", which lets K8s remove the pod from the load balancer before the pod refuses connections. The SIGTERM handler delegates to the gate rather than short-circuiting supervisor shutdown, so the supervisor tree is still the authority on child termination. The preStop sleep gives kube-proxy time to propagate endpoint updates cluster-wide, which is the actual cause of the residual 502 rate people blame on "the pod dying too fast".
+
 ---
 
-## Performance notes
+## Benchmark
 
 The drain itself has no steady-state cost. Readiness probe check is `:persistent_term.get/1` — ~20 ns.  
 Signal handler install is one-time.
 
 The real measurement to make is the **502 rate during deploy**. Before fix: run a deploy while `ab -n 100000 -c 50` hammers the service. Count 502s. After fix: same load, expect 0 (or < 0.01 %).
+
+Target: 502 rate during rolling deploy < 0.01 % under 5k rps; drain completes within the supervisor shutdown timeout.
+
+---
+
+## Reflection
+
+1. Your service has long-poll connections that last up to 60 seconds. How do you reconcile the K8s `terminationGracePeriodSeconds` with the tail latency of those connections — do you cap the long-poll, extend the grace period, or drop them mid-poll? Argue from the client's perspective.
+2. A new team argues drain is unnecessary because their service is idempotent. Construct a concrete failure scenario where idempotency alone does not prevent user-visible regressions during a rolling deploy.
 
 ---
 

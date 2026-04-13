@@ -7,9 +7,6 @@ processes them concurrently, batches them for a downstream sink (e.g., a
 database insert), and acknowledges with at-least-once semantics. Tests use
 Broadway's in-process test helpers — no real broker needed.
 
-**Difficulty**: ★★★☆☆
-**Estimated time**: 3–5 hours
-
 ---
 
 ## Project context
@@ -90,9 +87,36 @@ producer. No broker required.
 
 ---
 
+## Design decisions
+
+**Option A — plain `AMQP.Basic.consume/3` with a single-process consumer**
+- Pros: no extra dep; straightforward for a one-shot drain; you see every wire frame.
+- Cons: you re-implement backpressure, batching, graceful shutdown, and retry semantics by hand; sharing work across processors becomes your problem; testing requires a live broker.
+
+**Option B — `Broadway` with `BroadwayRabbitMQ.Producer`, processors, and batchers (chosen)**
+- Pros: demand-driven flow control via GenStage; per-stage concurrency knobs; `handle_batch/4` amortises downstream writes; `Broadway.test_message/3` enables tests without a broker; graceful shutdown handled for you.
+- Cons: larger mental model; you must size `prefetch_count` against `max_demand × processor_concurrency` or the pipeline stalls; poisoned messages with `:reject_and_requeue` need a DLX or you have an infinite loop.
+
+→ Chose **B** because anything beyond a one-script drain eventually needs backpressure and batching, and Broadway is the idiomatic Elixir answer.
+
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+    {:"jason", "~> 1.0"},
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
 
 ```bash
 mix new rabbit_worker --sup
@@ -112,6 +136,9 @@ end
 ```
 
 ### Step 2: `lib/rabbit_worker/application.ex`
+
+**Objective**: Wire `application.ex` to start the supervision tree that boots Repo and external adapters in the correct order before serving traffic.
+
 
 ```elixir
 defmodule RabbitWorker.Application do
@@ -138,6 +165,9 @@ end
 ```
 
 ### Step 3: `lib/rabbit_worker/pipeline.ex`
+
+**Objective**: Implement `pipeline.ex` — the integration seam where external protocol semantics meet Elixir domain code.
+
 
 ```elixir
 defmodule RabbitWorker.Pipeline do
@@ -217,6 +247,9 @@ end
 
 ### Step 4: `lib/rabbit_worker.ex` — the sink
 
+**Objective**: Edit `rabbit_worker.ex` — the sink, exposing the integration seam where external protocol semantics meet Elixir domain code.
+
+
 ```elixir
 defmodule RabbitWorker.Sink do
   @moduledoc """
@@ -246,6 +279,9 @@ end
 ```
 
 ### Step 5: `test/pipeline_test.exs`
+
+**Objective**: Write `pipeline_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
 
 ```elixir
 defmodule RabbitWorker.PipelineTest do
@@ -325,6 +361,20 @@ mix test
 
 ---
 
+## Key Concepts
+
+Broadway is a stream processing library for message queues (RabbitMQ, Kafka, Kinesis). You define producers (sources), processors (transformations), and consumers (sinks). Broadway handles concurrency, batching, and graceful shutdown automatically. This is how you build resilient data pipelines: define stages, let Broadway orchestrate parallelism. The trade-off: Broadway is opinionated; if your pipeline is nonstandard, you may need lower-level libraries. For message-queue-driven workflows, Broadway is the right abstraction—it abstracts away the complexity of flow control, acknowledgment, and backpressure.
+
+---
+
+## Deep Dive: Demand-Driven Backpressure and Message Batching
+
+Broadway sits on GenStage, implementing demand-driven flow control: processors only request messages when ready. This prevents unbounded mailbox growth and naturally throttles fast producers against slower consumers. Batching (grouping N messages or waiting T milliseconds) amortizes expensive downstream operations: a single database insert of 100 records beats 100 individual inserts.
+
+The `:prefetch_count` is RabbitMQ's backpressure mechanism—it limits unacked messages the broker delivers. Set too low and you starve processors; too high and you lose backpressure. Safe formula: `prefetch_count ≥ max_demand × processor_concurrency`. In production, monitor stage demand and adjust concurrency and batch size based on downstream latency (database time, API response time).
+
+Graceful shutdown is critical: Broadway drains in-flight messages before terminating. In Kubernetes, ensure `terminationGracePeriodSeconds ≥ expected_shutdown_time`. Without it, pods are force-killed mid-message, causing redelivery storms when the next pod starts. Always pair backpressure monitoring with load testing to find optimal configuration.
+
 ## Trade-offs and production gotchas
 
 **1. `reject_and_requeue` without a dead-letter exchange is a time bomb**
@@ -360,6 +410,14 @@ via `terminationGracePeriodSeconds`.
 - If your throughput is <10 msg/s, the complexity isn't worth it.
 
 ---
+
+## Benchmark
+
+<!-- benchmark N/A: integration/configuration exercise -->
+
+## Reflection
+
+- `on_failure: :reject_and_requeue` is at-least-once, but without a dead-letter exchange a genuinely un-processable message loops forever. If you had to pick between `:reject_and_requeue_once` (simpler, caps the damage) and a DLX (harder, preserves the message for inspection), what operational signal would push you to one versus the other?
 
 ## Resources
 

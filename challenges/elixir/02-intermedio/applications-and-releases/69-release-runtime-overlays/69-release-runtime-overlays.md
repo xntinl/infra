@@ -109,18 +109,23 @@ script just symlinks it into `/etc/systemd/system/`.
 
 ## Implementation
 
-### Dependencies (`mix.exs`)
+### Dependencies (mix.exs)
 
 ```elixir
 defp deps do
   [
-    # stdlib-only by default; add `{:benchee, "~> 1.3", only: :dev}` if you benchmark
+    # Standard library: no external dependencies required
   ]
 end
 ```
 
 
+
+
 ### Step 1: Create the project and overlay directory
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — isolated from any external state, so we demonstrate this concept cleanly without dependencies.
+
 
 ```bash
 mix new runtime_overlays --sup
@@ -129,6 +134,9 @@ mkdir -p rel/overlays/systemd rel/overlays/scripts config
 ```
 
 ### Step 2: `rel/overlays/systemd/runtime_overlays.service`
+
+**Objective**: Provide `rel/overlays/systemd/runtime_overlays.service` — these are the supporting fixtures the main module depends on to make its concept demonstrable.
+
 
 ```ini
 [Unit]
@@ -154,6 +162,9 @@ WantedBy=multi-user.target
 
 ### Step 3: `rel/overlays/scripts/migrate.sh`
 
+**Objective**: Implement `migrate.sh` — release-time behavior that depends on application env resolution and runtime boot semantics.
+
+
 ```bash
 #!/usr/bin/env bash
 # Run database migrations against the running release node.
@@ -166,6 +177,9 @@ RELEASE_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
 ### Step 4: `rel/overlays/OPS_README.md`
 
+**Objective**: Implement `OPS_README.md` — release-time behavior that depends on application env resolution and runtime boot semantics.
+
+
 ```markdown
 # runtime_overlays — operations quickstart
 
@@ -176,6 +190,9 @@ RELEASE_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ```
 
 ### Step 5: `mix.exs` — declare the overlay step
+
+**Objective**: Edit `mix.exs` — declare the overlay step, exposing release-time behavior that depends on application env resolution and runtime boot semantics.
+
 
 ```elixir
 defmodule RuntimeOverlays.MixProject do
@@ -238,6 +255,9 @@ end
 
 ### Step 6: `lib/runtime_overlays/application.ex`
 
+**Objective**: Wire `application.ex` to start the OTP application callback so BEAM starts/stops the supervision tree through the proper application controller lifecycle.
+
+
 ```elixir
 defmodule RuntimeOverlays.Application do
   @moduledoc false
@@ -251,6 +271,9 @@ end
 ```
 
 ### Step 7: `test/runtime_overlays_test.exs`
+
+**Objective**: Write `runtime_overlays_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
 
 ```elixir
 defmodule RuntimeOverlaysTest do
@@ -280,6 +303,9 @@ end
 
 ### Step 8: Build the release and inspect
 
+**Objective**: Build the release and inspect.
+
+
 ```bash
 MIX_ENV=prod mix release
 ls _build/prod/rel/runtime_overlays/systemd
@@ -292,6 +318,21 @@ cat _build/prod/rel/runtime_overlays/scripts/migrate.sh
 
 The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
 
+
+
+## Key Concepts
+
+Runtime overlays are files placed on disk after a release is built but before it starts, overriding configuration without rebuilding. Build the release in CI, then copy config files to the target server before `bin/myapp start`. Overlays use `import_config/1` in `config/` to load files whose location is not known at build time. This enables the workflow: one immutable release artifact, multiple deployments with different configs. Overlays add deployment complexity but enable true infrastructure-as-code—configuration is part of the deployment pipeline, not baked into the artifact. Most production systems use overlays for secrets and environment-specific tuning.
+
+---
+
+## Deep Dive: Compile-Time vs Runtime Configuration Boundaries
+
+A release is a static artifact: code and compile-time config are baked in. Runtime config must be provided at boot via environment variables, config files, or config providers. Simple rule: if a value changes between dev and prod, it goes in `config/runtime.exs`, not `config/config.exs`.
+
+Footgun: putting config in compile-time files and assuming environment variables work at runtime. Releases ignore env vars unless `config/runtime.exs` explicitly reads them. If you need env vars, fetch them in `config/runtime.exs` and store in application state.
+
+For distributed systems, config providers (modules loading config from Consul, S3, etc.) are powerful but complex. Start with environment variables and `config/runtime.exs`; only reach for providers if you need dynamic reloading without downtime or multi-tenant config switching. Premature provider complexity is a mistake.
 
 ## Benchmark
 
@@ -317,8 +358,7 @@ from the host's target directory.
 **4. `Type=simple` vs `Type=notify`**
 `simple` means systemd considers the service started as soon as it
 forks. For a BEAM release, boot takes seconds — systemd won't know if
-it failed. Consider `Type=notify` with systemd integration (see
-exercise 73).
+it failed. Consider `Type=notify` with systemd integration.
 
 **5. When NOT to use overlays**
 If the file belongs elsewhere in the system (package metadata,

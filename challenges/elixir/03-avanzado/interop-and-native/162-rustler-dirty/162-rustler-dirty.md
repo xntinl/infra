@@ -76,6 +76,16 @@ fn read_big_file(path: String) -> Vec<u8> { ... }
 
 ### 4. Observability: `scheduler_wall_time`
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
+
 ```elixir
 :erlang.system_flag(:scheduler_wall_time, true)
 before = :erlang.statistics(:scheduler_wall_time)
@@ -111,6 +121,8 @@ Moving a NIF call onto a dirty scheduler is not free — BEAM migrates the call 
 
 ### Step 1: `native/rustler_dirty_nif/Cargo.toml`
 
+**Objective**: Declare argon2 dep so the NIF reuses vetted password-hashing without reimplementing constant-time comparison.
+
 ```toml
 [package]
 name = "rustler_dirty_nif"
@@ -127,6 +139,8 @@ argon2 = "0.5"
 ```
 
 ### Step 2: `native/rustler_dirty_nif/src/lib.rs`
+
+**Objective**: Route CPU-bound hashing and blocking IO to separate dirty schedulers so main scheduler stays responsive.
 
 ```rust
 use argon2::{Argon2, PasswordHasher, PasswordVerifier, PasswordHash};
@@ -184,6 +198,8 @@ rustler::init!(
 
 ### Step 3: `lib/rustler_dirty/native.ex`
 
+**Objective**: Provide typed stubs so Dialyzer validates dirty-scheduled calls before dylib load succeeds.
+
 ```elixir
 defmodule RustlerDirty.Native do
   @moduledoc "NIFs scheduled on dirty CPU or dirty IO pools."
@@ -205,6 +221,8 @@ end
 
 ### Step 4: `mix.exs`
 
+**Objective**: Declare release-mode Rustler build so argon2 compiles with optimizations, avoiding debug-mode throughput penalties.
+
 ```elixir
 defmodule RustlerDirty.MixProject do
   use Mix.Project
@@ -225,51 +243,55 @@ end
 
 ### Step 5: `test/rustler_dirty_test.exs`
 
+**Objective**: Assert heartbeat responsiveness during heavy CPU NIFs and verify dirty-scheduled hash correctness under concurrent load.
+
 ```elixir
 defmodule RustlerDirtyTest do
   use ExUnit.Case, async: true
   alias RustlerDirty.Native
 
-  test "argon2 hash + verify roundtrip" do
-    hash = Native.argon2_hash("secret")
-    assert String.starts_with?(hash, "$argon2")
-    assert Native.argon2_verify("secret", hash)
-    refute Native.argon2_verify("wrong", hash)
-  end
+  describe "RustlerDirty" do
+    test "argon2 hash + verify roundtrip" do
+      hash = Native.argon2_hash("secret")
+      assert String.starts_with?(hash, "$argon2")
+      assert Native.argon2_verify("secret", hash)
+      refute Native.argon2_verify("wrong", hash)
+    end
 
-  test "count_primes up to 100 = 25" do
-    assert Native.count_primes(100) == 25
-  end
+    test "count_primes up to 100 = 25" do
+      assert Native.count_primes(100) == 25
+    end
 
-  test "schedulers stay responsive during heavy NIF" do
-    parent = self()
+    test "schedulers stay responsive during heavy NIF" do
+      parent = self()
 
-    # Start long dirty NIF in one task
-    heavy = Task.async(fn -> Native.count_primes(50_000_000) end)
+      # Start long dirty NIF in one task
+      heavy = Task.async(fn -> Native.count_primes(50_000_000) end)
 
-    # Meanwhile a snappy heartbeat process
-    heartbeat =
-      Task.async(fn ->
-        for i <- 1..20 do
-          send(parent, {:beat, i, System.monotonic_time(:millisecond)})
-          Process.sleep(5)
-        end
-      end)
+      # Meanwhile a snappy heartbeat process
+      heartbeat =
+        Task.async(fn ->
+          for i <- 1..20 do
+            send(parent, {:beat, i, System.monotonic_time(:millisecond)})
+            Process.sleep(5)
+          end
+        end)
 
-    Task.await(heartbeat)
-    Task.await(heavy, 60_000)
+      Task.await(heartbeat)
+      Task.await(heavy, 60_000)
 
-    # All 20 heartbeats arrived within ~150 ms total — scheduler was not starved
-    beats = for i <- 1..20, do: (receive do {:beat, ^i, t} -> t end)
-    span = List.last(beats) - hd(beats)
-    assert span < 200, "heartbeat span was #{span}ms — scheduler stalled"
-  end
+      # All 20 heartbeats arrived within ~150 ms total — scheduler was not starved
+      beats = for i <- 1..20, do: (receive do {:beat, ^i, t} -> t end)
+      span = List.last(beats) - hd(beats)
+      assert span < 200, "heartbeat span was #{span}ms — scheduler stalled"
+    end
 
-  test "dirty IO blocking sleep does not block regular scheduler" do
-    parent = self()
-    _t = Task.async(fn -> Native.blocking_sleep(500) end)
-    send(parent, :live)
-    assert_receive :live, 50
+    test "dirty IO blocking sleep does not block regular scheduler" do
+      parent = self()
+      _t = Task.async(fn -> Native.blocking_sleep(500) end)
+      send(parent, :live)
+      assert_receive :live, 50
+    end
   end
 end
 ```
@@ -280,6 +302,26 @@ end
 ### Why this works
 
 The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
+
+## Advanced Considerations: Dirty Scheduler Pooling and Cost Models
+
+Dirty schedulers are a finite resource pool — typically 8 CPU and 10 IO threads. Once saturated, callers queue, blocking until a thread becomes available. Understanding saturation curves is critical for production design. A single Argon2 hash at cost 12 takes ~200 ms; on 8 DirtyCpu schedulers, concurrent calls are limited to ~40 per second. Beyond that, latency grows quadratically. Diagram: 10 concurrent hashes → average wait 1.1 s; 20 hashes → 2.4 s; 50 hashes → 6 s.
+
+**Pooling strategies** mitigate this. A GenServer fronting the NIF enforces a bounded queue and backpressure: if `:queue.len(state)` exceeds 16, reject new work with `{:error, :overloaded}`. Clients then back off or timeout gracefully instead of queuing infinitely. Combine with `scheduler_wall_time` monitoring: if DirtyCpu queue depth is climbing, auto-scale horizontal workers (on other nodes) or increase the dirty scheduler count (requires restart).
+
+**Hybrid architectures** are sometimes necessary. CPU-heavy work (Argon2, image resizing) stays on DirtyCpu NIFs. I/O-heavy work (database queries, HTTP calls) should NOT use DirtyIo — instead use async Rust (tokio) via a background Task or a standalone Port process. DirtyIo blocks real OS threads (limited to 10 by default); a blocked thread pool is a resource leak.
+
+**Cost-benefit analysis**: A DirtyCpu NIF saves ~100–200 ns of the BEAM call boundary vs a Port (serialization + spawn + deserialize). But a 10 μs function flagged `DirtyCpu` incurs ~20 μs overhead for thread pool handoff — *20× slower*. Rule of thumb: only flag work > 500 μs. For fast cryptographic operations (SHA256), benchmarking often reveals pure Elixir (with `:crypto` NIF bindings) beats a custom DirtyCpu wrapper.
+
+**Observability tooling** is critical. Use `sys:get_status(scheduler_metrics)` in OTP 25+ to track dirty scheduler queue depth and CPU utilization separately. Set up alerts on DirtyCpu utilization > 80% as a precursor to cascading queue delays.
+
+---
+
+## Deep Dive: Interop Patterns and Production Implications
+
+Interop with native code (NIFs, ports, C extensions) introduces failure modes that pure Elixir code doesn't have: segfaults, memory leaks, deadlocks with the Erlang emulator. Testing interop requires separate test suites for the native layer and integration tests that exercise the boundary.
+
+---
 
 ## Trade-offs and production gotchas
 

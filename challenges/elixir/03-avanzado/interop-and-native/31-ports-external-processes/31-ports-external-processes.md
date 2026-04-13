@@ -123,6 +123,18 @@ Mitigations:
 
 ### Step 1: `mix.exs`
 
+**Objective**: Wire OTP application startup and logger registration so Port messages route through the supervision tree.
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
+
 ```elixir
 defmodule PortDemo.MixProject do
   use Mix.Project
@@ -133,6 +145,8 @@ end
 ```
 
 ### Step 2: `lib/port_demo/application.ex`
+
+**Objective**: Boot Port owner as a persistent child so cat subprocess persists across call bursts without respawn overhead.
 
 ```elixir
 defmodule PortDemo.Application do
@@ -150,6 +164,8 @@ end
 ```
 
 ### Step 3: `lib/port_demo/worker.ex`
+
+**Objective**: Serialize Port commands via GenServer and queue waiters so concurrent senders receive replies in FIFO order without races.
 
 ```elixir
 defmodule PortDemo.Worker do
@@ -235,6 +251,8 @@ end
 
 ### Step 4: `test/port_demo/worker_test.exs`
 
+**Objective**: Assert rapid echo delivery, external termination, and reply matching so Port lifecycle and message ordering are bulletproof.
+
 ```elixir
 defmodule PortDemo.WorkerTest do
   use ExUnit.Case, async: false
@@ -247,22 +265,24 @@ defmodule PortDemo.WorkerTest do
     %{worker: name, pid: pid}
   end
 
-  test "echoes back the payload", %{worker: w} do
-    assert {:ok, "hello"} = Worker.send(w, "hello")
-    assert {:ok, "world"} = Worker.send(w, "world")
-  end
+  describe "PortDemo.Worker" do
+    test "echoes back the payload", %{worker: w} do
+      assert {:ok, "hello"} = Worker.send(w, "hello")
+      assert {:ok, "world"} = Worker.send(w, "world")
+    end
 
-  test "handles many rapid sends", %{worker: w} do
-    replies = for i <- 1..100, do: Worker.send(w, "msg-#{i}")
-    expected = for i <- 1..100, do: {:ok, "msg-#{i}"}
-    assert replies == expected
-  end
+    test "handles many rapid sends", %{worker: w} do
+      replies = for i <- 1..100, do: Worker.send(w, "msg-#{i}")
+      expected = for i <- 1..100, do: {:ok, "msg-#{i}"}
+      assert replies == expected
+    end
 
-  test "crashes cleanly when external dies", %{worker: w, pid: pid} do
-    Process.monitor(pid)
-    {:os_pid, os_pid} = Port.info(:sys.get_state(pid).port, :os_pid)
-    System.cmd("kill", ["-9", Integer.to_string(os_pid)])
-    assert_receive {:DOWN, _ref, :process, ^pid, {:port_exited, _}}, 2_000
+    test "crashes cleanly when external dies", %{worker: w, pid: pid} do
+      Process.monitor(pid)
+      {:os_pid, os_pid} = Port.info(:sys.get_state(pid).port, :os_pid)
+      System.cmd("kill", ["-9", Integer.to_string(os_pid)])
+      assert_receive {:DOWN, _ref, :process, ^pid, {:port_exited, _}}, 2_000
+    end
   end
 end
 ```
@@ -273,6 +293,14 @@ end
 ### Why this works
 
 The design leans on BEAM guarantees (process isolation, mailbox ordering, supervisor restarts) and pushes invariants to the boundaries of each module. State transitions are explicit, failure modes are declared rather than implicit, and each step is independently testable. That combination keeps the implementation correct under concurrent load and cheap to change later.
+
+
+## Key Concepts: Out-of-Process Communication and Process Isolation
+
+Ports connect the Erlang VM to external processes (e.g., a Python script, a shell command). The protocol is simple: send binary data to the port, receive results as messages. Ports provide **process isolation**—if the external process crashes, the VM is unaffected. Unlike NIFs, ports handle I/O gracefully (blocking the external process doesn't block the VM).
+
+The trade-off: messaging overhead (serializing to binary, deserializing the response) is higher than function calls. But you gain resilience and the ability to use any language. Patterns: spawn a persistent external process and exchange messages repeatedly (less overhead per call), or spawn short-lived processes per request (simpler but more startup cost). For production, wrap ports in a GenServer to handle failures and reconnection logic.
+
 
 ## Benchmark
 
@@ -285,6 +313,23 @@ IO.puts("avg: #{time_us / 10_000} µs/op")
 ```
 
 Target: operation should complete in the low-microsecond range on modern hardware; deviations by >2× indicate a regression worth investigating.
+
+## Advanced Considerations: NIF Isolation and Scheduler Integration
+
+NIF calls run atomically on a scheduler thread, blocking all other processes on that scheduler until the function returns. For operations exceeding ~1 millisecond, this starvation becomes visible: heartbeat processes delay, ETS owner replies hang, supervision timeouts fire. The BEAM's dirty scheduler pool (8 CPU + 10 IO by default) isolates long NIFs from the main scheduler ring, but they're still a finite resource.
+
+Understanding scheduler capacity is critical. Each dirty CPU scheduler can run ~1,000 100-microsecond operations per second, or ~5 100-millisecond operations. Beyond that, callers queue. A GenServer pool capping concurrency and applying backpressure prevents cascade failures: if the dirty pool saturates, reject new work immediately instead of queuing unboundedly.
+
+Resource management inside NIFs differs from pure Elixir. A `Binary<'a>` is a borrow tied to the NIF call; it cannot escape to threads or be stored in resources. An `OwnedBinary` allocation isn't visible to BEAM's garbage collector, so memory limits must be enforced in the Elixir layer. Hybrid architectures (Port processes for I/O, NIFs for CPU work) offer better observability and failure isolation than trying to do everything in a single NIF crate.
+
+---
+
+
+## Deep Dive: Interop Patterns and Production Implications
+
+Interop with native code (NIFs, ports, C extensions) introduces failure modes that pure Elixir code doesn't have: segfaults, memory leaks, deadlocks with the Erlang emulator. Testing interop requires separate test suites for the native layer and integration tests that exercise the boundary.
+
+---
 
 ## Trade-offs and production gotchas
 

@@ -82,6 +82,8 @@ end
 
 ### Step 1: Application — enable `scheduler_wall_time`
 
+**Objective**: Enable `:scheduler_wall_time` at boot so per-scheduler active:total ratios emerge without losing counts on node restart.
+
 ```elixir
 defmodule SchedulerObservatory.Application do
   use Application
@@ -100,6 +102,8 @@ end
 ```
 
 ### Step 2: Sampler — `lib/scheduler_observatory/sampler.ex`
+
+**Objective**: Diff two `:scheduler.sample/0` snapshots via GenServer so scheduler utilization percentages export to Prometheus/LiveDashboard unchanged.
 
 ```elixir
 defmodule SchedulerObservatory.Sampler do
@@ -160,6 +164,8 @@ end
 ```
 
 ### Step 3: A workload to actually observe — `lib/scheduler_observatory/workload.ex`
+
+**Objective**: Spawn N CPU-bound loopers burning reductions so telemetry capture shows observable scheduler saturation under synthetic load.
 
 ```elixir
 defmodule SchedulerObservatory.Workload do
@@ -255,6 +261,46 @@ IO.puts("run queue lengths: #{inspect(:erlang.statistics(:run_queue_lengths))}")
 
 **Expected**: aggregate > 90% during saturation, per-scheduler numbers close to each other (balanced). If one scheduler is > 95% and others < 20%, a NIF or port driver is not releasing the scheduler.
 
+## Deep Dive: BEAM Scheduler Tuning and Memory Profiling in Production
+
+The BEAM scheduler is not "magic" — it's a preemptive work-stealing scheduler that divides CPU time 
+into reductions (bytecode instructions). Understanding scheduler tuning is critical when you suspect 
+latency spikes in production.
+
+**Key concepts**:
+- **Reductions budget**: By default, a process gets ~2000 reductions before yielding to another process.
+  Heavy CPU work (binary matching, list recursion) can exhaust the budget and cause tail latency.
+- **Dirty schedulers**: If a process does CPU-intensive work (crypto, compression, numerical), it blocks 
+  the main scheduler. Use dirty NIFs or `spawn_opt(..., [{:fullsweep_after, 0}])` for GC tuning.
+- **Heap tuning per process**: `Process.flag(:min_heap_size, ...)` reserves heap upfront, reducing GC 
+  pauses. Measure; don't guess.
+
+**Memory profiling workflow**:
+1. Run `recon:memory/0` in iex; identify top 10 memory consumers by type (atoms, binaries, ets).
+2. If binaries dominate, check for refc binary leaks (binary held by process that should have been freed).
+3. Use `eprof` or `fprof` for function-level CPU attribution; `recon:proc_window/3` for process memory trends.
+
+**Production pattern**: Deploy with `+K true` (async IO), `-env ERL_MAX_PORTS 65536` (port limit), 
+`+T 9` (async threads). Measure GC time with `erlang:statistics(garbage_collection)` — if >5% of uptime, 
+tune heap or reduce allocation pressure. Never assume defaults are optimal for YOUR workload.
+
+---
+
+## Advanced Considerations
+
+Understanding BEAM internals at production scale requires deep knowledge of scheduler behavior, memory models, and garbage collection dynamics. The soft real-time guarantees of BEAM only hold under specific conditions — high system load, uneven process distribution across schedulers, or GC pressure can break predictable latency completely. Monitor `erlang:statistics(run_queue)` in production to catch scheduler saturation before it degrades latency significantly. The difference between immediate, offheap, and continuous GC garbage collection strategies can significantly impact tail latencies in systems with millions of messages per second and sustained memory pressure.
+
+Process reductions and the reduction counter affect scheduler fairness fundamentally. A process that runs for extended periods without yielding can starve other processes, even though the scheduler treats it fairly by reduction count per scheduling interval. This is especially critical in pipelines processing large data structures or performing recursive computations where yielding points are infrequent and difficult to predict. The BEAM's preemption model is deterministic per reduction, making performance testing reproducible but sometimes hiding race conditions that only manifest under specific load patterns and GC interactions.
+
+The interaction between ETS, Mnesia, and process message queues creates subtle bottlenecks in distributed systems. ETS reads don't block other processes, but writes require acquiring locks; understanding when your workload transitions from read-heavy to write-heavy is crucial for capacity planning. Port drivers and NIFs bypass the BEAM scheduler entirely, which can lead to unexpected priority inversions if not carefully managed. Always profile with `eprof` and `fprof` in realistic production-like environments before deployment to catch performance surprises.
+
+
+## Deep Dive: Otp Patterns and Production Implications
+
+OTP primitives (GenServer, Supervisor, Application) are tested through their public interfaces, not by inspecting internal state. This discipline forces correct design: if you can't test a behavior without peeking into the server's state, the behavior is not public. Production systems with tight integration tests on GenServer internals are fragile and hard to refactor.
+
+---
+
 ## Trade-offs and production gotchas
 
 **1. `scheduler_wall_time` has ~1% overhead.** Enable during investigation; disable in steady state. Some teams leave it on permanently — measure before committing.
@@ -279,3 +325,13 @@ You see aggregate utilization at 30% but tail latencies are 10x normal. Schedule
 - [`:erlang.statistics/1` — erlang.org](https://www.erlang.org/doc/man/erlang.html#statistics-1)
 - [Erlang in Anger — Fred Hebert, chapter on scheduling](https://www.erlang-in-anger.com/)
 - [Understanding BEAM Schedulers — Lukas Larsson](https://www.erlang.org/blog/a-complete-guide-to-beam-scheduler/)
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Add dependencies here
+  ]
+end
+```

@@ -2,9 +2,6 @@
 
 **Project**: `ast_walker` — build a custom Credo-style linter that reads `.ex` files, walks their AST, and emits warnings for patterns you care about (banned modules, missing `@moduledoc`, deprecated functions).
 
-**Difficulty**: ★★★★☆
-**Estimated time**: 4–6 hours
-
 ---
 
 ## Project context
@@ -30,6 +27,12 @@ ast_walker/
 │   └── linter_test.exs
 └── mix.exs
 ```
+
+---
+
+## Why AST traversal and not regex
+
+Source text is a lossy view of Elixir. The AST has the information the compiler uses — operator associativity, special forms, metadata. Working at the AST level means the transform stays correct as syntax evolves.
 
 ---
 
@@ -80,9 +83,35 @@ Each finding carries `file`, `line`, `column`, `rule`, `message`. Format as:
 
 ---
 
+## Design decisions
+
+**Option A — regex over source text**
+- Pros: simple; no compile-time plumbing.
+- Cons: breaks on any non-trivial shape; cannot respect scoping; easy to corrupt.
+
+**Option B — `Macro.prewalk/postwalk` traversal** (chosen)
+- Pros: operates on the real tree; respects quoting, scope, and special forms.
+- Cons: must understand Elixir AST shapes; larger mental model.
+
+→ Chose **B** because any production-worthy transform eventually hits a case regex cannot handle; start with the real structure.
+
+---
+
 ## Implementation
 
 ### Step 1: `lib/ast_walker/issue.ex`
+
+**Objective**: Define Issue struct to model lint findings with file, line, column, rule, severity for formatted output.
+
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # No external dependencies — pure Elixir
+  ]
+end
+```
 
 ```elixir
 defmodule AstWalker.Issue do
@@ -115,6 +144,8 @@ end
 ```
 
 ### Step 2: `lib/ast_walker/rules.ex`
+
+**Objective**: Implement check_deprecated/2, check_debug_calls/2, check_moduledoc/2 using Macro.prewalk to traverse AST.
 
 ```elixir
 defmodule AstWalker.Rules do
@@ -211,6 +242,8 @@ end
 
 ### Step 3: `lib/ast_walker/linter.ex`
 
+**Objective**: Parse source files via Code.string_to_quoted, run rules, aggregate and sort issues by file/line/column.
+
 ```elixir
 defmodule AstWalker.Linter do
   @moduledoc "Lints a list of files, aggregating issues from all rules."
@@ -270,6 +303,8 @@ end
 ```
 
 ### Step 4: Tests
+
+**Objective**: Assert missing @moduledoc detected, deprecated functions flagged, clean code passes, formatting is stable.
 
 ```elixir
 defmodule AstWalker.LinterTest do
@@ -346,6 +381,27 @@ defmodule AstWalker.LinterTest do
 end
 ```
 
+### Why this works
+
+`Macro.prewalk/2` visits parent then children, `Macro.postwalk/2` visits children then parent, both threading an accumulator. Picking the right direction controls whether a node can see its already-rewritten subtree. Returning the node unchanged skips it; returning a replacement grafts it in.
+
+---
+
+## Advanced Considerations: Macro Hygiene and Compile-Time Validation
+
+Macros execute at compile time, walking the AST and returning new AST. That power is easy to abuse: a macro that generates variables can shadow outer scope bindings, or a quote block that references variables directly can fail if the macro is used in a context where those variables don't exist. The `unquote` mechanism is the escape hatch, but misusing it leads to hard-to-debug compile errors.
+
+Macro hygiene is about capturing intent correctly. A `defmacro` that takes `:my_option` and uses it directly might match an unrelated `:my_option` from the caller's scope. The idiomatic pattern is to use `unquote` for values that should be "from the outside" and keep AST nodes quoted for safety. The `quote` block's binding of `var!` and `binding!` provides escape valves for the rare case when shadowing is intentional.
+
+Compile-time validation unlocks errors that would otherwise surface at runtime. A macro can call functions to validate input, generate code conditionally, or fail the build with `IO.warn`. Schema libraries like `Ecto` and `Ash` use macros to define fields at compile time, so runtime queries are guaranteed type-safe. The cost is cognitive load: developers must reason about both the code as written and the code generated.
+
+---
+
+
+## Deep Dive: Metaprogramming Patterns and Production Implications
+
+Metaprogramming (macros, AST manipulation) requires testing at compile time and runtime. The challenge is that macro tests often involve parsing and expanding code, which couples tests to compiler internals. Production bugs in macros can corrupt entire modules; testing macros rigorously is non-negotiable.
+
 ---
 
 ## Trade-offs and production gotchas
@@ -399,6 +455,13 @@ Benchee.run(%{
 ```
 
 Expect parallel to be 4–8× faster on modern hardware.
+
+---
+
+## Reflection
+
+- A transform needs to rewrite only variables bound in an outer `fn`. Which walker direction do you pick, and how do you track scope in the accumulator?
+- If your walker emits valid AST that the compiler later rejects, where is the bug — in your rules or in your pattern matching? How do you bisect it?
 
 ---
 

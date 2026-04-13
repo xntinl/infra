@@ -128,9 +128,26 @@ more than one team consumes a lib, pay for the org.
 
 ---
 
+### Dependencies (`mix.exs`)
+
+```elixir
+def deps do
+  [
+    {ex_doc},
+    {exunit},
+    {git},
+    {lib},
+    {mix},
+    {private_hex_demo},
+  ]
+end
+```
 ## Implementation
 
 ### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
 
 ```bash
 mix new private_hex_demo
@@ -138,6 +155,9 @@ cd private_hex_demo
 ```
 
 ### Step 2: `mix.exs` — publish-ready configuration
+
+**Objective**: Edit `mix.exs` — publish-ready configuration, exposing code whose shape is chosen to exercise the tool's capabilities, not to solve a domain problem.
+
 
 ```elixir
 defmodule PrivateHexDemo.MixProject do
@@ -200,6 +220,9 @@ end
 
 ### Step 3: `lib/private_hex_demo.ex`
 
+**Objective**: Implement `private_hex_demo.ex` — code whose shape is chosen to exercise the tool's capabilities, not to solve a domain problem.
+
+
 ```elixir
 defmodule PrivateHexDemo do
   @moduledoc """
@@ -221,6 +244,9 @@ end
 ```
 
 ### Step 4: The accompanying files
+
+**Objective**: Provide The accompanying files — these are the supporting fixtures the main module depends on to make its concept demonstrable.
+
 
 `README.md`:
 
@@ -258,6 +284,9 @@ For the private org variant:
 
 ### Step 5: `test/private_hex_demo_test.exs`
 
+**Objective**: Write `private_hex_demo_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+
 ```elixir
 defmodule PrivateHexDemoTest do
   use ExUnit.Case, async: true
@@ -272,6 +301,9 @@ end
 ```
 
 ### Step 6: Dry run and (optionally) publish
+
+**Objective**: Dry run and (optionally) publish.
+
 
 ```bash
 mix deps.get
@@ -368,3 +400,20 @@ private dep needs the flag.
 - [`mix hex.build`](https://hexdocs.pm/hex/Mix.Tasks.Hex.Build.html) — dry-run the tarball
 - [`mix hex.retire`](https://hexdocs.pm/hex/Mix.Tasks.Hex.Retire.html) — mark a bad version as retired
 - [`mix hex.organization`](https://hexdocs.pm/hex/Mix.Tasks.Hex.Organization.html) — manage organization auth
+
+
+## Deep Dive
+
+Elixir's tooling ecosystem extends beyond the language into DevOps, profiling, and observability. Understanding each tool's role prevents misuse and false optimizations.
+
+**Mix tasks and releases:**
+Custom mix tasks (`mix myapp.setup`, `mix myapp.migrate`) encapsulate operational knowledge. Tasks run in the host environment (not the compiled app), so they're ideal for setup, teardown, or scripting. Releases, built with `mix release`, create self-contained OTP applications deployable without Elixir installed. They're immutable: no source code changes after release — all config comes from environment variables or runtime files.
+
+**Debugging and profiling tools:**
+- `:observer` (GUI): real-time process tree, metrics, and port inspection
+- `Recon`: production-safe introspection (stable even under high load)
+- `:eprof`: function-level timing; lower overhead than `:fprof`
+- `:fprof`: detailed trace analysis; use only in staging
+
+**Profiling approaches:**
+Ceiling profiling (e.g., "which modules consume CPU?") is cheap; go there first with `perf` or `eprof`. Floor profiling (e.g., "which lines in this function are slow?") is expensive; reserve for specific functions. In production, prefer metrics (Prometheus, New Relic) over profiling — continuous profiling has overhead. Store profiling data for post-mortem analysis, not real-time dashboards.

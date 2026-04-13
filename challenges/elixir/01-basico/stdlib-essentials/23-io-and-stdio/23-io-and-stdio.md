@@ -97,7 +97,20 @@ Chose **B** because REPLs are the canonical recursion-over-state case and the BE
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### Step 1: Create the project
+
+**Objective**: Recursive IO.gets loop (not IO.stream) threads state through REPL; prints prompt between reads; handles EOF.
 
 ```bash
 mix new calc_repl --sup
@@ -108,6 +121,8 @@ The `--sup` flag is for `History` — it runs as a supervised Agent so state
 survives across REPL reads without being passed through every function.
 
 ### Step 2: `mix.exs`
+
+**Objective**: --sup flag starts a Supervisor; Agent stores history across REPL restarts.
 
 ```elixir
 defmodule CalcRepl.MixProject do
@@ -135,6 +150,8 @@ end
 
 ### Step 3: `lib/calc_repl/application.ex`
 
+**Objective**: use Application behavior; start_link children — Supervisor trees are the only way to run stateful processes.
+
 ```elixir
 defmodule CalcRepl.Application do
   @moduledoc false
@@ -152,6 +169,8 @@ end
 ```
 
 ### Step 4: `lib/calc_repl/history.ex`
+
+**Objective**: Agent.update/3 is atomic; indexed-from-1 history avoids off-by-one bugs in bash-like `!N` recall syntax.
 
 ```elixir
 defmodule CalcRepl.History do
@@ -196,6 +215,8 @@ end
 ```
 
 ### Step 5: `lib/calc_repl/evaluator.ex`
+
+**Objective**: Precedence (mult before add) requires a second pass or recursive descent; simple left-to-right evaluation is wrong.
 
 ```elixir
 defmodule CalcRepl.Evaluator do
@@ -313,6 +334,8 @@ end
 ```
 
 ### Step 6: `lib/calc_repl/repl.ex`
+
+**Objective**: IO.ANSI.enabled? conditionally colors output; piped I/O is monochrome; TTY is colored — never assume terminal.
 
 ```elixir
 defmodule CalcRepl.REPL do
@@ -465,6 +488,8 @@ end
 
 ### Step 7: Tests
 
+**Objective**: ExUnit.CaptureIO captures IO.puts output; test REPL interactions end-to-end (prompt, eval, history).
+
 ```elixir
 # test/calc_repl/evaluator_test.exs
 defmodule CalcRepl.EvaluatorTest do
@@ -558,6 +583,8 @@ end
 
 ### Step 8: Run the tests and the REPL
 
+**Objective**: --warnings-as-errors catches unused History functions; test coverage validates IO formatting and ANSI codes.
+
 ```bash
 mix test --trace
 
@@ -578,6 +605,24 @@ mix escript.build
 
 ---
 
+
+
+---
+## Key Concepts
+
+### 1. `IO.puts/1` Writes Strings, `IO.write/1` Writes Binaries
+
+`IO.puts("hello")` writes a string and newline. `IO.write("hello")` writes without newline. For binary output (images, compressed data), use `IO.write/1` or `File.write/2` to preserve bytes.
+
+### 2. `IO.inspect/1` is for Debugging, Not Production
+
+`IO.inspect(value)` pretty-prints the value and returns it. It's perfect for debugging in pipelines: `data |> IO.inspect() |> process()`. But do not use it in production code for logging—use a proper logging library like `Logger`.
+
+### 3. Standard Input is Rarely Used in Server Code
+
+`IO.gets/1` reads from stdin—fine for CLI tools, rarely useful in servers. In concurrent systems, multiple processes reading stdin causes chaos. For server input, use network sockets or message passing.
+
+---
 ## Benchmark
 
 <!-- benchmark N/A: an interactive REPL's performance is bounded by keyboard/piped input, not by computation. The meaningful metrics are per-line evaluation latency (already sub-millisecond for trivial math) and memory growth over long sessions, both of which you verify by eyeballing `:observer.start()` during a long interactive run. -->

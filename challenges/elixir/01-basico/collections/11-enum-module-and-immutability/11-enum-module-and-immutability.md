@@ -64,6 +64,17 @@ Chose **B** because the language optimizes for this shape: the pipe operator, `E
 
 ## Implementation
 
+### Dependencies (mix.exs)
+
+```elixir
+defp deps do
+  [
+    # Standard library: no external dependencies required
+  ]
+end
+```
+
+
 ### `lib/analytics.ex`
 
 ```elixir
@@ -428,6 +439,24 @@ Every `Enum` function takes an enumerable, produces a new enumerable, and never 
 
 ---
 
+
+
+---
+## Key Concepts
+
+### 1. Enum Returns New Collections, Never Mutates
+
+In imperative languages, iterating often modifies in place. In Elixir, every Enum function returns a new collection. This guarantees functions are composable, you can safely share collections between processes, and testing is deterministic.
+
+### 2. Lazy vs Eager Evaluation
+
+`Enum` is eager—all operations execute immediately. `Stream` is lazy—operations compose and execute only when consumed. For large datasets or infinite sequences, use Streams. For finite collections you need immediately, use Enum.
+
+### 3. Enum.reduce is the Workhorse
+
+Every aggregation (sum, group, filter-and-map) can be built with `reduce`. Mastering `reduce` means you understand how to fold any data structure into any shape.
+
+---
 ## Benchmark
 
 ```elixir
