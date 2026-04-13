@@ -67,6 +67,33 @@ Monitoring systems ingest millions of metric data points per second from thousan
 
 → Chose **B** because time-series workloads are write-once-read-many and range-dominated — columnar is the native layout.
 
+## Project Structure
+
+```
+chronos/
+├── lib/
+│   └── chronos/
+│       ├── application.ex           # database supervisor, retention scheduler
+│       ├── database.ex              # public API: ingest, query, cardinality, stats
+│       ├── series.ex                # series identity: metric + labels → series_id
+│       ├── chunk.ex                 # time bucket: compressed binary chunk per series per hour
+│       ├── gorilla.ex               # Gorilla encoding: delta-of-delta timestamps, XOR floats
+│       ├── query_engine.ex          # decompress, filter, aggregate over time ranges
+│       ├── downsampler.ex           # GenServer: raw → hourly → daily aggregates on schedule
+│       ├── retention.ex             # GenServer: delete raw/hourly/daily buckets past threshold
+│       └── label_index.ex           # inverted index: label key=value → [series_id]
+├── test/
+│   └── chronos/
+│       ├── gorilla_test.exs         # compression ratio, correctness
+│       ├── ingest_test.exs          # throughput, ordering
+│       ├── query_test.exs           # range queries, aggregation, gap fill
+│       ├── cardinality_test.exs     # 1M series, O(1) lookup
+│       └── retention_test.exs       # downsampling, deletion schedule
+├── bench/
+│   └── chronos_bench.exs
+└── mix.exs
+```
+
 ## Implementation milestones
 
 ### Step 1: Create the project

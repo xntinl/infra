@@ -65,6 +65,33 @@ Relational databases represent relationships as foreign keys — finding all peo
 
 → Chose **B** because real graph databases are sparse by construction; paying O(V²) memory for dense-matrix ergonomics isn't acceptable for any non-trivial dataset.
 
+## Project Structure
+
+```
+graphdb/
+├── lib/
+│   └── graphdb/
+│       ├── application.ex           # database supervisor
+│       ├── database.ex              # public API: create_node, create_edge, neighbors, query
+│       ├── storage.ex               # three ETS tables: nodes, edges, adjacency
+│       ├── traversal.ex             # BFS, DFS with configurable depth and direction
+│       ├── dijkstra.ex              # shortest path: weighted and unweighted
+│       ├── parser.ex                # Cypher-like query parser (recursive descent)
+│       ├── planner.ex               # query plan from parsed AST
+│       ├── executor.ex              # executes query plan against storage
+│       └── transaction.ex           # diff log for rollback: inverse operations
+├── test/
+│   └── graphdb/
+│       ├── storage_test.exs         # CRUD, neighbor lookups
+│       ├── traversal_test.exs       # BFS/DFS correctness, depth limiting
+│       ├── dijkstra_test.exs        # shortest path, disconnected graph
+│       ├── query_test.exs           # Cypher-like query execution
+│       └── transaction_test.exs    # commit and rollback correctness
+├── bench/
+│   └── graphdb_bench.exs
+└── mix.exs
+```
+
 ## Implementation milestones
 
 ### Step 1: Create the project

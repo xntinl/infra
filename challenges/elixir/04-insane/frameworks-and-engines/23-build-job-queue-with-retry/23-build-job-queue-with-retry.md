@@ -69,6 +69,35 @@ Services need to offload work to background processes: send emails, generate rep
 
 → Chose **B** because at our scale target (10k jobs/s), Postgres-backed queues spend most of their time in index maintenance; an in-memory queue with a dedicated WAL hits the target with headroom.
 
+## Project Structure
+
+```
+jobqueue/
+├── lib/
+│   └── jobqueue/
+│       ├── application.ex           # supervisor: queues, scheduler, cron engine, deduplicator
+│       ├── job.ex                   # job struct and lifecycle FSM
+│       ├── queue.ex                 # per-queue GenServer: dequeue, concurrency limit, worker pool
+│       ├── worker.ex                # runs a single job in an isolated supervised process
+│       ├── storage.ex               # durable storage: DETS backend
+│       ├── scheduler.ex             # polls for ready jobs every 500ms
+│       ├── retry.ex                 # exponential backoff + jitter calculation
+│       ├── cron.ex                  # cron expression parser and next-tick calculator
+│       ├── deduplicator.ex          # unique key + period enforcement
+│       └── dependency_resolver.ex  # DAG of job dependencies, unlock on completion
+├── test/
+│   └── jobqueue/
+│       ├── queue_test.exs           # concurrency limits, priority ordering
+│       ├── retry_test.exs           # backoff calculation, dead queue after max_attempts
+│       ├── scheduler_test.exs       # run_at correctness, sub-second polling accuracy
+│       ├── cron_test.exs            # expression parsing, next-tick for edge cases
+│       ├── unique_test.exs          # deduplication within period
+│       └── dependency_test.exs      # fan-in unlock, cascade failure
+├── bench/
+│   └── jobqueue_bench.exs
+└── mix.exs
+```
+
 ## Implementation milestones
 
 ### Step 1: Create the project

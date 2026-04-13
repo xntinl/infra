@@ -124,6 +124,7 @@ defmodule CollabRoom.MixProject do
     ]
   end
 end
+end
 ```
 
 ### Step 1: Presence module — `lib/collab_room/presence.ex`

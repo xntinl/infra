@@ -167,6 +167,35 @@ Mitigation: use a shared epoch-based logical clock or add a skew buffer. Alterna
 
 ---
 
+## Project Structure
+
+```
+throttlex/
+├── lib/
+│   └── throttlex/
+│       ├── application.ex           # OTP supervision: cluster, shards
+│       ├── limiter.ex               # public API: check/3, record/2
+│       ├── token_bucket.ex          # token bucket algorithm: refill on check
+│       ├── sliding_window.ex        # exact sliding window: no fixed-window approximation
+│       ├── ring.ex                  # consistent hashing: account → replica nodes
+│       ├── shard.ex                 # GenServer per shard: stores account state in ETS
+│       ├── quorum.ex                # quorum protocol: read/write with majority acks
+│       ├── lease.ex                 # lease manager: local approval with TTL
+│       ├── clock.ex                 # monotonic clock wrapper, skew-aware comparisons
+│       └── cluster.ex               # cluster management for testing
+├── test/
+│   └── throttlex/
+│       ├── token_bucket_test.exs    # refill rate, burst capacity, token depletion
+│       ├── sliding_window_test.exs  # exact count, no boundary artifacts
+│       ├── quorum_test.exs          # single node failure tolerance
+│       ├── lease_test.exs           # local approval within lease, expiry
+│       ├── clock_skew_test.exs      # monotonic time correctness under adjustment
+│       └── distributed_test.exs     # 3-node cluster correctness under load
+├── bench/
+│   └── throttlex_bench.exs
+└── mix.exs
+```
+
 ## Implementation milestones
 
 ### Step 1: Create the project

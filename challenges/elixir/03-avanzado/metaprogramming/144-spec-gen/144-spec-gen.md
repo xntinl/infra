@@ -292,6 +292,7 @@ defmodule SpecGen.Sample.Simple do
 
   deftyped echo(i), :: i, do: var!(i0)
 end
+end
 ```
 
 ### Step 4: Tests

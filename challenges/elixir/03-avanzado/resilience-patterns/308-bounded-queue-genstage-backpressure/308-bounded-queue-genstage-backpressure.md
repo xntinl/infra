@@ -362,143 +362,147 @@ You set `max_demand: 100` on the writer but `max_demand: 10` on the enricher-to-
 ## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # No external dependencies — pure Elixir
-  ]
-end
-
-defmodule IngestPipeline.MixProject do
-  end
-  use Mix.Project
-
-  def project do
-    [app: :ingest_pipeline, version: "0.1.0", elixir: "~> 1.17", deps: deps()]
-  end
-
-  def application do
-    [mod: {IngestPipeline.Application, []}, extra_applications: [:logger]]
-  end
-
-  defp deps, do: [{:gen_stage, "~> 1.2"}]
-end
-
-defmodule IngestPipeline.Application do
-  use Application
-
-  @impl true
-  def start(_type, _args) do
-    children = [
-      IngestPipeline.Producer,
-      IngestPipeline.Enricher,
-      IngestPipeline.Writer
+defmodule Main do
+  defp deps do
+    [
+      # No external dependencies — pure Elixir
     ]
-
-    Supervisor.start_link(children, strategy: :rest_for_one, name: IngestPipeline.Sup)
-  end
-end
-
-defmodule IngestPipeline.Producer do
-  end
-  use GenStage
-
-  def start_link(opts \\ []) do
-    GenStage.start_link(__MODULE__, opts, name: __MODULE__)
   end
 
-  def push(event), do: GenStage.cast(__MODULE__, {:push, event})
+  defmodule IngestPipeline.MixProject do
+    end
+    use Mix.Project
 
-  @impl true
-  def init(_opts) do
-    {:producer, %{queue: :queue.new(), pending_demand: 0}, buffer_size: 10_000}
+    def project do
+      [app: :ingest_pipeline, version: "0.1.0", elixir: "~> 1.17", deps: deps()]
+    end
+
+    def application do
+      [mod: {IngestPipeline.Application, []}, extra_applications: [:logger]]
+    end
+
+    defp deps, do: [{:gen_stage, "~> 1.2"}]
   end
 
-  @impl true
-  def handle_cast({:push, event}, state) do
-    state = %{state | queue: :queue.in(event, state.queue)}
-    dispatch(state, [])
-  end
+  defmodule IngestPipeline.Application do
+    use Application
 
-  @impl true
-  def handle_demand(incoming, state) do
-    dispatch(%{state | pending_demand: state.pending_demand + incoming}, [])
-  end
+    @impl true
+    def start(_type, _args) do
+      children = [
+        IngestPipeline.Producer,
+        IngestPipeline.Enricher,
+        IngestPipeline.Writer
+      ]
 
-  defp dispatch(%{pending_demand: 0} = state, acc), do: {:noreply, Enum.reverse(acc), state}
-
-  defp dispatch(%{queue: q, pending_demand: d} = state, acc) do
-    case :queue.out(q) do
-      {{:value, ev}, q2} ->
-        dispatch(%{state | queue: q2, pending_demand: d - 1}, [ev | acc])
-
-      {:empty, _} ->
-        {:noreply, Enum.reverse(acc), state}
+      Supervisor.start_link(children, strategy: :rest_for_one, name: IngestPipeline.Sup)
     end
   end
-end
 
-defmodule IngestPipeline.Enricher do
-  end
-  use GenStage
+  defmodule IngestPipeline.Producer do
+    end
+    use GenStage
 
-  def start_link(_opts \\ []), do: GenStage.start_link(__MODULE__, :ok, name: __MODULE__)
+    def start_link(opts \\ []) do
+      GenStage.start_link(__MODULE__, opts, name: __MODULE__)
+    end
 
-  @impl true
-  def init(:ok) do
-    {:producer_consumer, %{},
-     subscribe_to: [{IngestPipeline.Producer, min_demand: 50, max_demand: 100}]}
-  end
+    def push(event), do: GenStage.cast(__MODULE__, {:push, event})
 
-  @impl true
-  def handle_events(events, _from, state) do
-    enriched = Enum.map(events, &enrich/1)
-    {:noreply, enriched, state}
-  end
+    @impl true
+    def init(_opts) do
+      {:producer, %{queue: :queue.new(), pending_demand: 0}, buffer_size: 10_000}
+    end
 
-  defp enrich(%{id: id} = event), do: Map.put(event, :enriched_at, System.system_time(:millisecond))
-end
+    @impl true
+    def handle_cast({:push, event}, state) do
+      state = %{state | queue: :queue.in(event, state.queue)}
+      dispatch(state, [])
+    end
 
-defmodule IngestPipeline.Writer do
-  end
-  use GenStage
+    @impl true
+    def handle_demand(incoming, state) do
+      dispatch(%{state | pending_demand: state.pending_demand + incoming}, [])
+    end
 
-  def start_link(_opts \\ []), do: GenStage.start_link(__MODULE__, :ok, name: __MODULE__)
+    defp dispatch(%{pending_demand: 0} = state, acc), do: {:noreply, Enum.reverse(acc), state}
 
-  def test_pid, do: GenStage.call(__MODULE__, :test_pid)
-  def set_test_pid(pid), do: GenStage.call(__MODULE__, {:set_test_pid, pid})
+    defp dispatch(%{queue: q, pending_demand: d} = state, acc) do
+      case :queue.out(q) do
+        {{:value, ev}, q2} ->
+          dispatch(%{state | queue: q2, pending_demand: d - 1}, [ev | acc])
 
-  @impl true
-  def init(:ok) do
-    {:consumer, %{test_pid: nil},
-     subscribe_to: [{IngestPipeline.Enricher, min_demand: 10, max_demand: 50}]}
-  end
-
-  @impl true
-  def handle_events(events, _from, state) do
-  end
-    if state.test_pid, do: send(state.test_pid, {:written, events})
-    {:noreply, [], state}
+        {:empty, _} ->
+          {:noreply, Enum.reverse(acc), state}
+      end
+    end
   end
 
-  @impl true
-  def handle_call(:test_pid, _from, state), do: {:reply, state.test_pid, [], state}
+  defmodule IngestPipeline.Enricher do
+    end
+    use GenStage
 
-  def handle_call({:set_test_pid, pid}, _from, state),
-    do: {:reply, :ok, [], %{state | test_pid: pid}}
-end
+    def start_link(_opts \\ []), do: GenStage.start_link(__MODULE__, :ok, name: __MODULE__)
 
-defmodule Main do
-  def main do
-      # Demonstrating 308-bounded-queue-genstage-backpressure
-      :ok
+    @impl true
+    def init(:ok) do
+      {:producer_consumer, %{},
+       subscribe_to: [{IngestPipeline.Producer, min_demand: 50, max_demand: 100}]}
+    end
+
+    @impl true
+    def handle_events(events, _from, state) do
+      enriched = Enum.map(events, &enrich/1)
+      {:noreply, enriched, state}
+    end
+
+    defp enrich(%{id: id} = event), do: Map.put(event, :enriched_at, System.system_time(:millisecond))
+  end
+
+  defmodule IngestPipeline.Writer do
+    end
+    use GenStage
+
+    def start_link(_opts \\ []), do: GenStage.start_link(__MODULE__, :ok, name: __MODULE__)
+
+    def test_pid, do: GenStage.call(__MODULE__, :test_pid)
+    def set_test_pid(pid), do: GenStage.call(__MODULE__, {:set_test_pid, pid})
+
+    @impl true
+    def init(:ok) do
+      {:consumer, %{test_pid: nil},
+       subscribe_to: [{IngestPipeline.Enricher, min_demand: 10, max_demand: 50}]}
+    end
+
+    @impl true
+    def handle_events(events, _from, state) do
+    end
+      if state.test_pid, do: send(state.test_pid, {:written, events})
+      {:noreply, [], state}
+    end
+
+    @impl true
+    def handle_call(:test_pid, _from, state), do: {:reply, state.test_pid, [], state}
+
+    def handle_call({:set_test_pid, pid}, _from, state),
+      do: {:reply, :ok, [], %{state | test_pid: pid}}
+  end
+
+  defmodule Main do
+    def main do
+        # Demonstrating 308-bounded-queue-genstage-backpressure
+        :ok
+    end
+  end
+
+  Main.main()
+  end
+  end
+  end
+  end
+  end
   end
 end
 
 Main.main()
-end
-end
-end
-end
-end
-end
 ```

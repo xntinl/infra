@@ -530,228 +530,230 @@ Target: mutator runtime ≤ 1 ms for point edits on maps up to ~10k entries.
 ## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # No external dependencies — pure Elixir
-  ]
-end
-
-defmodule SysReplaceState.MixProject do
-  end
-  use Mix.Project
-
-  def project do
+defmodule Main do
+  defp deps do
     [
-      app: :sys_replace_state,
-      version: "0.1.0",
-      elixir: "~> 1.16",
-      start_permanent: Mix.env() == :prod,
-      deps: deps()
+      # No external dependencies — pure Elixir
     ]
   end
 
-  def application do
-    [
-      extra_applications: [:logger],
-      mod: {SysReplaceState.Application, []}
-    ]
+  defmodule SysReplaceState.MixProject do
+    end
+    use Mix.Project
+
+    def project do
+      [
+        app: :sys_replace_state,
+        version: "0.1.0",
+        elixir: "~> 1.16",
+        start_permanent: Mix.env() == :prod,
+        deps: deps()
+      ]
+    end
+
+    def application do
+      [
+        extra_applications: [:logger],
+        mod: {SysReplaceState.Application, []}
+      ]
+    end
+
+    defp deps, do: [{:decimal, "~> 2.1"}]
   end
 
-  defp deps, do: [{:decimal, "~> 2.1"}]
-end
+  defmodule SysReplaceState.Application do
+    @moduledoc false
+    use Application
 
-defmodule SysReplaceState.Application do
-  @moduledoc false
-  use Application
-
-  @impl true
-  def start(_type, _args) do
-    children = [SysReplaceState.Ledger]
-    Supervisor.start_link(children, strategy: :one_for_one, name: SysReplaceState.Supervisor)
-  end
-end
-
-defmodule SysReplaceState.Ledger do
-  end
-  @moduledoc """
-  In-memory ledger mapping `merchant_id` to a `Decimal.t()` balance.
-
-  The ledger is deliberately minimal: we only want the public API to
-  demonstrate how `:sys.replace_state/2` bypasses `handle_call/3`.
-  """
-
-  use GenServer
-  require Logger
-
-  @type merchant_id :: String.t()
-  @type state :: %{merchant_id() => Decimal.t()}
-
-  # Public API ---------------------------------------------------------------
-
-  def start_link(opts \\ []) do
-    GenServer.start_link(__MODULE__, %{}, Keyword.put_new(opts, :name, __MODULE__))
+    @impl true
+    def start(_type, _args) do
+      children = [SysReplaceState.Ledger]
+      Supervisor.start_link(children, strategy: :one_for_one, name: SysReplaceState.Supervisor)
+    end
   end
 
-  @spec credit(merchant_id(), Decimal.t()) :: :ok
-  def credit(merchant_id, amount) do
-    GenServer.call(__MODULE__, {:credit, merchant_id, amount})
+  defmodule SysReplaceState.Ledger do
+    end
+    @moduledoc """
+    In-memory ledger mapping `merchant_id` to a `Decimal.t()` balance.
+
+    The ledger is deliberately minimal: we only want the public API to
+    demonstrate how `:sys.replace_state/2` bypasses `handle_call/3`.
+    """
+
+    use GenServer
+    require Logger
+
+    @type merchant_id :: String.t()
+    @type state :: %{merchant_id() => Decimal.t()}
+
+    # Public API ---------------------------------------------------------------
+
+    def start_link(opts \\ []) do
+      GenServer.start_link(__MODULE__, %{}, Keyword.put_new(opts, :name, __MODULE__))
+    end
+
+    @spec credit(merchant_id(), Decimal.t()) :: :ok
+    def credit(merchant_id, amount) do
+      GenServer.call(__MODULE__, {:credit, merchant_id, amount})
+    end
+
+    @spec balance(merchant_id()) :: Decimal.t()
+    def balance(merchant_id) do
+      GenServer.call(__MODULE__, {:balance, merchant_id})
+    end
+
+    # GenServer ----------------------------------------------------------------
+
+    @impl true
+    def init(state), do: {:ok, state}
+
+    @impl true
+    def handle_call({:credit, merchant_id, amount}, _from, state) do
+      current = Map.get(state, merchant_id, Decimal.new(0))
+      new_balance = Decimal.add(current, amount)
+      {:reply, :ok, Map.put(state, merchant_id, new_balance)}
+    end
+
+    def handle_call({:balance, merchant_id}, _from, state) do
+      {:reply, Map.get(state, merchant_id, Decimal.new(0)), state}
+    end
   end
 
-  @spec balance(merchant_id()) :: Decimal.t()
-  def balance(merchant_id) do
-    GenServer.call(__MODULE__, {:balance, merchant_id})
+  defmodule SysReplaceState.Rescue do
+    @moduledoc """
+    Operator-facing helpers that wrap `:sys.replace_state/2` with invariant checks,
+    structured logging, and a before/after diff.
+
+    This module is the **only** blessed entry point for state surgery in production.
+    """
+
+    require Logger
+
+    @type diff :: %{
+            merchant_id: String.t(),
+            before: term(),
+            after: term(),
+            reason: String.t()
+          }
+
+    @doc """
+    Replaces the balance for `merchant_id` with `new_balance` on the given GenServer.
+
+    The replacement is aborted if:
+
+      * the current value is already a well-formed `Decimal.t()` (refuse to clobber good data);
+      * `new_balance` is not a `Decimal.t()` (refuse to install garbage).
+
+    Returns `{:ok, diff()}` on success, `{:error, reason}` otherwise.
+    """
+    @spec patch_balance(GenServer.server(), String.t(), Decimal.t(), String.t()) ::
+            {:ok, diff()} | {:error, atom()}
+    def patch_balance(server, merchant_id, new_balance, reason)
+        when is_binary(merchant_id) and is_binary(reason) do
+      with :ok <- validate_incoming(new_balance),
+           {:ok, before} <- fetch_current(server, merchant_id),
+           :ok <- validate_corrupt(before) do
+        mutator = fn state -> Map.put(state, merchant_id, new_balance) end
+
+        # :sys.replace_state swallows exceptions silently; we assert post-state.
+        _ = :sys.replace_state(server, mutator)
+        %{^merchant_id => installed} = :sys.get_state(server)
+
+        if installed == new_balance do
+          diff = %{merchant_id: merchant_id, before: before, after: installed, reason: reason}
+          Logger.warning("sys_replace_state applied", diff)
+          {:ok, diff}
+        else
+          {:error, :mutator_failed}
+        end
+      end
+    end
+
+    defp validate_incoming(%Decimal{} = _), do: :ok
+    defp validate_incoming(_), do: {:error, :new_balance_not_decimal}
+
+    defp fetch_current(server, merchant_id) do
+      state = :sys.get_state(server)
+      {:ok, Map.get(state, merchant_id)}
+    end
+
+    defp validate_corrupt(%Decimal{}), do: {:error, :current_is_healthy}
+    defp validate_corrupt(_), do: :ok
   end
 
-  # GenServer ----------------------------------------------------------------
+  defmodule SysReplaceState.LedgerTest do
+    use ExUnit.Case, async: false
 
-  @impl true
-  def init(state), do: {:ok, state}
+    alias SysReplaceState.Ledger
 
-  @impl true
-  def handle_call({:credit, merchant_id, amount}, _from, state) do
-    current = Map.get(state, merchant_id, Decimal.new(0))
-    new_balance = Decimal.add(current, amount)
-    {:reply, :ok, Map.put(state, merchant_id, new_balance)}
-  end
+    setup do
+      pid = start_supervised!({Ledger, name: :ledger_test})
+      %{pid: pid}
+    end
 
-  def handle_call({:balance, merchant_id}, _from, state) do
-    {:reply, Map.get(state, merchant_id, Decimal.new(0)), state}
-  end
-end
+    describe "SysReplaceState.Ledger" do
+      test "credit adds to running balance", %{pid: pid} do
+        :ok = GenServer.call(pid, {:credit, "m1", Decimal.new("10")})
+        :ok = GenServer.call(pid, {:credit, "m1", Decimal.new("2.5")})
+        assert Decimal.equal?(GenServer.call(pid, {:balance, "m1"}), Decimal.new("12.5"))
+      end
 
-defmodule SysReplaceState.Rescue do
-  @moduledoc """
-  Operator-facing helpers that wrap `:sys.replace_state/2` with invariant checks,
-  structured logging, and a before/after diff.
+      test "corrupt value crashes the server on credit", %{pid: pid} do
+        _ = :sys.replace_state(pid, fn _ -> %{"m_bad" => {:error, :decode}} end)
+        Process.flag(:trap_exit, true)
+        Process.monitor(pid)
 
-  This module is the **only** blessed entry point for state surgery in production.
-  """
-
-  require Logger
-
-  @type diff :: %{
-          merchant_id: String.t(),
-          before: term(),
-          after: term(),
-          reason: String.t()
-        }
-
-  @doc """
-  Replaces the balance for `merchant_id` with `new_balance` on the given GenServer.
-
-  The replacement is aborted if:
-
-    * the current value is already a well-formed `Decimal.t()` (refuse to clobber good data);
-    * `new_balance` is not a `Decimal.t()` (refuse to install garbage).
-
-  Returns `{:ok, diff()}` on success, `{:error, reason}` otherwise.
-  """
-  @spec patch_balance(GenServer.server(), String.t(), Decimal.t(), String.t()) ::
-          {:ok, diff()} | {:error, atom()}
-  def patch_balance(server, merchant_id, new_balance, reason)
-      when is_binary(merchant_id) and is_binary(reason) do
-    with :ok <- validate_incoming(new_balance),
-         {:ok, before} <- fetch_current(server, merchant_id),
-         :ok <- validate_corrupt(before) do
-      mutator = fn state -> Map.put(state, merchant_id, new_balance) end
-
-      # :sys.replace_state swallows exceptions silently; we assert post-state.
-      _ = :sys.replace_state(server, mutator)
-      %{^merchant_id => installed} = :sys.get_state(server)
-
-      if installed == new_balance do
-        diff = %{merchant_id: merchant_id, before: before, after: installed, reason: reason}
-        Logger.warning("sys_replace_state applied", diff)
-        {:ok, diff}
-      else
-        {:error, :mutator_failed}
+        # handle_call will raise when Decimal.add gets a tuple.
+        catch_exit(GenServer.call(pid, {:credit, "m_bad", Decimal.new(1)}))
+        assert_receive {:DOWN, _ref, :process, ^pid, _reason}, 500
       end
     end
   end
 
-  defp validate_incoming(%Decimal{} = _), do: :ok
-  defp validate_incoming(_), do: {:error, :new_balance_not_decimal}
+  defmodule SysReplaceState.RescueTest do
+    use ExUnit.Case, async: false
 
-  defp fetch_current(server, merchant_id) do
-    state = :sys.get_state(server)
-    {:ok, Map.get(state, merchant_id)}
-  end
+    alias SysReplaceState.{Ledger, Rescue}
 
-  defp validate_corrupt(%Decimal{}), do: {:error, :current_is_healthy}
-  defp validate_corrupt(_), do: :ok
-end
-
-defmodule SysReplaceState.LedgerTest do
-  use ExUnit.Case, async: false
-
-  alias SysReplaceState.Ledger
-
-  setup do
-    pid = start_supervised!({Ledger, name: :ledger_test})
-    %{pid: pid}
-  end
-
-  describe "SysReplaceState.Ledger" do
-    test "credit adds to running balance", %{pid: pid} do
-      :ok = GenServer.call(pid, {:credit, "m1", Decimal.new("10")})
-      :ok = GenServer.call(pid, {:credit, "m1", Decimal.new("2.5")})
-      assert Decimal.equal?(GenServer.call(pid, {:balance, "m1"}), Decimal.new("12.5"))
+    setup do
+      pid = start_supervised!({Ledger, name: :rescue_test})
+      %{pid: pid}
     end
 
-    test "corrupt value crashes the server on credit", %{pid: pid} do
-      _ = :sys.replace_state(pid, fn _ -> %{"m_bad" => {:error, :decode}} end)
-      Process.flag(:trap_exit, true)
-      Process.monitor(pid)
+    describe "SysReplaceState.Rescue" do
+      test "patches a corrupt balance and logs a diff", %{pid: pid} do
+        _ = :sys.replace_state(pid, fn _ -> %{"m_bad" => {:error, :decode}} end)
 
-      # handle_call will raise when Decimal.add gets a tuple.
-      catch_exit(GenServer.call(pid, {:credit, "m_bad", Decimal.new(1)}))
-      assert_receive {:DOWN, _ref, :process, ^pid, _reason}, 500
+        assert {:ok, diff} =
+                 Rescue.patch_balance(pid, "m_bad", Decimal.new("42.0"), "INC-2031 decode bug")
+
+        assert diff.before == {:error, :decode}
+        assert Decimal.equal?(diff.after, Decimal.new("42.0"))
+
+        # The server keeps serving after the rescue; no restart occurred.
+        assert Decimal.equal?(GenServer.call(pid, {:balance, "m_bad"}), Decimal.new("42.0"))
+      end
+
+      test "refuses to overwrite a healthy balance", %{pid: pid} do
+        :ok = GenServer.call(pid, {:credit, "m_ok", Decimal.new("10")})
+        assert {:error, :current_is_healthy} =
+                 Rescue.patch_balance(pid, "m_ok", Decimal.new("99"), "manual override")
+      end
+
+      test "refuses garbage replacements", %{pid: pid} do
+        _ = :sys.replace_state(pid, fn _ -> %{"m_bad" => :broken} end)
+        assert {:error, :new_balance_not_decimal} =
+                 Rescue.patch_balance(pid, "m_bad", "not a decimal", "typo")
+      end
     end
   end
-end
 
-defmodule SysReplaceState.RescueTest do
-  use ExUnit.Case, async: false
-
-  alias SysReplaceState.{Ledger, Rescue}
-
-  setup do
-    pid = start_supervised!({Ledger, name: :rescue_test})
-    %{pid: pid}
-  end
-
-  describe "SysReplaceState.Rescue" do
-    test "patches a corrupt balance and logs a diff", %{pid: pid} do
-      _ = :sys.replace_state(pid, fn _ -> %{"m_bad" => {:error, :decode}} end)
-
-      assert {:ok, diff} =
-               Rescue.patch_balance(pid, "m_bad", Decimal.new("42.0"), "INC-2031 decode bug")
-
-      assert diff.before == {:error, :decode}
-      assert Decimal.equal?(diff.after, Decimal.new("42.0"))
-
-      # The server keeps serving after the rescue; no restart occurred.
-      assert Decimal.equal?(GenServer.call(pid, {:balance, "m_bad"}), Decimal.new("42.0"))
+  defmodule Main do
+    def main do
+        # Demonstrating 77-sys-replace-state-live
+        :ok
     end
-
-    test "refuses to overwrite a healthy balance", %{pid: pid} do
-      :ok = GenServer.call(pid, {:credit, "m_ok", Decimal.new("10")})
-      assert {:error, :current_is_healthy} =
-               Rescue.patch_balance(pid, "m_ok", Decimal.new("99"), "manual override")
-    end
-
-    test "refuses garbage replacements", %{pid: pid} do
-      _ = :sys.replace_state(pid, fn _ -> %{"m_bad" => :broken} end)
-      assert {:error, :new_balance_not_decimal} =
-               Rescue.patch_balance(pid, "m_bad", "not a decimal", "typo")
-    end
-  end
-end
-
-defmodule Main do
-  def main do
-      # Demonstrating 77-sys-replace-state-live
-      :ok
   end
 end
 

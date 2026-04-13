@@ -425,173 +425,177 @@ Stateless web workers behind a load balancer. Rolling restart is simpler, safer,
 ## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # No external dependencies — pure Elixir
-  ]
-end
-
-defmodule CoinCounter.MixProject do
-  use Mix.Project
-
-  def project do
-    [
-      app: :coin_counter,
-      version: "1.0.0",       # bump to 2.0.0 before the second release
-      elixir: "~> 1.17",
-      start_permanent: Mix.env() == :prod,
-      releases: releases(),
-      deps: []
-    ]
-  end
-
-  def application do
-    [
-      extra_applications: [:logger, :sasl, :runtime_tools],
-      mod: {CoinCounter.Application, []}
-    ]
-  end
-
-  defp releases do
-    [
-      coin_counter: [
-        include_executables_for: [:unix],
-        applications: [runtime_tools: :permanent]
-      ]
-    ]
-  end
-end
-
-defmodule CoinCounter.Application do
-  use Application
-
-  @impl true
-  def start(_type, _args) do
-    children = [CoinCounter.Counter]
-    Supervisor.start_link(children, strategy: :one_for_one, name: CoinCounter.Supervisor)
-  end
-end
-
-defmodule CoinCounter.Counter do
-  end
-  @moduledoc "v1 — just a click counter."
-  @vsn "1"
-
-  use GenServer
-
-  defmodule State do
-    @moduledoc false
-    defstruct [:count]
-  end
-
-  def start_link(_), do: GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
-  def click, do: GenServer.cast(__MODULE__, :click)
-  def count, do: GenServer.call(__MODULE__, :count)
-
-  @impl true
-  def init(:ok), do: {:ok, %State{count: 0}}
-
-  @impl true
-  def handle_cast(:click, %State{count: c} = s), do: {:noreply, %{s | count: c + 1}}
-
-  @impl true
-  def handle_call(:count, _from, %State{count: c} = s), do: {:reply, c, s}
-end
-
-defmodule CoinCounter.Counter do
-  end
-  @moduledoc "v2 — clicks + timestamps (last 100)."
-  @vsn "2"
-
-  use GenServer
-
-  @max_timestamps 100
-
-  defmodule State do
-    @moduledoc false
-    defstruct count: 0, timestamps: []
-  end
-
-  def start_link(_), do: GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
-  def click, do: GenServer.cast(__MODULE__, :click)
-  def count, do: GenServer.call(__MODULE__, :count)
-  def recent(n \\ 10), do: GenServer.call(__MODULE__, {:recent, n})
-
-  @impl true
-  def init(:ok), do: {:ok, %State{}}
-
-  @impl true
-  def handle_cast(:click, %State{} = s) do
-    now = System.monotonic_time(:millisecond)
-    ts = [now | Enum.take(s.timestamps, @max_timestamps - 1)]
-    {:noreply, %{s | count: s.count + 1, timestamps: ts}}
-  end
-
-  @impl true
-  def handle_call(:count, _f, s), do: {:reply, s.count, s}
-  def handle_call({:recent, n}, _f, s), do: {:reply, Enum.take(s.timestamps, n), s}
-
-  # --- state migration v1 → v2 ---
-
-  @impl true
-  def code_change("1", old_state, _extra) do
-    # old_state has shape %CoinCounter.Counter.State{count: N} — only :count defaulted.
-    # We re-wrap into the new struct explicitly so the record descriptor is the new one.
-    count = Map.get(old_state, :count, 0)
-    {:ok, %State{count: count, timestamps: []}}
-  end
-
-  def code_change(_other, state, _extra), do: {:ok, state}
-end
-
-%% rel/coin_counter-1.0.0.rel
-{release,
- {"coin_counter", "1.0.0"},
- {erts, "15.0"},
- [
-  {kernel, "10.0"},
-  {stdlib, "6.0"},
-  {sasl, "4.2"},
-  {coin_counter, "1.0.0"}
- ]}.
-
-%% rel/coin_counter-2.0.0.rel
-{release,
- {"coin_counter", "2.0.0"},
- {erts, "15.0"},
- [
-  {kernel, "10.0"},
-  {stdlib, "6.0"},
-  {sasl, "4.2"},
-  {coin_counter, "2.0.0"}
- ]}.
-
-{"2.0.0",
- [{"1.0.0", [
-    {update, 'Elixir.CoinCounter.Counter', {advanced, []}, [], []}
-  ]}],
- [{"1.0.0", [
-    {update, 'Elixir.CoinCounter.Counter', {advanced, []}, [], []}
-  ]}]}.
-
 defmodule Main do
-  def main do
-      # Demonstrating 386-hot-code-upgrades-release-handler
-      :ok
+  defp deps do
+    [
+      # No external dependencies — pure Elixir
+    ]
+  end
+
+  defmodule CoinCounter.MixProject do
+    use Mix.Project
+
+    def project do
+      [
+        app: :coin_counter,
+        version: "1.0.0",       # bump to 2.0.0 before the second release
+        elixir: "~> 1.17",
+        start_permanent: Mix.env() == :prod,
+        releases: releases(),
+        deps: []
+      ]
+    end
+
+    def application do
+      [
+        extra_applications: [:logger, :sasl, :runtime_tools],
+        mod: {CoinCounter.Application, []}
+      ]
+    end
+
+    defp releases do
+      [
+        coin_counter: [
+          include_executables_for: [:unix],
+          applications: [runtime_tools: :permanent]
+        ]
+      ]
+    end
+  end
+
+  defmodule CoinCounter.Application do
+    use Application
+
+    @impl true
+    def start(_type, _args) do
+      children = [CoinCounter.Counter]
+      Supervisor.start_link(children, strategy: :one_for_one, name: CoinCounter.Supervisor)
+    end
+  end
+
+  defmodule CoinCounter.Counter do
+    end
+    @moduledoc "v1 — just a click counter."
+    @vsn "1"
+
+    use GenServer
+
+    defmodule State do
+      @moduledoc false
+      defstruct [:count]
+    end
+
+    def start_link(_), do: GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
+    def click, do: GenServer.cast(__MODULE__, :click)
+    def count, do: GenServer.call(__MODULE__, :count)
+
+    @impl true
+    def init(:ok), do: {:ok, %State{count: 0}}
+
+    @impl true
+    def handle_cast(:click, %State{count: c} = s), do: {:noreply, %{s | count: c + 1}}
+
+    @impl true
+    def handle_call(:count, _from, %State{count: c} = s), do: {:reply, c, s}
+  end
+
+  defmodule CoinCounter.Counter do
+    end
+    @moduledoc "v2 — clicks + timestamps (last 100)."
+    @vsn "2"
+
+    use GenServer
+
+    @max_timestamps 100
+
+    defmodule State do
+      @moduledoc false
+      defstruct count: 0, timestamps: []
+    end
+
+    def start_link(_), do: GenServer.start_link(__MODULE__, :ok, name: __MODULE__)
+    def click, do: GenServer.cast(__MODULE__, :click)
+    def count, do: GenServer.call(__MODULE__, :count)
+    def recent(n \\ 10), do: GenServer.call(__MODULE__, {:recent, n})
+
+    @impl true
+    def init(:ok), do: {:ok, %State{}}
+
+    @impl true
+    def handle_cast(:click, %State{} = s) do
+      now = System.monotonic_time(:millisecond)
+      ts = [now | Enum.take(s.timestamps, @max_timestamps - 1)]
+      {:noreply, %{s | count: s.count + 1, timestamps: ts}}
+    end
+
+    @impl true
+    def handle_call(:count, _f, s), do: {:reply, s.count, s}
+    def handle_call({:recent, n}, _f, s), do: {:reply, Enum.take(s.timestamps, n), s}
+
+    # --- state migration v1 → v2 ---
+
+    @impl true
+    def code_change("1", old_state, _extra) do
+      # old_state has shape %CoinCounter.Counter.State{count: N} — only :count defaulted.
+      # We re-wrap into the new struct explicitly so the record descriptor is the new one.
+      count = Map.get(old_state, :count, 0)
+      {:ok, %State{count: count, timestamps: []}}
+    end
+
+    def code_change(_other, state, _extra), do: {:ok, state}
+  end
+
+  %% rel/coin_counter-1.0.0.rel
+  {release,
+   {"coin_counter", "1.0.0"},
+   {erts, "15.0"},
+   [
+    {kernel, "10.0"},
+    {stdlib, "6.0"},
+    {sasl, "4.2"},
+    {coin_counter, "1.0.0"}
+   ]}.
+
+  %% rel/coin_counter-2.0.0.rel
+  {release,
+   {"coin_counter", "2.0.0"},
+   {erts, "15.0"},
+   [
+    {kernel, "10.0"},
+    {stdlib, "6.0"},
+    {sasl, "4.2"},
+    {coin_counter, "2.0.0"}
+   ]}.
+
+  {"2.0.0",
+   [{"1.0.0", [
+      {update, 'Elixir.CoinCounter.Counter', {advanced, []}, [], []}
+    ]}],
+   [{"1.0.0", [
+      {update, 'Elixir.CoinCounter.Counter', {advanced, []}, [], []}
+    ]}]}.
+
+  defmodule Main do
+    def main do
+        # Demonstrating 386-hot-code-upgrades-release-handler
+        :ok
+    end
+  end
+
+  Main.main()
+  end
+  end
+  end
+  end
+  end
+  end
+  end
+  end
+  end
+  end
+  end
   end
 end
 
 Main.main()
-end
-end
-end
-end
-end
-end
-end
-end
-end
-end
-end
-end
 ```

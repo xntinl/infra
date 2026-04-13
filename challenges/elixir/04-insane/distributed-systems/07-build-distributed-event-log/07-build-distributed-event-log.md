@@ -72,6 +72,36 @@ You need a durable, high-throughput message channel between services. Producers 
 
 ---
 
+## Project Structure
+
+```
+klog/
+├── lib/
+│   └── klog/
+│       ├── application.ex           # starts broker supervisor, listener
+│       ├── broker.ex                # entry point: topic/partition management
+│       ├── partition_leader.ex      # GenServer: accepts writes, replicates, tracks ISR
+│       ├── partition_follower.ex    # GenServer: receives replicated entries, reports lag
+│       ├── segment.ex               # segment file: append, read by offset, rotate
+│       ├── segment_index.ex         # binary search over segment filenames for offset lookup
+│       ├── replication.ex           # ISR management: add/remove followers, high-watermark
+│       ├── consumer_group.ex        # group coordinator: partition assignment, rebalance
+│       ├── offset_store.ex          # committed offsets per group per partition (durable)
+│       ├── retention.ex             # time/size-based segment cleanup
+│       ├── idempotent_producer.ex   # deduplication by producer_id + sequence_number
+│       └── protocol.ex              # binary framing: msgpack-encoded over TCP
+├── test/
+│   └── klog/
+│       ├── produce_consume_test.exs # round-trip correctness, ordering
+│       ├── replication_test.exs     # ISR, leader failover, follower catch-up
+│       ├── consumer_group_test.exs  # assignment, rebalance, offset recovery
+│       ├── retention_test.exs       # segment rotation and cleanup
+│       └── idempotent_test.exs      # deduplication on retry
+├── bench/
+│   └── klog_bench.exs
+└── mix.exs
+```
+
 ## Implementation milestones
 
 ### Step 1: Create the project

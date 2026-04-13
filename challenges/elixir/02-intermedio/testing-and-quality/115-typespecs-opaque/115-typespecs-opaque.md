@@ -325,13 +325,10 @@ caller.
 
 ---
 
-## Executable Example
-
-Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
-
 ```elixir
 defmodule Main do
-  defmodule UserId do
+  import ExUnit.Assertions
+
     @moduledoc """
     An opaque user identifier. Callers MUST use `new/1` to construct and
     `to_string/1` to render. The underlying representation is private and

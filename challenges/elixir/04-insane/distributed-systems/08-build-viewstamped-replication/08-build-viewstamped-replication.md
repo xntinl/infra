@@ -173,6 +173,34 @@ Mitigation: block entry into normal operation until `recovery_responses.count >=
 
 ---
 
+## Project Structure
+
+```
+vr_replica/
+├── lib/
+│   └── vr_replica/
+│       ├── application.ex           # OTP supervision tree: replica cluster
+│       ├── replica.ex               # GenServer: primary/backup, all message handlers
+│       ├── log.ex                   # immutable log operations: append, read_at, range
+│       ├── state_machine.ex         # pure KV apply: deterministic per op-number
+│       ├── normal_op.ex             # normal operation: PREPARE, PREPARE-OK, COMMIT
+│       ├── view_change.ex           # view-change protocol: START_VIEW_CHANGE, DO_VIEW_CHANGE, START_VIEW
+│       ├── recovery.ex              # replica restart protocol: RECOVERY, RECOVERY-RESPONSE
+│       ├── client.ex                # client session: nonce tracking, exactly-once
+│       └── cluster.ex               # public API: cluster setup and client interface
+├── test/
+│   └── vr_replica/
+│       ├── normal_op_test.exs       # PREPARE quorum commit, linearizability
+│       ├── view_change_test.exs     # primary failure, log selection, membership
+│       ├── recovery_test.exs        # replica restart from lost state
+│       ├── exactly_once_test.exs    # nonce-based idempotency
+│       ├── stale_view_test.exs      # view number rejection on backups
+│       └── property_test.exs        # invariant: committed ops never revert
+├── bench/
+│   └── vr_bench.exs                 # commit latency, view-change overhead
+└── mix.exs
+```
+
 ## Implementation milestones
 
 ### Step 1: Create the project

@@ -133,6 +133,7 @@ defmodule ObservabilityStack.MixProject do
     ]
   end
 end
+end
 ```
 
 ### Step 1: Telemetry supervisor — `lib/observability_stack/telemetry.ex`

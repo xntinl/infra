@@ -546,7 +546,8 @@ given a round-trip latency of R ms and a per-row transfer cost of t ms?
 ## Executable Example
 
 ```elixir
-defp deps do
+defmodule Main do
+  defp deps do
   [
     {:ecto_sql, "~> 3.12"},
     {:postgrex, "~> 0.19"},
@@ -705,6 +706,7 @@ defmodule Main do
   def main do
       :ok
   end
+end
 end
 
 Main.main()

@@ -71,6 +71,57 @@ You need a cache that multiple services connect to over TCP using the Redis prot
 
 → Chose **B** because the cost of a single rebalance under mod-N (cold cache → origin stampede) dominates any lookup savings; consistent hashing is the only choice once topology isn't static.
 
+## Project Structure
+
+```
+krebs/
+├── lib/
+│   └── krebs/
+│       ├── application.ex           # starts TCP listener, ring supervisor, pub/sub
+│       ├── listener.ex              # :gen_tcp accept loop, spawns connection handlers
+│       ├── connection.ex            # GenServer per TCP connection, RESP parser state machine
+│       ├── resp.ex                  # RESP2 encoder and decoder
+│       ├── command.ex               # command dispatch: SET, GET, DEL, TTL, SUBSCRIBE, PUBLISH
+│       ├── ring.ex                  # consistent hashing ring with virtual nodes
+│       ├── shard.ex                 # GenServer per shard: ETS-backed KV store with LRU
+│       ├── replication.ex           # quorum writes, quorum reads across R replicas
+│       ├── pubsub.ex                # pub/sub: subscribe, publish, cross-node routing
+│       ├── ttl_sweeper.ex           # background process: active TTL expiration sweep
+│       ├── aof.ex                   # append-only file: write before ack, replay on start
+│       └── hinted_handoff.ex        # sloppy quorum: hinted writes, forwarding on recovery
+├── test/
+│   └── krebs/
+│       ├── resp_test.exs            # RESP2 encoding/decoding correctness
+│       ├── ring_test.exs            # consistent hashing distribution
+│       ├── replication_test.exs     # quorum reads/writes, failure tolerance
+│       ├── ttl_test.exs             # TTL expiration and lazy cleanup
+│       ├── pubsub_test.exs          # cross-node pub/sub delivery
+│       └── aof_test.exs             # persistence and replay
+├── bench/
+│   └── krebs_bench.exs
+└── mix.exs
+```
+
+### Architecture
+
+```
+    redis-cli                     Krebs TCP Listener (port 6379)
+       |                                    |
+       +--[RESP2 Commands]-->  Connection Handler (GenServer)
+                                    |
+                              RESP Parser (resumable)
+                                    |
+                    +-----------+---+---+----------+
+                    |                   |
+                Command Dispatch    Ring Lookup
+                    |                   |
+        [SET/GET/DEL/TTL]        Physical Node (shard)
+                    |                   |
+                WAL (aof.ex)      ETS LRU Cache
+                    |                   |
+              [durability]      [Replication to R-1 nodes]
+```
+
 ## Implementation milestones
 
 ### Step 1: Create the project
@@ -447,26 +498,58 @@ Target: 100,000 reads/second and 50,000 writes/second with AOF enabled and R=2 q
 Each key maps to exactly one primary owner on the ring, and replicas follow the next R-1 vnodes clockwise. Because vnodes are hash-distributed, adding a node moves only its share of keys, and reads can fall back to replicas without violating the ownership invariant.
 
 ---
-## Main Entry Point
+## Quick start
 
-```elixir
-def main do
-  IO.puts("======== 03-build-distributed-cache-redis-like ========")
-  IO.puts("Build Distributed Cache Redis Like")
-  IO.puts("")
-  
-{:ok, cache} = Cache.start_link([])
-  IO.puts("Cache started")
-  
-  :ok = Cache.set(cache, "user:1", %{name: "Alice", age: 30})
-  {:ok, val} = Cache.get(cache, "user:1")
-  IO.puts("Cached user:1: #{inspect(val)}")
-  
-  :ok = Cache.delete(cache, "user:1")
-  {:error, :not_found} = Cache.get(cache, "user:1")
-  IO.puts("Key deleted successfully")
-  
-  IO.puts("Run: mix test")
-end
-```
+1. **Generate the project**:
+   ```bash
+   mix new krebs --sup
+   cd krebs
+   mkdir -p lib/krebs test/krebs bench
+   ```
+
+2. **Test RESP protocol and ring**:
+   ```bash
+   mix test test/krebs/resp_test.exs test/krebs/ring_test.exs --trace
+   ```
+
+3. **Run benchmarks** (start `iex -S mix` first, then in another terminal):
+   ```bash
+   mix run bench/krebs_bench.exs
+   ```
+
+---
+
+## Key Concepts
+
+- **RESP2 Protocol**: Redis Serialization Protocol v2 — wire format for client-server communication. Types: simple strings (`+OK\r\n`), errors (`-ERR\r\n`), integers, bulk strings, arrays.
+- **Consistent hashing**: Distributes keys across nodes such that adding/removing a node moves only ~`1/N` of keys (vs. modulo-N which moves ~`(N-1)/N` keys).
+- **Virtual nodes (vnodes)**: Each physical node owns V virtual token positions (typically 150), reducing hot spots and improving distribution variance.
+- **Sloppy quorum**: A write succeeds on any R replicas (not necessarily the primary), with a "hint" for later forwarding to the true replica. Improves availability during partial failures.
+- **Quorum reads**: A read succeeds once R replicas respond; the value with the highest version wins (read repair).
+- **Hinted handoff**: When a replica recovers, accept writes that were hinted to other nodes and forward them to the primary.
+- **LRU eviction**: O(1) via doubly-linked list + hash map; ETS `:ordered_set` alone is insufficient.
+- **Append-only file (AOF)**: Write-before-ack durability; replay on restart.
+
+---
+
+## Reflection
+
+1. **Why does consistent hashing with virtual nodes scale better than modulo-N?** Consider the rebalancing cost when a node joins or leaves in a 1000-node cluster. What fraction of keys move with each strategy?
+2. **In sloppy quorum, when does read repair matter?** If a write goes to {A, B} instead of {B, C} due to A's availability, and later A is rebuilt from its AOF, what race conditions can occur?
+
+---
+
+## Benchmark
+
+**Target metrics** (8 parallel clients, 10s duration):
+- **GET — cache hit**: ~100,000 ops/s (R=2 quorum, AOF enabled)
+- **SET — no replica**: ~50,000 ops/s
+
+**Setup**:
+- 3-node cluster with 150 vnodes per node
+- R=2 replication factor
+- 64KB per-shard LRU cache
+- Benchee with `time: 10, warmup: 3`
+
+**Expected variance**: ±5% across runs (ring distribution uniformity).
 

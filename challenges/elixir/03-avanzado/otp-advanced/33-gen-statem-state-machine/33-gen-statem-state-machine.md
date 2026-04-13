@@ -537,20 +537,22 @@ Target: transition latency ≤ 5 µs; postponed-event re-delivery ≤ 10 µs; no
 ## Executable Example
 
 ```elixir
-defp deps do
-  []
-end
-
-
-
-The first argument is the **event type**: `{:call, from}`, `:cast`, `:info`, `:state_timeout`, `:timeout`, `:internal`. The second is the event payload. The third is your data (analogous to GenServer state).
-
-### 4. Returning actions
-
 defmodule Main do
-  def main do
-      # Demonstrating 33-gen-statem-state-machine
-      :ok
+  defp deps do
+    []
+  end
+
+
+
+  The first argument is the **event type**: `{:call, from}`, `:cast`, `:info`, `:state_timeout`, `:timeout`, `:internal`. The second is the event payload. The third is your data (analogous to GenServer state).
+
+  ### 4. Returning actions
+
+  defmodule Main do
+    def main do
+        # Demonstrating 33-gen-statem-state-machine
+        :ok
+    end
   end
 end
 

@@ -71,6 +71,35 @@ LSM-trees invert this: all writes are sequential. Data is first written to a WAL
 
 → Chose **B** because the workload we're targeting (ingest-heavy, analytical reads) is exactly the one LSM was designed for; B-tree's in-place update cost is the wrong trade-off.
 
+## Project Structure
+
+```
+lsmex/
+├── lib/
+│   └── lsmex/
+│       ├── application.ex           # engine supervisor
+│       ├── engine.ex                # public API: put, get, delete, scan, snapshot
+│       ├── memtable.ex              # in-memory sorted ETS table; accepts put/delete
+│       ├── wal.ex                   # write-ahead log: append, fsync, replay
+│       ├── sstable.ex               # immutable on-disk sorted file: write, read, binary search
+│       ├── bloom.ex                 # Bloom filter: build from key set, check membership
+│       ├── compaction.ex            # GenServer: merge SSTables, discard tombstones
+│       ├── snapshot.ex              # snapshot isolation: sequence numbers, version fencing
+│       ├── level_manager.ex         # level metadata: SSTable list per level, trigger thresholds
+│       └── checksum.ex              # CRC32: compute and verify per block
+├── test/
+│   └── lsmex/
+│       ├── engine_test.exs          # put/get/delete/scan correctness
+│       ├── wal_test.exs             # crash recovery via WAL replay
+│       ├── compaction_test.exs      # merge, tombstone discard, level growth
+│       ├── bloom_test.exs           # false positive rate at configured capacity
+│       ├── snapshot_test.exs        # snapshot isolation under concurrent compaction
+│       └── checksum_test.exs        # corruption detection
+├── bench/
+│   └── lsmex_bench.exs
+└── mix.exs
+```
+
 ## Implementation milestones
 
 ### Step 1: Create the project

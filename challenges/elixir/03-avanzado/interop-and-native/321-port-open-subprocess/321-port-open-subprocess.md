@@ -433,161 +433,163 @@ blowing the BEAM heap — and what problem does that introduce for the timeout s
 ## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # No external dependencies — pure Elixir
-  ]
-end
-
-defmodule PdfRenderer.MixProject do
-  end
-  use Mix.Project
-
-  def project do
-    [
-      app: :pdf_renderer,
-      version: "0.1.0",
-      elixir: "~> 1.17",
-      deps: [{:benchee, "~> 1.3", only: :dev}]
-    ]
-  end
-
-  def application,
-    do: [extra_applications: [:logger], mod: {PdfRenderer.Application, []}]
-end
-
-defmodule PdfRenderer.PortGuard do
-  end
-  @moduledoc """
-  Runs a single external command with:
-    - hard per-request timeout
-    - stdin push
-    - stdout + exit status capture
-    - forced SIGKILL of the OS pid on timeout
-
-  Callers receive `{:ok, stdout_binary}` or `{:error, reason}`.
-  """
-
-  require Logger
-
-  @spec run(String.t(), [String.t()], iodata() | nil, keyword()) ::
-          {:ok, binary()} | {:error, term()}
-  def run(cmd, args, stdin \\ nil, opts \\ []) do
-    timeout_ms = Keyword.get(opts, :timeout_ms, 5_000)
-    max_output = Keyword.get(opts, :max_output_bytes, 50_000_000)
-
-    case System.find_executable(cmd) do
-      nil  -> {:error, {:executable_not_found, cmd}}
-      path -> do_run(path, args, stdin, timeout_ms, max_output)
-    end
-  end
-
-  defp do_run(path, args, stdin, timeout_ms, max_output) do
-    port_opts = [
-      :binary,
-      :exit_status,
-      :use_stdio,
-      :stderr_to_stdout,
-      args: args,
-      line: false
-    ]
-
-    port = Port.open({:spawn_executable, path}, port_opts)
-    os_pid = Port.info(port, :os_pid) |> elem(1)
-
-    if stdin, do: Port.command(port, stdin)
-    # Closing our end of stdin tells chromium "input is done".
-    send_eof(port)
-
-    collect(port, os_pid, <<>>, timeout_ms, max_output)
-  end
-
-  defp send_eof(port) do
-    # Port.close on Elixir's side would terminate the subprocess.
-    # Instead, simulate EOF by sending an empty write and keeping the port open.
-    # For commands that need explicit close-stdin, caller must do it externally.
-    :ok
-  end
-
-  defp collect(port, os_pid, acc, timeout_ms, max_output) do
-    receive do
-      {^port, {:data, chunk}} ->
-        new_acc = acc <> chunk
-        if byte_size(new_acc) > max_output do
-          kill_hard(port, os_pid)
-          {:error, {:output_too_large, byte_size(new_acc)}}
-        else
-          collect(port, os_pid, new_acc, timeout_ms, max_output)
-        end
-
-      {^port, {:exit_status, 0}} ->
-        {:ok, acc}
-
-      {^port, {:exit_status, code}} ->
-        {:error, {:exit_status, code, acc}}
-    after
-      timeout_ms ->
-        kill_hard(port, os_pid)
-        {:error, :timeout}
-    end
-  end
-
-  defp kill_hard(port, os_pid) do
-    # Port.close sends SIGTERM; give no mercy on timeout path.
-    try do
-      Port.close(port)
-    rescue
-      ArgumentError -> :ok  # already closed
-    end
-    System.cmd("kill", ["-9", "#{os_pid}"], stderr_to_stdout: true)
-    :ok
-  end
-end
-
-defmodule PdfRenderer.Renderer do
-  @moduledoc """
-  Renders HTML to PDF by invoking headless chromium via PortGuard.
-  Each call is a fresh subprocess — no shared state.
-  """
-
-  alias PdfRenderer.PortGuard
-
-  @chromium System.get_env("CHROMIUM_BIN") || "chromium"
-
-  @spec html_to_pdf(String.t(), keyword()) ::
-          {:ok, binary()} | {:error, term()}
-  def html_to_pdf(html, opts \\ []) when is_binary(html) do
-    timeout_ms = Keyword.get(opts, :timeout_ms, 5_000)
-
-    args = [
-      "--headless=new",
-      "--disable-gpu",
-      "--no-sandbox",
-      "--print-to-pdf=/dev/stdout",
-      "--virtual-time-budget=10000",
-      "data:text/html;base64," <> Base.encode64(html)
-    ]
-
-    PortGuard.run(@chromium, args, nil, timeout_ms: timeout_ms)
-  end
-end
-
-defmodule PdfRenderer.Application do
-  use Application
-
-  @impl true
-  def start(_, _) do
-    children = [
-      {Task.Supervisor, name: PdfRenderer.TaskSup}
-    ]
-    Supervisor.start_link(children, strategy: :one_for_one, name: PdfRenderer.Supervisor)
-  end
-end
-
 defmodule Main do
-  def main do
-      # Demonstrating 321-port-open-subprocess
+  defp deps do
+    [
+      # No external dependencies — pure Elixir
+    ]
+  end
+
+  defmodule PdfRenderer.MixProject do
+    end
+    use Mix.Project
+
+    def project do
+      [
+        app: :pdf_renderer,
+        version: "0.1.0",
+        elixir: "~> 1.17",
+        deps: [{:benchee, "~> 1.3", only: :dev}]
+      ]
+    end
+
+    def application,
+      do: [extra_applications: [:logger], mod: {PdfRenderer.Application, []}]
+  end
+
+  defmodule PdfRenderer.PortGuard do
+    end
+    @moduledoc """
+    Runs a single external command with:
+      - hard per-request timeout
+      - stdin push
+      - stdout + exit status capture
+      - forced SIGKILL of the OS pid on timeout
+
+    Callers receive `{:ok, stdout_binary}` or `{:error, reason}`.
+    """
+
+    require Logger
+
+    @spec run(String.t(), [String.t()], iodata() | nil, keyword()) ::
+            {:ok, binary()} | {:error, term()}
+    def run(cmd, args, stdin \\ nil, opts \\ []) do
+      timeout_ms = Keyword.get(opts, :timeout_ms, 5_000)
+      max_output = Keyword.get(opts, :max_output_bytes, 50_000_000)
+
+      case System.find_executable(cmd) do
+        nil  -> {:error, {:executable_not_found, cmd}}
+        path -> do_run(path, args, stdin, timeout_ms, max_output)
+      end
+    end
+
+    defp do_run(path, args, stdin, timeout_ms, max_output) do
+      port_opts = [
+        :binary,
+        :exit_status,
+        :use_stdio,
+        :stderr_to_stdout,
+        args: args,
+        line: false
+      ]
+
+      port = Port.open({:spawn_executable, path}, port_opts)
+      os_pid = Port.info(port, :os_pid) |> elem(1)
+
+      if stdin, do: Port.command(port, stdin)
+      # Closing our end of stdin tells chromium "input is done".
+      send_eof(port)
+
+      collect(port, os_pid, <<>>, timeout_ms, max_output)
+    end
+
+    defp send_eof(port) do
+      # Port.close on Elixir's side would terminate the subprocess.
+      # Instead, simulate EOF by sending an empty write and keeping the port open.
+      # For commands that need explicit close-stdin, caller must do it externally.
       :ok
+    end
+
+    defp collect(port, os_pid, acc, timeout_ms, max_output) do
+      receive do
+        {^port, {:data, chunk}} ->
+          new_acc = acc <> chunk
+          if byte_size(new_acc) > max_output do
+            kill_hard(port, os_pid)
+            {:error, {:output_too_large, byte_size(new_acc)}}
+          else
+            collect(port, os_pid, new_acc, timeout_ms, max_output)
+          end
+
+        {^port, {:exit_status, 0}} ->
+          {:ok, acc}
+
+        {^port, {:exit_status, code}} ->
+          {:error, {:exit_status, code, acc}}
+      after
+        timeout_ms ->
+          kill_hard(port, os_pid)
+          {:error, :timeout}
+      end
+    end
+
+    defp kill_hard(port, os_pid) do
+      # Port.close sends SIGTERM; give no mercy on timeout path.
+      try do
+        Port.close(port)
+      rescue
+        ArgumentError -> :ok  # already closed
+      end
+      System.cmd("kill", ["-9", "#{os_pid}"], stderr_to_stdout: true)
+      :ok
+    end
+  end
+
+  defmodule PdfRenderer.Renderer do
+    @moduledoc """
+    Renders HTML to PDF by invoking headless chromium via PortGuard.
+    Each call is a fresh subprocess — no shared state.
+    """
+
+    alias PdfRenderer.PortGuard
+
+    @chromium System.get_env("CHROMIUM_BIN") || "chromium"
+
+    @spec html_to_pdf(String.t(), keyword()) ::
+            {:ok, binary()} | {:error, term()}
+    def html_to_pdf(html, opts \\ []) when is_binary(html) do
+      timeout_ms = Keyword.get(opts, :timeout_ms, 5_000)
+
+      args = [
+        "--headless=new",
+        "--disable-gpu",
+        "--no-sandbox",
+        "--print-to-pdf=/dev/stdout",
+        "--virtual-time-budget=10000",
+        "data:text/html;base64," <> Base.encode64(html)
+      ]
+
+      PortGuard.run(@chromium, args, nil, timeout_ms: timeout_ms)
+    end
+  end
+
+  defmodule PdfRenderer.Application do
+    use Application
+
+    @impl true
+    def start(_, _) do
+      children = [
+        {Task.Supervisor, name: PdfRenderer.TaskSup}
+      ]
+      Supervisor.start_link(children, strategy: :one_for_one, name: PdfRenderer.Supervisor)
+    end
+  end
+
+  defmodule Main do
+    def main do
+        # Demonstrating 321-port-open-subprocess
+        :ok
+    end
   end
 end
 

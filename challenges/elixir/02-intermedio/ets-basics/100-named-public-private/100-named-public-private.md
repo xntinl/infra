@@ -449,13 +449,10 @@ at scale (thousands of ops/sec, many cores, hot keys).
 
 ---
 
-## Executable Example
-
-Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
-
 ```elixir
 defmodule Main do
-  defmodule EtsAccessModes do
+  import ExUnit.Assertions
+
     @moduledoc """
     Demonstrates the three ETS access modes (`:public`, `:protected`, `:private`)
     by opening tables from a deliberately separate *owner process* and letting

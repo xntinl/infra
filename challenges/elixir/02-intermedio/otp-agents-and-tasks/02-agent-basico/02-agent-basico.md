@@ -332,13 +332,10 @@ pass the pid through the context.
 
 - Si agregás validación y side-effects al Agent, ¿cuándo sabés que es momento de migrar a GenServer? Dá el criterio concreto.
 
-## Executable Example
-
-Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
-
 ```elixir
 defmodule Main do
-  defmodule ConfigAgent do
+  import ExUnit.Assertions
+
     @moduledoc """
     A small key/value configuration store backed by `Agent`.
 

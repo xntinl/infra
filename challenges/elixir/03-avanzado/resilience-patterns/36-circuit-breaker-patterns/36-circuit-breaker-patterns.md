@@ -657,41 +657,43 @@ is pure win vs 30-second upstream timeouts.
 ## Executable Example
 
 ```elixir
-defp deps do
-  [
-    {:telemetry, "~> 1.2"},
-    {:jason, "~> 1.4", only: [:dev, :test]}
-  ]
-end
-
-
-
-### Step 2: `lib/circuit_breaker_patterns/classifier.ex`
-
-**Objective**: Extract failure classification rules so breaker FSM remains pure and per-upstream policies (429 vs 408) are swappable without modifying state machine.
-
-
-
-### Step 3: `lib/circuit_breaker_patterns/breaker.ex`
-
-**Objective**: Serialize state transitions through GenServer but read current state from ETS so call/2 gate checks scale lock-free across cores without mailbox contention.
-
-
-
-### Step 4: Supervisor & Registry in application.ex
-
-**Objective**: Own the shared ETS table at the application level and supervise breakers dynamically so individual FSM crashes never lose the published gate state.
-
-
-
-### Step 5: `test/circuit_breaker_patterns/breaker_test.exs`
-
-**Objective**: Drive the FSM across closed→open→half-open→closed transitions with deterministic time control so regressions in trip thresholds surface instantly.
-
 defmodule Main do
-  def main do
-      # Demonstrating 36-circuit-breaker-patterns
-      :ok
+  defp deps do
+    [
+      {:telemetry, "~> 1.2"},
+      {:jason, "~> 1.4", only: [:dev, :test]}
+    ]
+  end
+
+
+
+  ### Step 2: `lib/circuit_breaker_patterns/classifier.ex`
+
+  **Objective**: Extract failure classification rules so breaker FSM remains pure and per-upstream policies (429 vs 408) are swappable without modifying state machine.
+
+
+
+  ### Step 3: `lib/circuit_breaker_patterns/breaker.ex`
+
+  **Objective**: Serialize state transitions through GenServer but read current state from ETS so call/2 gate checks scale lock-free across cores without mailbox contention.
+
+
+
+  ### Step 4: Supervisor & Registry in application.ex
+
+  **Objective**: Own the shared ETS table at the application level and supervise breakers dynamically so individual FSM crashes never lose the published gate state.
+
+
+
+  ### Step 5: `test/circuit_breaker_patterns/breaker_test.exs`
+
+  **Objective**: Drive the FSM across closed→open→half-open→closed transitions with deterministic time control so regressions in trip thresholds surface instantly.
+
+  defmodule Main do
+    def main do
+        # Demonstrating 36-circuit-breaker-patterns
+        :ok
+    end
   end
 end
 

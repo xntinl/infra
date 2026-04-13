@@ -142,15 +142,6 @@ defp deps do
 end
 ```
 
-### Dependencies (mix.exs)
-
-```elixir
-```elixir
-{:noreply, state, @idle_ms}      # arm
-# ... message arrives, callback runs, timeout is discarded
-{:noreply, state, @idle_ms}      # re-arm, zero-leak
-```
-
 ### 5. Measuring hibernation: `:erlang.process_info/2`
 
 The quantitative feedback loop for this exercise uses three keys:
@@ -184,17 +175,6 @@ Convert words to bytes with `:erlang.system_info(:wordsize)` (usually 8 on 64-bi
 ---
 
 ## Implementation
-
-### Dependencies (`mix.exs`)
-
-```elixir
-defp deps do
-  [
-    {:benchee, "~> 1.3", only: :dev}
-  ]
-end
-```
-
 
 ### Step 1: `mix.exs`
 
@@ -527,16 +507,18 @@ Target: idle-worker footprint under 1 KB (`:erlang.process_info(pid, :memory)` <
 ## Executable Example
 
 ```elixir
-defp deps do
-  [
-    {:benchee, "~> 1.3", only: :dev}
-  ]
-end
-
 defmodule Main do
-  def main do
-      # Demonstrating 01-genserver-hibernation-state-compaction
-      :ok
+  defp deps do
+    [
+      {:benchee, "~> 1.3", only: :dev}
+    ]
+  end
+
+  defmodule Main do
+    def main do
+        # Demonstrating 01-genserver-hibernation-state-compaction
+        :ok
+    end
   end
 end
 

@@ -476,7 +476,8 @@ bypass long work without violating the dirty pool bound?
 ## Executable Example
 
 ```elixir
-defp deps do
+defmodule Main do
+  defp deps do
   [
     # No external dependencies — pure Elixir
   ]
@@ -528,6 +529,7 @@ defmodule Main do
       # Demonstrating 319-dirty-nif-cpu-bound
       :ok
   end
+end
 end
 
 Main.main()

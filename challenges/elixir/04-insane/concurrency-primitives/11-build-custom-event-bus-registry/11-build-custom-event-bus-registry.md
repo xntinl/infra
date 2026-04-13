@@ -1,12 +1,14 @@
-# Custom Distributed Event Bus and Registry
+# Build a Distributed Event Bus with Topic Routing
 
-**Project**: `nexus` — a distributed process registry and hierarchical event bus across BEAM nodes
+**Project**: `nexus` — A distributed process registry and hierarchical event bus across multi-node BEAM clusters, using ETS-backed O(1) registry lookups and trie-based wildcard matching.
+
+**Learning Goal**: Understand how to combine ETS for fast, lock-free O(1) lookups with a trie for O(S) wildcard matching (S = matching subscribers), implement cross-node delivery gossip, and enforce QoS semantics.
 
 ---
 
-## Project context
+## Project Context
 
-You are building `nexus`, a distributed process registry and hierarchical event bus that operates across a multi-node cluster without any external dependencies. No Redis, no RabbitMQ, no libcluster. The registry maps names to PIDs; the event bus routes events using AMQP-style topic wildcards.
+You are building `nexus`, a distributed registry and event bus with no external dependencies (no Redis, no RabbitMQ, no libcluster).
 
 Project structure:
 
@@ -37,44 +39,105 @@ nexus/
 
 ---
 
-## The problem
+## The Problem
 
-Services on different BEAM nodes need to discover each other by name and receive events from each other. A naive approach uses `:global` for registration and `GenServer.cast` for events. The problem: `:global` does not scale to fast-changing registrations, and direct PID messaging does not support topic routing or delivery guarantees.
+Services on different BEAM nodes need to:
+- Discover each other by name (with O(1) lookup)
+- Receive events from each other with topic routing
+- Support delivery guarantees (at least once, exactly once)
 
-The registry must have O(1) lookup and automatic cleanup when processes die. The event bus must support topic hierarchies with wildcards so consumers can subscribe to broad patterns without enumerating every publisher. Cross-node delivery must work without manual routing.
-
----
-
-## Why this design
-
-**ETS for the registry**: `:ets.lookup/2` is O(1) average time with concurrent reads. `Process.monitor/1` triggers cleanup automatically when a process dies — no polling, no TTL. This is the same pattern used by Elixir's built-in `Registry`.
-
-**Trie for wildcard routing**: a trie where each path segment is a node key makes wildcard matching O(S) where S is the number of active subscriptions, not O(T) where T is the total length of all topic strings. `"*"` is a special trie node that matches any single segment; `"#"` matches zero or more segments. Matching walks the trie, branching at wildcards.
-
-**QoS levels as delivery semantics**: `:at_most_once` is fire-and-forget — no retry, no confirmation. `:at_least_once` retries until the subscriber acknowledges with `{:ack, event_id}`. `:exactly_once` is two-phase: publisher sends PREPARE, subscriber acks, publisher sends COMMIT. These map directly to AMQP's QoS levels.
-
-**Cross-node delivery via `:pg`-inspired gossip**: when a node subscribes, its subscription is gossiped to all cluster members. When an event is published, the publisher routes it to every node that has a matching subscriber. This avoids a central routing node.
+A naive approach (`:global` + `GenServer.cast`) fails because:
+- `:global` doesn't scale with fast-changing registrations
+- Direct PID messaging offers no topic routing
+- No delivery guarantees or QoS levels
 
 ---
 
-## Design decisions
+## Key Concepts
 
-**Option A — Central dispatcher GenServer**
-- Pros: easy to reason about ordering; single place to add middleware.
-- Cons: becomes the bottleneck at high fan-out; one slow subscriber stalls the bus.
+### ETS Registry for O(1) Lookup
 
-**Option B — ETS-backed registry with sender-side fan-out** (chosen)
-- Pros: publishers read subscriber list from ETS with zero copy and send directly; no central hop; slow subscribers only hurt themselves.
-- Cons: ordering guarantees are per-sender, not global.
+`:ets.lookup/2` is O(1) with concurrent-safe reads. Combined with `Process.monitor/1`, dead PIDs self-evict on `:DOWN`. This is how Elixir's `Registry` module works internally.
 
-→ Chose **B** because the whole reason to skip the central dispatcher is to remove the head-of-line blocking it introduces — this is the pattern Phoenix.PubSub uses for exactly this reason.
+### Trie for Wildcard Matching
+
+A trie where each segment is a node key achieves O(S) matching (S = matching subscribers):
+
+```
+Topic patterns: "orders.*.created", "orders.#", "metrics.cpu.load"
+
+Trie:
+%{
+  "orders" => %{
+    "*" => %{
+      "created" => %{:leaf => [sub_a]}
+    },
+    "#" => %{:leaf => [sub_b]}
+  },
+  "metrics" => %{
+    "cpu" => %{
+      "load" => %{:leaf => [sub_c]}
+    }
+  }
+}
+```
+
+- `"*"` matches exactly one segment
+- `"#"` matches zero or more segments
+- Matching walks all paths simultaneously (NFA-style)
+
+### QoS Delivery Semantics
+
+| Level | Guarantee | Retry | Ack | Use Case |
+|-------|-----------|-------|-----|----------|
+| `:at_most_once` | may drop | no | no | metrics, logs |
+| `:at_least_once` | no drop | yes | yes | orders, payments |
+| `:exactly_once` | no dup, no drop | 2-phase | yes | ledger |
+
+### Design Decisions
+
+| Option | Pros | Cons | Chosen? |
+|--------|------|------|---------|
+| **A: Central dispatcher** | simple; ordered | head-of-line blocking | No |
+| **B: ETS + sender fan-out** | no bottleneck; slow subscribers self-isolate | per-sender ordering | **Yes** |
+
+**Rationale**: Removes the head-of-line blocking that central dispatchers introduce. This is exactly why Phoenix.PubSub uses sender-side fan-out.
+
+## Full Project Structure
+
+```
+nexus/
+├── mix.exs                          # Project configuration
+├── lib/
+│   ├── nexus.ex                    # Module docstring
+│   └── nexus/
+│       ├── application.ex          # starts registry, event_bus, cluster watcher
+│       ├── registry.ex             # ETS: O(1) name → pid, monitor-based cleanup
+│       ├── event_bus.ex            # GenServer: subscribe, publish, backpressure
+│       ├── trie.ex                 # wildcard trie: *, # matching (O(S))
+│       ├── history.ex              # circular buffer: event replay on subscribe
+│       ├── delivery.ex             # at_most_once, at_least_once, exactly_once
+│       ├── cluster.ex              # node monitoring, cross-node gossip
+│       └── backpressure.ex         # mailbox monitoring, overflow strategies
+├── test/
+│   ├── test_helper.exs             # ExUnit config
+│   └── nexus/
+│       ├── registry_test.exs       # O(1) lookup, cleanup on process death
+│       ├── trie_test.exs           # wildcard matching (* and # semantics)
+│       ├── delivery_test.exs       # QoS: at_least_once, exactly_once
+│       ├── history_test.exs        # event replay semantics
+│       ├── backpressure_test.exs   # overflow handling
+│       └── distributed_test.exs    # cross-node delivery
+├── bench/
+│   └── nexus_bench.exs             # ETS lookup, trie match, publish throughput
+└── .gitignore
+```
 
 ## Implementation milestones
 
-### Step 1: Create the project
+### Step 1: Project Setup
 
-**Objective**: Split registry, trie, and bus into separate modules so the routing data structure stays testable without standing up the full dispatcher.
-
+**Objective**: Separate registry, trie, and bus into testable modules.
 
 ```bash
 mix new nexus --sup
@@ -82,11 +145,9 @@ cd nexus
 mkdir -p lib/nexus test/nexus bench
 ```
 
-### Step 2: `mix.exs` — dependencies
+### Step 2: Dependencies (mix.exs)
 
-**Objective**: Pull in only `benchee` and `stream_data` — the trie and QoS protocol must be hand-rolled, not borrowed from Phoenix.PubSub or `:pg`.
-
-### Dependencies (mix.exs)
+**Objective**: Minimal deps — only `benchee` and `stream_data`. Hand-roll the trie and QoS protocol.
 
 ```elixir
 defp deps do
@@ -97,30 +158,9 @@ defp deps do
 end
 ```
 
-### Step 3: Application
+### Step 3: Process Registry
 
-**Objective**: Boot the registry under `:one_for_one` so a crashed ETS owner restarts cleanly without taking the bus with it.
-
-
-```elixir
-# lib/nexus/application.ex
-defmodule Nexus.Application do
-  use Application
-
-  @impl true
-  def start(_type, _args) do
-    children = [
-      Nexus.Registry
-    ]
-    opts = [strategy: :one_for_one, name: Nexus.Supervisor]
-    Supervisor.start_link(children, opts)
-  end
-end
-```
-
-### Step 4: Process registry
-
-**Objective**: Combine `:ets.insert_new` with `Process.monitor` inside the GenServer so register+monitor is atomic and dead PIDs self-evict on `:DOWN`.
+**Objective**: Combine `:ets.insert_new` with `Process.monitor` so register+monitor is atomic and dead PIDs self-evict.
 
 
 ```elixir
@@ -194,10 +234,9 @@ defmodule Nexus.Registry do
 end
 ```
 
-### Step 5: Wildcard trie
+### Step 4: Wildcard Trie
 
-**Objective**: Use a nested-map trie with NFA-style branching on `*` and `#` so match cost is O(subscriptions) instead of O(patterns × topic length).
-
+**Objective**: Use nested-map trie with NFA-style branching so match cost is O(subscriptions) not O(patterns × length).
 
 ```elixir
 # lib/nexus/trie.ex
@@ -286,10 +325,9 @@ defmodule Nexus.Trie do
 end
 ```
 
-### Step 6: Event bus
+### Step 5: Event Bus
 
-**Objective**: Fan out directly from publisher to subscriber PIDs so one slow consumer only blocks its own mailbox, not the whole bus.
-
+**Objective**: Fan out directly from publisher to subscribers so one slow consumer doesn't block others.
 
 ```elixir
 # lib/nexus/event_bus.ex
@@ -399,10 +437,9 @@ defmodule Nexus.EventBus do
 end
 ```
 
-### Step 7: Given tests — must pass without modification
+### Step 6: Tests — Contract as Specs
 
-**Objective**: Lock in wildcard semantics and `:at_least_once` retry behavior so later refactors cannot silently weaken delivery guarantees.
-
+**Objective**: Lock in wildcard semantics and retry behavior so delivery guarantees cannot degrade silently.
 
 ```elixir
 # test/nexus/registry_test.exs
@@ -494,50 +531,64 @@ end
 
 ---
 
-## Quick start
+## Quick Start
 
 **Prerequisites**: Elixir 1.14+, OTP 25+
 
-**Setup and run**:
+**Setup**:
 ```bash
-mix test test/nexus/ --trace
-mix run -e "IO.puts(\"Nexus module loaded\")"
+mix new nexus --sup
+cd nexus
+mkdir -p lib/nexus test/nexus bench
 ```
 
-**Run benchmarks**:
+**Run tests** (serially due to ETS singleton):
 ```bash
-mix run bench/nexus_bench.exs
+mix test test/nexus/ --trace
+```
+
+**Interactive example**:
+```bash
+iex -S mix
+```
+
+Then in iex:
+```elixir
+# Registry: O(1) lookup
+{:ok, pid} = spawn_link(fn -> Process.sleep(:infinity) end)
+:ok = Nexus.Registry.register(:my_service, pid)
+{:ok, ^pid} = Nexus.Registry.lookup(:my_service)
+
+# Event bus: topic routing with wildcards
+Nexus.EventBus.subscribe("orders.eu.*", self())
+Nexus.EventBus.publish("orders.eu.created", %{order_id: 123})
+receive do
+  {:event, _id, %{order_id: 123}} -> :ok
+after 1000 -> :timeout
+end
 ```
 
 ---
 
-### Step 8: Run the tests
+## Benchmark
 
-**Objective**: Run serially (`async: false` on registry/delivery) because the bus and ETS table are named singletons that cross-contaminate parallel tests.
+**Objective**: Measure ETS lookup, trie matching, and publish throughput separately.
 
-```bash
-mix test test/nexus/ --trace
-```
-
-### Step 9: Benchmark
-
-**Objective**: Compare ETS-lookup, trie-match, and publish paths separately so you can attribute overhead to routing vs. delivery instead of guessing.
-
-
+**Setup**:
 ```elixir
 # bench/nexus_bench.exs
-{:ok, _} = Nexus.EventBus.start_link()
+{:ok, _bus} = Nexus.EventBus.start_link()
 Nexus.EventBus.subscribe("bench.topic.a", self(), qos: :at_most_once)
 
 Benchee.run(
   %{
-    "registry lookup — O(1)" => fn ->
+    "registry lookup (O(1))" => fn ->
       Nexus.Registry.lookup(:nonexistent)
     end,
-    "publish — single exact match" => fn ->
+    "publish (single match)" => fn ->
       Nexus.EventBus.publish("bench.topic.a", %{ts: :erlang.monotonic_time()})
     end,
-    "trie match — 1000 subscriptions" => fn ->
+    "trie match (1000 subs)" => fn ->
       Nexus.Trie.match(Nexus.EventBus.trie(), "bench.topic.a")
     end
   },
@@ -548,66 +599,33 @@ Benchee.run(
 )
 ```
 
-### Why this works
-
-Subscriptions are rows in an ETS `:bag` keyed by topic, so lookup is O(1) and concurrent-safe. The publisher sends directly to each subscriber PID, which means backpressure surfaces naturally through mailbox length on the slow subscriber rather than the bus.
-
----
-
-
-## Main Entry Point
-
-```elixir
-def main do
-  IO.puts("======== 11-build-custom-event-bus-registry ========")
-  IO.puts("Build custom event bus registry")
-  IO.puts("")
-  
-  Nexus.Application.start_link([])
-  IO.puts("Nexus.Application started")
-  
-  IO.puts("Run: mix test")
-end
+**Run**:
+```bash
+mix run bench/nexus_bench.exs
 ```
 
-
-
-## Benchmark
-
-**Objective**: Measure publisher throughput with increasing fan-out and validate ETS lookup performance.
-
-**Expected results**:
-- Registry `lookup/1` (O(1) ETS): 400,000–800,000 ops/second
-- Trie `match/2` with 1,000 subscriptions: 50,000–100,000 ops/second
-- `publish/2` with 10 matching subscribers: 100,000–200,000 ops/second
-- `publish/2` with 100 matching subscribers: 20,000–50,000 ops/second
-
-**Test scenarios**:
-1. Single subscriber, repeated publish (baseline)
-2. 1,000 subscriptions, one matching (trie overhead)
-3. 1,000 subscriptions, 100 matching (fan-out cost)
-4. Wildcard patterns at varying depths ("a.*.*", "a.b.#")
+**Expected Results**:
+- Registry lookup: 400k–800k ops/sec
+- Trie match (1000 subscriptions): 50k–100k ops/sec
+- Publish (10 subscribers): 100k–200k ops/sec
+- Publish (100 subscribers): 20k–50k ops/sec
 
 **Interpretation**:
-Registry lookup dominates for small subscriber counts. As fan-out grows, trie traversal and message-send batching become visible. Wildcard matching cost depends on pattern complexity and matching subscription density.
+Registry dominates at small scale. Trie traversal and message batching become visible with many subscriptions. Wildcard patterns add cost proportional to matching subscription count.
 
 ---
 
-## Deep Dive: Lock-Free Patterns and the BEAM Scheduler
+## Reflection
 
-Concurrency on the BEAM differs from OS threads: each Elixir process is a lightweight logical task scheduled by the BEAM VM. There are no kernel locks or mutexes; instead, processes communicate via message passing.
+These questions deepen your understanding:
 
-Lock-free data structures (e.g., ETS with `:write_concurrency`, atomic counters) use compare-and-swap primitives to avoid a centralized lock holder. On OS threads, this is critical because a preempted lock holder starves all waiters. On the BEAM, processes yield cooperatively, so even simple spinlocks are viable—but lock contention still matters.
+1. **Backpressure**: If one subscriber blocks on a 100 ms disk write per message, how does the rest of the bus behave? What guardrails would you add?
 
-The ETS table is the BEAM's primary lockfree structure: concurrent readers use an RWLock per bucket (readers do not block each other); writers grab an exclusive lock. For a counter with 100K increments/sec from 10 processes, ETS wins if reads are rare (fast writers, no reader contention). But a dedicated GenServer (serializing all increments via messages) can outperform ETS if the write rate is so high that RWLock contention dominates.
-
-Scheduler affinity (pinning a process to a specific scheduler thread) is an advanced optimization: if a GenServer is pinned and its callers are on the same scheduler, message delivery avoids cross-thread synchronization. But this requires deep knowledge of your workload and can degrade fairness.
-
-**Production gotcha**: Measuring concurrency on a single machine is misleading. ETS counters appear faster than GenServer counters until you hit a few thousand ops/sec from many processes, then RWLock overhead dominates. Always benchmark at realistic concurrency levels and check for starvation (e.g., do slow processes still make progress?).
+2. **Exactly-Once Delivery**: Would you change the design if subscribers needed exactly-once semantics? What trade-offs appear?
 
 ---
 
-## Trade-off analysis
+## Trade-off Analysis
 
 | Aspect | `:at_most_once` | `:at_least_once` | `:exactly_once` |
 |--------|----------------|-----------------|----------------|
@@ -621,24 +639,19 @@ Reflection: `:exactly_once` delivery requires idempotency on the subscriber side
 
 ---
 
-## Common production mistakes
+## Common Production Mistakes
 
-**1. Looking up in ETS from outside the owning process in a write-heavy scenario**
-The ETS table is `:public` for concurrent reads. But writes to the registry go through the GenServer to guarantee atomicity of "check-and-insert + start-monitor". If you insert directly from the caller and monitor from the server, there is a window where the process can die between insert and monitor start, leaving a stale entry.
+**1. Direct ETS writes from outside the owning process**
+ETS is `:public` for reads, but writes must go through the GenServer to keep "insert + monitor" atomic. A direct insert followed by server-side monitor leaves a window where the process dies before monitoring starts, leaving a stale entry.
 
-**2. Wildcard matching via string comparison**
-Iterating all subscription patterns and doing string comparison for every publish is O(P × T) where P is patterns and T is topic length. The trie reduces this to O(S) where S is the number of matching subscribers.
+**2. Wildcard matching via string iteration**
+Iterating all patterns and comparing strings is O(P × T) (patterns × topic length). A trie reduces this to O(S) (matching subscribers).
 
-**3. Retrying `:at_least_once` without exponential backoff**
-A subscriber that is slow or crashed causes the publisher to retry at the configured interval, flooding the subscriber's mailbox. Use exponential backoff with a maximum retry limit before giving up and dead-lettering.
+**3. Retrying without exponential backoff**
+Simple retry intervals flood slow subscribers' mailboxes. Add exponential backoff with a max retry limit and dead-lettering.
 
-**4. Cross-node subscriptions not cleaned up on node disconnect**
-When a remote node disconnects, subscriptions registered by processes on that node must be removed. Monitor the node with `Node.monitor/2` and clean up on `:nodedown`.
-
-## Reflection
-
-- If one subscriber blocks on a 100 ms disk write per message, how does the rest of the bus behave? What guardrails would you add?
-- Would you change the design if subscribers needed exactly-once delivery? Justify the trade-off.
+**4. Cross-node subscriptions not cleaned on disconnect**
+Use `Node.monitor/2` to detect `:nodedown` and clean up subscriptions from that node.
 
 ---
 

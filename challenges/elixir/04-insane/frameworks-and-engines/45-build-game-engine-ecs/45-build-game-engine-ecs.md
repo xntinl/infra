@@ -22,6 +22,23 @@ You will build `GameEngine`: an ECS engine with a fixed-timestep game loop, ETS-
 
 → Chose **B** because performance-critical ECS engines all converged on SoA layout — cache behavior matters more than code aesthetics.
 
+
+## Quick start
+
+1. Create project:
+   ```bash
+   mix new <project_name>
+   cd <project_name>
+   ```
+
+2. Copy dependencies to `mix.exs`
+
+3. Implement modules following the project structure
+
+4. Run tests: `mix test`
+
+5. Benchmark: `mix run lib/benchmark.exs`
+
 ## Why ECS and not OOP inheritance for game objects
 
 OOP inheritance for game objects produces a diamond-inheritance problem within three levels. An entity that is "a flying enemy that is also a projectile collector" either requires multiple inheritance or a deeply nested struct with duplicated fields.

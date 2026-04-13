@@ -418,13 +418,10 @@ single node.
 
 - Si el handler del timer tarda más que el intervalo del timer, ¿qué ocurre? ¿Cómo lo detectás y mitigás?
 
-## Executable Example
-
-Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
-
 ```elixir
 defmodule Main do
-  defmodule TimerGs.SendAfter do
+  import ExUnit.Assertions
+
     @moduledoc """
     Heartbeat implemented with `Process.send_after/3` and self-rescheduling.
     This is the idiomatic OTP pattern for per-process periodic work.

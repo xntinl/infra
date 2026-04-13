@@ -332,13 +332,10 @@ for **pure utility functions** where the example is also the tutorial.
 
 ---
 
-## Executable Example
-
-Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
-
 ```elixir
 defmodule Main do
-  defmodule StringKit do
+  import ExUnit.Assertions
+
     @moduledoc """
     A tiny string-utility module demonstrating doctests. Every public
     function carries at least one `iex>` example that doubles as a test.

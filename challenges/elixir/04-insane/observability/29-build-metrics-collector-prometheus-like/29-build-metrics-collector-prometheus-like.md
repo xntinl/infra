@@ -1,110 +1,138 @@
 # Prometheus-compatible Metrics Collector
 
-**Project**: `metrics_collector` — a standalone metrics backend built from scratch
+**Project**: `metrics_collector` — a standalone metrics backend built from scratch, compatible with any Prometheus scraper
 
 ---
 
-## Project context
+## Overview
 
-You are building `metrics_collector`, a Prometheus-compatible metrics system that your platform team will deploy alongside production services. The scraper is already configured to hit `GET /metrics` every 15 seconds. Your job is to build everything behind that endpoint, plus the push gateway, recording rules, alerting, and a minimal PromQL evaluator.
+A Prometheus-compatible metrics system that your platform team deploys alongside production services. Scrapers hit `GET /metrics` every 15 seconds. You build everything behind that endpoint: metric registration, lock-free increment, PromQL evaluation, recording rules, alerting, and push gateway.
 
-Project structure:
+---
+
+## Key Concepts
+
+**Lock-free counter via :atomics**: 64-bit integers with hardware CAS. Single-instruction increments, no process boundary, scales to millions of series.
+
+**Monotonic counter principle**: Counters never decrease. If they could, `rate(counter[5m])` would compute negative rates during resets. Use Gauge for values that go down.
+
+**Label cardinality cap**: Prevent runaway labels (e.g., request_id) from OOMing the node. Registration enforces a static limit on unique label sets per metric.
+
+**XOR-encoded Gorilla chunks**: Double-delta timestamps + XOR of float64 values achieves 1.37 bytes/sample vs 16 bytes naive. Decodes sequentially at memory-bandwidth speed.
+
+**PromQL subset evaluator**: Instant queries (return current values) and range queries (return time series). Supports basic functions: `rate()`, `sum()`, `histogram_quantile()`.
+
+---
+
+## The Business Problem
+
+The observability team needs to instrument **fifty microservices without a full Prometheus cluster**. Three immediate requirements drove the design:
+
+1. **Scrape via `GET /metrics` every 15 seconds without blocking request handling**
+2. **Short-lived batch jobs must push metrics before exiting** (push gateway)
+3. **Alert webhooks fire when error rates cross thresholds** (on-call team requirement)
+
+---
+
+## Why Lock-Free Counters Matter
+
+A naive counter backed by GenServer serializes every increment through the GenServer mailbox. Under 50k req/s, the GenServer becomes the bottleneck before application logic. Erlang `:atomics` provides a fixed-size array of 64-bit integers with compare-and-swap (CAS) semantics.
+
+**Incrementing is a single hardware instruction** — no process boundary, no message passing:
+
+```
+request A ──:atomics.add──▶ atomic integer (hardware CAS) ~5ns
+request B ──:atomics.add──▶ atomic integer (hardware CAS) ~5ns
+request C ──:atomics.add──▶ atomic integer (hardware CAS) ~5ns
+```
+
+The GenServer is the **owner process** — it creates and holds the `:atomics` reference. Reads and increments go directly to the array. The only GenServer call is registration (once at startup).
+
+---
+
+## Why XOR Encoding for Time-Series Chunks
+
+Storing float64 samples as raw 8-byte values is wasteful. Consecutive samples in a time series tend to be similar. **Gorilla** (Facebook 2015) exploits two properties:
+
+- **Timestamps**: Delta between consecutive timestamps is nearly constant → store delta-of-deltas in variable-width bits
+- **Values**: XOR of consecutive float64 values has many leading zeros when values are similar → encode only significant bits
+
+A 2-hour chunk of 720 samples (one per 10 seconds) compresses from **5.8 KB to < 1.5 KB** on typical gauge data. Your TSDB uses this to bound memory handling hundreds of series.
+
+---
+
+## Design Decisions
+
+**Option A — GenServer per metric series**
+- Pros: Serialized writes, trivial reasoning
+- Cons: 1M series = 1M processes → scheduler pressure, slow increments
+
+**Option B — Lock-free ETS counters with :atomics** (CHOSEN)
+- Pros: Nanosecond increments, no message-passing tax, scales to millions of series
+- Cons: Harder concurrent-read reasoning, requires careful snapshot semantics
+
+**Rationale**: Increment is on the hot request path of every service that scrapes. Must be nanosecond-cheap.
+
+---
+
+## Directory Structure
 
 ```
 metrics_collector/
 ├── lib/
 │   └── metrics_collector/
-│       ├── application.ex
-│       ├── registry.ex              # ← metric registration + label cardinality
+│       ├── application.ex           # OTP supervisor; starts registry, rules, scrape handler
+│       ├── registry.ex              # Metric registration + label cardinality enforcement
 │       ├── types/
-│       │   ├── counter.ex           # ← monotonic counter via :atomics
-│       │   ├── gauge.ex             # ← arbitrary up/down value
-│       │   ├── histogram.ex         # ← configurable buckets + quantile math
-│       │   └── summary.ex           # ← streaming quantile over sliding window
+│       │   ├── counter.ex           # Monotonic counter via :atomics (nanosecond increments)
+│       │   ├── gauge.ex             # Arbitrary up/down value
+│       │   ├── histogram.ex         # Configurable buckets + quantile interpolation
+│       │   └── summary.ex           # Streaming quantile over sliding window
 │       ├── tsdb/
-│       │   ├── chunk.ex             # ← XOR-compressed sample chunks
-│       │   ├── store.ex             # ← chunk store + range queries
-│       │   └── compactor.ex         # ← background retention sweep
+│       │   ├── chunk.ex             # XOR-compressed sample chunks (Gorilla algorithm)
+│       │   ├── store.ex             # Chunk store + range query interface
+│       │   └── compactor.ex         # Background retention sweep + TTL enforcement
 │       ├── exposition/
-│       │   ├── text_format.ex       # ← Prometheus text 0.0.4 serializer
-│       │   └── parser.ex            # ← text format parser (push gateway)
-│       ├── push_gateway.ex          # ← POST /push/:job/:instance + TTL
+│       │   ├── text_format.ex       # Prometheus text 0.0.4 serializer
+│       │   └── parser.ex            # Text format parser (push gateway ingest)
+│       ├── push_gateway.ex          # POST /push/:job/:instance + TTL-based cleanup
 │       ├── rules/
-│       │   ├── evaluator.ex         # ← periodic rule evaluation loop
-│       │   ├── recording.ex         # ← recording rules → new time series
-│       │   └── alerting.ex          # ← alerting state machine + webhook
+│       │   ├── evaluator.ex         # Periodic rule evaluation loop
+│       │   ├── recording.ex         # Recording rules → new time series
+│       │   └── alerting.ex          # Alert state machine + webhook fire/resolve
 │       └── promql/
-│           ├── parser.ex            # ← PromQL subset lexer + parser
-│           └── evaluator.ex         # ← instant/range vector evaluation
+│           ├── parser.ex            # PromQL subset lexer + parser
+│           └── evaluator.ex         # Instant/range vector evaluation
 ├── test/
 │   └── metrics_collector/
-│       ├── registry_test.exs
-│       ├── counter_test.exs
-│       ├── histogram_test.exs
-│       ├── tsdb_test.exs
-│       ├── exposition_test.exs
-│       ├── push_gateway_test.exs
-│       ├── rules_test.exs
-│       └── promql_test.exs
+│       ├── registry_test.exs        # Metric registration, cardinality limits
+│       ├── counter_test.exs         # Concurrency, label isolation
+│       ├── histogram_test.exs       # Bucket math, quantile accuracy
+│       ├── tsdb_test.exs            # Chunk compression, range queries
+│       ├── exposition_test.exs      # Prometheus text format round-trip
+│       ├── push_gateway_test.exs    # Push ingest, TTL cleanup
+│       ├── rules_test.exs           # Rule evaluation, alert state transitions
+│       └── promql_test.exs          # Query parsing, evaluation, aggregation
 ├── bench/
-│   └── counter_bench.exs
+│   └── counter_bench.exs            # Throughput at 16 schedulers, p99 latency
 └── mix.exs
 ```
 
----
+## Quick Start
 
-## Why XOR-encoded Gorilla chunks for time-series storage and not naive list-of-floats or a general-purpose compressor
+Initialize a Mix project with supervisor:
 
-Gorilla's double-delta + XOR achieves ~1.37 bytes/sample on realistic monitoring data vs 16 bytes for naive storage, and it decodes sequentially at memory-bandwidth speed. A general-purpose compressor (zstd, lz4) compresses similarly but can't stream single samples and needs block-level reads.
-
-## Design decisions
-
-**Option A — GenServer per metric series**
-- Pros: serialized writes, trivial reasoning
-- Cons: one process per series → 1M series = 1M processes, scheduler pressure, slow increments
-
-**Option B — lock-free ETS counters with :atomics for hot paths** (chosen)
-- Pros: nanosecond increments, no message-passing tax, scales to millions of series
-- Cons: harder to reason about concurrent reads, requires careful snapshot semantics
-
-→ Chose **B** because an increment is on the hot request path of every service that scrapes — it must be nanosecond-cheap.
-
-## The business problem
-
-The observability team needs to instrument fifty microservices without deploying a full Prometheus cluster. You will build a compatible collector that any Prometheus scraper can target. Three immediate requirements drove the design:
-
-1. Services can be scraped via `GET /metrics` every 15 seconds without blocking request handling.
-2. Short-lived batch jobs cannot be scraped — they must push metrics before exiting.
-3. The on-call team needs alert webhooks that fire when error rates cross thresholds.
-
----
-
-## Why lock-free counters matter
-
-A naive counter backed by a `GenServer` serializes every increment through the GenServer mailbox. Under 50k req/s this becomes the bottleneck before the application logic. Erlang `:atomics` provides a fixed-size array of 64-bit integers with compare-and-swap semantics. Incrementing is a single hardware instruction — no process boundary, no message passing.
-
-```
-request A ──:atomics.add──▶ atomic integer (hardware CAS)
-request B ──:atomics.add──▶ atomic integer (hardware CAS)
-request C ──:atomics.add──▶ atomic integer (hardware CAS)
+```bash
+mix new metrics_collector --sup
+cd metrics_collector
+mkdir -p lib/metrics_collector/{types,tsdb,exposition,rules,promql}
+mkdir -p test/metrics_collector bench
+mix test
 ```
 
-The `GenServer` for a `Counter` is the owner process — it creates and holds the `:atomics` reference. Reads and increments go directly to the `:atomics` array. The only GenServer call is registration (once at startup).
-
 ---
 
-## Why XOR encoding for time-series chunks
-
-Storing float64 samples as raw 8-byte values is wasteful. Consecutive samples in a time series tend to be similar. Gorilla (Facebook 2015) exploits two properties:
-
-- **Timestamps**: the delta between consecutive timestamps is nearly constant. Store delta-of-deltas in variable-width bits.
-- **Values**: XOR of consecutive float64 values has many leading zeros when values are similar. Encode only the significant bits.
-
-A 2-hour chunk of 720 samples (one per 10 seconds) compresses from 5.8 KB to under 1.5 KB on typical gauge data. Your TSDB uses this to bound memory when handling hundreds of time series.
-
----
-
-## Implementation
+## Implementation Milestones
 
 ### Step 1: Create the project
 
@@ -119,21 +147,9 @@ mkdir -p test/metrics_collector
 mkdir -p bench
 ```
 
-### Step 2: `mix.exs`
+### Step 2: Dependencies and mix.exs
 
-**Objective**: Add Plug for `/metrics`, Jason for push, StreamData for property tests — no Prometheus client libs.
-
-
-```elixir
-defp deps do
-  [
-    {:plug_cowboy, "~> 2.7"},
-    {:jason, "~> 1.4"},
-    {:benchee, "~> 1.3", only: :dev},
-    {:stream_data, "~> 1.1", only: :test}
-  ]
-end
-```
+**Objective**: Plug for `/metrics` endpoint, Jason for push gateway JSON parsing, StreamData for property tests. No external Prometheus client libraries.
 
 ### Dependencies (mix.exs)
 
@@ -621,21 +637,124 @@ Expected: `inc no-label` should exceed 5 million ops/second on modern hardware (
 
 ---
 
-### Why this works
+## Why This Works
 
-The design separates concerns along their real axes: what must be correct (the Prometheus-compatible metrics invariants), what must be fast (the hot path isolated from slow paths), and what must be evolvable (external contracts kept narrow). Each module has one job and fails loudly when given inputs outside its contract, so bugs surface near their source instead of as mysterious downstream symptoms. The tests exercise the invariants directly rather than implementation details, which keeps them useful across refactors.
-## Main Entry Point
+The design separates concerns along their real axes:
+- **What must be correct**: Prometheus-compatible metrics invariants (monotonic counters, label isolation)
+- **What must be fast**: Hot path (increments via :atomics) isolated from slow paths (PromQL evaluation, chunk storage)
+- **What must be evolvable**: External contracts kept narrow (one registration API, one scrape format, one rule evaluation API)
 
-```elixir
-def main do
-  IO.puts("======== 29-build-metrics-collector-prometheus-like ========")
-  IO.puts("Build Metrics Collector Prometheus Like")
-  IO.puts("")
-  
-  MetricsCollector.Registry.start_link([])
-  IO.puts("MetricsCollector.Registry started")
-  
-  IO.puts("Run: mix test")
-end
+Each module has one job and fails loudly when given inputs outside its contract. Bugs surface near their source instead of downstream.
+
+---
+
+## ASCII Architecture Diagram
+
 ```
+┌──────────────────────────────────────────────────────┐
+│  Application Code (50k req/s)                        │
+└────────┬─────────────────────────────────────────────┘
+         │ Counter.inc, Gauge.set, Histogram.observe
+         │
+         ▼
+┌──────────────────────────────────────────────────────┐
+│  :atomics Lock-Free Registry                         │
+│  - Per-label-set index (ETS)                         │
+│  - Direct hardware CAS (nanoseconds)                 │
+└────────┬─────────────────────────────────────────────┘
+         │
+    ┌────┴─────────────────────┐
+    ▼                          ▼
+┌──────────────────┐  ┌─────────────────────┐
+│ Scraper          │  │ Push Gateway        │
+│ GET /metrics     │  │ POST /push/:job/:id │
+│ every 15s        │  │ Short-lived jobs    │
+└────────┬─────────┘  └──────────┬──────────┘
+         │                       │
+         └───────────┬───────────┘
+                     ▼
+         ┌───────────────────────┐
+         │ Text Format Exposition │
+         │ Prometheus 0.0.4      │
+         └───────────┬───────────┘
+                     │
+         ┌───────────┴───────────┐
+         ▼                       ▼
+    ┌─────────────┐      ┌──────────────┐
+    │ TSDB        │      │ Recording    │
+    │ Chunks      │      │ Rules        │
+    │ (Gorilla)   │      │ Evaluation   │
+    └─────────────┘      └──────┬───────┘
+                                │
+                                ▼
+                        ┌────────────────┐
+                        │ Alert Webhooks │
+                        │ (fire/resolve) │
+                        └────────────────┘
+                                │
+                        ┌───────┴────────┐
+                        ▼                ▼
+                    PromQL        Alerting
+                    Evaluator     State Machine
+```
+
+---
+
+## Reflection
+
+1. **Why is lock-free :atomics better than a GenServer per metric series?** What would be the memory/CPU cost at 1M series?
+
+2. **How does Gorilla XOR encoding achieve 8x compression?** Why doesn't a general-purpose compressor (zstd) work for streaming chunk decoding?
+
+3. **What is the purpose of label cardinality enforcement?** What happens if you allow request_id as a metric label?
+
+---
+
+## Benchmark Results
+
+**Target**: 
+- Counter increment: > 5 million ops/sec per core
+- P99 latency: < 100 nanoseconds
+- Throughput at 16 schedulers: > 80 million increments/sec
+
+**Expected benchmark output** (on modern hardware):
+
+```
+Benchee.run(
+  %{
+    "inc no-label" => fn ->
+      MetricsCollector.Types.Counter.inc(counter)
+    end,
+    "inc with label" => fn ->
+      MetricsCollector.Types.Counter.inc(counter, %{method: "GET"})
+    end
+  },
+  parallel: 16,
+  time: 5,
+  warmup: 2
+)
+```
+
+Results show:
+- `inc no-label`: ~5-7M ops/sec (single CAS instruction)
+- `inc with label`: ~2-4M ops/sec (includes label index lookup)
+
+If you see < 1M ops/s, you have accidentally routed increments through a GenServer instead of direct :atomics access.
+
+---
+
+## Testing and Validation
+
+Run with `--trace` to expose any race conditions in label isolation:
+
+```bash
+mix test test/metrics_collector/ --trace
+```
+
+This ensures:
+- 100 concurrent increments produce exact count (no lost updates)
+- Label sets are physically isolated
+- Counter monotonicity is preserved
+- Histogram quantile math is accurate
+- PromQL queries evaluate correctly
 

@@ -24,6 +24,23 @@ You will build `JobQueue`: a production-quality background job system backed by 
 
 → Chose **B** because any production queue must survive a node restart; durability is the minimum bar.
 
+
+## Quick start
+
+1. Create project:
+   ```bash
+   mix new <project_name>
+   cd <project_name>
+   ```
+
+2. Copy dependencies to `mix.exs`
+
+3. Implement modules following the project structure
+
+4. Run tests: `mix test`
+
+5. Benchmark: `mix run lib/benchmark.exs`
+
 ## Why `FOR UPDATE SKIP LOCKED` and not advisory locks
 
 PostgreSQL advisory locks are manual; the application must release them explicitly. If a worker crashes, the advisory lock is held until the session closes. `FOR UPDATE SKIP LOCKED` works at the row level: when a worker claims a job row, the row is locked for the duration of the worker's transaction. Other workers trying to claim the same job see it as locked and skip it (SKIP LOCKED). When the worker commits (marking the job `executing`), the lock is released and the job is no longer available for claiming. The lock lifetime equals the transaction duration — no manual cleanup.

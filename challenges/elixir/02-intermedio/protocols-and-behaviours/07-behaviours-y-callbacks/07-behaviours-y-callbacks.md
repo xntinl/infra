@@ -389,6 +389,7 @@ module call is clearer.
 Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
 
 ```elixir
+defmodule Main do
 defmodule Storage do
   @moduledoc """
   Storage behaviour. Defines the contract that any storage adapter must implement.
@@ -529,6 +530,9 @@ assert value == "default"
 
 IO.puts("Storage.fetch works with adapters")
 IO.puts("All behaviour assertions passed!")
+end
+
+Main.main()
 ```
 
 

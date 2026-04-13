@@ -26,6 +26,23 @@ pull demand is self-regulating — consumers set the pace exactly at their proce
 
 → Chose **B** because reactive streams without backpressure is just streams — the whole spec exists to make backpressure explicit.
 
+
+## Quick start
+
+1. Create project:
+   ```bash
+   mix new <project_name>
+   cd <project_name>
+   ```
+
+2. Copy dependencies to `mix.exs`
+
+3. Implement modules following the project structure
+
+4. Run tests: `mix test`
+
+5. Benchmark: `mix run lib/benchmark.exs`
+
 ## Why backpressure must be an explicit protocol
 
 TCP flow control is implicit backpressure at the network level. Application-level pipelines do not automatically inherit this. If a Publisher calls on_next in a loop without regard for subscriber capacity, the subscriber's process mailbox fills up. At 100k msg/s, a 10k/s subscriber accumulates 90k messages per second in its mailbox.
@@ -1024,7 +1041,7 @@ end
 RStreams.Bench.Pipeline.run()
 ```
 
-## Key Concepts: Demand-Driven Backpressure en Streaming
+## Key Concepts: Architecture & Design Patterns Demand-Driven Backpressure en Streaming
 
 **Reactive Streams** resuelve un problema fundamental del streaming: qué pasa cuando el consumidor es lento.
 

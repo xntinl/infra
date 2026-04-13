@@ -411,6 +411,7 @@ both sides.
 Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
 
 ```elixir
+defmodule Main do
 defmodule Jsonable.Impls do
   @moduledoc false
 
@@ -563,6 +564,9 @@ assert encoded_list =~ "\"x\":3"
 IO.puts("List of points: #{encoded_list}")
 
 IO.puts("All @derive assertions passed!")
+end
+
+Main.main()
 ```
 
 

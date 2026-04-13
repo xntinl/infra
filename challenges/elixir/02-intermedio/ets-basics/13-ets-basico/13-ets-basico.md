@@ -415,13 +415,10 @@ worth reading before you build anything serious on top of ETS.
 
 ---
 
-## Executable Example
-
-Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
-
 ```elixir
 defmodule Main do
-  defmodule EtsIntro do
+  import ExUnit.Assertions
+
     @moduledoc """
     Minimal ETS playground. Creates an owned table, exposes insert/lookup/delete,
     and demonstrates the lifecycle rule: when the owner dies, the table dies.

@@ -68,6 +68,32 @@ This tool closes those gaps by reading module metadata from `.beam` files after 
 
 → Chose **B** because a behaviour validator exists precisely to catch bugs before runtime; doing it at runtime defeats its entire purpose.
 
+## Project Structure
+
+```
+behaviour_check/
+├── lib/
+│   └── behaviour_check/
+│       ├── application.ex           # starts nothing; framework for compile hooks
+│       ├── validator.ex             # core validator: checks modules, emits diagnostics
+│       ├── callback_loader.ex       # reads @callback specs from behaviour modules
+│       ├── impl_loader.ex           # reads @spec and @doc from implementing modules via :beam_lib
+│       ├── type_checker.ex          # structural comparison of spec ASTs
+│       ├── inheritance.ex           # resolves BehaviourB extends BehaviourA callbacks
+│       └── compiler.ex              # Mix.Compiler implementation: hooks into mix compile
+├── mix_tasks/
+│   └── mix/tasks/behaviour/check.ex # mix behaviour.check task
+├── test/
+│   └── behaviour_check/
+│       ├── validator_test.exs        # missing required, optional warning, type mismatch
+│       ├── inheritance_test.exs      # inherited callbacks enforced
+│       ├── documentation_test.exs    # missing @doc warning
+│       └── mix_task_test.exs         # exit code 1 on violations
+├── bench/
+│   └── validator_bench.exs
+└── mix.exs
+```
+
 ## Implementation milestones
 
 ### Step 1: Create the project

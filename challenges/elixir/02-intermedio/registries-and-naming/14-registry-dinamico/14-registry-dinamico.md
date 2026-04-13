@@ -438,6 +438,7 @@ need duplicate-key pubsub semantics.
 Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
 
 ```elixir
+defmodule Main do
 defmodule ChatRoomsRegistry.Room do
   @moduledoc """
   A single chat room. State is just a list of messages; what matters for
@@ -564,6 +565,9 @@ IO.puts("Rooms registered: #{inspect(rooms)}")
 IO.puts("General room messages: #{inspect(ChatRoomsRegistry.Room.history("general"))}")
 IO.puts("Dev-ops room messages: #{inspect(ChatRoomsRegistry.Room.history("dev-ops"))}")
 IO.puts("All registry assertions passed!")
+end
+
+Main.main()
 ```
 
 

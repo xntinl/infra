@@ -1,30 +1,32 @@
 # AI Inference Engine
 
-**Project**: `inference_engine` — Elixir ML inference runtime for ONNX models with int8 quantization
+**Project**: `inference_engine` — Elixir ML inference runtime for ONNX models with int8 quantization and batch processing
 
-## Project context
+## Project Context
 
-Your team maintains a real-time fraud detection pipeline. The data science team delivers trained models as ONNX files. Currently, every inference request is forwarded to a Python microservice that runs PyTorch. That service adds 30–80ms of network latency, requires a separate deployment, and cannot share BEAM process memory with your Elixir application.
+Your team maintains a real-time fraud detection pipeline. The data science team delivers trained models as ONNX files. Currently, every inference request is forwarded to a Python microservice that runs PyTorch. That service adds **30–80ms network latency**, requires a separate deployment, cannot share BEAM process memory with your Elixir application, and scales unpredictably.
 
-The ask is clear: load a trained model directly in the Elixir process and run inference without any network hop. The models are convolutional classifiers — five to ten layers, weights in the hundreds of MB range. Accuracy must match the Python service to within 2%.
+**The ask**: Load a trained model directly in the Elixir process and run inference without any network hop. Models are convolutional classifiers — five to ten layers, weights in the hundreds of MB. Accuracy must match the Python service within 2%.
 
-You will build `InferenceEngine`: a pure-Elixir ML inference runtime that loads a subset of ONNX, runs forward passes, and supports int8 quantization for faster throughput.
+**Building blocks**: You will build `InferenceEngine`: a pure-Elixir ML inference runtime that loads a subset of ONNX, runs forward passes, supports int8 quantization for faster throughput, and batches multiple inference requests to amortize graph setup cost.
 
-## Why NIFs via Nx and EXLA for tensor ops and not pure-Elixir tensor implementations
+---
 
-Elixir on the BEAM is not designed for tight numeric loops; it's 100-1000x slower than a BLAS kernel. NIFs let us call the actually-fast code while keeping the orchestration in Elixir where it belongs.
+## Why Tensor Ops Are in Native Code, Not Pure Elixir
 
-## Design decisions
+Elixir on the BEAM is not designed for tight numeric loops. A single inner loop with floating-point arithmetic is **100–1000× slower** than an equivalent BLAS kernel (CPU-optimized matrix multiplication). NIFs (native-implemented functions) or Erlang NIF wrappers let you call the actually-fast code while keeping orchestration in Elixir where it belongs.
 
-**Option A — interpreted eager execution (each op dispatched individually)**
-- Pros: simple, matches PyTorch defaults
-- Cons: no kernel fusion, dispatch overhead dominates for small ops
+## Design Decisions
 
-**Option B — graph-level tracing + kernel fusion before execution** (chosen)
-- Pros: fused ops amortize dispatch cost, unlocks operator-level optimizations
-- Cons: first call pays a trace-and-compile tax
+**Option A — Interpreted eager execution (each op dispatched individually)**
+- Pros: simple, matches PyTorch eager mode defaults, easy to debug
+- Cons: no kernel fusion, dispatch overhead dominates for small ops, 50–200% slower on typical models
 
-→ Chose **B** because for production inference the same model is called millions of times; a one-time trace cost is rounding error.
+**Option B — Graph-level tracing + kernel fusion before execution** (chosen)
+- Pros: fused ops amortize dispatch cost, unlocks operator-level optimizations, 30–50% faster inference
+- Cons: first call pays a trace-and-compile tax (100–500ms), requires deterministic graph structure
+
+**Why we chose B**: In production inference, the same model is called millions of times. A one-time compile tax of 100–500ms is rounding error compared to millions of 5–50ms inference calls. Additionally, fusion uncovers micro-optimizations (e.g., ReLU + BatchNorm fused into a single kernel) that would be impossible in eager mode.
 
 ## Project Structure
 

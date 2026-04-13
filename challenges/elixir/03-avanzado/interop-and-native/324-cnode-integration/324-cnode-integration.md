@@ -528,52 +528,54 @@ piece of C code that you cannot audit?
 ## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # No external dependencies — pure Elixir
-  ]
-end
-
-defmodule HwBridge.MixProject do
-  end
-  use Mix.Project
-
-  def project do
+defmodule Main do
+  defp deps do
     [
-      app: :hw_bridge,
-      version: "0.1.0",
-      elixir: "~> 1.17",
-      compilers: [:elixir_make] ++ Mix.compilers(),
-      make_makefile: "Makefile",
-      deps: [{:elixir_make, "~> 0.8", runtime: false}]
+      # No external dependencies — pure Elixir
     ]
   end
 
-  def application,
-    do: [extra_applications: [:logger], mod: {HwBridge.Application, []}]
-end
+  defmodule HwBridge.MixProject do
+    end
+    use Mix.Project
+
+    def project do
+      [
+        app: :hw_bridge,
+        version: "0.1.0",
+        elixir: "~> 1.17",
+        compilers: [:elixir_make] ++ Mix.compilers(),
+        make_makefile: "Makefile",
+        deps: [{:elixir_make, "~> 0.8", runtime: false}]
+      ]
+    end
+
+    def application,
+      do: [extra_applications: [:logger], mod: {HwBridge.Application, []}]
+  end
 
 
-### Step 2: The C node (`c_src/hw_node.c`)
+  ### Step 2: The C node (`c_src/hw_node.c`)
 
-**Objective**: Publish node via epmd and reply to distribution RPC calls so BEAM sees a native peer.
-
-
-
-### Step 3: Elixir client (`lib/hw_bridge/client.ex`)
-
-**Objective**: Own C node subprocess lifecycle and wait for distribution handshake so callers never race connection setup.
+  **Objective**: Publish node via epmd and reply to distribution RPC calls so BEAM sees a native peer.
 
 
 
-### Step 4: Application
+  ### Step 3: Elixir client (`lib/hw_bridge/client.ex`)
 
-**Objective**: Enforce distributed mode at boot so connection failures are caught early, not silently ignored.
+  **Objective**: Own C node subprocess lifecycle and wait for distribution handshake so callers never race connection setup.
 
-defmodule Main do
-  def main do
-      # Demonstrating 324-cnode-integration
-      :ok
+
+
+  ### Step 4: Application
+
+  **Objective**: Enforce distributed mode at boot so connection failures are caught early, not silently ignored.
+
+  defmodule Main do
+    def main do
+        # Demonstrating 324-cnode-integration
+        :ok
+    end
   end
 end
 

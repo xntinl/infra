@@ -305,6 +305,7 @@ stages, or a parent-built lookup table that references pids. Use
 Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
 
 ```elixir
+defmodule Main do
 defmodule OneForOneDemo.Counter do
   @moduledoc """
   A named counter GenServer used to demonstrate sibling isolation under
@@ -399,6 +400,9 @@ IO.puts("  :a restarted (state reset to 0)")
 IO.puts("  :b unaffected (still 2)")
 IO.puts("  :c unaffected (still 1)")
 IO.puts("All :one_for_one assertions passed!")
+end
+
+Main.main()
 ```
 
 

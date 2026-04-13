@@ -330,13 +330,10 @@ and **numerical code**.
 
 ---
 
-## Executable Example
-
-Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
-
 ```elixir
 defmodule Main do
-  defmodule Sort do
+  import ExUnit.Assertions
+
     @moduledoc """
     A didactic merge sort implementation — deliberately written from scratch
     so we can verify it against `Enum.sort/1` via properties.

@@ -287,6 +287,7 @@ missing impl is clearer than a garbage string.
 Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
 
 ```elixir
+defmodule Main do
 defmodule Money do
   @moduledoc """
   A minimal money value with integer-cent precision and a currency code.
@@ -368,6 +369,9 @@ IO.puts("String.Chars output: #{to_string(m1)}")
 IO.puts("Inspect output: #{inspect(m1)}")
 IO.puts("Interpolation: #{msg}")
 IO.puts("All Money protocol assertions passed!")
+end
+
+Main.main()
 ```
 
 

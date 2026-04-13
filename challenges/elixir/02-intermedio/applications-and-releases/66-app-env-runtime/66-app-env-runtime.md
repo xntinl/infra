@@ -335,13 +335,10 @@ reach into `Application.env`. Apps own their env; libraries are guests.
 
 - ¿Cuándo `Application.get_env` se vuelve un anti-pattern y pasás a pasar config explícitamente por arg? Definí el límite.
 
-## Executable Example
-
-Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
-
 ```elixir
 defmodule Main do
-  defmodule AppEnvRuntime.Config do
+  import ExUnit.Assertions
+
     @moduledoc """
     The single entry point for reading configuration.
 

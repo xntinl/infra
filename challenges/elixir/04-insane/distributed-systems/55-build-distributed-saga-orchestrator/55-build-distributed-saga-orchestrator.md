@@ -113,6 +113,36 @@ If compensation for step 2 fails and is retried, it must be safe to run twice. I
 
 ---
 
+## Project Structure
+
+```
+saga_orchestrator/
+├── lib/
+│   └── saga_orchestrator/
+│       ├── application.ex             # supervisor: saga manager, persistent log
+│       ├── saga.ex                    # saga definition DSL and FSM
+│       ├── orchestrator.ex            # saga execution engine
+│       ├── step.ex                    # individual step: action, compensation, timeout
+│       ├── log.ex                     # durable event log for saga state
+│       ├── compensation.ex            # compensation logic for rollback
+│       ├── timeout_manager.ex         # step timeouts and deadline tracking
+│       ├── retry.ex                   # exponential backoff for failed steps
+│       ├── circuit_breaker.ex         # per-service failure isolation
+│       └── observer.ex                # saga state change notifications
+├── test/
+│   └── saga_orchestrator/
+│       ├── saga_test.exs              # basic saga definition and execution
+│       ├── compensation_test.exs      # rollback correctness on failure
+│       ├── timeout_test.exs           # step timeout handling
+│       ├── retry_test.exs             # backoff and max attempts
+│       ├── persistence_test.exs       # recovery after crashes
+│       ├── concurrent_sagas_test.exs  # parallel saga execution
+│       └── chaos_test.exs             # failures mid-step and mid-compensation
+├── bench/
+│   └── saga_bench.exs                 # throughput of saga orchestration
+└── mix.exs
+```
+
 ## Implementation milestones (abbreviated)
 
 ### Saga DSL

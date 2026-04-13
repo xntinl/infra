@@ -450,7 +450,8 @@ defmodule Main do
 
   def main do
     # Demo: config providers para configuración dinámica
-    {:ok, _} = Application.ensure_all_started(:config_providers_demo)
+    # For this standalone example, we simulate the config provider behavior
+    Application.put_env(:config_providers_demo, :dynamic_config, "loaded from provider")
   
     # Verificar que los valores estén disponibles
     value = Application.get_env(:config_providers_demo, :dynamic_config, "default")

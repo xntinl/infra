@@ -379,13 +379,10 @@ need range queries or match patterns.
 
 ---
 
-## Executable Example
-
-Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
-
 ```elixir
 defmodule Main do
-  defmodule SetVsBag.TagStore do
+  import ExUnit.Assertions
+
     @moduledoc """
     A "which tags does this item have?" store, implemented four ways so you can
     compare table types side by side. Tuples are `{item_id, tag}`.

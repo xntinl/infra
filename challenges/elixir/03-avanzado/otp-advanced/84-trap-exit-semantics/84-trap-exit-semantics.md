@@ -580,244 +580,248 @@ Target: trap_exit overhead ≤ 200 ns per exit signal on modern hardware; ≤ 3�
 ## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # No external dependencies — pure Elixir
-  ]
-end
-
-defmodule TrapExitDeep.MixProject do
+defmodule Main do
+  defp deps do
+    [
+      # No external dependencies — pure Elixir
+    ]
   end
-  use Mix.Project
-  def project, do: [app: :trap_exit_deep, version: "0.1.0", elixir: "~> 1.16", deps: []]
-  def application, do: [extra_applications: [:logger]]
-end
 
-defmodule TrapExitDeep.SignalMatrix do
-  @moduledoc """
-  Experimental harness for exit-signal behaviour.
+  defmodule TrapExitDeep.MixProject do
+    end
+    use Mix.Project
+    def project, do: [app: :trap_exit_deep, version: "0.1.0", elixir: "~> 1.16", deps: []]
+    def application, do: [extra_applications: [:logger]]
+  end
 
-  Spawns a *target* process, links or monitors it from the *observer*,
-  sends the configured exit reason, and returns what the observer sees.
-  """
+  defmodule TrapExitDeep.SignalMatrix do
+    @moduledoc """
+    Experimental harness for exit-signal behaviour.
 
-  @type relation :: :link | :monitor | :link_trap
-  @type exit_reason :: :normal | :shutdown | :kill | atom() | tuple()
-  @type observation ::
-          {:exit_signal_received, term()}
-          | {:down, term()}
-          | :observer_crashed_with
-          | :nothing
+    Spawns a *target* process, links or monitors it from the *observer*,
+    sends the configured exit reason, and returns what the observer sees.
+    """
 
-  @spec observe(relation(), exit_reason(), timeout()) :: {observation(), term() | nil}
-  def observe(relation, reason, timeout \\ 500) do
-    parent = self()
+    @type relation :: :link | :monitor | :link_trap
+    @type exit_reason :: :normal | :shutdown | :kill | atom() | tuple()
+    @type observation ::
+            {:exit_signal_received, term()}
+            | {:down, term()}
+            | :observer_crashed_with
+            | :nothing
 
-    observer =
-      spawn(fn ->
-        if relation == :link_trap, do: Process.flag(:trap_exit, true)
+    @spec observe(relation(), exit_reason(), timeout()) :: {observation(), term() | nil}
+    def observe(relation, reason, timeout \\ 500) do
+      parent = self()
 
-        target =
-          case relation do
-            :link       -> spawn_link(fn -> wait_for_signal() end)
-            :link_trap  -> spawn_link(fn -> wait_for_signal() end)
-            :monitor    -> spawn(fn -> wait_for_signal() end)
+      observer =
+        spawn(fn ->
+          if relation == :link_trap, do: Process.flag(:trap_exit, true)
+
+          target =
+            case relation do
+              :link       -> spawn_link(fn -> wait_for_signal() end)
+              :link_trap  -> spawn_link(fn -> wait_for_signal() end)
+              :monitor    -> spawn(fn -> wait_for_signal() end)
+            end
+
+          monitor_ref =
+            if relation == :monitor, do: Process.monitor(target), else: nil
+
+          send(parent, {:ready, self(), target, monitor_ref})
+
+          receive do
+            :go ->
+              # intentionally don't cleanup links/monitors — we're testing raw behaviour
+              :ok
           end
 
-        monitor_ref =
-          if relation == :monitor, do: Process.monitor(target), else: nil
+          Process.exit(target, reason)
 
-        send(parent, {:ready, self(), target, monitor_ref})
+          receive do
+            {:EXIT, ^target, r} -> send(parent, {:observation, {:exit_signal_received, r}})
+            {:DOWN, ^monitor_ref, :process, ^target, r} -> send(parent, {:observation, {:down, r}})
+          after
+            timeout -> send(parent, {:observation, :nothing})
+          end
+        end)
 
-        receive do
-          :go ->
-            # intentionally don't cleanup links/monitors — we're testing raw behaviour
-            :ok
-        end
+      observer_ref = Process.monitor(observer)
 
-        Process.exit(target, reason)
+      receive do
+        {:ready, ^observer, _target, _ref} -> send(observer, :go)
+      after
+        timeout -> flunk!("observer never started")
+      end
 
-        receive do
-          {:EXIT, ^target, r} -> send(parent, {:observation, {:exit_signal_received, r}})
-          {:DOWN, ^monitor_ref, :process, ^target, r} -> send(parent, {:observation, {:down, r}})
-        after
-          timeout -> send(parent, {:observation, :nothing})
-        end
-      end)
+      receive do
+        {:observation, obs} ->
+          Process.demonitor(observer_ref, [:flush])
+          {obs, nil}
 
-    observer_ref = Process.monitor(observer)
-
-    receive do
-      {:ready, ^observer, _target, _ref} -> send(observer, :go)
-    after
-      timeout -> flunk!("observer never started")
+        {:DOWN, ^observer_ref, :process, ^observer, reason} ->
+          {:observer_crashed_with, reason}
+      after
+        timeout * 2 -> {:nothing, nil}
+      end
     end
 
-    receive do
-      {:observation, obs} ->
-        Process.demonitor(observer_ref, [:flush])
-        {obs, nil}
-
-      {:DOWN, ^observer_ref, :process, ^observer, reason} ->
-        {:observer_crashed_with, reason}
-    after
-      timeout * 2 -> {:nothing, nil}
-    end
-  end
-
-  defp wait_for_signal do
-    receive do
-      _ -> wait_for_signal()
-    end
-  end
-
-  defp flunk!(msg), do: raise(msg)
-end
-
-defmodule TrapExitDeep.TrappingWorker do
-  end
-  @moduledoc """
-  A GenServer that trap_exits and exposes what signals it receives.
-
-  Used to demonstrate the `:kill → :killed` asymmetry and linked-child
-  failures.
-  """
-
-  use GenServer
-
-  def start_link(opts \\ []), do: GenServer.start_link(__MODULE__, opts, [])
-
-  @spec received_signals(pid()) :: [tuple()]
-  def received_signals(pid), do: GenServer.call(pid, :signals)
-
-  @spec link_child(pid()) :: pid()
-  def link_child(pid), do: GenServer.call(pid, :link_child)
-
-  @impl true
-  def init(_opts) do
-    Process.flag(:trap_exit, true)
-    {:ok, %{signals: []}}
-  end
-
-  @impl true
-  def handle_call(:signals, _from, state), do: {:reply, Enum.reverse(state.signals), state}
-
-  def handle_call(:link_child, _from, state) do
-    child = spawn_link(fn -> Process.sleep(:infinity) end)
-    {:reply, child, state}
-  end
-
-  @impl true
-  def handle_info({:EXIT, _pid, _reason} = msg, state) do
-    {:noreply, %{state | signals: [msg | state.signals]}}
-  end
-end
-
-defmodule TrapExitDeep.Application do
-  @moduledoc false
-  use Application
-
-  @impl true
-  def start(_type, _args) do
-    Supervisor.start_link([], strategy: :one_for_one, name: TrapExitDeep.Sup)
-  end
-end
-
-defmodule TrapExitDeep.SignalMatrixTest do
-  use ExUnit.Case, async: true
-
-  alias TrapExitDeep.SignalMatrix
-
-  describe "link (no trap)" do
-    test "normal exit does not kill observer" do
-      assert {:nothing, _} = SignalMatrix.observe(:link, :normal)
+    defp wait_for_signal do
+      receive do
+        _ -> wait_for_signal()
+      end
     end
 
-    test "abnormal exit propagates, observer dies with same reason" do
-      assert {:observer_crashed_with, :boom} = SignalMatrix.observe(:link, :boom)
+    defp flunk!(msg), do: raise(msg)
+  end
+
+  defmodule TrapExitDeep.TrappingWorker do
+    end
+    @moduledoc """
+    A GenServer that trap_exits and exposes what signals it receives.
+
+    Used to demonstrate the `:kill → :killed` asymmetry and linked-child
+    failures.
+    """
+
+    use GenServer
+
+    def start_link(opts \\ []), do: GenServer.start_link(__MODULE__, opts, [])
+
+    @spec received_signals(pid()) :: [tuple()]
+    def received_signals(pid), do: GenServer.call(pid, :signals)
+
+    @spec link_child(pid()) :: pid()
+    def link_child(pid), do: GenServer.call(pid, :link_child)
+
+    @impl true
+    def init(_opts) do
+      Process.flag(:trap_exit, true)
+      {:ok, %{signals: []}}
     end
 
-    test ":kill propagates as :killed to observer" do
-      assert {:observer_crashed_with, :killed} = SignalMatrix.observe(:link, :kill)
+    @impl true
+    def handle_call(:signals, _from, state), do: {:reply, Enum.reverse(state.signals), state}
+
+    def handle_call(:link_child, _from, state) do
+      child = spawn_link(fn -> Process.sleep(:infinity) end)
+      {:reply, child, state}
+    end
+
+    @impl true
+    def handle_info({:EXIT, _pid, _reason} = msg, state) do
+      {:noreply, %{state | signals: [msg | state.signals]}}
     end
   end
 
-  describe "link_trap" do
-    test "normal exit arrives as {:EXIT, pid, :normal}" do
-      assert {{:exit_signal_received, :normal}, _} = SignalMatrix.observe(:link_trap, :normal)
-    end
+  defmodule TrapExitDeep.Application do
+    @moduledoc false
+    use Application
 
-    test "abnormal exit arrives as {:EXIT, pid, reason}" do
-      assert {{:exit_signal_received, :boom}, _} = SignalMatrix.observe(:link_trap, :boom)
-    end
-
-    test ":kill becomes {:EXIT, pid, :killed} on the observer" do
-      assert {{:exit_signal_received, :killed}, _} = SignalMatrix.observe(:link_trap, :kill)
+    @impl true
+    def start(_type, _args) do
+      Supervisor.start_link([], strategy: :one_for_one, name: TrapExitDeep.Sup)
     end
   end
 
-  describe "monitor" do
-    test "normal exit delivers DOWN with :normal" do
-      assert {{:down, :normal}, _} = SignalMatrix.observe(:monitor, :normal)
+  defmodule TrapExitDeep.SignalMatrixTest do
+    use ExUnit.Case, async: true
+
+    alias TrapExitDeep.SignalMatrix
+
+    describe "link (no trap)" do
+      test "normal exit does not kill observer" do
+        assert {:nothing, _} = SignalMatrix.observe(:link, :normal)
+      end
+
+      test "abnormal exit propagates, observer dies with same reason" do
+        assert {:observer_crashed_with, :boom} = SignalMatrix.observe(:link, :boom)
+      end
+
+      test ":kill propagates as :killed to observer" do
+        assert {:observer_crashed_with, :killed} = SignalMatrix.observe(:link, :kill)
+      end
     end
 
-    test "abnormal exit delivers DOWN with reason" do
-      assert {{:down, :boom}, _} = SignalMatrix.observe(:monitor, :boom)
+    describe "link_trap" do
+      test "normal exit arrives as {:EXIT, pid, :normal}" do
+        assert {{:exit_signal_received, :normal}, _} = SignalMatrix.observe(:link_trap, :normal)
+      end
+
+      test "abnormal exit arrives as {:EXIT, pid, reason}" do
+        assert {{:exit_signal_received, :boom}, _} = SignalMatrix.observe(:link_trap, :boom)
+      end
+
+      test ":kill becomes {:EXIT, pid, :killed} on the observer" do
+        assert {{:exit_signal_received, :killed}, _} = SignalMatrix.observe(:link_trap, :kill)
+      end
     end
 
-    test ":kill delivers DOWN with :killed" do
-      assert {{:down, :killed}, _} = SignalMatrix.observe(:monitor, :kill)
+    describe "monitor" do
+      test "normal exit delivers DOWN with :normal" do
+        assert {{:down, :normal}, _} = SignalMatrix.observe(:monitor, :normal)
+      end
+
+      test "abnormal exit delivers DOWN with reason" do
+        assert {{:down, :boom}, _} = SignalMatrix.observe(:monitor, :boom)
+      end
+
+      test ":kill delivers DOWN with :killed" do
+        assert {{:down, :killed}, _} = SignalMatrix.observe(:monitor, :kill)
+      end
     end
   end
-end
 
-defmodule TrapExitDeep.TrappingWorkerTest do
-  use ExUnit.Case, async: true
+  defmodule TrapExitDeep.TrappingWorkerTest do
+    use ExUnit.Case, async: true
 
-  alias TrapExitDeep.TrappingWorker
+    alias TrapExitDeep.TrappingWorker
 
-  test "linked child death is observed as {:EXIT, pid, reason}" do
-    {:ok, w} = TrappingWorker.start_link()
-    child = TrappingWorker.link_child(w)
+    test "linked child death is observed as {:EXIT, pid, reason}" do
+      {:ok, w} = TrappingWorker.start_link()
+      child = TrappingWorker.link_child(w)
 
-    Process.exit(child, :ouch)
-    Process.sleep(30)
+      Process.exit(child, :ouch)
+      Process.sleep(30)
 
-    assert [{:EXIT, ^child, :ouch}] = TrappingWorker.received_signals(w)
+      assert [{:EXIT, ^child, :ouch}] = TrappingWorker.received_signals(w)
+    end
+
+    test "linked child killed is reported as :killed not :kill" do
+      {:ok, w} = TrappingWorker.start_link()
+      child = TrappingWorker.link_child(w)
+
+      Process.exit(child, :kill)
+      Process.sleep(30)
+
+      assert [{:EXIT, ^child, :killed}] = TrappingWorker.received_signals(w)
+    end
+
+    test "linked child normal exit is still observed (trap_exit = true)" do
+      {:ok, w} = TrappingWorker.start_link()
+      child = TrappingWorker.link_child(w)
+
+      send(child, :stop)
+      # spawn_link child above sleeps forever; we cannot ask it to exit :normal
+      # through a plain send, so emulate via explicit exit.
+      Process.exit(child, :normal)
+      Process.sleep(30)
+
+      assert [{:EXIT, ^child, :normal}] = TrappingWorker.received_signals(w)
+    end
   end
 
-  test "linked child killed is reported as :killed not :kill" do
-    {:ok, w} = TrappingWorker.start_link()
-    child = TrappingWorker.link_child(w)
-
-    Process.exit(child, :kill)
-    Process.sleep(30)
-
-    assert [{:EXIT, ^child, :killed}] = TrappingWorker.received_signals(w)
+  defmodule Main do
+    def main do
+        # Demonstrating 84-trap-exit-semantics
+        :ok
+    end
   end
 
-  test "linked child normal exit is still observed (trap_exit = true)" do
-    {:ok, w} = TrappingWorker.start_link()
-    child = TrappingWorker.link_child(w)
-
-    send(child, :stop)
-    # spawn_link child above sleeps forever; we cannot ask it to exit :normal
-    # through a plain send, so emulate via explicit exit.
-    Process.exit(child, :normal)
-    Process.sleep(30)
-
-    assert [{:EXIT, ^child, :normal}] = TrappingWorker.received_signals(w)
+  Main.main()
   end
-end
-
-defmodule Main do
-  def main do
-      # Demonstrating 84-trap-exit-semantics
-      :ok
   end
 end
 
 Main.main()
-end
-end
 ```

@@ -352,7 +352,8 @@ In the benchmark, you measured a memory drop after hibernation. Now imagine your
 ## Executable Example
 
 ```elixir
-defp deps do
+defmodule Main do
+  defp deps do
   [
     # No external dependencies — pure Elixir
   ]
@@ -473,4 +474,7 @@ end
 end
 end
 end
+end
+
+Main.main()
 ```

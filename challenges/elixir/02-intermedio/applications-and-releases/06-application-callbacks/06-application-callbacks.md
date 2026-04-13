@@ -320,13 +320,10 @@ app is enough — starting it is overhead for a library with no runtime.
 
 - Tu `start/2` necesita leer config de DB antes de construir el tree. ¿Dónde leés y qué pasa si la DB no responde?
 
-## Executable Example
-
-Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
-
 ```elixir
 defmodule Main do
-  defmodule MyServiceApp.Application do
+  import ExUnit.Assertions
+
     @moduledoc """
     OTP entry point. BEAM invokes `start/2` when the application boots and
     `stop/1` when it shuts down. The pid returned from `start/2` is the root

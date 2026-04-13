@@ -1,12 +1,8 @@
-# Custom Dynamic Process Pool
+# Build a Custom Dynamic Process Pool
 
-**Project**: `poolex` — a production-grade dynamic worker pool with priority, overflow, and metrics
+**Project**: `poolex` — A production-grade dynamic worker pool with priority queuing, overflow workers, and real-time metrics.
 
----
-
-## Project context
-
-You are building `poolex`, a dynamic worker pool from scratch in Elixir. No Poolboy, no Poolex, no existing pooling library. The pool manages concurrent access to a fixed set of worker processes, handles checkout timeouts, survives worker crashes, and exposes real operational metrics.
+**Learning Goal**: Understand queue-based resource management, why monitors beat links for worker crash recovery, and how priority queuing prevents starvation.
 
 Project structure:
 
@@ -34,44 +30,79 @@ poolex/
 
 ---
 
-## The problem
+## The Problem
 
-You have a limited resource — database connections, HTTP connections to a third-party API, CPU-bound worker processes — that multiple concurrent callers need. Without a pool, you either serialize all callers through one process (bottleneck) or spawn unlimited processes (resource exhaustion). A pool bounds concurrency at the resource limit and queues callers when all workers are busy.
+You have limited resources (DB connections, API calls, worker processes) but multiple concurrent callers. Without a pool:
+- Serialize all callers = bottleneck
+- Spawn unlimited = resource exhaustion
 
-The hard problems are: a caller that times out must be cleanly removed from the queue; a worker that crashes while checked out must be replaced; priority queues must not starve low-priority callers indefinitely; overflow workers must be created on demand and destroyed after use.
-
----
-
-## Why this design
-
-**GenServer as pool state manager**: all state transitions (checkout, checkin, crash detection) are serialized through the pool GenServer. This simplicity avoids race conditions. The GenServer is not in the hot path for the workers themselves — it only manages assignment. Workers execute concurrently.
-
-**Monitor both workers and waiting callers**: a worker that crashes while checked out sends `{:DOWN, ref, :process, pid, reason}` to the pool server, which then spawns a replacement. A caller that dies while waiting in the queue also sends `{:DOWN, ...}`, allowing the pool to clean the dead caller from the queue rather than delivering a worker to nobody.
-
-**Three separate queues for priority**: a heap-based priority queue requires careful implementation and adds complexity. Three independent queues (`:high`, `:normal`, `:low`) drained in order is equivalent for this use case and trivial to implement correctly.
-
-**Overflow workers separate from pool workers**: overflow workers are created when all pool workers are checked out and overflow > 0. They are not added to the pool's available list — they are destroyed on checkin. This keeps the pool size bounded at max_size after peak load subsides.
+A pool must:
+- Bound concurrency at resource limit
+- Queue callers when all workers busy
+- Clean up on caller timeout
+- Replace crashed workers
+- Prevent starvation with priority queuing
+- Destroy overflow workers after use
 
 ---
 
-## Design decisions
+## Key Concepts
 
-**Option A — Round-robin dispatch from a central queue**
-- Pros: simple; fair.
-- Cons: ignores worker load; can queue behind a slow worker while idle workers sit empty.
+### GenServer as Pool State Manager
 
-**Option B — Least-loaded checkout with worker-self-announced availability** (chosen)
-- Pros: workers advertise `:ready` after each task, so checkout picks a truly free worker; naturally adapts to heterogeneous task durations.
-- Cons: more coordination messages; the ready-set data structure must be correct under races.
+All state transitions (checkout, checkin, crash recovery) serialize through the pool GenServer. This avoids race conditions. Workers themselves execute concurrently — the GenServer just manages assignment.
 
-→ Chose **B** because poolboy's real-world pain is head-of-line blocking on uneven task durations; a ready-set design removes it outright.
+### Monitor Both Workers and Callers
+
+- **Worker crash**: sends `{:DOWN, ref, ...}` → pool spawns replacement
+- **Caller timeout**: sends `{:DOWN, ref, ...}` → pool cleans queue instead of delivering to dead caller
+
+### Three Priority Queues
+
+A heap requires careful implementation. Three separate FIFO queues (`:high`, `:normal`, `:low`) drained in order is equivalent, simpler, and correct.
+
+### Overflow Workers Separate from Pool
+
+Overflow workers are spawned on demand when all pool workers checked out. They are NOT added to the available pool — they're destroyed on checkin. This keeps the pool size bounded at `max_size`.
+
+### Design Decisions
+
+| Option | Pros | Cons | Chosen? |
+|--------|------|------|---------|
+| **A: Round-robin** | simple, fair | head-of-line blocking | No |
+| **B: Least-loaded** | adapts to uneven durations | more messages | **Yes** |
+
+**Rationale**: Real-world pain is uneven task durations blocking FIFO queues. Least-loaded avoids this entirely.
+
+## Full Project Structure
+
+```
+poolex/
+├── mix.exs                          # Project configuration
+├── lib/
+│   ├── poolex.ex                   # Module docstring
+│   └── poolex/
+│       ├── pool.ex                 # Public API: checkout, checkin, metrics
+│       ├── pool_server.ex          # GenServer: state machine, queue, monitors
+│       ├── priority_queue.ex       # Three-queue: :high, :normal, :low
+│       └── metrics.ex              # EMA: checkout duration, counters
+├── test/
+│   ├── test_helper.exs             # ExUnit config
+│   └── poolex/
+│       ├── pool_test.exs           # checkout, checkin, timeout, concurrency
+│       ├── crash_test.exs          # worker crash → replacement
+│       ├── priority_test.exs       # priority queue ordering
+│       └── overflow_test.exs       # overflow: create on demand, destroy on checkin
+├── bench/
+│   └── poolex_bench.exs            # Benchee: checkout/call/checkin throughput
+└── .gitignore
+```
 
 ## Implementation milestones
 
-### Step 1: Create the project
+### Step 1: Project Setup
 
-**Objective**: Separate pool server, priority queue, and metrics modules so the state machine can be unit-tested without spawning real workers.
-
+**Objective**: Separate pool server, priority queue, and metrics for unit testing.
 
 ```bash
 mix new poolex --sup
@@ -79,11 +110,9 @@ cd poolex
 mkdir -p lib/poolex test/poolex bench
 ```
 
-### Step 2: `mix.exs` — dependencies
+### Step 2: Dependencies (mix.exs)
 
-**Objective**: Only `benchee` — the pool mechanics, monitors, and queue must come from you, not from poolboy or NimblePool.
-
-### Dependencies (mix.exs)
+**Objective**: Only `benchee`. Hand-roll the pool mechanics, monitors, and priority queue.
 
 ```elixir
 defp deps do
@@ -93,10 +122,9 @@ defp deps do
 end
 ```
 
-### Step 3: Pool server state machine
+### Step 3: Pool Server State Machine
 
-**Objective**: Serialize checkout/checkin through one GenServer and monitor both workers and waiting callers so crashes on either side self-heal.
-
+**Objective**: Serialize checkout/checkin through GenServer with bidirectional monitoring for self-healing.
 
 ```elixir
 # lib/poolex/pool_server.ex
@@ -268,10 +296,9 @@ defmodule Poolex.PoolServer do
 end
 ```
 
-### Step 4: Priority queue
+### Step 4: Priority Queue
 
-**Objective**: Use three separate `:queue` instances drained high→normal→low — simpler than a heap and equivalent for three discrete levels.
-
+**Objective**: Three separate FIFO queues drained high → normal → low.
 
 ```elixir
 # lib/poolex/priority_queue.ex
@@ -336,10 +363,9 @@ defmodule Poolex.PriorityQueue do
 end
 ```
 
-### Step 5: Pool public API
+### Step 5: Pool Public API
 
-**Objective**: Wrap the GenServer behind `checkout/checkin/metrics` so callers never touch protocol internals and the server can be refactored freely.
-
+**Objective**: Clean wrapper over GenServer internals.
 
 ```elixir
 # lib/poolex/pool.ex
@@ -373,10 +399,9 @@ defmodule Poolex.Pool do
 end
 ```
 
-### Step 6: Given tests — must pass without modification
+### Step 6: Tests — Contract as Specs
 
-**Objective**: Pin the hardest invariants — timeout cleanup, crash replacement, concurrent fairness — as frozen tests so optimizations cannot regress them.
-
+**Objective**: Freeze timeout cleanup, crash replacement, and concurrent fairness as executable tests.
 
 ```elixir
 # test/poolex/pool_test.exs
@@ -463,36 +488,55 @@ end
 
 ---
 
-## Quick start
+## Quick Start
 
 **Prerequisites**: Elixir 1.14+, OTP 25+
 
-**Setup and run**:
+**Setup**:
 ```bash
-mix test test/poolex/ --trace
-mix run -e "IO.puts(\"Poolex module loaded\")"
+mix new poolex --sup
+cd poolex
+mkdir -p lib/poolex test/poolex bench
 ```
 
-**Run benchmarks**:
+**Run tests** (serially — pool is a singleton):
 ```bash
-mix run bench/poolex_bench.exs
+mix test test/poolex/ --trace
+```
+
+**Interactive example**:
+```bash
+iex -S mix
+```
+
+Then in iex:
+```elixir
+defmodule EchoWorker do
+  use GenServer
+  def start_link(_), do: GenServer.start_link(__MODULE__, :ok)
+  def init(:ok), do: {:ok, :idle}
+  def handle_call(:ping, _from, state), do: {:reply, :pong, state}
+end
+
+{:ok, pool} = Poolex.Pool.start_link(EchoWorker, [], min_size: 5, max_size: 10)
+
+# Checkout a worker
+{:ok, worker} = Poolex.Pool.checkout(pool, timeout: 5000)
+GenServer.call(worker, :ping)  # => :pong
+Poolex.Pool.checkin(pool, worker)
+
+# Check pool metrics
+metrics = Poolex.Pool.metrics(pool)
+IO.inspect(metrics)
 ```
 
 ---
 
-### Step 7: Run the tests
+## Benchmark
 
-**Objective**: Tests are `async: false` because the pool is a named singleton — parallel runs cross-contaminate checked-out worker state.
+**Objective**: Measure checkout/call/checkin throughput under concurrent load.
 
-```bash
-mix test test/poolex/ --trace
-```
-
-### Step 8: Benchmark
-
-**Objective**: Drive `parallel: 20` against 10 workers to expose serialization cost in the GenServer — the pool itself is the contention point.
-
-
+**Setup**:
 ```elixir
 # bench/poolex_bench.exs
 defmodule NoopWorker do
@@ -519,75 +563,33 @@ Benchee.run(
 )
 ```
 
-### Why this works
-
-Workers register with the pool when idle and deregister when busy; `checkout/1` pops from the ready-set or enqueues the caller. Because the set is kept in ETS, multiple callers don't contend on a single dispatcher process.
-
----
-
-
-## Main Entry Point
-
-```elixir
-def main do
-  IO.puts("======== 12-build-custom-process-pool ========")
-  IO.puts("Build custom process pool")
-  IO.puts("")
-  
-  Poolex.PoolServer.start_link([])
-  IO.puts("Poolex.PoolServer started")
-  
-  IO.puts("Run: mix test")
-end
+**Run**:
+```bash
+mix run bench/poolex_bench.exs
 ```
 
-
-
-## Benchmark
-
-**Objective**: Measure checkout+checkin throughput under sustained concurrent load and verify priority queue fairness.
-
-**Expected results**:
-- `checkout/1` latency (idle pool): 10–20 microseconds
-- `checkout/1` latency (saturated pool, queued): 100–500 microseconds
-- Throughput (100 workers, 200 concurrent callers): 50,000–100,000 ops/sec
-- Overflow worker creation overhead: < 1 millisecond per overflow
-
-**Test scenarios**:
-1. Baseline: single worker, repeated checkout/checkin
-2. Saturation: 100 workers, 200 concurrent checkout requests
-3. Priority skew: 50% high, 30% normal, 20% low priority callers
-4. Crash injection: random worker deaths, verify replacement latency
-
-**Measurement methodology**:
-- Warmup: 500 ops to stabilize pool state
-- Measure: 10,000 ops per scenario
-- Report: p50, p99, p99.9 latencies
-- Pool size: 10–100 workers
-- Caller concurrency: 4–200 parallel tasks
+**Expected Results**:
+- Idle checkout: 10–20 µs
+- Saturated checkout (queued): 100–500 µs
+- Throughput (100 workers, 200 concurrent): 50k–100k ops/sec
+- Overflow creation: < 1 ms
 
 **Interpretation**:
-Baseline latency scales with GenServer mailbox contention. Saturation latency reflects queue-draining and worker dispatch. Priority queue should reduce p99 for high-priority callers by 50–70% relative to FIFO under mixed workloads.
-
-If p99 > 1 ms: investigate whether GenServer is accumulating too many pending messages or whether the priority queue is being drained inefficiently.
+GenServer mailbox contention limits peak throughput. Priority queuing should reduce p99 for high-priority callers by 50–70% vs. FIFO under mixed workloads.
 
 ---
 
-## Deep Dive: Lock-Free Patterns and the BEAM Scheduler
+## Reflection
 
-Concurrency on the BEAM differs from OS threads: each Elixir process is a lightweight logical task scheduled by the BEAM VM. There are no kernel locks or mutexes; instead, processes communicate via message passing.
+These questions deepen your understanding:
 
-Lock-free data structures (e.g., ETS with `:write_concurrency`, atomic counters) use compare-and-swap primitives to avoid a centralized lock holder. On OS threads, this is critical because a preempted lock holder starves all waiters. On the BEAM, processes yield cooperatively, so even simple spinlocks are viable—but lock contention still matters.
+1. **Bimodal Durations**: If tasks have bimodal durations (1 ms vs 1 s), does least-loaded still win over round-robin? Measure the tail latency.
 
-The ETS table is the BEAM's primary lockfree structure: concurrent readers use an RWLock per bucket (readers do not block each other); writers grab an exclusive lock. For a counter with 100K increments/sec from 10 processes, ETS wins if reads are rare (fast writers, no reader contention). But a dedicated GenServer (serializing all increments via messages) can outperform ETS if the write rate is so high that RWLock contention dominates.
-
-Scheduler affinity (pinning a process to a specific scheduler thread) is an advanced optimization: if a GenServer is pinned and its callers are on the same scheduler, message delivery avoids cross-thread synchronization. But this requires deep knowledge of your workload and can degrade fairness.
-
-**Production gotcha**: Measuring concurrency on a single machine is misleading. ETS counters appear faster than GenServer counters until you hit a few thousand ops/sec from many processes, then RWLock overhead dominates. Always benchmark at realistic concurrency levels and check for starvation (e.g., do slow processes still make progress?).
+2. **Poolboy Comparison**: Compare your design to poolboy. Which exhaustion semantics would you default to (queue vs reject), and why?
 
 ---
 
-## Trade-off analysis
+## Trade-off Analysis
 
 | Aspect | Your implementation | Poolboy | NimblePool |
 |--------|--------------------|---------|----|
@@ -604,24 +606,19 @@ Architectural question: Little's Law states `L = λW` (mean queue length = arriv
 
 ---
 
-## Common production mistakes
+## Common Production Mistakes
 
 **1. Not monitoring waiting callers**
-A caller that dies while in the queue leaves a dead entry. When a worker becomes available, the pool delivers it to the dead caller, which silently discards it. The next caller in the queue waits unnecessarily. Always monitor waiting callers and clean up on `:DOWN`.
+Dead callers in the queue cause workers to be delivered to nobody. Always monitor waiting callers and clean up on `:DOWN`.
 
 **2. Race between worker crash and caller timeout**
-Worker crashes at t=0. Caller timeout fires at t=1. Pool tries to reply to the timed-out caller with the replacement worker — but the caller has already received `:error, :timeout`. The pool must check whether the caller's timeout has already fired before delivering the replacement. Track timeout state with a per-caller flag.
+Worker crashes while caller timeout is firing. Pool tries to deliver replacement to a caller that already got `:error, :timeout`. Check timeout state before delivering.
 
-**3. Average checkout time calculated as a running sum/count**
-A running sum is unbounded and accumulates floating-point error over time. Use an Exponential Moving Average: `ema = alpha * new_sample + (1 - alpha) * ema`. This gives a time-weighted average that adapts to load changes without unbounded memory.
+**3. Running average for checkout latency**
+Running sum/count accumulates unbounded error. Use Exponential Moving Average instead: `ema = alpha * sample + (1 - alpha) * ema`.
 
 **4. Overflow workers not destroyed on checkin**
-An overflow worker checked back in to the pool is incorrectly added to the available pool, causing the pool to permanently grow. Track which workers are overflow workers (e.g., with a MapSet) and stop them instead of recycling them.
-
-## Reflection
-
-- If tasks have bimodal durations (1 ms vs 1 s), does least-loaded still win over round-robin, or do you need priority queuing? Measure the tail latency.
-- Compare your design to poolboy. Which pool exhaustion semantics (queue vs reject) would you default to, and why?
+Overflow workers recycled into the pool cause it to permanently grow. Track overflow workers separately and stop them, not recycle them.
 
 ---
 

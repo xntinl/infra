@@ -22,6 +22,23 @@ You will build `Vivo`: a Phoenix LiveView-equivalent framework. One GenServer pe
 
 → Chose **B** because LiveView's value is entirely in the diffing — without it, it's just a worse SPA.
 
+
+## Quick start
+
+1. Create project:
+   ```bash
+   mix new <project_name>
+   cd <project_name>
+   ```
+
+2. Copy dependencies to `mix.exs`
+
+3. Implement modules following the project structure
+
+4. Run tests: `mix test`
+
+5. Benchmark: `mix run lib/benchmark.exs`
+
 ## Why a GenServer per connection and not a single shared process
 
 LiveView's process-per-connection model maps to the BEAM's cheap process model. A minimal GenServer with no heap data costs ~3KB of memory. 10,000 connections x 3KB = 30MB. The advantage: failure isolation. A crash in one user's view process does not affect any other user.
@@ -1031,7 +1048,7 @@ end
 Vivo.Bench.Connections.run()
 ```
 
-## Key Concepts: Server-Driven UI vs. Client-Side SPAs
+## Key Concepts: Architecture & Design Patterns Server-Driven UI vs. Client-Side SPAs
 
 La arquitectura **server-driven UI** (LiveView, Vivo) es fundamentalmente diferente a una SPA:
 

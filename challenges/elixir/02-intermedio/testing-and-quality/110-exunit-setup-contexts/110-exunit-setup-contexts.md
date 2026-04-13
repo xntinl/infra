@@ -347,13 +347,10 @@ introduces test-order coupling. Use `setup` + `start_supervised!/1` instead.
 
 ---
 
-## Executable Example
-
-Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
-
 ```elixir
 defmodule Main do
-  defmodule UserRepo do
+  import ExUnit.Assertions
+
     @moduledoc """
     A trivial in-memory user repository backed by an Agent, used purely to
     demonstrate ExUnit setup patterns.

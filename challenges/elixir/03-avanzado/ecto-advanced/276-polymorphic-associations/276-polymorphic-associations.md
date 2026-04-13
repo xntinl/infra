@@ -563,195 +563,193 @@ invariant protects the data during that window?
 ## Executable Example
 
 ```elixir
-defp deps do
-  [
-    {:ecto_sql, "~> 3.12"},
-    {:postgrex, "~> 0.19"},
-    {:benchee, "~> 1.3", only: :dev}
-  ]
-end
-
-# priv/repo/migrations/20260101000000_polymorphic_comments.exs
-defmodule CommentsSystem.Repo.Migrations.PolymorphicComments do
-  use Ecto.Migration
-
-  def change do
-    create table(:articles) do
-      add :title, :string, null: false
-      timestamps()
-    end
-
-    create table(:videos) do
-      add :url, :string, null: false
-      timestamps()
-    end
-
-    create table(:photos) do
-      add :caption, :string
-      timestamps()
-    end
-
-    create table(:comments) do
-      add :body, :text, null: false
-      add :article_id, references(:articles, on_delete: :delete_all)
-      add :video_id, references(:videos, on_delete: :delete_all)
-      add :photo_id, references(:photos, on_delete: :delete_all)
-      timestamps()
-    end
-
-    create constraint(
-             :comments,
-             :exactly_one_parent,
-             check:
-               "(article_id IS NOT NULL)::int + (video_id IS NOT NULL)::int + (photo_id IS NOT NULL)::int = 1"
-           )
-
-    create index(:comments, [:article_id], where: "article_id IS NOT NULL")
-    create index(:comments, [:video_id], where: "video_id IS NOT NULL")
-    create index(:comments, [:photo_id], where: "photo_id IS NOT NULL")
-  end
-end
-
-# lib/comments_system/schemas/article.ex
-defmodule CommentsSystem.Schemas.Article do
-  use Ecto.Schema
-
-  schema "articles" do
-    field :title, :string
-    has_many :comments, CommentsSystem.Schemas.Comment
-    timestamps()
-  end
-end
-
-# lib/comments_system/schemas/video.ex
-defmodule CommentsSystem.Schemas.Video do
-  use Ecto.Schema
-
-  schema "videos" do
-    field :url, :string
-    has_many :comments, CommentsSystem.Schemas.Comment
-    timestamps()
-  end
-end
-
-# lib/comments_system/schemas/photo.ex
-defmodule CommentsSystem.Schemas.Photo do
-  use Ecto.Schema
-
-  schema "photos" do
-    field :caption, :string
-    has_many :comments, CommentsSystem.Schemas.Comment
-    timestamps()
-  end
-end
-
-# lib/comments_system/schemas/comment.ex
-defmodule CommentsSystem.Schemas.Comment do
-  use Ecto.Schema
-  import Ecto.Changeset
-
-  alias CommentsSystem.Schemas.{Article, Photo, Video}
-
-  schema "comments" do
-    field :body, :string
-    belongs_to :article, Article
-    belongs_to :video, Video
-    belongs_to :photo, Photo
-    timestamps()
-  end
-
-  def changeset(comment, attrs) do
-    comment
-    |> cast(attrs, [:body, :article_id, :video_id, :photo_id])
-    |> validate_required([:body])
-    |> validate_exactly_one_parent()
-    |> check_constraint(:base,
-      name: :exactly_one_parent,
-      message: "exactly one of article/video/photo must be set"
-    )
-  end
-
-  # App-level fast path so users see a nice error before the DB CHECK triggers.
-  defp validate_exactly_one_parent(changeset) do
-    fks = [:article_id, :video_id, :photo_id]
-
-    set =
-      fks
-      |> Enum.map(&get_field(changeset, &1))
-      |> Enum.count(&(not is_nil(&1)))
-
-    case set do
-      1 -> changeset
-      0 -> add_error(changeset, :base, "must attach to a parent (article/video/photo)")
-      _ -> add_error(changeset, :base, "cannot attach to multiple parents")
-    end
-  end
-end
-
-# lib/comments_system/comments.ex
-defmodule CommentsSystem.Comments do
-  end
-  import Ecto.Query
-
-  alias CommentsSystem.Repo
-  alias CommentsSystem.Schemas.{Article, Comment, Photo, Video}
-
-  @type parent :: Article.t() | Video.t() | Photo.t()
-
-  @spec add(parent(), String.t()) :: {:ok, Comment.t()} | {:error, Ecto.Changeset.t()}
-  def add(parent, body) do
-    attrs = Map.merge(%{body: body}, parent_fk(parent))
-
-    %Comment{}
-    |> Comment.changeset(attrs)
-    |> Repo.insert()
-  end
-
-  @spec list(parent()) :: [Comment.t()]
-  def list(parent) do
-    {fk_field, fk_value} = parent_fk_pair(parent)
-
-    Comment
-    |> where([c], field(c, ^fk_field) == ^fk_value)
-    |> order_by([c], asc: c.inserted_at)
-    |> Repo.all()
-  end
-
-  @spec count_across_all_types() :: %{atom() => non_neg_integer()}
-  def count_across_all_types do
-    query =
-      from c in Comment,
-        select: %{
-          articles: count() |> filter(not is_nil(c.article_id)),
-          videos: count() |> filter(not is_nil(c.video_id)),
-          photos: count() |> filter(not is_nil(c.photo_id))
-        }
-
-    Repo.one(query)
-  end
-
-  # ------------------------------------------------------------------------
-
-  defp parent_fk(%Article{id: id}), do: %{article_id: id}
-  defp parent_fk(%Video{id: id}), do: %{video_id: id}
-  defp parent_fk(%Photo{id: id}), do: %{photo_id: id}
-
-  defp parent_fk_pair(%Article{id: id}), do: {:article_id, id}
-  defp parent_fk_pair(%Video{id: id}), do: {:video_id, id}
-  defp parent_fk_pair(%Photo{id: id}), do: {:photo_id, id}
-end
-
 defmodule Main do
-  def main do
-      # Demonstrating 276-polymorphic-associations
-      :ok
+  defp deps do
+    [
+      {:ecto_sql, "~> 3.12"},
+      {:postgrex, "~> 0.19"},
+      {:benchee, "~> 1.3", only: :dev}
+    ]
   end
-end
+
+  # priv/repo/migrations/20260101000000_polymorphic_comments.exs
+  defmodule CommentsSystem.Repo.Migrations.PolymorphicComments do
+    use Ecto.Migration
+
+    def change do
+      create table(:articles) do
+        add :title, :string, null: false
+        timestamps()
+      end
+
+      create table(:videos) do
+        add :url, :string, null: false
+        timestamps()
+      end
+
+      create table(:photos) do
+        add :caption, :string
+        timestamps()
+      end
+
+      create table(:comments) do
+        add :body, :text, null: false
+        add :article_id, references(:articles, on_delete: :delete_all)
+        add :video_id, references(:videos, on_delete: :delete_all)
+        add :photo_id, references(:photos, on_delete: :delete_all)
+        timestamps()
+      end
+
+      create constraint(
+               :comments,
+               :exactly_one_parent,
+               check:
+                 "(article_id IS NOT NULL)::int + (video_id IS NOT NULL)::int + (photo_id IS NOT NULL)::int = 1"
+             )
+
+      create index(:comments, [:article_id], where: "article_id IS NOT NULL")
+      create index(:comments, [:video_id], where: "video_id IS NOT NULL")
+      create index(:comments, [:photo_id], where: "photo_id IS NOT NULL")
+    end
+  end
+
+  # lib/comments_system/schemas/article.ex
+  defmodule CommentsSystem.Schemas.Article do
+    use Ecto.Schema
+
+    schema "articles" do
+      field :title, :string
+      has_many :comments, CommentsSystem.Schemas.Comment
+      timestamps()
+    end
+  end
+
+  # lib/comments_system/schemas/video.ex
+  defmodule CommentsSystem.Schemas.Video do
+    use Ecto.Schema
+
+    schema "videos" do
+      field :url, :string
+      has_many :comments, CommentsSystem.Schemas.Comment
+      timestamps()
+    end
+  end
+
+  # lib/comments_system/schemas/photo.ex
+  defmodule CommentsSystem.Schemas.Photo do
+    use Ecto.Schema
+
+    schema "photos" do
+      field :caption, :string
+      has_many :comments, CommentsSystem.Schemas.Comment
+      timestamps()
+    end
+  end
+
+  # lib/comments_system/schemas/comment.ex
+  defmodule CommentsSystem.Schemas.Comment do
+    use Ecto.Schema
+    import Ecto.Changeset
+
+    alias CommentsSystem.Schemas.{Article, Photo, Video}
+
+    schema "comments" do
+      field :body, :string
+      belongs_to :article, Article
+      belongs_to :video, Video
+      belongs_to :photo, Photo
+      timestamps()
+    end
+
+    def changeset(comment, attrs) do
+      comment
+      |> cast(attrs, [:body, :article_id, :video_id, :photo_id])
+      |> validate_required([:body])
+      |> validate_exactly_one_parent()
+      |> check_constraint(:base,
+        name: :exactly_one_parent,
+        message: "exactly one of article/video/photo must be set"
+      )
+    end
+
+    # App-level fast path so users see a nice error before the DB CHECK triggers.
+    defp validate_exactly_one_parent(changeset) do
+      fks = [:article_id, :video_id, :photo_id]
+
+      set =
+        fks
+        |> Enum.map(&get_field(changeset, &1))
+        |> Enum.count(&(not is_nil(&1)))
+
+      case set do
+        1 -> changeset
+        0 -> add_error(changeset, :base, "must attach to a parent (article/video/photo)")
+        _ -> add_error(changeset, :base, "cannot attach to multiple parents")
+      end
+    end
+  end
+
+  # lib/comments_system/comments.ex
+  defmodule CommentsSystem.Comments do
+    end
+    import Ecto.Query
+
+    alias CommentsSystem.Repo
+    alias CommentsSystem.Schemas.{Article, Comment, Photo, Video}
+
+    @type parent :: Article.t() | Video.t() | Photo.t()
+
+    @spec add(parent(), String.t()) :: {:ok, Comment.t()} | {:error, Ecto.Changeset.t()}
+    def add(parent, body) do
+      attrs = Map.merge(%{body: body}, parent_fk(parent))
+
+      %Comment{}
+      |> Comment.changeset(attrs)
+      |> Repo.insert()
+    end
+
+    @spec list(parent()) :: [Comment.t()]
+    def list(parent) do
+      {fk_field, fk_value} = parent_fk_pair(parent)
+
+      Comment
+      |> where([c], field(c, ^fk_field) == ^fk_value)
+      |> order_by([c], asc: c.inserted_at)
+      |> Repo.all()
+    end
+
+    @spec count_across_all_types() :: %{atom() => non_neg_integer()}
+    def count_across_all_types do
+      query =
+        from c in Comment,
+          select: %{
+            articles: count() |> filter(not is_nil(c.article_id)),
+            videos: count() |> filter(not is_nil(c.video_id)),
+            photos: count() |> filter(not is_nil(c.photo_id))
+          }
+
+      Repo.one(query)
+    end
+
+    # ------------------------------------------------------------------------
+
+    defp parent_fk(%Article{id: id}), do: %{article_id: id}
+    defp parent_fk(%Video{id: id}), do: %{video_id: id}
+    defp parent_fk(%Photo{id: id}), do: %{photo_id: id}
+
+    defp parent_fk_pair(%Article{id: id}), do: {:article_id, id}
+    defp parent_fk_pair(%Video{id: id}), do: {:video_id, id}
+    defp parent_fk_pair(%Photo{id: id}), do: {:photo_id, id}
+  end
+
+  defmodule Main do
+    def main do
+        # Demonstrating 276-polymorphic-associations
+        :ok
+    end
+  end
+
+  Main.main()
 
 Main.main()
-end
-end
-end
-end
-end
 ```

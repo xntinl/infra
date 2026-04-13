@@ -341,6 +341,7 @@ not zero.
 Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
 
 ```elixir
+defmodule Main do
 defmodule WorkerFactory.JobWorker do
   @moduledoc """
   Minimal job worker. Holds a job id and an arbitrary payload. Exposes
@@ -445,6 +446,9 @@ assert Process.alive?(pid2)
 IO.puts("Worker 1 crashed; Worker 2 still alive (independent)")
 
 IO.puts("All DynamicSupervisor assertions passed!")
+end
+
+Main.main()
 ```
 
 

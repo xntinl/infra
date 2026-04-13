@@ -313,13 +313,10 @@ or a test-local supervisor you fully control.
 
 ---
 
-## Executable Example
-
-Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
-
 ```elixir
 defmodule Main do
-  defmodule Counter do
+  import ExUnit.Assertions
+
     @moduledoc """
     Minimal GenServer counter — used to demonstrate `start_supervised!/1`.
     """

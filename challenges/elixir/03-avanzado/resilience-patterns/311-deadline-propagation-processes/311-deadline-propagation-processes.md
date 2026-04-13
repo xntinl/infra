@@ -364,144 +364,148 @@ You call `TaskSup.async_stream/3` with `max_concurrency: 5` and a deadline of 10
 ## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # No external dependencies — pure Elixir
-  ]
-end
-
-defmodule RpcDeadlines.MixProject do
+defmodule Main do
+  defp deps do
+    [
+      # No external dependencies — pure Elixir
+    ]
   end
-  use Mix.Project
-  def project, do: [app: :rpc_deadlines, version: "0.1.0", elixir: "~> 1.17", deps: []]
-  def application, do: [extra_applications: [:logger]]
-end
 
-defmodule RpcDeadlines.Deadline do
+  defmodule RpcDeadlines.MixProject do
+    end
+    use Mix.Project
+    def project, do: [app: :rpc_deadlines, version: "0.1.0", elixir: "~> 1.17", deps: []]
+    def application, do: [extra_applications: [:logger]]
   end
-  @type t :: %__MODULE__{at: integer()}
-  defstruct [:at]
 
-  def within(ms), do: %__MODULE__{at: System.monotonic_time(:millisecond) + ms}
+  defmodule RpcDeadlines.Deadline do
+    end
+    @type t :: %__MODULE__{at: integer()}
+    defstruct [:at]
 
-  def remaining(%__MODULE__{at: at}),
-    do: max(0, at - System.monotonic_time(:millisecond))
+    def within(ms), do: %__MODULE__{at: System.monotonic_time(:millisecond) + ms}
 
-  def expired?(%__MODULE__{} = d), do: remaining(d) == 0
-end
+    def remaining(%__MODULE__{at: at}),
+      do: max(0, at - System.monotonic_time(:millisecond))
 
-defmodule RpcDeadlines.Context do
+    def expired?(%__MODULE__{} = d), do: remaining(d) == 0
   end
-  alias RpcDeadlines.Deadline
 
-  @key :rpc_deadline
+  defmodule RpcDeadlines.Context do
+    end
+    alias RpcDeadlines.Deadline
 
-  def put(%Deadline{} = d), do: Process.put(@key, d)
+    @key :rpc_deadline
 
-  def get, do: Process.get(@key)
+    def put(%Deadline{} = d), do: Process.put(@key, d)
 
-  def remaining do
-    case get() do
-      nil -> :infinity
-      %Deadline{} = d -> Deadline.remaining(d)
+    def get, do: Process.get(@key)
+
+    def remaining do
+      case get() do
+        nil -> :infinity
+        %Deadline{} = d -> Deadline.remaining(d)
+      end
+    end
+
+    def expired? do
+      case get() do
+        nil -> false
+        %Deadline{} = d -> Deadline.expired?(d)
+      end
     end
   end
 
-  def expired? do
-    case get() do
-      nil -> false
-      %Deadline{} = d -> Deadline.expired?(d)
-    end
-  end
-end
+  defmodule RpcDeadlines.TaskSup do
+    @moduledoc """
+    Drop-in alternative to Task.async/1 that carries the caller's deadline
+    into the spawned process.
+    """
+    alias RpcDeadlines.Context
 
-defmodule RpcDeadlines.TaskSup do
-  @moduledoc """
-  Drop-in alternative to Task.async/1 that carries the caller's deadline
-  into the spawned process.
-  """
-  alias RpcDeadlines.Context
+    def async(fun) when is_function(fun, 0) do
+      parent_deadline = Context.get()
 
-  def async(fun) when is_function(fun, 0) do
-    parent_deadline = Context.get()
-
-    Task.async(fn ->
-      if parent_deadline, do: Context.put(parent_deadline)
-      fun.()
-    end)
-  end
-
-  def await(%Task{} = t) do
-    Task.await(t, Context.remaining())
-  end
-
-  def async_stream(enum, fun, opts \\ []) do
-    parent = Context.get()
-
-    wrapped = fn item ->
-      if parent, do: Context.put(parent)
-      fun.(item)
+      Task.async(fn ->
+        if parent_deadline, do: Context.put(parent_deadline)
+        fun.()
+      end)
     end
 
-    remaining =
-      case Context.remaining() do
-        :infinity -> 5_000
-        n -> n
+    def await(%Task{} = t) do
+      Task.await(t, Context.remaining())
+    end
+
+    def async_stream(enum, fun, opts \\ []) do
+      parent = Context.get()
+
+      wrapped = fn item ->
+        if parent, do: Context.put(parent)
+        fun.(item)
       end
 
-    Task.async_stream(
-      enum,
-      wrapped,
-      Keyword.merge([timeout: remaining, on_timeout: :kill_task], opts)
-    )
-  end
-end
+      remaining =
+        case Context.remaining() do
+          :infinity -> 5_000
+          n -> n
+        end
 
-defmodule RpcDeadlines.Pricing do
-  alias RpcDeadlines.{Context, TaskSup}
-
-  def compute(items) do
-    if Context.expired?() do
-      {:error, :deadline_exceeded}
-    else
-      results =
-        TaskSup.async_stream(items, &price_one/1, max_concurrency: 5)
-        |> Enum.to_list()
-
-      {:ok, results}
+      Task.async_stream(
+        enum,
+        wrapped,
+        Keyword.merge([timeout: remaining, on_timeout: :kill_task], opts)
+      )
     end
   end
 
-  defp price_one(item) do
-    cond do
-      Context.expired?() -> {:error, :deadline_exceeded}
-      true -> do_work(item)
+  defmodule RpcDeadlines.Pricing do
+    alias RpcDeadlines.{Context, TaskSup}
+
+    def compute(items) do
+      if Context.expired?() do
+        {:error, :deadline_exceeded}
+      else
+        results =
+          TaskSup.async_stream(items, &price_one/1, max_concurrency: 5)
+          |> Enum.to_list()
+
+        {:ok, results}
+      end
+    end
+
+    defp price_one(item) do
+      cond do
+        Context.expired?() -> {:error, :deadline_exceeded}
+        true -> do_work(item)
+      end
+    end
+
+    defp do_work(item) do
+      remaining = Context.remaining()
+      sleep_ms = min(remaining, item.work_ms)
+      Process.sleep(sleep_ms)
+
+      if Context.expired?() do
+        {:error, :deadline_exceeded}
+      else
+        {:ok, item.id}
+      end
     end
   end
 
-  defp do_work(item) do
-    remaining = Context.remaining()
-    sleep_ms = min(remaining, item.work_ms)
-    Process.sleep(sleep_ms)
-
-    if Context.expired?() do
-      {:error, :deadline_exceeded}
-    else
-      {:ok, item.id}
+  defmodule Main do
+    def main do
+        # Demonstrating 311-deadline-propagation-processes
+        :ok
     end
   end
-end
 
-defmodule Main do
-  def main do
-      # Demonstrating 311-deadline-propagation-processes
-      :ok
+  Main.main()
+  end
+  end
+  end
   end
 end
 
 Main.main()
-end
-end
-end
-end
 ```

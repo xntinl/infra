@@ -1,12 +1,8 @@
-# Alternative Actor Framework
+# Build a Typed Actor Framework with Compile-Time Protocol Enforcement
 
-**Project**: `typed_actors` — an Elixir actor framework with typed message protocols and location transparency
+**Project**: `typed_actors` — An actor framework that enforces typed message protocols at compile-time and provides location transparency via `ActorRef`.
 
----
-
-## Project context
-
-You are building `typed_actors`, an actor framework for Elixir with a deliberately different API from OTP's GenServer. The framework enforces typed message protocols at the macro level, provides location transparency via `ActorRef`, supports hot state update, and benchmarks against native GenServer.
+**Learning Goal**: Understand how to use macros with `@before_compile` to enforce contracts at compile time, abstract over location (local vs. remote), and implement hot actor updates.
 
 Project structure:
 
@@ -35,44 +31,101 @@ typed_actors/
 
 ---
 
-## The problem
+## The Problem
 
-OTP's GenServer handles all message types through a single `handle_call/3` function. This is flexible but untyped — you cannot express at the module level which messages an actor accepts. A caller can send any term; the only feedback is a runtime error. Akka Typed and Proto.Actor solve this by requiring actors to declare their accepted message types. Any send of an undeclared type is rejected.
+OTP's GenServer is flexible but untyped:
+- A caller can send any term to `handle_call/3`
+- Errors appear at runtime, not compile time
+- No way to declare which message types an actor accepts
 
-The second problem is location transparency. `GenServer.call(pid, msg)` only works if `pid` is local or you know the node. An `ActorRef` abstracts over locality — the framework routes the message to the correct node without the caller knowing.
-
----
-
-## Why this design
-
-**`receive_message` macro for typed dispatch**: the macro accumulates declared message types using `Module.register_attribute/2` in `@before_compile`. At compilation, it generates a `dispatch/2` function with a pattern-match clause per declared message type, plus a catch-all that raises `Actor.UnknownMessageError`. This converts a runtime discovery (wrong message type) into a clearly reported runtime error with the actor's declared types listed.
-
-**Struct-based message types**: each message type is an Elixir struct module (`%CreateUser{}`, `%DeleteUser{}`). Pattern matching on structs is idiomatic Elixir, compiles to efficient BEAM pattern matching, and gives you type-checking-like feedback because you cannot accidentally pass the wrong struct type.
-
-**`ActorRef` over raw PID**: the `ActorRef` struct holds either `{:local, pid}` or `{:remote, node, name}`. `ActorRef.send/2` pattern-matches on the variant and uses `send/2` or `:rpc.cast/4` accordingly. The caller never sees the distinction.
-
-**Hot update via `:sys` protocol**: OTP's `:sys` module defines `code_change/3` for hot code upgrades. Your framework wraps this to allow swapping the dispatch module at runtime. The actor's state is preserved; subsequent messages go through the new module's `dispatch/2`. In-flight messages are handled by whichever dispatch module the actor is currently running.
+Location transparency is manual:
+- `GenServer.call(pid, msg)` only works if `pid` is local or you know the node
+- No abstraction over locality; callers must know node names
 
 ---
 
-## Design decisions
+## Key Concepts
 
-**Option A — Thin wrapper over GenServer**
-- Pros: inherits OTP supervision for free.
-- Cons: can't tune mailbox semantics or scheduling; you're not actually building an actor framework, just decorating one.
+### Typed Dispatch via `@before_compile` Macro
 
-**Option B — Custom process with `:proc_lib` and explicit mailbox handling** (chosen)
-- Pros: direct control over receive patterns, priority mailboxes, and message selection; can experiment with selective receive and actor-private state.
-- Cons: must re-implement every OTP feature you want (sys messages, code upgrades, shutdown).
+```elixir
+defmodule MyActor do
+  use TypedActors.Actor
 
-→ Chose **B** because a framework whose distinguishing feature is how it handles messages must control the message loop — a GenServer wrapper hides exactly the part you're trying to teach.
+  receive_message %CreateUser{} = msg do
+    {:reply, :ok, new_state}
+  end
 
-## Implementation milestones
+  receive_message %DeleteUser{} = msg do
+    {:noreply, new_state}
+  end
+  # Sending any other message type raises UnknownMessageError
+end
+```
 
-### Step 1: Create the project
+The macro:
+1. Accumulates `receive_message` clauses with `Module.register_attribute`
+2. At `@before_compile`, generates a `dispatch/2` function with one clause per message type
+3. Includes a catch-all that raises `UnknownMessageError` with declared types
 
-**Objective**: Keep the actor macro, ActorRef, and registry in separate files so the compile-time message accumulation stays isolated from runtime dispatch.
+This converts runtime discovery (wrong type) into a clear compile-time contract.
 
+### Struct-Based Message Types
+
+Each message is an Elixir struct (`%CreateUser{}`, `%DeleteUser{}`):
+- Idiomatic Elixir pattern matching
+- Efficient BEAM-level compilation
+- Type-checking-like feedback (cannot accidentally pass wrong struct)
+
+### ActorRef for Location Transparency
+
+```elixir
+local_ref = ActorRef.local(pid)
+remote_ref = ActorRef.remote(:node@host, :actor_name)
+
+# Same API for both:
+ActorRef.send(local_ref, %CreateUser{...})  # => :ok
+ActorRef.call(remote_ref, %GetUser{...})    # => {:ok, user}
+```
+
+### Design Decisions
+
+| Option | Pros | Cons | Chosen? |
+|--------|------|------|---------|
+| **A: GenServer wrapper** | free supervision | hides mailbox semantics | No |
+| **B: Custom process** | direct control; teach message handling | re-implement OTP features | **Yes** |
+
+**Rationale**: A framework about message handling must control the message loop.
+
+## Full Project Structure
+
+```
+typed_actors/
+├── mix.exs                          # Project configuration
+├── lib/
+│   ├── typed_actors.ex             # Module docstring
+│   └── typed_actors/
+│       ├── actor.ex                # Macro: receive_message DSL + @before_compile
+│       ├── actor_ref.ex            # Location-transparent ActorRef
+│       ├── registry.ex             # ETS: name → ActorRef
+│       └── supervisor.ex           # ActorSupervisor: restart strategies
+├── test/
+│   ├── test_helper.exs             # ExUnit setup
+│   └── typed_actors/
+│       ├── protocol_test.exs       # typed dispatch + UnknownMessageError
+│       ├── actor_ref_test.exs      # local and remote delivery
+│       ├── supervision_test.exs    # restart strategies
+│       └── hot_update_test.exs     # behavior swap without message loss
+├── bench/
+│   └── actors_bench.exs            # Throughput vs. GenServer
+└── .gitignore
+```
+
+## Implementation Milestones
+
+### Step 1: Project Setup
+
+**Objective**: Separate actor macro, ActorRef, and registry modules.
 
 ```bash
 mix new typed_actors --sup
@@ -80,11 +133,9 @@ cd typed_actors
 mkdir -p lib/typed_actors test/typed_actors bench
 ```
 
-### Step 2: `mix.exs` — dependencies
+### Step 2: Dependencies (mix.exs)
 
-**Objective**: Keep deps to `benchee` alone — the macro, dispatch, and ActorRef must be hand-rolled, not borrowed from GenStage or `:gen_statem`.
-
-### Dependencies (mix.exs)
+**Objective**: Only `benchee`. Hand-roll the macro, dispatch, and ActorRef.
 
 ```elixir
 defp deps do
@@ -94,10 +145,9 @@ defp deps do
 end
 ```
 
-### Step 3: Actor macro
+### Step 3: Actor Macro
 
-**Objective**: Accumulate `receive_message` clauses at compile time so undeclared struct types raise instead of silently hitting a catch-all handler.
-
+**Objective**: Accumulate `receive_message` clauses so undeclared types raise instead of silently catching.
 
 ```elixir
 # lib/typed_actors/actor.ex

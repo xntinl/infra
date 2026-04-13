@@ -566,386 +566,390 @@ Target: operation should complete in the low-microsecond range on modern hardwar
 ## Executable Example
 
 ```elixir
-defp deps do
-  [
-    {:nerves, "~> 1.10", runtime: false},
-    {:nerves_runtime, "~> 0.13"},
-    {:circuits_gpio, "~> 2.0"},
-    {:circuits_i2c, "~> 2.0"},
-    {:plug_cowboy, "~> 2.7"},
-    {:jason, "~> 1.4"},
-    {:toolshed, "~> 0.4"},
-    {:shoehorn, "~> 0.9"}
-  ]
-end
-
-defmodule ApiGateway.Sensor.Store do
-  @moduledoc """
-  ETS-backed circular buffer for sensor readings.
-
-  Uses :ordered_set keyed by monotonic timestamp so history queries
-  are O(log n) and eviction always removes the oldest entry.
-  """
-  use GenServer
-
-  @table    :sensor_readings
-  @max_size 100
-
-  @spec start_link(keyword()) :: GenServer.on_start()
-  def start_link(_opts), do: GenServer.start_link(__MODULE__, [], name: __MODULE__)
-
-  @doc "Inserts a new reading. Evicts the oldest if over capacity."
-  @spec insert(map()) :: :ok
-  def insert(reading) do
-    ts = System.monotonic_time(:millisecond)
-    :ets.insert(@table, {ts, reading})
-    GenServer.cast(__MODULE__, :maybe_evict)
-  end
-
-  @doc "Returns the most recent reading, or nil."
-  @spec latest() :: map() | nil
-  def latest do
-    case :ets.last(@table) do
-      :"$end_of_table" -> nil
-      key -> :ets.lookup(@table, key) |> hd() |> elem(1)
-    end
-  end
-
-  @doc "Returns the last N readings, newest first."
-  @spec history(pos_integer()) :: [map()]
-  def history(n \\ 10) do
-    :ets.tab2list(@table)
-    |> Enum.sort_by(fn {ts, _} -> ts end, :desc)
-    |> Enum.take(n)
-    |> Enum.map(&elem(&1, 1))
-  end
-
-  @impl true
-  def init(_) do
-    :ets.new(@table, [:ordered_set, :public, :named_table, read_concurrency: true])
-    {:ok, %{}}
-  end
-
-  @impl true
-  def handle_cast(:maybe_evict, state) do
-    if :ets.info(@table, :size) > @max_size do
-      oldest = :ets.first(@table)
-      :ets.delete(@table, oldest)
-    end
-    {:noreply, state}
-  end
-end
-
-defmodule ApiGateway.Sensor.BME280 do
-  end
-  @moduledoc """
-  Reads temperature, humidity, and pressure from a BME280 sensor over I2C.
-  Polls every @poll_interval_ms. On read errors, applies exponential backoff.
-
-  The GenServer owns the I2C bus reference. It opens at init and closes at terminate.
-  """
-  use GenServer
-  require Logger
-  alias Circuits.I2C
-
-  @bme280_addr      0x76
-  @poll_interval_ms 5_000
-  @max_backoff_ms   60_000
-
-  @spec start_link(keyword()) :: GenServer.on_start()
-  def start_link(opts) do
-    bus     = Keyword.get(opts, :bus, "i2c-1")
-    address = Keyword.get(opts, :address, @bme280_addr)
-    GenServer.start_link(__MODULE__, {bus, address}, name: __MODULE__)
-  end
-
-  @spec current_reading() :: map() | nil
-  def current_reading, do: ApiGateway.Sensor.Store.latest()
-
-  @impl true
-  def init({bus, address}) do
-    {:ok, bus_ref} = I2C.open(bus)
-
-    I2C.write(bus_ref, address, <<0xF2, 0x01>>)
-    I2C.write(bus_ref, address, <<0xF4, 0x27>>)
-
-    schedule_poll(@poll_interval_ms)
-
-    {:ok, %{bus_ref: bus_ref, address: address, error_count: 0}}
-  end
-
-  @impl true
-  def handle_info(:poll, state) do
-    case read_sensor(state.bus_ref, state.address) do
-      {:ok, reading} ->
-        ApiGateway.Sensor.Store.insert(reading)
-        schedule_poll(@poll_interval_ms)
-        {:noreply, %{state | error_count: 0}}
-
-      {:error, reason} ->
-        Logger.warning("BME280 read failed: #{inspect(reason)}")
-        backoff = min(@poll_interval_ms * Integer.pow(2, state.error_count), @max_backoff_ms)
-        schedule_poll(backoff)
-        {:noreply, %{state | error_count: state.error_count + 1}}
-    end
-  end
-
-  @impl true
-  def terminate(_reason, state) do
-    I2C.close(state.bus_ref)
-  end
-
-  defp schedule_poll(ms), do: Process.send_after(self(), :poll, ms)
-
-  defp read_sensor(bus_ref, address) do
-    with {:ok, t_raw}  <- I2C.write_read(bus_ref, address, <<0xFA>>, 3),
-         {:ok, h_raw}  <- I2C.write_read(bus_ref, address, <<0xFD>>, 2),
-         {:ok, p_raw}  <- I2C.write_read(bus_ref, address, <<0xF7>>, 3) do
-      reading = %{
-        temperature_c: decode_temp(t_raw),
-        humidity_pct:  decode_hum(h_raw),
-        pressure_hpa:  decode_press(p_raw),
-        timestamp:     DateTime.utc_now()
-      }
-      {:ok, reading}
-    end
-  end
-
-  defp decode_temp(<<msb, lsb, xlsb>>),
-    do: ((msb <<< 12) ||| (lsb <<< 4) ||| (xlsb >>> 4)) / 5120.0
-
-  defp decode_hum(<<msb, lsb>>),
-    do: ((msb <<< 8) ||| lsb) / 1024.0
-
-  defp decode_press(<<msb, lsb, xlsb>>),
-    do: ((msb <<< 12) ||| (lsb <<< 4) ||| (xlsb >>> 4)) / 25_600.0
-end
-
-defmodule ApiGateway.Indicator.LED do
-  end
-  @moduledoc """
-  Controls the status LED on GPIO pin 18.
-
-  Blink patterns:
-    :healthy  — 500ms on/off (1 Hz)
-    :warning  — 100ms on/off (5 Hz)
-    :off      — solid off
-  """
-  use GenServer
-  alias Circuits.GPIO
-
-  @pin 18
-
-  @spec start_link(keyword()) :: GenServer.on_start()
-  def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
-
-  @spec set_mode(:healthy | :warning | :off) :: :ok
-  def set_mode(mode) when mode in [:healthy, :warning, :off] do
-    GenServer.cast(__MODULE__, {:set_mode, mode})
-  end
-
-  @spec status() :: map()
-  def status, do: GenServer.call(__MODULE__, :status)
-
-  @impl true
-  def init(_opts) do
-    {:ok, gpio} = GPIO.open(@pin, :output)
-    GPIO.write(gpio, 0)
-    state = %{gpio: gpio, mode: :healthy, level: 0, timer: nil}
-    {:ok, schedule_blink(state)}
-  end
-
-  @impl true
-  def handle_info(:blink, %{mode: :off} = state) do
-    GPIO.write(state.gpio, 0)
-    {:noreply, %{state | level: 0}}
-  end
-
-  def handle_info(:blink, state) do
-    new_level = 1 - state.level
-    GPIO.write(state.gpio, new_level)
-    {:noreply, schedule_blink(%{state | level: new_level})}
-  end
-
-  @impl true
-  def handle_cast({:set_mode, mode}, state) do
-    cancel_timer(state.timer)
-    GPIO.write(state.gpio, 0)
-    {:noreply, schedule_blink(%{state | mode: mode, level: 0, timer: nil})}
-  end
-
-  @impl true
-  def handle_call(:status, _from, state) do
-    {:reply, %{mode: state.mode, level: state.level, pin: @pin}, state}
-  end
-
-  @impl true
-  def terminate(_reason, state) do
-    cancel_timer(state.timer)
-    GPIO.write(state.gpio, 0)
-    GPIO.close(state.gpio)
-  end
-
-  defp interval(:healthy), do: 500
-  defp interval(:warning), do: 100
-  defp interval(:off),     do: 60_000
-
-  defp schedule_blink(state) do
-    timer = Process.send_after(self(), :blink, interval(state.mode))
-    %{state | timer: timer}
-  end
-
-  defp cancel_timer(nil), do: :ok
-  defp cancel_timer(ref), do: Process.cancel_timer(ref)
-end
-
-defmodule ApiGateway.DeviceAPI do
-  end
-  @moduledoc """
-  Local HTTP API for the edge gateway device.
-  Exposes sensor readings and device system info.
-  """
-  use Plug.Router
-  import Plug.Conn
-
-  plug :match
-  plug Plug.Parsers, parsers: [:json], json_decoder: Jason
-  plug :dispatch
-
-  get "/sensor/current" do
-    case ApiGateway.Sensor.Store.latest() do
-      nil     -> json(conn, 503, %{error: "no readings yet"})
-      reading -> json(conn, 200, reading)
-    end
-  end
-
-  get "/sensor/history" do
-    conn = fetch_query_params(conn)
-    n = conn.query_params["n"] |> parse_int(10)
-    json(conn, 200, ApiGateway.Sensor.Store.history(n))
-  end
-
-  match _ do
-    json(conn, 404, %{error: "not found"})
-  end
-
-  defp json(conn, status, body) do
-    conn
-    |> put_resp_content_type("application/json")
-    |> send_resp(status, Jason.encode!(normalize_for_json(body)))
-  end
-
-  defp normalize_for_json(%DateTime{} = dt), do: DateTime.to_iso8601(dt)
-  defp normalize_for_json(%{timestamp: %DateTime{} = ts} = r),
-    do: Map.put(r, :timestamp, DateTime.to_iso8601(ts))
-  defp normalize_for_json(list) when is_list(list), do: Enum.map(list, &normalize_for_json/1)
-  defp normalize_for_json(other), do: other
-
-  defp parse_int(nil, default), do: default
-  defp parse_int(s, default) do
-    case Integer.parse(s) do
-      {n, ""} when n > 0 -> min(n, 100)
-      _                  -> default
-    end
-  end
-end
-
-defmodule ApiGateway.Application do
-  @moduledoc """
-  Target-aware application that starts hardware-dependent children
-  only when running on a Nerves device, not during host-based tests.
-  """
-  use Application
-  require Logger
-
-  @impl true
-  def start(_type, _args) do
-    children = children(target())
-    Supervisor.start_link(children, strategy: :one_for_one, name: ApiGateway.Supervisor)
-  end
-
-  # On the host (dev/test): no GPIO, no I2C — business logic only
-  defp children(:host) do
-    [ApiGateway.Sensor.Store]
-  end
-
-  defp children(_target) do
-    Logger.info("Starting edge gateway on #{target()}")
+defmodule Main do
+  defp deps do
     [
-      ApiGateway.Sensor.Store,
-      ApiGateway.Indicator.LED,
-      {ApiGateway.Sensor.BME280, [bus: "i2c-1", address: 0x76]},
-      {Plug.Cowboy, scheme: :http, plug: ApiGateway.DeviceAPI, options: [port: 4000]}
+      {:nerves, "~> 1.10", runtime: false},
+      {:nerves_runtime, "~> 0.13"},
+      {:circuits_gpio, "~> 2.0"},
+      {:circuits_i2c, "~> 2.0"},
+      {:plug_cowboy, "~> 2.7"},
+      {:jason, "~> 1.4"},
+      {:toolshed, "~> 0.4"},
+      {:shoehorn, "~> 0.9"}
     ]
   end
 
-  defp target do
-    Application.get_env(:api_gateway, :target, Mix.target())
-  end
-end
+  defmodule ApiGateway.Sensor.Store do
+    @moduledoc """
+    ETS-backed circular buffer for sensor readings.
 
-# test/api_gateway/sensor_store_test.exs
-defmodule ApiGateway.Sensor.StoreTest do
-  use ExUnit.Case, async: false
+    Uses :ordered_set keyed by monotonic timestamp so history queries
+    are O(log n) and eviction always removes the oldest entry.
+    """
+    use GenServer
 
-  setup do
-    start_supervised!(ApiGateway.Sensor.Store)
-    :ok
-  end
+    @table    :sensor_readings
+    @max_size 100
 
-  describe "ApiGateway.Sensor.Store" do
-    test "latest returns nil with empty store" do
-      assert ApiGateway.Sensor.Store.latest() == nil
+    @spec start_link(keyword()) :: GenServer.on_start()
+    def start_link(_opts), do: GenServer.start_link(__MODULE__, [], name: __MODULE__)
+
+    @doc "Inserts a new reading. Evicts the oldest if over capacity."
+    @spec insert(map()) :: :ok
+    def insert(reading) do
+      ts = System.monotonic_time(:millisecond)
+      :ets.insert(@table, {ts, reading})
+      GenServer.cast(__MODULE__, :maybe_evict)
     end
 
-    test "insert and latest" do
-      reading = %{temperature_c: 22.5, humidity_pct: 60.0, pressure_hpa: 1013.2}
-      ApiGateway.Sensor.Store.insert(reading)
-      assert ApiGateway.Sensor.Store.latest() == reading
-    end
-
-    test "history returns newest first" do
-      for i <- 1..5 do
-        ApiGateway.Sensor.Store.insert(%{temperature_c: i * 1.0})
-        Process.sleep(1)
+    @doc "Returns the most recent reading, or nil."
+    @spec latest() :: map() | nil
+    def latest do
+      case :ets.last(@table) do
+        :"$end_of_table" -> nil
+        key -> :ets.lookup(@table, key) |> hd() |> elem(1)
       end
-
-      history = ApiGateway.Sensor.Store.history(3)
-      assert length(history) == 3
-      assert hd(history).temperature_c == 5.0
     end
 
-    test "eviction keeps store at max 100 entries" do
-      for i <- 1..110 do
-        ApiGateway.Sensor.Store.insert(%{temperature_c: i * 1.0})
-      end
+    @doc "Returns the last N readings, newest first."
+    @spec history(pos_integer()) :: [map()]
+    def history(n \\ 10) do
+      :ets.tab2list(@table)
+      |> Enum.sort_by(fn {ts, _} -> ts end, :desc)
+      |> Enum.take(n)
+      |> Enum.map(&elem(&1, 1))
+    end
 
-      Process.sleep(20)
-      assert length(ApiGateway.Sensor.Store.history(200)) <= 100
+    @impl true
+    def init(_) do
+      :ets.new(@table, [:ordered_set, :public, :named_table, read_concurrency: true])
+      {:ok, %{}}
+    end
+
+    @impl true
+    def handle_cast(:maybe_evict, state) do
+      if :ets.info(@table, :size) > @max_size do
+        oldest = :ets.first(@table)
+        :ets.delete(@table, oldest)
+      end
+      {:noreply, state}
     end
   end
-end
 
-defmodule Main do
-  def main do
-      # Demonstrating 63-nerves-iot-embedded
+  defmodule ApiGateway.Sensor.BME280 do
+    end
+    @moduledoc """
+    Reads temperature, humidity, and pressure from a BME280 sensor over I2C.
+    Polls every @poll_interval_ms. On read errors, applies exponential backoff.
+
+    The GenServer owns the I2C bus reference. It opens at init and closes at terminate.
+    """
+    use GenServer
+    require Logger
+    alias Circuits.I2C
+
+    @bme280_addr      0x76
+    @poll_interval_ms 5_000
+    @max_backoff_ms   60_000
+
+    @spec start_link(keyword()) :: GenServer.on_start()
+    def start_link(opts) do
+      bus     = Keyword.get(opts, :bus, "i2c-1")
+      address = Keyword.get(opts, :address, @bme280_addr)
+      GenServer.start_link(__MODULE__, {bus, address}, name: __MODULE__)
+    end
+
+    @spec current_reading() :: map() | nil
+    def current_reading, do: ApiGateway.Sensor.Store.latest()
+
+    @impl true
+    def init({bus, address}) do
+      {:ok, bus_ref} = I2C.open(bus)
+
+      I2C.write(bus_ref, address, <<0xF2, 0x01>>)
+      I2C.write(bus_ref, address, <<0xF4, 0x27>>)
+
+      schedule_poll(@poll_interval_ms)
+
+      {:ok, %{bus_ref: bus_ref, address: address, error_count: 0}}
+    end
+
+    @impl true
+    def handle_info(:poll, state) do
+      case read_sensor(state.bus_ref, state.address) do
+        {:ok, reading} ->
+          ApiGateway.Sensor.Store.insert(reading)
+          schedule_poll(@poll_interval_ms)
+          {:noreply, %{state | error_count: 0}}
+
+        {:error, reason} ->
+          Logger.warning("BME280 read failed: #{inspect(reason)}")
+          backoff = min(@poll_interval_ms * Integer.pow(2, state.error_count), @max_backoff_ms)
+          schedule_poll(backoff)
+          {:noreply, %{state | error_count: state.error_count + 1}}
+      end
+    end
+
+    @impl true
+    def terminate(_reason, state) do
+      I2C.close(state.bus_ref)
+    end
+
+    defp schedule_poll(ms), do: Process.send_after(self(), :poll, ms)
+
+    defp read_sensor(bus_ref, address) do
+      with {:ok, t_raw}  <- I2C.write_read(bus_ref, address, <<0xFA>>, 3),
+           {:ok, h_raw}  <- I2C.write_read(bus_ref, address, <<0xFD>>, 2),
+           {:ok, p_raw}  <- I2C.write_read(bus_ref, address, <<0xF7>>, 3) do
+        reading = %{
+          temperature_c: decode_temp(t_raw),
+          humidity_pct:  decode_hum(h_raw),
+          pressure_hpa:  decode_press(p_raw),
+          timestamp:     DateTime.utc_now()
+        }
+        {:ok, reading}
+      end
+    end
+
+    defp decode_temp(<<msb, lsb, xlsb>>),
+      do: ((msb <<< 12) ||| (lsb <<< 4) ||| (xlsb >>> 4)) / 5120.0
+
+    defp decode_hum(<<msb, lsb>>),
+      do: ((msb <<< 8) ||| lsb) / 1024.0
+
+    defp decode_press(<<msb, lsb, xlsb>>),
+      do: ((msb <<< 12) ||| (lsb <<< 4) ||| (xlsb >>> 4)) / 25_600.0
+  end
+
+  defmodule ApiGateway.Indicator.LED do
+    end
+    @moduledoc """
+    Controls the status LED on GPIO pin 18.
+
+    Blink patterns:
+      :healthy  — 500ms on/off (1 Hz)
+      :warning  — 100ms on/off (5 Hz)
+      :off      — solid off
+    """
+    use GenServer
+    alias Circuits.GPIO
+
+    @pin 18
+
+    @spec start_link(keyword()) :: GenServer.on_start()
+    def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+
+    @spec set_mode(:healthy | :warning | :off) :: :ok
+    def set_mode(mode) when mode in [:healthy, :warning, :off] do
+      GenServer.cast(__MODULE__, {:set_mode, mode})
+    end
+
+    @spec status() :: map()
+    def status, do: GenServer.call(__MODULE__, :status)
+
+    @impl true
+    def init(_opts) do
+      {:ok, gpio} = GPIO.open(@pin, :output)
+      GPIO.write(gpio, 0)
+      state = %{gpio: gpio, mode: :healthy, level: 0, timer: nil}
+      {:ok, schedule_blink(state)}
+    end
+
+    @impl true
+    def handle_info(:blink, %{mode: :off} = state) do
+      GPIO.write(state.gpio, 0)
+      {:noreply, %{state | level: 0}}
+    end
+
+    def handle_info(:blink, state) do
+      new_level = 1 - state.level
+      GPIO.write(state.gpio, new_level)
+      {:noreply, schedule_blink(%{state | level: new_level})}
+    end
+
+    @impl true
+    def handle_cast({:set_mode, mode}, state) do
+      cancel_timer(state.timer)
+      GPIO.write(state.gpio, 0)
+      {:noreply, schedule_blink(%{state | mode: mode, level: 0, timer: nil})}
+    end
+
+    @impl true
+    def handle_call(:status, _from, state) do
+      {:reply, %{mode: state.mode, level: state.level, pin: @pin}, state}
+    end
+
+    @impl true
+    def terminate(_reason, state) do
+      cancel_timer(state.timer)
+      GPIO.write(state.gpio, 0)
+      GPIO.close(state.gpio)
+    end
+
+    defp interval(:healthy), do: 500
+    defp interval(:warning), do: 100
+    defp interval(:off),     do: 60_000
+
+    defp schedule_blink(state) do
+      timer = Process.send_after(self(), :blink, interval(state.mode))
+      %{state | timer: timer}
+    end
+
+    defp cancel_timer(nil), do: :ok
+    defp cancel_timer(ref), do: Process.cancel_timer(ref)
+  end
+
+  defmodule ApiGateway.DeviceAPI do
+    end
+    @moduledoc """
+    Local HTTP API for the edge gateway device.
+    Exposes sensor readings and device system info.
+    """
+    use Plug.Router
+    import Plug.Conn
+
+    plug :match
+    plug Plug.Parsers, parsers: [:json], json_decoder: Jason
+    plug :dispatch
+
+    get "/sensor/current" do
+      case ApiGateway.Sensor.Store.latest() do
+        nil     -> json(conn, 503, %{error: "no readings yet"})
+        reading -> json(conn, 200, reading)
+      end
+    end
+
+    get "/sensor/history" do
+      conn = fetch_query_params(conn)
+      n = conn.query_params["n"] |> parse_int(10)
+      json(conn, 200, ApiGateway.Sensor.Store.history(n))
+    end
+
+    match _ do
+      json(conn, 404, %{error: "not found"})
+    end
+
+    defp json(conn, status, body) do
+      conn
+      |> put_resp_content_type("application/json")
+      |> send_resp(status, Jason.encode!(normalize_for_json(body)))
+    end
+
+    defp normalize_for_json(%DateTime{} = dt), do: DateTime.to_iso8601(dt)
+    defp normalize_for_json(%{timestamp: %DateTime{} = ts} = r),
+      do: Map.put(r, :timestamp, DateTime.to_iso8601(ts))
+    defp normalize_for_json(list) when is_list(list), do: Enum.map(list, &normalize_for_json/1)
+    defp normalize_for_json(other), do: other
+
+    defp parse_int(nil, default), do: default
+    defp parse_int(s, default) do
+      case Integer.parse(s) do
+        {n, ""} when n > 0 -> min(n, 100)
+        _                  -> default
+      end
+    end
+  end
+
+  defmodule ApiGateway.Application do
+    @moduledoc """
+    Target-aware application that starts hardware-dependent children
+    only when running on a Nerves device, not during host-based tests.
+    """
+    use Application
+    require Logger
+
+    @impl true
+    def start(_type, _args) do
+      children = children(target())
+      Supervisor.start_link(children, strategy: :one_for_one, name: ApiGateway.Supervisor)
+    end
+
+    # On the host (dev/test): no GPIO, no I2C — business logic only
+    defp children(:host) do
+      [ApiGateway.Sensor.Store]
+    end
+
+    defp children(_target) do
+      Logger.info("Starting edge gateway on #{target()}")
+      [
+        ApiGateway.Sensor.Store,
+        ApiGateway.Indicator.LED,
+        {ApiGateway.Sensor.BME280, [bus: "i2c-1", address: 0x76]},
+        {Plug.Cowboy, scheme: :http, plug: ApiGateway.DeviceAPI, options: [port: 4000]}
+      ]
+    end
+
+    defp target do
+      Application.get_env(:api_gateway, :target, Mix.target())
+    end
+  end
+
+  # test/api_gateway/sensor_store_test.exs
+  defmodule ApiGateway.Sensor.StoreTest do
+    use ExUnit.Case, async: false
+
+    setup do
+      start_supervised!(ApiGateway.Sensor.Store)
       :ok
+    end
+
+    describe "ApiGateway.Sensor.Store" do
+      test "latest returns nil with empty store" do
+        assert ApiGateway.Sensor.Store.latest() == nil
+      end
+
+      test "insert and latest" do
+        reading = %{temperature_c: 22.5, humidity_pct: 60.0, pressure_hpa: 1013.2}
+        ApiGateway.Sensor.Store.insert(reading)
+        assert ApiGateway.Sensor.Store.latest() == reading
+      end
+
+      test "history returns newest first" do
+        for i <- 1..5 do
+          ApiGateway.Sensor.Store.insert(%{temperature_c: i * 1.0})
+          Process.sleep(1)
+        end
+
+        history = ApiGateway.Sensor.Store.history(3)
+        assert length(history) == 3
+        assert hd(history).temperature_c == 5.0
+      end
+
+      test "eviction keeps store at max 100 entries" do
+        for i <- 1..110 do
+          ApiGateway.Sensor.Store.insert(%{temperature_c: i * 1.0})
+        end
+
+        Process.sleep(20)
+        assert length(ApiGateway.Sensor.Store.history(200)) <= 100
+      end
+    end
+  end
+
+  defmodule Main do
+    def main do
+        # Demonstrating 63-nerves-iot-embedded
+        :ok
+    end
+  end
+
+  Main.main()
+  end
+  end
+  end
+  end
+  end
+  end
+  end
+  end
+  end
+  end
+  end
+  end
+  end
   end
 end
 
 Main.main()
-end
-end
-end
-end
-end
-end
-end
-end
-end
-end
-end
-end
-end
-end
 ```

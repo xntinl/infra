@@ -469,17 +469,19 @@ Phoenix.PubSub partitions topics across a pool of processes, allowing horizontal
 ## Executable Example
 
 ```elixir
-defp deps do
-  [
-    {:plug_cowboy, "~> 2.7"},
-    {:jason, "~> 1.4"}
-  ]
-end
-
 defmodule Main do
-  def main do
-      # Demonstrating 58-plug-router-api
-      :ok
+  defp deps do
+    [
+      {:plug_cowboy, "~> 2.7"},
+      {:jason, "~> 1.4"}
+    ]
+  end
+
+  defmodule Main do
+    def main do
+        # Demonstrating 58-plug-router-api
+        :ok
+    end
   end
 end
 

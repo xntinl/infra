@@ -428,13 +428,10 @@ tuples per key — "the" counter is ambiguous. OTP will raise.
 
 ---
 
-## Executable Example
-
-Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
-
 ```elixir
 defmodule Main do
-  defmodule EtsCountersDemo do
+  import ExUnit.Assertions
+
     @moduledoc """
     Three flavors of counter:
 

@@ -435,54 +435,56 @@ checkout protocol changes would support least-loaded without a global coordinato
 ## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # No external dependencies — pure Elixir
-  ]
-end
-
-defmodule MlInference.MixProject do
-  end
-  use Mix.Project
-
-  def project do
+defmodule Main do
+  defp deps do
     [
-      app: :ml_inference,
-      version: "0.1.0",
-      elixir: "~> 1.17",
-      deps: [
-        {:erlport, "~> 0.11"}
-      ]
+      # No external dependencies — pure Elixir
     ]
   end
 
-  def application,
-    do: [extra_applications: [:logger], mod: {MlInference.Application, []}]
-end
+  defmodule MlInference.MixProject do
+    end
+    use Mix.Project
+
+    def project do
+      [
+        app: :ml_inference,
+        version: "0.1.0",
+        elixir: "~> 1.17",
+        deps: [
+          {:erlport, "~> 0.11"}
+        ]
+      ]
+    end
+
+    def application,
+      do: [extra_applications: [:logger], mod: {MlInference.Application, []}]
+  end
 
 
-Empty `priv/python/__init__.py` makes it an importable package.
+  Empty `priv/python/__init__.py` makes it an importable package.
 
-### Step 2: Worker GenServer (`lib/ml_inference/worker.ex`)
+  ### Step 2: Worker GenServer (`lib/ml_inference/worker.ex`)
 
-**Objective**: Own long-lived interpreter per worker and warm it so first prediction call skips import cost.
-
-
-
-### Step 3: Pool (`lib/ml_inference/pool.ex`)
-
-**Objective**: Round-robin workers so Python calls parallelize across schedulers without per-request interpreter spin-up.
+  **Objective**: Own long-lived interpreter per worker and warm it so first prediction call skips import cost.
 
 
 
-### Step 4: Application supervision
+  ### Step 3: Pool (`lib/ml_inference/pool.ex`)
 
-**Objective**: Boot pool so interpreter crashes are isolated to their workers and peers survive.
+  **Objective**: Round-robin workers so Python calls parallelize across schedulers without per-request interpreter spin-up.
 
-defmodule Main do
-  def main do
-      # Demonstrating 327-erlport-python-bridge
-      :ok
+
+
+  ### Step 4: Application supervision
+
+  **Objective**: Boot pool so interpreter crashes are isolated to their workers and peers survive.
+
+  defmodule Main do
+    def main do
+        # Demonstrating 327-erlport-python-bridge
+        :ok
+    end
   end
 end
 

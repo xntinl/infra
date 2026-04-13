@@ -377,13 +377,10 @@ time (which is usually nothing useful).
 
 ---
 
-## Executable Example
-
-Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
-
 ```elixir
 defmodule Main do
-  defmodule SafeInject do
+  import ExUnit.Assertions
+
     @moduledoc """
     Two versions of the same macro, `log_twice/1`, contrasting raw
     `unquote` with `bind_quoted`.

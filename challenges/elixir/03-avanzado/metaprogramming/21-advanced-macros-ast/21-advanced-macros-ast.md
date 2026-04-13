@@ -173,6 +173,7 @@ defmodule AstSurgeon.MixProject do
     [{:telemetry, "~> 1.2"}, {:benchee, "~> 1.3", only: :dev}]
   end
 end
+end
 ```
 
 ### Step 2: `lib/ast_surgeon/traced_http.ex` — the runtime target

@@ -144,19 +144,6 @@ defp deps do
 end
 ```
 
-### Dependencies (mix.exs)
-
-```elixir
-```elixir
-def handle_cast(:touch, state) do
-  {:noreply, state, @idle_ms}       # arm
-end
-
-def handle_info(:timeout, state) do  # fires if mailbox is silent for @idle_ms
-  {:stop, :idle, state}
-end
-```
-
 OTP stores the timeout internally; it is not a `Process.send_after` call. Every subsequent callback either re-arms it (by including a timeout in the return) or disables it (by omitting it). No refs, no leaks.
 
 ### 2. Why the 5th-element timeout is not a heartbeat
@@ -226,15 +213,6 @@ Linux TCP keepalive defaults to 2 h idle + 75 s interval × 9 probes — detecti
 ---
 
 ## Implementation
-
-### Dependencies (`mix.exs`)
-
-```elixir
-defp deps do
-  []
-end
-```
-
 
 ### Step 1: `mix.exs`
 
@@ -540,38 +518,40 @@ Target: peer-death detection p99 ≤ `@ping_ms + @pong_ms + 200 ms` (= 7.2 s wit
 ## Executable Example
 
 ```elixir
-defp deps do
-  []
-end
-
-
-
-OTP stores the timeout internally; it is not a `Process.send_after` call. Every subsequent callback either re-arms it (by including a timeout in the return) or disables it (by omitting it). No refs, no leaks.
-
-### 2. Why the 5th-element timeout is not a heartbeat
-
-If *any* message arrives — a telemetry probe, a debug ping, a spurious `:DOWN` from an unrelated monitor — the timeout resets. The process thinks it is "active" even though no real work has occurred. You need a separate mechanism that measures peer liveness, not mailbox activity.
-
-
-
-### 3. Heartbeat pattern
-
-
-
-A separate `:pong_deadline` timer fires only if the peer does not respond within `@pong_ms`. The `:send_ping` timer triggers the next ping after `@ping_ms`. Two timers; `Process.cancel_timer/2` cleans up the deadline when a pong arrives.
-
-### 4. Interaction with the 5th-element timeout
-
-This is where most implementations break. If you return `{:noreply, state, @idle_ms}` after every heartbeat-related callback, the heartbeat traffic itself resets the inactivity timer and the process never dies from client inactivity. The fix is to separate concerns: use the heartbeat to kill on peer silence, and use the 5th-element timeout only for a truly orthogonal condition (e.g. "no client-initiated action in 30 min" vs. "no pong in 10 s").
-
-### 5. `Process.cancel_timer/2` semantics
-
-`Process.cancel_timer/2` returns the milliseconds remaining or `false` if the timer already fired. If it already fired, the message is sitting in the mailbox. You must consume it:
-
 defmodule Main do
-  def main do
-      # Demonstrating 03-genserver-timeouts-and-heartbeats
-      :ok
+  defp deps do
+    []
+  end
+
+
+
+  OTP stores the timeout internally; it is not a `Process.send_after` call. Every subsequent callback either re-arms it (by including a timeout in the return) or disables it (by omitting it). No refs, no leaks.
+
+  ### 2. Why the 5th-element timeout is not a heartbeat
+
+  If *any* message arrives — a telemetry probe, a debug ping, a spurious `:DOWN` from an unrelated monitor — the timeout resets. The process thinks it is "active" even though no real work has occurred. You need a separate mechanism that measures peer liveness, not mailbox activity.
+
+
+
+  ### 3. Heartbeat pattern
+
+
+
+  A separate `:pong_deadline` timer fires only if the peer does not respond within `@pong_ms`. The `:send_ping` timer triggers the next ping after `@ping_ms`. Two timers; `Process.cancel_timer/2` cleans up the deadline when a pong arrives.
+
+  ### 4. Interaction with the 5th-element timeout
+
+  This is where most implementations break. If you return `{:noreply, state, @idle_ms}` after every heartbeat-related callback, the heartbeat traffic itself resets the inactivity timer and the process never dies from client inactivity. The fix is to separate concerns: use the heartbeat to kill on peer silence, and use the 5th-element timeout only for a truly orthogonal condition (e.g. "no client-initiated action in 30 min" vs. "no pong in 10 s").
+
+  ### 5. `Process.cancel_timer/2` semantics
+
+  `Process.cancel_timer/2` returns the milliseconds remaining or `false` if the timer already fired. If it already fired, the message is sitting in the mailbox. You must consume it:
+
+  defmodule Main do
+    def main do
+        # Demonstrating 03-genserver-timeouts-and-heartbeats
+        :ok
+    end
   end
 end
 

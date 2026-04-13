@@ -355,6 +355,7 @@ explicit traversal functions (`walk_bfs/1`, `walk_dfs/1`) instead.
 Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
 
 ```elixir
+defmodule Main do
 defmodule Bag do
   @moduledoc """
   A multiset: each element is stored with a positive integer count. Order is
@@ -479,6 +480,9 @@ assert Enum.member?(accumulated, :b)
 
 IO.puts("Enum.into on non-empty bag accumulated correctly")
 IO.puts("All Enumerable & Collectable assertions passed!")
+end
+
+Main.main()
 ```
 
 

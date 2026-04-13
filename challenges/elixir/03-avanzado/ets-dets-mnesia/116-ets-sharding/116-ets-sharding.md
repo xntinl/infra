@@ -467,246 +467,250 @@ with cross-key transactions. Sharding is an optimization for known contention �
 ## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # No external dependencies — pure Elixir
-  ]
-end
-
-defmodule EtsSharding.MixProject do
-  end
-  use Mix.Project
-
-  def project do
-    [app: :ets_sharding, version: "0.1.0", elixir: "~> 1.16", deps: deps()]
-  end
-
-  def application, do: [extra_applications: [:logger], mod: {EtsSharding.Application, []}]
-
-  defp deps, do: [{:benchee, "~> 1.3", only: [:dev, :test]}]
-end
-
-defmodule EtsSharding.Application do
-  end
-  @moduledoc false
-  use Application
-
-  @impl true
-  def start(_type, _args) do
-    shards = System.schedulers_online() |> next_power_of_two()
-
-    children = [
-      {EtsSharding.ShardedStore, [name: :default_store, shards: shards]}
+defmodule Main do
+  defp deps do
+    [
+      # No external dependencies — pure Elixir
     ]
-
-    Supervisor.start_link(children, strategy: :one_for_one, name: EtsSharding.Supervisor)
   end
 
-  defp next_power_of_two(n) when n <= 1, do: 1
-  defp next_power_of_two(n), do: trunc(:math.pow(2, :math.ceil(:math.log2(n))))
-end
-
-defmodule EtsSharding.ShardedStore do
-  @moduledoc """
-  A key-value store backed by N ETS tables routed by `:erlang.phash2(key, N)`.
-
-  The GenServer owns all shard tables (if it dies, every shard dies with it).
-  Reads and writes go directly to ETS — the GenServer is only the table owner
-  and configuration holder.
-  """
-  use GenServer
-
-  @type store :: atom()
-
-  # ---- Public API ---------------------------------------------------------
-
-  def start_link(opts) do
-    name = Keyword.fetch!(opts, :name)
-    GenServer.start_link(__MODULE__, opts, name: name)
-  end
-
-  @spec put(store(), term(), term()) :: :ok
-  def put(store, key, value) do
-    :ets.insert(shard_for(store, key), {key, value})
-    :ok
-  end
-
-  @spec get(store(), term()) :: {:ok, term()} | :miss
-  def get(store, key) do
-    case :ets.lookup(shard_for(store, key), key) do
-      [{^key, v}] -> {:ok, v}
-      [] -> :miss
+  defmodule EtsSharding.MixProject do
     end
+    use Mix.Project
+
+    def project do
+      [app: :ets_sharding, version: "0.1.0", elixir: "~> 1.16", deps: deps()]
+    end
+
+    def application, do: [extra_applications: [:logger], mod: {EtsSharding.Application, []}]
+
+    defp deps, do: [{:benchee, "~> 1.3", only: [:dev, :test]}]
   end
 
-  @spec delete(store(), term()) :: :ok
-  def delete(store, key) do
-    :ets.delete(shard_for(store, key), key)
-    :ok
+  defmodule EtsSharding.Application do
+    end
+    @moduledoc false
+    use Application
+
+    @impl true
+    def start(_type, _args) do
+      shards = System.schedulers_online() |> next_power_of_two()
+
+      children = [
+        {EtsSharding.ShardedStore, [name: :default_store, shards: shards]}
+      ]
+
+      Supervisor.start_link(children, strategy: :one_for_one, name: EtsSharding.Supervisor)
+    end
+
+    defp next_power_of_two(n) when n <= 1, do: 1
+    defp next_power_of_two(n), do: trunc(:math.pow(2, :math.ceil(:math.log2(n))))
   end
 
-  @spec size(store()) :: non_neg_integer()
-  def size(store) do
-    {_n, tables} = config(store)
-    Enum.reduce(tables, 0, fn t, acc -> acc + :ets.info(t, :size) end)
-  end
+  defmodule EtsSharding.ShardedStore do
+    @moduledoc """
+    A key-value store backed by N ETS tables routed by `:erlang.phash2(key, N)`.
 
-  @doc """
-  Returns all `{key, value}` pairs across all shards. O(total_size).
-  Use sparingly — full scans defeat the point of sharding for reads.
-  """
-  @spec all(store()) :: [{term(), term()}]
-  def all(store) do
-    {_n, tables} = config(store)
-    Enum.flat_map(tables, &:ets.tab2list/1)
-  end
+    The GenServer owns all shard tables (if it dies, every shard dies with it).
+    Reads and writes go directly to ETS — the GenServer is only the table owner
+    and configuration holder.
+    """
+    use GenServer
 
-  # ---- GenServer ----------------------------------------------------------
+    @type store :: atom()
 
-  @impl true
-  def init(opts) do
-    name = Keyword.fetch!(opts, :name)
-    n = Keyword.fetch!(opts, :shards)
+    # ---- Public API ---------------------------------------------------------
 
-    tables =
-      for i <- 0..(n - 1) do
-        :ets.new(shard_table(name, i), [
-          :named_table, :public, :set,
-          read_concurrency: true,
-          write_concurrency: :auto,
-          decentralized_counters: true
-        ])
+    def start_link(opts) do
+      name = Keyword.fetch!(opts, :name)
+      GenServer.start_link(__MODULE__, opts, name: name)
+    end
+
+    @spec put(store(), term(), term()) :: :ok
+    def put(store, key, value) do
+      :ets.insert(shard_for(store, key), {key, value})
+      :ok
+    end
+
+    @spec get(store(), term()) :: {:ok, term()} | :miss
+    def get(store, key) do
+      case :ets.lookup(shard_for(store, key), key) do
+        [{^key, v}] -> {:ok, v}
+        [] -> :miss
       end
-
-    :persistent_term.put({__MODULE__, name}, {n, tables})
-
-    {:ok, %{name: name, n: n, tables: tables}}
-  end
-
-  # ---- helpers ------------------------------------------------------------
-
-  defp config(store), do: :persistent_term.get({__MODULE__, store})
-
-  defp shard_for(store, key) do
-    {n, _tables} = config(store)
-    shard_table(store, :erlang.phash2(key, n))
-  end
-
-  defp shard_table(store, i), do: :"#{store}_shard_#{i}"
-end
-
-alias EtsSharding.ShardedStore
-
-# Baseline: one fat table with best-possible concurrency flags
-:ets.new(:baseline, [
-  :named_table, :public, :set,
-  write_concurrency: :auto, read_concurrency: true, decentralized_counters: true
-])
-
-Benchee.run(
-  %{
-    "single table write" => fn ->
-      k = :rand.uniform(1_000_000)
-      :ets.insert(:baseline, {k, k})
-    end,
-    "sharded write (N=#{System.schedulers_online()})" => fn ->
-      k = :rand.uniform(1_000_000)
-      ShardedStore.put(:default_store, k, k)
     end
-  },
-  parallel: System.schedulers_online(),
-  time: 4,
-  warmup: 2
-)
 
-defmodule EtsSharding.ShardedStoreTest do
+    @spec delete(store(), term()) :: :ok
+    def delete(store, key) do
+      :ets.delete(shard_for(store, key), key)
+      :ok
+    end
+
+    @spec size(store()) :: non_neg_integer()
+    def size(store) do
+      {_n, tables} = config(store)
+      Enum.reduce(tables, 0, fn t, acc -> acc + :ets.info(t, :size) end)
+    end
+
+    @doc """
+    Returns all `{key, value}` pairs across all shards. O(total_size).
+    Use sparingly — full scans defeat the point of sharding for reads.
+    """
+    @spec all(store()) :: [{term(), term()}]
+    def all(store) do
+      {_n, tables} = config(store)
+      Enum.flat_map(tables, &:ets.tab2list/1)
+    end
+
+    # ---- GenServer ----------------------------------------------------------
+
+    @impl true
+    def init(opts) do
+      name = Keyword.fetch!(opts, :name)
+      n = Keyword.fetch!(opts, :shards)
+
+      tables =
+        for i <- 0..(n - 1) do
+          :ets.new(shard_table(name, i), [
+            :named_table, :public, :set,
+            read_concurrency: true,
+            write_concurrency: :auto,
+            decentralized_counters: true
+          ])
+        end
+
+      :persistent_term.put({__MODULE__, name}, {n, tables})
+
+      {:ok, %{name: name, n: n, tables: tables}}
+    end
+
+    # ---- helpers ------------------------------------------------------------
+
+    defp config(store), do: :persistent_term.get({__MODULE__, store})
+
+    defp shard_for(store, key) do
+      {n, _tables} = config(store)
+      shard_table(store, :erlang.phash2(key, n))
+    end
+
+    defp shard_table(store, i), do: :"#{store}_shard_#{i}"
   end
-  use ExUnit.Case, async: false
 
   alias EtsSharding.ShardedStore
 
-  @store :test_store
+  # Baseline: one fat table with best-possible concurrency flags
+  :ets.new(:baseline, [
+    :named_table, :public, :set,
+    write_concurrency: :auto, read_concurrency: true, decentralized_counters: true
+  ])
 
-  setup do
-    stop_if_started(@store)
-    start_supervised!({ShardedStore, [name: @store, shards: 4]})
-    :ok
-  end
+  Benchee.run(
+    %{
+      "single table write" => fn ->
+        k = :rand.uniform(1_000_000)
+        :ets.insert(:baseline, {k, k})
+      end,
+      "sharded write (N=#{System.schedulers_online()})" => fn ->
+        k = :rand.uniform(1_000_000)
+        ShardedStore.put(:default_store, k, k)
+      end
+    },
+    parallel: System.schedulers_online(),
+    time: 4,
+    warmup: 2
+  )
 
-  defp stop_if_started(name) do
-    case Process.whereis(name) do
-      nil -> :ok
-      pid -> GenServer.stop(pid, :normal, 1_000)
+  defmodule EtsSharding.ShardedStoreTest do
     end
-  end
+    use ExUnit.Case, async: false
 
-  describe "put/get/delete" do
-    test "basic round-trip" do
-      ShardedStore.put(@store, "user:1", %{name: "ada"})
-      assert {:ok, %{name: "ada"}} = ShardedStore.get(@store, "user:1")
-    end
+    alias EtsSharding.ShardedStore
 
-    test "miss returns :miss" do
-      assert :miss = ShardedStore.get(@store, "nope")
-    end
+    @store :test_store
 
-    test "delete removes the entry" do
-      ShardedStore.put(@store, :k, 1)
-      ShardedStore.delete(@store, :k)
-      assert :miss = ShardedStore.get(@store, :k)
-    end
-  end
-
-  describe "sharding distribution" do
-  end
-    test "keys spread across all shards" do
-  end
-      for i <- 1..1_000, do: ShardedStore.put(@store, {:k, i}, i)
-
-      sizes = for i <- 0..3, do: :ets.info(:"#{@store}_shard_#{i}", :size)
-      # Chi-squared-ish sanity: every shard has at least 100 entries in a 4-way
-      # distribution of 1000 uniform keys
-      assert Enum.all?(sizes, &(&1 > 100))
-      assert Enum.sum(sizes) == 1_000
-    end
-  end
-
-  describe "cross-shard operations" do
-  end
-    test "size/1 returns total across shards" do
-  end
-      for i <- 1..50, do: ShardedStore.put(@store, i, :v)
-      assert ShardedStore.size(@store) == 50
+    setup do
+      stop_if_started(@store)
+      start_supervised!({ShardedStore, [name: @store, shards: 4]})
+      :ok
     end
 
-    test "all/1 returns every pair across shards" do
-      for i <- 1..10, do: ShardedStore.put(@store, i, i * 10)
-      pairs = ShardedStore.all(@store) |> Enum.sort()
-      assert pairs == for(i <- 1..10, do: {i, i * 10})
+    defp stop_if_started(name) do
+      case Process.whereis(name) do
+        nil -> :ok
+        pid -> GenServer.stop(pid, :normal, 1_000)
+      end
     end
-  end
 
-  describe "concurrent writes" do
-    test "never loses updates under 8 writers" do
-      tasks = for w <- 0..7 do
-        Task.async(fn ->
-          for i <- 1..2_000, do: ShardedStore.put(@store, {w, i}, i)
-        end)
+    describe "put/get/delete" do
+      test "basic round-trip" do
+        ShardedStore.put(@store, "user:1", %{name: "ada"})
+        assert {:ok, %{name: "ada"}} = ShardedStore.get(@store, "user:1")
       end
 
-      Task.await_many(tasks, 10_000)
-      assert ShardedStore.size(@store) == 8 * 2_000
+      test "miss returns :miss" do
+        assert :miss = ShardedStore.get(@store, "nope")
+      end
+
+      test "delete removes the entry" do
+        ShardedStore.put(@store, :k, 1)
+        ShardedStore.delete(@store, :k)
+        assert :miss = ShardedStore.get(@store, :k)
+      end
+    end
+
+    describe "sharding distribution" do
+    end
+      test "keys spread across all shards" do
+    end
+        for i <- 1..1_000, do: ShardedStore.put(@store, {:k, i}, i)
+
+        sizes = for i <- 0..3, do: :ets.info(:"#{@store}_shard_#{i}", :size)
+        # Chi-squared-ish sanity: every shard has at least 100 entries in a 4-way
+        # distribution of 1000 uniform keys
+        assert Enum.all?(sizes, &(&1 > 100))
+        assert Enum.sum(sizes) == 1_000
+      end
+    end
+
+    describe "cross-shard operations" do
+    end
+      test "size/1 returns total across shards" do
+    end
+        for i <- 1..50, do: ShardedStore.put(@store, i, :v)
+        assert ShardedStore.size(@store) == 50
+      end
+
+      test "all/1 returns every pair across shards" do
+        for i <- 1..10, do: ShardedStore.put(@store, i, i * 10)
+        pairs = ShardedStore.all(@store) |> Enum.sort()
+        assert pairs == for(i <- 1..10, do: {i, i * 10})
+      end
+    end
+
+    describe "concurrent writes" do
+      test "never loses updates under 8 writers" do
+        tasks = for w <- 0..7 do
+          Task.async(fn ->
+            for i <- 1..2_000, do: ShardedStore.put(@store, {w, i}, i)
+          end)
+        end
+
+        Task.await_many(tasks, 10_000)
+        assert ShardedStore.size(@store) == 8 * 2_000
+      end
     end
   end
-end
 
-defmodule Main do
-  def main do
-      # Demonstrating 116-ets-sharding
-      :ok
+  defmodule Main do
+    def main do
+        # Demonstrating 116-ets-sharding
+        :ok
+    end
+  end
+
+  Main.main()
   end
 end
 
 Main.main()
-end
 ```

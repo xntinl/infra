@@ -70,6 +70,38 @@ Breaking this cascade requires:
 
 ---
 
+## Project Structure
+
+```
+platform/
+├── lib/
+│   └── platform/
+│       ├── application.ex             # supervisor: gateway, coordinator, storage, queue, processor
+│       ├── gateway.ex                 # API server: auth, rate limit, circuit breaker
+│       ├── coordinator.ex             # state machine: accepts jobs, publishes events
+│       ├── storage.ex                 # in-memory KV with snapshots
+│       ├── queue.ex                   # job queue with priority and retry
+│       ├── processor.ex               # stream processor: consumes events
+│       ├── raft_simple.ex             # leader election (no log replication)
+│       ├── circuit_breaker.ex         # per-service failure handling
+│       ├── telemetry.ex               # metrics collection and sampling
+│       └── health_check.ex            # readiness and liveness probes
+├── test/
+│   └── platform/
+│       ├── gateway_test.exs           # rate limiting, auth, circuit breaker
+│       ├── coordinator_test.exs       # state consistency under concurrent loads
+│       ├── storage_test.exs           # snapshot correctness
+│       ├── queue_test.exs             # job ordering and retry logic
+│       ├── processor_test.exs         # event consumption and ordering
+│       ├── end_to_end_test.exs        # full request flow with failures
+│       └── fault_injection_test.exs   # cascading failure scenarios
+├── bench/
+│   └── platform_bench.exs             # throughput at 50k RPS
+├── simulation/
+│   └── chaos.ex                       # network partitions, delays, crashes
+└── mix.exs
+```
+
 ## Implementation milestones (abbreviated)
 
 ### Why ETS for the Gateway hot path

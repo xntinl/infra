@@ -131,16 +131,6 @@ defp deps do
 end
 ```
 
-### Dependencies (mix.exs)
-
-```elixir
-```elixir
-defp deps do
-  []
-end
-```
-
-
 ### Step 1: `mix.exs`
 
 **Objective**: Define OTP application with `mod: {Application, []}` so supervisor boot doesn't block on init/1 before handle_continue runs.
@@ -432,45 +422,47 @@ Target: `init/1` returns in < 5 ms regardless of DETS size; recovery throughput 
 ## Executable Example
 
 ```elixir
-defp deps do
-  []
-end
-
-
-
-
-### Step 1: `mix.exs`
-
-**Objective**: Define OTP application with `mod: {Application, []}` so supervisor boot doesn't block on init/1 before handle_continue runs.
-
-
-
-### Step 2: `lib/continue_recovery_gs/dets_store.ex`
-
-**Objective**: Abstract :dets file operations behind stable interface so recovery logic decouples from disk I/O serialization details.
-
-
-
-### Step 3: `lib/continue_recovery_gs/offsets.ex`
-
-**Objective**: Defer DETS hydration to handle_continue/2 with mailbox priority so supervisor boot + registration happen before recovery latency blocks callers.
-
-
-
-### Step 4: `lib/continue_recovery_gs/application.ex`
-
-**Objective**: Build supervision tree that binds worker lifecycle to DETS handle so termination always flushes final state before close.
-
-
-
-### Step 5: `test/continue_recovery_gs/recovery_test.exs`
-
-**Objective**: Assert init returns < 5ms (supervisor timeout) while handle_continue hydrates DETS independently, proving non-blocking boot.
-
 defmodule Main do
-  def main do
-      # Demonstrating 02-genserver-handle-continue-recovery
-      :ok
+  defp deps do
+    []
+  end
+
+
+
+
+  ### Step 1: `mix.exs`
+
+  **Objective**: Define OTP application with `mod: {Application, []}` so supervisor boot doesn't block on init/1 before handle_continue runs.
+
+
+
+  ### Step 2: `lib/continue_recovery_gs/dets_store.ex`
+
+  **Objective**: Abstract :dets file operations behind stable interface so recovery logic decouples from disk I/O serialization details.
+
+
+
+  ### Step 3: `lib/continue_recovery_gs/offsets.ex`
+
+  **Objective**: Defer DETS hydration to handle_continue/2 with mailbox priority so supervisor boot + registration happen before recovery latency blocks callers.
+
+
+
+  ### Step 4: `lib/continue_recovery_gs/application.ex`
+
+  **Objective**: Build supervision tree that binds worker lifecycle to DETS handle so termination always flushes final state before close.
+
+
+
+  ### Step 5: `test/continue_recovery_gs/recovery_test.exs`
+
+  **Objective**: Assert init returns < 5ms (supervisor timeout) while handle_continue hydrates DETS independently, proving non-blocking boot.
+
+  defmodule Main do
+    def main do
+        # Demonstrating 02-genserver-handle-continue-recovery
+        :ok
+    end
   end
 end
 

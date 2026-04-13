@@ -119,6 +119,34 @@ Mitigation: track `count` in the lease; only release on `count == 1`.
 
 ---
 
+## Project Structure
+
+```
+locksmith/
+├── lib/
+│   └── locksmith/
+│       ├── application.ex             # starts the lock manager cluster
+│       ├── lock_manager.ex            # quorum-based lock state machine
+│       ├── quorum.ex                  # quorum write/read logic
+│       ├── lease.ex                   # TTL tracking and renewal
+│       ├── watch.ex                   # subscriptions to lock state changes
+│       ├── fencing.ex                 # fencing tokens for safety
+│       ├── replication.ex             # replication across 3-node cluster
+│       ├── rpc.ex                     # inter-node RPC
+│       └── client.ex                  # public API: acquire, release, watch
+├── test/
+│   └── locksmith/
+│       ├── quorum_test.exs            # quorum correctness under partitions
+│       ├── lease_test.exs             # TTL expiration and renewal
+│       ├── watch_test.exs             # watchers notified on lock release
+│       ├── fencing_test.exs           # fencing tokens prevent stale holders
+│       ├── split_brain_test.exs       # partition scenarios
+│       └── linearizability_test.exs   # lock safety under concurrent clients
+├── bench/
+│   └── locksmith_bench.exs            # latency under contention
+└── mix.exs
+```
+
 ## Implementation milestones (abbreviated)
 
 ### Lease struct with epoch and fencing token

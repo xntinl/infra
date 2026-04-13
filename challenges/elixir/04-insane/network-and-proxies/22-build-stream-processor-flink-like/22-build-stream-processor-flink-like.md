@@ -69,6 +69,43 @@ You need to process a stream of events — clicks, transactions, sensor readings
 
 → Chose **B** because Flink's success is built on Chandy–Lamport; any serious stream processor needs this property and there's no simpler way to get it.
 
+## Full Project Directory Tree
+
+```
+flowex/
+├── lib/
+│   ├── flowex.ex                    # main module
+│   └── flowex/
+│       ├── application.ex           # OTP supervisor for framework
+│       ├── job.ex                   # DSL: define operator DAG, validate connectivity
+│       ├── runtime.ex               # job executor: topological sort, spawn workers
+│       ├── operator.ex              # worker GenServer: stateful, receives events, emits
+│       ├── window.ex                # tumbling, sliding, and session window semantics
+│       ├── watermark.ex             # watermark propagation, late event handling
+│       ├── checkpoint.ex            # coordinator: Chandy-Lamport barrier injection, snapshots
+│       ├── state_backend.ex         # operator state storage: ETS + DETS for durability
+│       ├── backpressure.ex          # credit-based flow control between operators
+│       ├── sources/
+│       │   └── injected.ex          # test source that receives events via Runtime.inject
+│       └── sinks/
+│           ├── map_sink.ex          # collects output into ETS for verification
+│           └── noop.ex              # discards events (for throughput benchmarks)
+├── test/
+│   ├── flowex_test.exs              # integration smoke tests
+│   └── flowex/
+│       ├── job_test.exs             # DAG validation, topological sort
+│       ├── window_test.exs          # tumbling, sliding, session window semantics
+│       ├── watermark_test.exs       # late events, grace period, window firing
+│       ├── checkpoint_test.exs      # state snapshot, recovery correctness
+│       ├── exactly_once_test.exs    # replay without duplicate output
+│       ├── backpressure_test.exs    # no unbounded buffer growth under overload
+│       └── throughput_test.exs      # 1M events/second pipeline benchmark
+├── bench/
+│   └── flowex_bench.exs             # performance benchmarks: with/without checkpoints
+├── mix.exs                          # dependencies and config
+└── README.md
+```
+
 ## Implementation milestones
 
 ### Step 1: Create the project
@@ -629,65 +666,14 @@ Barriers are injected at sources and flow through operators; when an operator se
 ---
 
 
-## Main Entry Point
-
-```elixir
-def main do
-  IO.puts("======== 22-build-stream-processor-flink-like ========")
-  IO.puts("Build stream processor flink like")
-  IO.puts("")
-  
-  Flowex.Job.start_link([])
-  IO.puts("Flowex.Job started")
-  
-  IO.puts("Run: mix test")
-end
-```
-
-
-
-## Benchmark
-
-```elixir
-# bench/flowex_bench.exs
-job = Flowex.Job.new()
-  |> Flowex.Job.source(:source, Flowex.Sources.Injected, [])
-  |> Flowex.Job.filter(:filter, fn e -> e.value > 0 end)
-  |> Flowex.Job.map(:transform, fn e -> %{e | value: e.value * 2} end)
-  |> Flowex.Job.aggregate(:count, fn _key, acc -> (acc || 0) + 1 end)
-  |> Flowex.Job.sink(:sink, Flowex.Sinks.Noop, [])
-  |> Flowex.Job.edge(:source, :filter)
-  |> Flowex.Job.edge(:filter, :transform)
-  |> Flowex.Job.edge(:transform, :count)
-  |> Flowex.Job.edge(:count, :sink)
-
-{:ok, runtime} = Flowex.Runtime.start_link(job)
-
-Benchee.run(%{
-  "without_checkpoint" => fn ->
-    Enum.each(1..100_000, fn i ->
-      Flowex.Runtime.inject(runtime, :source, %{id: i, value: rem(i, 100), ts: i})
-    end)
-    Flowex.Runtime.flush(runtime)
-  end,
-  "with_checkpoint_every_10k" => fn ->
-    Enum.each(1..100_000, fn i ->
-      Flowex.Runtime.inject(runtime, :source, %{id: i, value: rem(i, 100), ts: i})
-      if rem(i, 10_000) == 0, do: Flowex.Checkpoint.trigger(runtime)
-    end)
-    Flowex.Runtime.flush(runtime)
-  end
-}, time: 10, warmup: 2)
-```
-
 ## Quick start
 
 ```bash
-# Start the application
+# Start the application and run tests
 mix deps.get
-mix test
+mix test test/flowex/ --trace
 
-# Or run the benchmark:
+# Or run performance benchmarks:
 mix run bench/flowex_bench.exs
 ```
 
@@ -695,19 +681,69 @@ Target: 1M events/second through a 5-operator pipeline with 1-second checkpoints
 
 ---
 
-## Key Concepts: Streaming Topology and Event-Time Semantics
+## Benchmark
 
-Stream processing pipelines handle data in motion. Unlike batch processing, streams are unbounded and events arrive in real time (or out of order). The fundamental challenge is combining events across time windows without knowing when all events for a window have arrived.
+```elixir
+# bench/flowex_bench.exs
+job = Flowex.Job.new()
+  |> Flowex.Job.source(:source, Flowex.Sources.Injected, [])
+  |> Flowex.Job.filter(:filter, fn e -> e.value > 0 end, parallelism: 2)
+  |> Flowex.Job.map(:transform, fn e -> %{e | value: e.value * 2} end, parallelism: 2)
+  |> Flowex.Job.key_by(:keyed, fn e -> rem(e.id, 100) end)
+  |> Flowex.Job.aggregate(:count, fn _key, acc -> (acc || 0) + 1 end, parallelism: 4)
+  |> Flowex.Job.sink(:sink, Flowex.Sinks.Noop, [])
+  |> Flowex.Job.edge(:source, :filter)
+  |> Flowex.Job.edge(:filter, :transform)
+  |> Flowex.Job.edge(:transform, :keyed)
+  |> Flowex.Job.edge(:keyed, :count)
+  |> Flowex.Job.edge(:count, :sink)
 
-**Watermarks**: A watermark is a system assertion: "no event with timestamp earlier than W will arrive." When the watermark advances past a window's end time, the window closes and fires. Watermarks account for late events by maintaining a grace period — a small window after the watermark where late events are still allowed. Events arriving after the grace period are discarded or routed to a side output.
+{:ok, runtime} = Flowex.Runtime.start_link(job)
 
-**Event-time vs. Processing-time**: Events have two timestamps. Event-time is when the event occurred (from the data source). Processing-time is when the system observed the event. A banking system must window on event-time (transaction happened at 10 AM even if observed at 10:05 AM). A monitoring system may use processing-time. Windowing on the wrong timestamp produces incorrect results.
+events = for i <- 1..1_000_000, do: %{id: i, value: :rand.uniform(100), ts: i}
 
-**Exactly-once semantics**: Barriers flow through the DAG with events. When an operator receives barriers on all inputs, it snapshots its state and forwards the barrier downstream. On failure, restarting from the snapshot and replaying source offsets guarantees that each input contributes exactly once to the output — no duplicates, no losses.
+Benchee.run(%{
+  "baseline_no_checkpoint" => fn ->
+    Enum.each(events, fn e -> Flowex.Runtime.inject(runtime, :source, e) end)
+    Flowex.Runtime.flush(runtime)
+  end,
+  "with_checkpoint_every_100k" => fn ->
+    Enum.each(Enum.with_index(events), fn {e, idx} ->
+      Flowex.Runtime.inject(runtime, :source, e)
+      if rem(idx, 100_000) == 0 and idx > 0, do: Flowex.Checkpoint.trigger(runtime)
+    end)
+    Flowex.Runtime.flush(runtime)
+  end
+}, time: 10, warmup: 2, memory_time: 2)
+```
 
-**Credit-based backpressure**: Each operator grants credits (capacity) to its upstream. Upstream sends one event per credit. When downstream is slow, it stops granting credits, throttling the upstream without blocking or dropping events. This is more efficient than buffering unbounded queues.
+**Expected results** (on modern hardware):
+- Baseline no checkpoint: ~1.5M events/sec
+- With checkpoints every 100k: ~900k events/sec (checkpoint overhead ~40%)
+- Memory per operator state: ~1-5MB for 1M unique keys
 
-**Production insight**: Streaming systems are deceptively hard. Test with watermark skew (events from 5 different time ranges arriving simultaneously), operator crashes mid-window, and out-of-order delivery to expose real bugs.
+---
+
+## Key Concepts: Event-Time Windows and Chandy-Lamport Barriers
+
+**Event-time vs. Processing-time**: Each event carries an event timestamp (when it occurred in the source) and arrives at the system at processing time (now). A stock trade at 10:00 AM UTC may be received by the system at 10:05 AM UTC due to network lag. Windowing must use event-time for correctness (group trades by when they happened, not when they arrived). Processing-time windowing is acceptable only for monitoring where timeliness matters more than accuracy.
+
+**Watermarks and Grace Periods**: A watermark is a system assertion: "no event with event_time < W will arrive." When the watermark passes a window's end time, the window closes. A grace period (typically 1-5 minutes) allows late events to be included even after the window has fired. Events arriving after the grace period are discarded or routed to a side-output ("late events") for separate handling.
+
+**Barrier-based Exactly-Once Semantics**: Chandy-Lamport barriers inject a marker event into each source. When an operator receives the barrier on all inputs, it:
+1. Stops processing new events
+2. Flushes all pending state to disk
+3. Forwards the barrier downstream
+4. Resumes processing
+
+On failure, the system restarts from the last complete barrier, replays source offsets, and reprocesses events. Result: exactly-once (no duplicates, no loss).
+
+**Tumbling vs. Sliding vs. Session Windows**:
+- **Tumbling**: `[0, 60000), [60000, 120000), ...` — fixed, non-overlapping buckets
+- **Sliding**: `[0, 60000), [30000, 90000), [60000, 120000), ...` — overlapping by step size
+- **Session**: Windows merge when events arrive within gap_ms of each other (e.g., user session ends after 30min of inactivity)
+
+**Production insight**: Streaming is genuinely hard. Test watermark skew (events from 10 different times arriving simultaneously), operator crashes mid-barrier, and out-of-order delivery from multiple sources to expose real bugs that hidden by toy examples.
 
 ---
 
@@ -738,10 +774,40 @@ With millions of unique keys, creating one `Process.send_after` per key creates 
 **4. Credit exhaustion causing deadlock in cyclic DAGs**
 If the DAG has cycles, credit-based backpressure can deadlock. Validate that the job DAG is acyclic before starting.
 
+### ASCII Diagram: Barrier Flow Through DAG
+
+```
+Source 1       Filter         Map            Sink
+   │             │              │             │
+   │─event──────>│─event──────>│─event──────>│
+   │             │              │             │
+   │─event──────>│─event──────>│─event──────>│
+   │             │              │             │
+   │─◇ barrier──>│─◇ barrier──>│─◇ barrier──>│ [snapshot state]
+   │             │              │             │
+   │─event──────>│─event──────>│─event──────>│
+   │             │              │             │
+Source 2                           
+   │             
+   │─event──────>│                           
+   │             │                           
+   │─◇ barrier──>│ [wait for both inputs]   
+   │             │                           
+                  
+◇ = barrier; at each operator, barrier triggers snapshot
+```
+
 ## Reflection
 
-- If your sink isn't idempotent, what guarantee can you actually give? Map it to two-phase commit semantics.
-- At 10x the state size, would you switch from aligned to unaligned checkpoints? What does that cost you in replay correctness?
+1. **Non-idempotent sinks and exactly-once**: If your sink writes to a non-idempotent database (e.g., unconditional increment), what happens during replay? 
+   - Without idempotence: event replayed twice → count increases twice → data corruption
+   - Solution: idempotent writes require dedup keys. Example: sink stores `{event_id, checkpoint_id, result}`. On replay, INSERT OR IGNORE or upsert by event_id.
+   - Two-phase commit: prepare phase (lock row, check dedup key), commit phase (apply change). If preparing the same event twice, the second prepare sees the dedup key and aborts.
+
+2. **Checkpoint frequency and correctness**: With 10x state size (e.g., 5GB instead of 500MB), would you use unaligned checkpoints (each operator snapshots independently without barriers)?
+   - Aligned (your impl): every operator waits → simpler guarantee → pipeline stalls during checkpoint
+   - Unaligned: operators snapshot whenever → no stalls → but replay must handle out-of-order state recovery (harder to debug)
+   - Threshold: if state > 1GB and checkpoint takes > 10sec, unaligned is tempting. But unaligned breaks the guarantee that all operators see the same event boundary. Safer to scale horizontally (partition state) than switch to unaligned.
 
 ---
 

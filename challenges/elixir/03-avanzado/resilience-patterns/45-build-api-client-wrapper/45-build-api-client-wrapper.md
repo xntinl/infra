@@ -678,29 +678,31 @@ expose.
 ## Executable Example
 
 ```elixir
-defp deps do
-  [
-    {:finch, "~> 0.18"},
-    {:jason, "~> 1.4"},
-    {:telemetry, "~> 1.2"}
-  ]
-end
-
-
-
-Order matters: Telemetry outermost (captures everything including breaker
-rejections); CircuitBreaker before RateLimit (don't waste rate-limit tokens on
-a known-dead upstream); Retry inside both so retries are counted against the
-breaker and the rate limiter.
-
-### 3. Structured error taxonomy
-
-Returning `{:error, :something}` loses causal chain. We use a struct:
-
 defmodule Main do
-  def main do
-      # Demonstrating 45-build-api-client-wrapper
-      :ok
+  defp deps do
+    [
+      {:finch, "~> 0.18"},
+      {:jason, "~> 1.4"},
+      {:telemetry, "~> 1.2"}
+    ]
+  end
+
+
+
+  Order matters: Telemetry outermost (captures everything including breaker
+  rejections); CircuitBreaker before RateLimit (don't waste rate-limit tokens on
+  a known-dead upstream); Retry inside both so retries are counted against the
+  breaker and the rate limiter.
+
+  ### 3. Structured error taxonomy
+
+  Returning `{:error, :something}` loses causal chain. We use a struct:
+
+  defmodule Main do
+    def main do
+        # Demonstrating 45-build-api-client-wrapper
+        :ok
+    end
   end
 end
 

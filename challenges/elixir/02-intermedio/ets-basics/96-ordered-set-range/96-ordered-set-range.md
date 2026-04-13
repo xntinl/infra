@@ -382,13 +382,10 @@ is arbitrary and ad-hoc.
 
 ---
 
-## Executable Example
-
-Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
-
 ```elixir
 defmodule Main do
-  defmodule OrderedSetRange do
+  import ExUnit.Assertions
+
     @moduledoc """
     An event store keyed by integer timestamp. Uses `:ordered_set` so that
     `range/3` can use a match spec with `:ets.select/2` and touch only the

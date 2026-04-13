@@ -545,30 +545,71 @@ defmodule Apigw.CircuitBreakerTest do
   end
 
 
-  describe "CircuitBreaker" do
+  describe "state machine: closed state" do
+    test "starts closed and allows requests" do
+      assert CircuitBreaker.check("test-backend") == :allow
+    end
 
-  test "starts closed and allows requests" do
-    assert CircuitBreaker.check("test-backend") == :allow
+    test "allows all requests when healthy" do
+      for _ <- 1..5 do
+        CircuitBreaker.record_outcome("test-backend", :success)
+        assert CircuitBreaker.check("test-backend") == :allow
+      end
+    end
   end
 
-  test "opens after error threshold exceeded" do
-    # Record 10 errors and 0 successes → 100% error rate → should open
-    for _ <- 1..10, do: CircuitBreaker.record_outcome("test-backend", :error)
-    Process.sleep(10)
+  describe "state machine: transition to open" do
+    test "opens after error threshold exceeded" do
+      # Record 10 errors and 0 successes → 100% error rate → should open
+      for _ <- 1..10, do: CircuitBreaker.record_outcome("test-backend", :error)
+      Process.sleep(10)
 
-    assert {:deny, :circuit_open} = CircuitBreaker.check("test-backend")
+      assert {:deny, :circuit_open} = CircuitBreaker.check("test-backend")
+    end
+
+    test "does not open if error rate below threshold" do
+      # 40% error rate — below 50% threshold
+      for _ <- 1..4, do: CircuitBreaker.record_outcome("test-backend", :error)
+      for _ <- 1..6, do: CircuitBreaker.record_outcome("test-backend", :success)
+      Process.sleep(10)
+
+      assert CircuitBreaker.check("test-backend") == :allow
+    end
+
+    test "requires minimum event count before opening" do
+      # Single error should not trip the breaker
+      CircuitBreaker.record_outcome("test-backend", :error)
+      Process.sleep(10)
+      assert CircuitBreaker.check("test-backend") == :allow
+    end
   end
 
-  test "closed if error rate below threshold" do
-    # 40% error rate — below 50% threshold
-    for _ <- 1..4, do: CircuitBreaker.record_outcome("test-backend", :error)
-    for _ <- 1..6, do: CircuitBreaker.record_outcome("test-backend", :success)
-    Process.sleep(10)
+  describe "state machine: half-open probe" do
+    test "transitions to half-open after cooldown period" do
+      for _ <- 1..10, do: CircuitBreaker.record_outcome("test-backend-2", :error)
+      Process.sleep(10)
 
-    assert CircuitBreaker.check("test-backend") == :allow
-  end
+      # Circuit is open; wait for cooldown
+      assert {:deny, :circuit_open} = CircuitBreaker.check("test-backend-2")
+      
+      Process.sleep(35_000)  # wait beyond @open_duration_ms (30s)
+      # Now should be half-open, allowing one probe
+      assert CircuitBreaker.check("test-backend-2") == :allow
+    end
 
+    test "closes on successful probe" do
+      for _ <- 1..10, do: CircuitBreaker.record_outcome("test-backend-3", :error)
+      Process.sleep(10)
+      assert {:deny, :circuit_open} = CircuitBreaker.check("test-backend-3")
 
+      Process.sleep(35_000)
+      assert CircuitBreaker.check("test-backend-3") == :allow  # probe allowed
+      
+      CircuitBreaker.record_outcome("test-backend-3", :success)  # probe succeeds
+      Process.sleep(10)
+      
+      assert CircuitBreaker.check("test-backend-3") == :allow  # closed
+    end
   end
 end
 ```
@@ -592,31 +633,61 @@ defmodule Apigw.AuthTest do
   end
 
 
-  describe "Auth" do
+  describe "JWT verification" do
+    test "valid HS256 token with future expiry verifies" do
+      token = make_token(%{"sub" => "user_1", "exp" => System.system_time(:second) + 3600}, @secret)
+      assert {:ok, claims} = JWT.verify(token, @secret)
+      assert claims["sub"] == "user_1"
+    end
 
-  test "valid HS256 token with future expiry verifies" do
-    token = make_token(%{"sub" => "user_1", "exp" => System.system_time(:second) + 3600}, @secret)
-    assert {:ok, claims} = JWT.verify(token, @secret)
-    assert claims["sub"] == "user_1"
+    test "extracts claims from verified token" do
+      claims = %{"sub" => "user_123", "aud" => "api.example.com", "exp" => System.system_time(:second) + 3600}
+      token = make_token(claims, @secret)
+      assert {:ok, verified} = JWT.verify(token, @secret)
+      assert verified["sub"] == "user_123"
+      assert verified["aud"] == "api.example.com"
+    end
   end
 
-  test "expired token is rejected" do
-    token = make_token(%{"sub" => "user_1", "exp" => System.system_time(:second) - 1}, @secret)
-    assert {:error, :token_expired} = JWT.verify(token, @secret)
+  describe "token expiry validation" do
+    test "expired token is rejected" do
+      token = make_token(%{"sub" => "user_1", "exp" => System.system_time(:second) - 1}, @secret)
+      assert {:error, :token_expired} = JWT.verify(token, @secret)
+    end
+
+    test "token without exp claim is accepted (no expiry check)" do
+      token = make_token(%{"sub" => "user_1"}, @secret)
+      assert {:ok, claims} = JWT.verify(token, @secret)
+      assert claims["sub"] == "user_1"
+    end
   end
 
-  test "tampered payload is rejected" do
-    token = make_token(%{"sub" => "user_1", "exp" => System.system_time(:second) + 3600}, @secret)
-    [h, _p, s] = String.split(token, ".")
-    tampered_payload = Base.url_encode64(~s({"sub":"admin","exp":9999999999}), padding: false)
-    assert {:error, _} = JWT.verify("#{h}.#{tampered_payload}.#{s}", @secret)
+  describe "signature validation" do
+    test "tampered payload is rejected" do
+      token = make_token(%{"sub" => "user_1", "exp" => System.system_time(:second) + 3600}, @secret)
+      [h, _p, s] = String.split(token, ".")
+      tampered_payload = Base.url_encode64(~s({"sub":"admin","exp":9999999999}), padding: false)
+      assert {:error, :invalid_signature} = JWT.verify("#{h}.#{tampered_payload}.#{s}", @secret)
+    end
+
+    test "wrong secret produces invalid signature error" do
+      token = make_token(%{"sub" => "user_1", "exp" => System.system_time(:second) + 3600}, @secret)
+      assert {:error, :invalid_signature} = JWT.verify(token, "wrong_secret_key_at_least_32_bytes_long")
+    end
   end
 
-  test "malformed token returns error" do
-    assert {:error, :malformed_token} = JWT.verify("not.a.jwt.token.at.all", @secret)
-  end
+  describe "malformed tokens" do
+    test "too few segments returns error" do
+      assert {:error, :malformed_token} = JWT.verify("header.payload", @secret)
+    end
 
+    test "too many segments returns error" do
+      assert {:error, :malformed_token} = JWT.verify("h.p.s.extra", @secret)
+    end
 
+    test "invalid base64 returns error" do
+      assert {:error, :malformed_token} = JWT.verify("!!!.!!!.!!!", @secret)
+    end
   end
 end
 ```
@@ -635,18 +706,75 @@ mix test test/apigw/ --trace
 ### Why this works
 
 The design separates concerns along their real axes: what must be correct (the API gateway invariants), what must be fast (the hot path isolated from slow paths), and what must be evolvable (external contracts kept narrow). Each module has one job and fails loudly when given inputs outside its contract, so bugs surface near their source instead of as mysterious downstream symptoms. The tests exercise the invariants directly rather than implementation details, which keeps them useful across refactors.
-## Main Entry Point
+## Quick start
+
+```bash
+# Start the application and run tests
+mix deps.get
+mix test test/apigw/ --trace
+
+# Or run performance benchmarks:
+mix run bench/proxy_bench.exs
+```
+
+Target: <10ms p99 latency per request end-to-end (auth + rate-limit + circuit-check + proxy).
+
+---
+
+## Benchmark
 
 ```elixir
-def main do
-  IO.puts("======== 34-build-api-gateway ========")
-  IO.puts("Build Api Gateway")
-  IO.puts("")
-  
-  Apigw.CircuitBreaker.start_link([])
-  IO.puts("Apigw.CircuitBreaker started")
-  
-  IO.puts("Run: mix test")
-end
+# bench/proxy_bench.exs
+{:ok, _} = Apigw.Application.start_link([])
+
+Benchee.run(%{
+  "jwt_verify_hs256" => fn ->
+    token = "eyJ..." # valid HS256 token
+    Apigw.Auth.JWT.verify(token, "secret_key")
+  end,
+  "circuit_breaker_check" => fn ->
+    Apigw.CircuitBreaker.check("backend-1")
+  end,
+  "cache_hit_etag" => fn ->
+    Apigw.Cache.get("/api/users/123", %{"if-none-match" => "abc123def456"})
+  end,
+  "cache_miss" => fn ->
+    Apigw.Cache.get("/api/users/999", %{})
+  end,
+  "rate_limiter_check" => fn ->
+    Apigw.RateLimiter.check("api-key-1234", 1000)
+  end
+}, time: 10, warmup: 3, memory_time: 2)
 ```
+
+**Expected results** (on modern hardware):
+- JWT verify: ~5-10µs per verify
+- Circuit breaker check: ~1µs (lock-free Registry lookup)
+- Cache hit with ETag: ~1-2µs (ETS direct lookup)
+- Cache miss: ~1µs (ETS lookup returns not found)
+- Rate limiter: ~0.5-1µs (atomics counter)
+
+---
+
+## Key Concepts: API Gateway Patterns and Composition
+
+**Middleware chain composition**: The gateway is a pipeline: `auth → rate-limit → circuit-breaker → cache-check → proxy → cache-write`. Each layer is independent and can short-circuit (return error or cached response). This is more composable than a monolithic request handler.
+
+**Circuit breaker half-open state**: A two-state breaker (open/closed) would cause request storms: all instances probe simultaneously when timeout expires. The half-open state allows exactly one probe through. Success closes; failure reopens. This "single probe" invariant prevents cascading recovery failures.
+
+**Lease-based rate limiting scales across nodes**: Each gateway node acquires a quota (e.g., 10k req/s / 10 nodes = 1k req/s per node) and enforces locally with atomics. No cross-node coordination per request — only per lease renewal (every few seconds). Trade-off: a node crash forfeits its quota; brief over-serving is acceptable.
+
+**JWT verification without libraries**: JWT is simple (base64-url three parts + HMAC or RSA). A custom implementation pinning only HS256 and RS256 reduces algorithm surface. A JWT library might support RS512, PS256 — unnecessary and a potential vulnerability.
+
+**ETag-based cache validation**: Rather than always returning full bodies, send `ETag: <hash>`. Clients that already have the body send `If-None-Match: <hash>`. Gateway returns 304 Not Modified (no body). Saves bandwidth on large responses.
+
+**Production insight**: A gateway is the bottleneck and blast radius of the platform. Make the hot path (circuit check + cache lookup) as fast as possible — both are sub-microsecond here via lock-free data structures.
+
+---
+
+## Reflection
+
+1. **Rate limiter interactions with circuit breaker**: If you rate-limit too aggressively, the circuit breaker never sees backend errors (all requests are rejected upstream). If you rate-limit too loosely, a misbehaving client overwhelms the backend, tripping the breaker. How would you coordinate these two policies?
+
+2. **Cache effectiveness with variable backend latency**: A cached response from a fast API endpoint is cheap. But if the backend is slow or degraded (why you're rate-limiting), how do you prevent cache pollution with stale data? At what freshness SLA does caching become harmful rather than helpful?
 

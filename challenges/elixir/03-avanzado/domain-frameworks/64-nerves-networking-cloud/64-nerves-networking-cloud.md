@@ -468,305 +468,309 @@ Target: operation should complete in the low-microsecond range on modern hardwar
 ## Executable Example
 
 ```elixir
-defp deps do
-  [
-    {:vintage_net, "~> 0.13"},
-    {:vintage_net_wifi, "~> 0.12"},
-    {:tortoise311, "~> 0.12"},
-    {:jason, "~> 1.4"}
-  ]
-end
-
-defmodule ApiGateway.Fleet.Identity do
-  @moduledoc """
-  Derives a stable device identity from the MAC address of eth0.
-
-  The MAC address is assigned at manufacture and does not change between
-  reboots or firmware updates. It is the most reliable identifier available
-  on Linux-based embedded devices without a dedicated hardware security module.
-  """
-
-  @doc "Returns a string like \"device-b827eb1a2b3c\"."
-  @spec device_id() :: String.t()
-  def device_id do
-    case mac_address("eth0") do
-      {:ok, mac} -> "device-" <> String.replace(mac, ":", "")
-      {:error, _} -> fallback_id()
-    end
-  end
-
-  @spec mac_address(String.t()) :: {:ok, String.t()} | {:error, term()}
-  def mac_address(interface) do
-    path = "/sys/class/net/#{interface}/address"
-
-    case File.read(path) do
-      {:ok, contents} -> {:ok, String.trim(contents)}
-      {:error, reason} -> {:error, reason}
-    end
-  end
-
-  @spec device_info() :: map()
-  def device_info do
-    %{
-      device_id:  device_id(),
-      connected:  false
-    }
-  end
-
-  defp fallback_id do
-    {:ok, hostname} = :inet.gethostname()
-    to_string(hostname)
-  end
-end
-
-defmodule ApiGateway.Network.WiFiManager do
-  end
-  @moduledoc """
-  Manages WiFi connectivity with exponential backoff and jitter.
-
-  Subscribes to VintageNet property changes instead of polling.
-  On :disconnected -> schedules reconnect with exponential backoff.
-  On :internet/:lan -> resets backoff counter.
-
-  Backoff formula: min(base * 2^attempt, max_backoff) + rand(0, backoff/4)
-  """
-  use GenServer
-  require Logger
-
-  @interface       "wlan0"
-  @base_backoff_ms  5_000
-  @max_backoff_ms   300_000
-  @connected_states [:internet, :lan]
-
-  @spec start_link(keyword()) :: GenServer.on_start()
-  def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
-
-  @spec connected?() :: boolean()
-  def connected? do
-    VintageNet.get(["interface", @interface, "connection"]) in @connected_states
-  end
-
-  @spec current_ip() :: String.t() | nil
-  def current_ip do
-    case VintageNet.get(["interface", @interface, "addresses"]) do
-      [%{address: addr} | _] -> addr |> :inet.ntoa() |> to_string()
-      _                      -> nil
-    end
-  end
-
-  @impl true
-  def init(opts) do
-    ssid = Keyword.fetch!(opts, :ssid)
-    psk  = Keyword.fetch!(opts, :psk)
-
-    VintageNet.subscribe(["interface", @interface, "connection"])
-
-    state = %{ssid: ssid, psk: psk, attempt: 0, backoff_ms: @base_backoff_ms, timer: nil}
-    {:ok, state, {:continue, :connect}}
-  end
-
-  @impl true
-  def handle_continue(:connect, state) do
-    apply_config(state.ssid, state.psk)
-    {:noreply, state}
-  end
-
-  @impl true
-  def handle_info(
-    {VintageNet, ["interface", @interface, "connection"], _old, new_status, _meta},
-    state
-  ) do
-    case new_status do
-      s when s in @connected_states ->
-        Logger.info("WiFi connected (#{s}) — IP: #{current_ip()}")
-        {:noreply, %{state | attempt: 0, backoff_ms: @base_backoff_ms}}
-
-      :disconnected ->
-        cancel_timer(state.timer)
-
-        next_backoff = min(state.backoff_ms * 2, @max_backoff_ms)
-        jitter = :rand.uniform(max(div(next_backoff, 4), 1))
-        delay = next_backoff + jitter
-
-        Logger.warning("WiFi disconnected — attempt #{state.attempt + 1}, retry in #{delay}ms")
-
-        timer = Process.send_after(self(), :reconnect, delay)
-        {:noreply, %{state | timer: timer, backoff_ms: next_backoff}}
-
-      other ->
-        Logger.debug("WiFi status: #{inspect(other)}")
-        {:noreply, state}
-    end
-  end
-
-  def handle_info(:reconnect, state) do
-    Logger.info("WiFi reconnect attempt #{state.attempt + 1}")
-    apply_config(state.ssid, state.psk)
-    {:noreply, %{state | attempt: state.attempt + 1, timer: nil}}
-  end
-
-  defp apply_config(ssid, psk) do
-    VintageNet.configure(@interface, %{
-      type: VintageNetWiFi,
-      vintage_net_wifi: %{
-        networks: [%{ssid: ssid, psk: psk, key_mgmt: :wpa_psk}]
-      },
-      ipv4: %{method: :dhcp}
-    })
-  end
-
-  defp cancel_timer(nil), do: :ok
-  defp cancel_timer(ref), do: Process.cancel_timer(ref)
-end
-
-defmodule ApiGateway.Network.TelemetryPublisher do
-  end
-  @moduledoc """
-  Publishes sensor readings to the cloud gateway via MQTT.
-
-  When the network is unavailable, readings are buffered in a :queue
-  (FIFO) up to @max_buffer entries. On reconnect, the buffer is flushed
-  in order. Oldest entries are dropped if the buffer is full.
-
-  QoS 1 ensures at-least-once delivery. The cloud gateway must be
-  idempotent on duplicate messages.
-  """
-  use GenServer
-  require Logger
-
-  @max_buffer      500
-  @topic_prefix    "devices"
-
-  @spec start_link(keyword()) :: GenServer.on_start()
-  def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
-
-  @spec publish(map()) :: :ok
-  def publish(payload) when is_map(payload) do
-    GenServer.cast(__MODULE__, {:publish, payload})
-  end
-
-  @impl true
-  def init(opts) do
-    host      = Keyword.fetch!(opts, :host)
-    device_id = Keyword.fetch!(opts, :device_id)
-
-    state = %{
-      host:          host,
-      device_id:     device_id,
-      mqtt_pid:      nil,
-      connected:     false,
-      buffer:        :queue.new(),
-      buffer_count:  0
-    }
-
-    {:ok, state}
-  end
-
-  @impl true
-  def handle_cast({:publish, payload}, state) do
-    message = encode(state.device_id, payload)
-    {:noreply, buffer_message(state, message)}
-  end
-
-  # -- Private --
-
-  defp encode(device_id, payload) do
-    Jason.encode!(%{
-      device_id:  device_id,
-      timestamp:  DateTime.utc_now() |> DateTime.to_iso8601(),
-      payload:    payload
-    })
-  end
-
-  defp buffer_message(%{buffer_count: count} = state, message) when count >= @max_buffer do
-    Logger.warning("MQTT buffer full — dropping oldest message")
-    {_, smaller} = :queue.out(state.buffer)
-    %{state | buffer: :queue.in(message, smaller)}
-  end
-
-  defp buffer_message(state, message) do
-    %{state |
-      buffer:       :queue.in(message, state.buffer),
-      buffer_count: state.buffer_count + 1
-    }
-  end
-end
-
-# test/api_gateway/telemetry_publisher_test.exs
-defmodule ApiGateway.Network.TelemetryPublisherTest do
-  use ExUnit.Case, async: false
-
-  alias ApiGateway.Network.TelemetryPublisher
-
-  setup do
-    Application.put_env(:api_gateway, :mqtt_publish_fn, fn _pid, _topic, msg, _opts ->
-      send(:test_sink, {:published, msg})
-      :ok
-    end)
-    Process.register(self(), :test_sink)
-    :ok
-  end
-
-  describe "ApiGateway.Network.TelemetryPublisher" do
-    test "buffers messages when not connected" do
-      {:ok, pid} = start_supervised({
-        TelemetryPublisher,
-        [host: "localhost", device_id: "test-001"]
-      })
-
-      TelemetryPublisher.publish(%{temperature: 22.5})
-      TelemetryPublisher.publish(%{temperature: 23.0})
-
-      Process.sleep(50)
-      state = :sys.get_state(pid)
-      assert state.buffer_count == 2
-      refute_received {:published, _}
-    end
-
-    test "buffer does not exceed max_buffer" do
-      {:ok, pid} = start_supervised({
-        TelemetryPublisher,
-        [host: "localhost", device_id: "test-002"]
-      })
-
-      for i <- 1..510, do: TelemetryPublisher.publish(%{seq: i})
-
-      Process.sleep(100)
-      state = :sys.get_state(pid)
-      assert state.buffer_count <= 500
-    end
-
-    test "dropping oldest when full — newest entry survives" do
-      {:ok, pid} = start_supervised({
-        TelemetryPublisher,
-        [host: "localhost", device_id: "test-003"]
-      })
-
-      for i <- 1..500, do: TelemetryPublisher.publish(%{seq: i})
-      Process.sleep(50)
-
-      TelemetryPublisher.publish(%{seq: :last})
-      Process.sleep(50)
-
-      state = :sys.get_state(pid)
-      messages =
-        state.buffer
-        |> :queue.to_list()
-        |> Enum.map(&Jason.decode!/1)
-
-      assert Enum.any?(messages, fn m -> get_in(m, ["payload", "seq"]) == "last" end)
-    end
-  end
-end
-
 defmodule Main do
-  def main do
-      # Demonstrating 64-nerves-networking-cloud
+  defp deps do
+    [
+      {:vintage_net, "~> 0.13"},
+      {:vintage_net_wifi, "~> 0.12"},
+      {:tortoise311, "~> 0.12"},
+      {:jason, "~> 1.4"}
+    ]
+  end
+
+  defmodule ApiGateway.Fleet.Identity do
+    @moduledoc """
+    Derives a stable device identity from the MAC address of eth0.
+
+    The MAC address is assigned at manufacture and does not change between
+    reboots or firmware updates. It is the most reliable identifier available
+    on Linux-based embedded devices without a dedicated hardware security module.
+    """
+
+    @doc "Returns a string like \"device-b827eb1a2b3c\"."
+    @spec device_id() :: String.t()
+    def device_id do
+      case mac_address("eth0") do
+        {:ok, mac} -> "device-" <> String.replace(mac, ":", "")
+        {:error, _} -> fallback_id()
+      end
+    end
+
+    @spec mac_address(String.t()) :: {:ok, String.t()} | {:error, term()}
+    def mac_address(interface) do
+      path = "/sys/class/net/#{interface}/address"
+
+      case File.read(path) do
+        {:ok, contents} -> {:ok, String.trim(contents)}
+        {:error, reason} -> {:error, reason}
+      end
+    end
+
+    @spec device_info() :: map()
+    def device_info do
+      %{
+        device_id:  device_id(),
+        connected:  false
+      }
+    end
+
+    defp fallback_id do
+      {:ok, hostname} = :inet.gethostname()
+      to_string(hostname)
+    end
+  end
+
+  defmodule ApiGateway.Network.WiFiManager do
+    end
+    @moduledoc """
+    Manages WiFi connectivity with exponential backoff and jitter.
+
+    Subscribes to VintageNet property changes instead of polling.
+    On :disconnected -> schedules reconnect with exponential backoff.
+    On :internet/:lan -> resets backoff counter.
+
+    Backoff formula: min(base * 2^attempt, max_backoff) + rand(0, backoff/4)
+    """
+    use GenServer
+    require Logger
+
+    @interface       "wlan0"
+    @base_backoff_ms  5_000
+    @max_backoff_ms   300_000
+    @connected_states [:internet, :lan]
+
+    @spec start_link(keyword()) :: GenServer.on_start()
+    def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+
+    @spec connected?() :: boolean()
+    def connected? do
+      VintageNet.get(["interface", @interface, "connection"]) in @connected_states
+    end
+
+    @spec current_ip() :: String.t() | nil
+    def current_ip do
+      case VintageNet.get(["interface", @interface, "addresses"]) do
+        [%{address: addr} | _] -> addr |> :inet.ntoa() |> to_string()
+        _                      -> nil
+      end
+    end
+
+    @impl true
+    def init(opts) do
+      ssid = Keyword.fetch!(opts, :ssid)
+      psk  = Keyword.fetch!(opts, :psk)
+
+      VintageNet.subscribe(["interface", @interface, "connection"])
+
+      state = %{ssid: ssid, psk: psk, attempt: 0, backoff_ms: @base_backoff_ms, timer: nil}
+      {:ok, state, {:continue, :connect}}
+    end
+
+    @impl true
+    def handle_continue(:connect, state) do
+      apply_config(state.ssid, state.psk)
+      {:noreply, state}
+    end
+
+    @impl true
+    def handle_info(
+      {VintageNet, ["interface", @interface, "connection"], _old, new_status, _meta},
+      state
+    ) do
+      case new_status do
+        s when s in @connected_states ->
+          Logger.info("WiFi connected (#{s}) — IP: #{current_ip()}")
+          {:noreply, %{state | attempt: 0, backoff_ms: @base_backoff_ms}}
+
+        :disconnected ->
+          cancel_timer(state.timer)
+
+          next_backoff = min(state.backoff_ms * 2, @max_backoff_ms)
+          jitter = :rand.uniform(max(div(next_backoff, 4), 1))
+          delay = next_backoff + jitter
+
+          Logger.warning("WiFi disconnected — attempt #{state.attempt + 1}, retry in #{delay}ms")
+
+          timer = Process.send_after(self(), :reconnect, delay)
+          {:noreply, %{state | timer: timer, backoff_ms: next_backoff}}
+
+        other ->
+          Logger.debug("WiFi status: #{inspect(other)}")
+          {:noreply, state}
+      end
+    end
+
+    def handle_info(:reconnect, state) do
+      Logger.info("WiFi reconnect attempt #{state.attempt + 1}")
+      apply_config(state.ssid, state.psk)
+      {:noreply, %{state | attempt: state.attempt + 1, timer: nil}}
+    end
+
+    defp apply_config(ssid, psk) do
+      VintageNet.configure(@interface, %{
+        type: VintageNetWiFi,
+        vintage_net_wifi: %{
+          networks: [%{ssid: ssid, psk: psk, key_mgmt: :wpa_psk}]
+        },
+        ipv4: %{method: :dhcp}
+      })
+    end
+
+    defp cancel_timer(nil), do: :ok
+    defp cancel_timer(ref), do: Process.cancel_timer(ref)
+  end
+
+  defmodule ApiGateway.Network.TelemetryPublisher do
+    end
+    @moduledoc """
+    Publishes sensor readings to the cloud gateway via MQTT.
+
+    When the network is unavailable, readings are buffered in a :queue
+    (FIFO) up to @max_buffer entries. On reconnect, the buffer is flushed
+    in order. Oldest entries are dropped if the buffer is full.
+
+    QoS 1 ensures at-least-once delivery. The cloud gateway must be
+    idempotent on duplicate messages.
+    """
+    use GenServer
+    require Logger
+
+    @max_buffer      500
+    @topic_prefix    "devices"
+
+    @spec start_link(keyword()) :: GenServer.on_start()
+    def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+
+    @spec publish(map()) :: :ok
+    def publish(payload) when is_map(payload) do
+      GenServer.cast(__MODULE__, {:publish, payload})
+    end
+
+    @impl true
+    def init(opts) do
+      host      = Keyword.fetch!(opts, :host)
+      device_id = Keyword.fetch!(opts, :device_id)
+
+      state = %{
+        host:          host,
+        device_id:     device_id,
+        mqtt_pid:      nil,
+        connected:     false,
+        buffer:        :queue.new(),
+        buffer_count:  0
+      }
+
+      {:ok, state}
+    end
+
+    @impl true
+    def handle_cast({:publish, payload}, state) do
+      message = encode(state.device_id, payload)
+      {:noreply, buffer_message(state, message)}
+    end
+
+    # -- Private --
+
+    defp encode(device_id, payload) do
+      Jason.encode!(%{
+        device_id:  device_id,
+        timestamp:  DateTime.utc_now() |> DateTime.to_iso8601(),
+        payload:    payload
+      })
+    end
+
+    defp buffer_message(%{buffer_count: count} = state, message) when count >= @max_buffer do
+      Logger.warning("MQTT buffer full — dropping oldest message")
+      {_, smaller} = :queue.out(state.buffer)
+      %{state | buffer: :queue.in(message, smaller)}
+    end
+
+    defp buffer_message(state, message) do
+      %{state |
+        buffer:       :queue.in(message, state.buffer),
+        buffer_count: state.buffer_count + 1
+      }
+    end
+  end
+
+  # test/api_gateway/telemetry_publisher_test.exs
+  defmodule ApiGateway.Network.TelemetryPublisherTest do
+    use ExUnit.Case, async: false
+
+    alias ApiGateway.Network.TelemetryPublisher
+
+    setup do
+      Application.put_env(:api_gateway, :mqtt_publish_fn, fn _pid, _topic, msg, _opts ->
+        send(:test_sink, {:published, msg})
+        :ok
+      end)
+      Process.register(self(), :test_sink)
       :ok
+    end
+
+    describe "ApiGateway.Network.TelemetryPublisher" do
+      test "buffers messages when not connected" do
+        {:ok, pid} = start_supervised({
+          TelemetryPublisher,
+          [host: "localhost", device_id: "test-001"]
+        })
+
+        TelemetryPublisher.publish(%{temperature: 22.5})
+        TelemetryPublisher.publish(%{temperature: 23.0})
+
+        Process.sleep(50)
+        state = :sys.get_state(pid)
+        assert state.buffer_count == 2
+        refute_received {:published, _}
+      end
+
+      test "buffer does not exceed max_buffer" do
+        {:ok, pid} = start_supervised({
+          TelemetryPublisher,
+          [host: "localhost", device_id: "test-002"]
+        })
+
+        for i <- 1..510, do: TelemetryPublisher.publish(%{seq: i})
+
+        Process.sleep(100)
+        state = :sys.get_state(pid)
+        assert state.buffer_count <= 500
+      end
+
+      test "dropping oldest when full — newest entry survives" do
+        {:ok, pid} = start_supervised({
+          TelemetryPublisher,
+          [host: "localhost", device_id: "test-003"]
+        })
+
+        for i <- 1..500, do: TelemetryPublisher.publish(%{seq: i})
+        Process.sleep(50)
+
+        TelemetryPublisher.publish(%{seq: :last})
+        Process.sleep(50)
+
+        state = :sys.get_state(pid)
+        messages =
+          state.buffer
+          |> :queue.to_list()
+          |> Enum.map(&Jason.decode!/1)
+
+        assert Enum.any?(messages, fn m -> get_in(m, ["payload", "seq"]) == "last" end)
+      end
+    end
+  end
+
+  defmodule Main do
+    def main do
+        # Demonstrating 64-nerves-networking-cloud
+        :ok
+    end
+  end
+
+  Main.main()
+  end
   end
 end
 
 Main.main()
-end
-end
 ```

@@ -70,6 +70,34 @@ Ranking is the second problem. A document that mentions "machine" 100 times is n
 
 → Chose **B** because every production full-text engine (Lucene, Tantivy, Bleve) converges on inverted indexes for a reason: they are the shape of the problem.
 
+## Project Structure
+
+```
+searcher/
+├── lib/
+│   └── searcher/
+│       ├── application.ex           # engine supervisor
+│       ├── engine.ex                # public API: index, search, phrase_search, delete
+│       ├── pipeline.ex              # NLP pipeline: tokenize, lowercase, stop-words, stem
+│       ├── stemmer.ex               # Porter stemmer: 5-phase suffix reduction algorithm
+│       ├── inverted_index.ex        # ETS-backed index: term → [{doc_id, tf, [positions]}]
+│       ├── scorer.ex                # TF-IDF and BM25 ranking functions
+│       ├── boolean_query.ex         # AND, OR, NOT via posting list operations
+│       ├── phrase_query.ex          # positional intersection for phrase matching
+│       └── tombstone.ex             # deleted doc tracking, exclusion from results
+├── test/
+│   └── searcher/
+│       ├── pipeline_test.exs        # tokenization, stop-words, stemming correctness
+│       ├── stemmer_test.exs         # Porter algorithm phase-by-phase
+│       ├── index_test.exs           # posting list structure and updates
+│       ├── bm25_test.exs            # scoring formula, length normalization
+│       ├── boolean_test.exs         # AND/OR/NOT semantics
+│       └── phrase_test.exs          # positional matching
+├── bench/
+│   └── searcher_bench.exs
+└── mix.exs
+```
+
 ## Implementation milestones
 
 ### Step 1: Create the project

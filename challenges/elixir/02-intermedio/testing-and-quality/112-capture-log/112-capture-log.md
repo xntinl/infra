@@ -306,13 +306,10 @@ for human-readable messages.
 
 ---
 
-## Executable Example
-
-Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
-
 ```elixir
 defmodule Main do
-  defmodule PaymentGateway do
+  import ExUnit.Assertions
+
     @moduledoc """
     A stub payment gateway that logs each attempt. Used to demonstrate
     `ExUnit.CaptureLog`. Deterministic — no randomness.

@@ -317,13 +317,10 @@ and don't agonize over specing every private one.
 
 ---
 
-## Executable Example
-
-Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
-
 ```elixir
 defmodule Main do
-  defmodule Pricing do
+  import ExUnit.Assertions
+
     @moduledoc """
     Minimal pricing helpers for orders with line items. All public functions
     carry `@spec`s so Dialyzer can verify the module end-to-end.

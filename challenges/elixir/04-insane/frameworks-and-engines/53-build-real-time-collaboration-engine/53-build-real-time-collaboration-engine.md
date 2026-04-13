@@ -22,6 +22,23 @@ You will build `Collab`: a real-time collaboration engine using Operational Tran
 
 → Chose **B** because CRDT's convergence proof eliminates a whole class of concurrency bugs OT has been fighting for 30 years.
 
+
+## Quick start
+
+1. Create project:
+   ```bash
+   mix new <project_name>
+   cd <project_name>
+   ```
+
+2. Copy dependencies to `mix.exs`
+
+3. Implement modules following the project structure
+
+4. Run tests: `mix test`
+
+5. Benchmark: `mix run lib/benchmark.exs`
+
 ## Why OT and not CRDT for this exercise
 
 Both Operational Transformation and CRDTs solve the convergence problem. CRDTs (specifically YATA/Yjs) are simpler to implement correctly because they embed ordering into the operation identifier — no `transform` function required. However, OT is educationally more valuable: it forces you to understand the core convergence problem at the algorithmic level. You will implement both (OT for the server, a CRDT simulation for comparison) and observe where the implementations diverge in complexity.
@@ -657,7 +674,7 @@ Collab.Bench.ConcurrentEdits.run()
 
 **Target**: <1ms para aplicar una operación remota en documento de 10k caracteres.
 
-## Key Concepts: Operational Transformation vs. CRDTs - Convergence Proofs
+## Key Concepts: Architecture & Design Patterns Operational Transformation vs. CRDTs - Convergence Proofs
 
 Los dos algoritmos fundamentales para edición colaborativa tienen semántica dramáticamente diferente:
 

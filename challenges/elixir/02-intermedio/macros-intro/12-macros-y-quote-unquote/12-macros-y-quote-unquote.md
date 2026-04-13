@@ -374,13 +374,10 @@ logic around," use a function or a fun.
 
 ---
 
-## Executable Example
-
-Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
-
 ```elixir
 defmodule Main do
-  defmodule MacroBasics do
+  import ExUnit.Assertions
+
     @moduledoc """
     A small tour of quote/unquote and defmacro.
 

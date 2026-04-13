@@ -590,14 +590,21 @@ defmodule Main do
 
     @impl true
     def handle_info({:DOWN, monitor_ref, :process, _pid, reason}, state) do
-      case Map.pop(state.waiters, monitor_ref) do
-        {nil, _} ->
+      # Find all entries with this monitor_ref
+      matching_keys = state.waiters
+        |> Map.keys()
+        |> Enum.filter(fn
+          {mr, _} -> mr == monitor_ref
+          _ -> false
+        end)
+
+      case matching_keys do
+        [] ->
           {:noreply, state}
 
-        {{caller_ref, caller_pid}, waiters} ->
-          # The task process is gone: successful tasks also produce a :DOWN
-          # because the worker fun exits after sending us the result via {:work_result, ...}.
-          outcome = pop_outcome(state, monitor_ref, reason)
+        [{^monitor_ref, work_ref} | _] ->
+          {{caller_ref, caller_pid}, waiters} = Map.pop(state.waiters, {monitor_ref, work_ref})
+          outcome = pop_outcome(state, work_ref, reason)
           send(caller_pid, {:work_done, caller_ref, outcome})
 
           new_state = %{state | waiters: waiters, in_flight: state.in_flight - 1}
@@ -605,10 +612,10 @@ defmodule Main do
       end
     end
 
-    def handle_info({:work_result, monitor_ref, result}, state) do
+    def handle_info({:work_result, work_ref, result}, state) do
       # Workers send their success value here BEFORE exiting.
       # We stash it on state so the subsequent :DOWN can pair it with the caller.
-      put_result(monitor_ref, result)
+      put_result(work_ref, result)
       {:noreply, state}
     end
 
@@ -619,6 +626,7 @@ defmodule Main do
     defp spawn_worker(fun, caller_pid, state) do
       caller_ref = make_ref()
       server = self()
+      work_ref = make_ref()
 
       {:ok, pid} =
         Task.Supervisor.start_child(@task_sup, fn ->
@@ -631,13 +639,13 @@ defmodule Main do
               kind, reason -> {:exit, {kind, reason}}
             end
 
-          # Send the outcome to the pool server; the :DOWN fires next.
-          send(server, {:work_result, self(), result})
+          # Send the outcome to the pool server with work_ref for correlation
+          send(server, {:work_result, work_ref, result})
         end)
 
       monitor_ref = Process.monitor(pid)
-      # We use the monitor_ref as the key and track {caller_ref, caller_pid}.
-      waiters = Map.put(state.waiters, monitor_ref, {caller_ref, caller_pid})
+      # Map the system monitor_ref to work_ref and caller info
+      waiters = Map.put(state.waiters, {monitor_ref, work_ref}, {caller_ref, caller_pid})
       {caller_ref, %{state | in_flight: state.in_flight + 1, waiters: waiters}}
     end
 
@@ -671,8 +679,8 @@ defmodule Main do
     # a state field.
     defp put_result(ref, result), do: Process.put({:pool_result, ref}, result)
 
-    defp pop_outcome(_state, monitor_ref, down_reason) do
-      case Process.delete({:pool_result, monitor_ref}) do
+    defp pop_outcome(_state, work_ref, down_reason) do
+      case Process.delete({:pool_result, work_ref}) do
         nil -> {:exit, down_reason}
         stashed -> stashed
       end

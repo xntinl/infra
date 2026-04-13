@@ -328,13 +328,10 @@ the codebase reaches ~5k lines or you start a library.
 
 ---
 
-## Executable Example
-
-Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
-
 ```elixir
 defmodule Main do
-  defmodule Reports do
+  import ExUnit.Assertions
+
     @moduledoc """
     Deliberately buggy. Run `mix dialyzer` — you should see warnings for
     each numbered issue below. Fix them one at a time, re-running Dialyzer.

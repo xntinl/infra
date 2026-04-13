@@ -368,13 +368,10 @@ loop of `delete/2` — and atomic from the table's point of view.
 
 ---
 
-## Executable Example
-
-Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
-
 ```elixir
 defmodule Main do
-  defmodule MatchObjectDemo do
+  import ExUnit.Assertions
+
     @moduledoc """
     A small "users" table storing `{user_id, name, role}` tuples, queried with
     `:ets.match/2` and `:ets.match_object/2` to illustrate pattern-based queries.

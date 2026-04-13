@@ -352,120 +352,122 @@ You set `hedge_after_ms: 20` based on measured p95. Three months later, the p95 
 ## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # No external dependencies — pure Elixir
-  ]
-end
-
-defmodule SearchHedger.MixProject do
-  use Mix.Project
-  def project, do: [app: :search_hedger, version: "0.1.0", elixir: "~> 1.17", deps: deps()]
-  def application, do: [extra_applications: [:logger]]
-  defp deps, do: [{:benchee, "~> 1.3", only: :dev}]
-end
-
-defmodule SearchHedger.Backend do
-  @doc """
-  Simulates a backend with controllable per-attempt latency.
-  Returns a function that, when called, sleeps then returns the given value.
-  """
-  def with_latency(latency_ms, value) do
-    fn ->
-      Process.sleep(latency_ms)
-      {:ok, value}
-    end
-  end
-
-  def failing(latency_ms, reason) do
-    fn ->
-      Process.sleep(latency_ms)
-      {:error, reason}
-    end
-  end
-end
-
-defmodule SearchHedger.Hedger do
-  @doc """
-  Executes `fun` once, and if no response arrives within `hedge_after_ms`,
-  fires a second copy. Returns the first successful result.
-
-  `fun` must be a 0-arity function returning `{:ok, _}` or `{:error, _}`.
-  """
-  def run(fun, opts) when is_function(fun, 0) do
-    hedge_after = Keyword.fetch!(opts, :hedge_after_ms)
-    timeout = Keyword.fetch!(opts, :timeout_ms)
-
-    task_primary = Task.async(fun)
-    deadline = System.monotonic_time(:millisecond) + timeout
-
-    case wait_primary(task_primary, hedge_after, deadline) do
-      {:ok, result} ->
-        result
-
-      :hedge ->
-        task_hedge = Task.async(fun)
-        await_first_success([task_primary, task_hedge], deadline)
-    end
-  end
-
-  defp wait_primary(task, hedge_after, deadline) do
-    remaining = min(hedge_after, max(0, deadline - System.monotonic_time(:millisecond)))
-
-    receive do
-      {ref, result} when ref == task.ref ->
-        Process.demonitor(ref, [:flush])
-        {:ok, result}
-    after
-      remaining -> :hedge
-    end
-  end
-
-  defp await_first_success(tasks, deadline) do
-    remaining = max(0, deadline - System.monotonic_time(:millisecond))
-
-    receive do
-      {ref, {:ok, _} = ok} ->
-        finish(tasks, ref)
-        ok
-
-      {ref, {:error, _} = err} ->
-        remaining_tasks = Enum.reject(tasks, &(&1.ref == ref))
-        Process.demonitor(ref, [:flush])
-
-        case remaining_tasks do
-          [] -> err
-          [_ | _] -> await_first_success(remaining_tasks, deadline)
-        end
-
-      {:DOWN, ref, :process, _, _} ->
-        remaining_tasks = Enum.reject(tasks, &(&1.ref == ref))
-        case remaining_tasks do
-          [] -> {:error, :both_down}
-          [_ | _] -> await_first_success(remaining_tasks, deadline)
-        end
-    after
-      remaining ->
-        Enum.each(tasks, &Task.shutdown(&1, :brutal_kill))
-        {:error, :timeout}
-    end
-  end
-
-  defp finish(tasks, winner_ref) do
-    Enum.each(tasks, fn t ->
-      if t.ref != winner_ref do
-        Task.shutdown(t, :brutal_kill)
-      else
-        Process.demonitor(t.ref, [:flush])
-      end
-    end)
-  end
-end
-
 defmodule Main do
-  def main do
-      # Demonstrating 316-hedged-requests
-      :ok
+  defp deps do
+    [
+      # No external dependencies — pure Elixir
+    ]
+  end
+
+  defmodule SearchHedger.MixProject do
+    use Mix.Project
+    def project, do: [app: :search_hedger, version: "0.1.0", elixir: "~> 1.17", deps: deps()]
+    def application, do: [extra_applications: [:logger]]
+    defp deps, do: [{:benchee, "~> 1.3", only: :dev}]
+  end
+
+  defmodule SearchHedger.Backend do
+    @doc """
+    Simulates a backend with controllable per-attempt latency.
+    Returns a function that, when called, sleeps then returns the given value.
+    """
+    def with_latency(latency_ms, value) do
+      fn ->
+        Process.sleep(latency_ms)
+        {:ok, value}
+      end
+    end
+
+    def failing(latency_ms, reason) do
+      fn ->
+        Process.sleep(latency_ms)
+        {:error, reason}
+      end
+    end
+  end
+
+  defmodule SearchHedger.Hedger do
+    @doc """
+    Executes `fun` once, and if no response arrives within `hedge_after_ms`,
+    fires a second copy. Returns the first successful result.
+
+    `fun` must be a 0-arity function returning `{:ok, _}` or `{:error, _}`.
+    """
+    def run(fun, opts) when is_function(fun, 0) do
+      hedge_after = Keyword.fetch!(opts, :hedge_after_ms)
+      timeout = Keyword.fetch!(opts, :timeout_ms)
+
+      task_primary = Task.async(fun)
+      deadline = System.monotonic_time(:millisecond) + timeout
+
+      case wait_primary(task_primary, hedge_after, deadline) do
+        {:ok, result} ->
+          result
+
+        :hedge ->
+          task_hedge = Task.async(fun)
+          await_first_success([task_primary, task_hedge], deadline)
+      end
+    end
+
+    defp wait_primary(task, hedge_after, deadline) do
+      remaining = min(hedge_after, max(0, deadline - System.monotonic_time(:millisecond)))
+
+      receive do
+        {ref, result} when ref == task.ref ->
+          Process.demonitor(ref, [:flush])
+          {:ok, result}
+      after
+        remaining -> :hedge
+      end
+    end
+
+    defp await_first_success(tasks, deadline) do
+      remaining = max(0, deadline - System.monotonic_time(:millisecond))
+
+      receive do
+        {ref, {:ok, _} = ok} ->
+          finish(tasks, ref)
+          ok
+
+        {ref, {:error, _} = err} ->
+          remaining_tasks = Enum.reject(tasks, &(&1.ref == ref))
+          Process.demonitor(ref, [:flush])
+
+          case remaining_tasks do
+            [] -> err
+            [_ | _] -> await_first_success(remaining_tasks, deadline)
+          end
+
+        {:DOWN, ref, :process, _, _} ->
+          remaining_tasks = Enum.reject(tasks, &(&1.ref == ref))
+          case remaining_tasks do
+            [] -> {:error, :both_down}
+            [_ | _] -> await_first_success(remaining_tasks, deadline)
+          end
+      after
+        remaining ->
+          Enum.each(tasks, &Task.shutdown(&1, :brutal_kill))
+          {:error, :timeout}
+      end
+    end
+
+    defp finish(tasks, winner_ref) do
+      Enum.each(tasks, fn t ->
+        if t.ref != winner_ref do
+          Task.shutdown(t, :brutal_kill)
+        else
+          Process.demonitor(t.ref, [:flush])
+        end
+      end)
+    end
+  end
+
+  defmodule Main do
+    def main do
+        # Demonstrating 316-hedged-requests
+        :ok
+    end
   end
 end
 

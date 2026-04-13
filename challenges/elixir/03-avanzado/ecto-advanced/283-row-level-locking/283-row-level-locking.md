@@ -566,220 +566,224 @@ decision between "add workers" vs. "partition the queue"?
 ## Executable Example
 
 ```elixir
-defp deps do
-  [
-    {:ecto_sql, "~> 3.12"},
-    {:postgrex, "~> 0.19"},
-    {:benchee, "~> 1.3", only: :dev}
-  ]
-end
-
-# lib/job_queue/schemas/job.ex
-defmodule JobQueue.Schemas.Job do
-  use Ecto.Schema
-  import Ecto.Changeset
-
-  schema "jobs" do
-    field :queue, :string, default: "default"
-    field :worker, :string, null: false
-    field :args, :map, default: %{}
-    field :state, :string, default: "pending"
-    field :attempts, :integer, default: 0
-    field :max_attempts, :integer, default: 3
-    field :scheduled_at, :utc_datetime
-    field :completed_at, :utc_datetime
-    field :last_error, :string
-    timestamps()
+defmodule Main do
+  defp deps do
+    [
+      {:ecto_sql, "~> 3.12"},
+      {:postgrex, "~> 0.19"},
+      {:benchee, "~> 1.3", only: :dev}
+    ]
   end
 
-  def changeset(job, attrs) do
-    job
-    |> cast(attrs, [:queue, :worker, :args, :scheduled_at, :max_attempts])
-    |> validate_required([:worker])
-    |> put_scheduled_at()
-  end
+  # lib/job_queue/schemas/job.ex
+  defmodule JobQueue.Schemas.Job do
+    use Ecto.Schema
+    import Ecto.Changeset
 
-  defp put_scheduled_at(cs) do
-    case get_field(cs, :scheduled_at) do
-      nil -> put_change(cs, :scheduled_at, DateTime.utc_now() |> DateTime.truncate(:second))
-      _ -> cs
-    end
-  end
-end
-
-# priv/repo/migrations/20260101000000_create_jobs.exs
-defmodule JobQueue.Repo.Migrations.CreateJobs do
-  use Ecto.Migration
-
-  def change do
-    create table(:jobs) do
-      add :queue, :string, null: false, default: "default"
-      add :worker, :string, null: false
-      add :args, :map, null: false, default: %{}
-      add :state, :string, null: false, default: "pending"
-      add :attempts, :integer, null: false, default: 0
-      add :max_attempts, :integer, null: false, default: 3
-      add :scheduled_at, :utc_datetime, null: false
-      add :completed_at, :utc_datetime
-      add :last_error, :text
+    schema "jobs" do
+      field :queue, :string, default: "default"
+      field :worker, :string, null: false
+      field :args, :map, default: %{}
+      field :state, :string, default: "pending"
+      field :attempts, :integer, default: 0
+      field :max_attempts, :integer, default: 3
+      field :scheduled_at, :utc_datetime
+      field :completed_at, :utc_datetime
+      field :last_error, :string
       timestamps()
     end
 
-    # Partial index for the hot pull query
-    create index(:jobs, [:queue, :scheduled_at],
-             where: "state = 'pending'",
-             name: :jobs_pending_idx)
+    def changeset(job, attrs) do
+      job
+      |> cast(attrs, [:queue, :worker, :args, :scheduled_at, :max_attempts])
+      |> validate_required([:worker])
+      |> put_scheduled_at()
+    end
 
-    create index(:jobs, [:state])
-  end
-end
-
-# lib/job_queue/queue.ex
-defmodule JobQueue.Queue do
-  import Ecto.Query
-
-  alias JobQueue.Repo
-  alias JobQueue.Schemas.Job
-
-  @spec enqueue(module(), map(), keyword()) :: {:ok, Job.t()}
-  def enqueue(worker, args, opts \\ []) do
-    attrs = %{
-      worker: to_string(worker),
-      args: args,
-      queue: Keyword.get(opts, :queue, "default"),
-      scheduled_at: Keyword.get(opts, :scheduled_at),
-      max_attempts: Keyword.get(opts, :max_attempts, 3)
-    }
-
-    %Job{}
-    |> Job.changeset(attrs)
-    |> Repo.insert()
-  end
-
-  @doc """
-  Pulls one ready job and marks it as running.
-
-  Returns `{:ok, job}` or `:empty`. Uses `FOR UPDATE SKIP LOCKED` so concurrent
-  workers never block each other.
-  """
-  @spec dequeue(String.t()) :: {:ok, Job.t()} | :empty
-  def dequeue(queue \\ "default") do
-    now = DateTime.utc_now() |> DateTime.truncate(:second)
-
-    Repo.transaction(fn ->
-      candidate =
-        from(j in Job,
-          where:
-            j.queue == ^queue and
-              j.state == "pending" and
-              j.scheduled_at <= ^now,
-          order_by: [asc: j.scheduled_at, asc: j.id],
-          limit: 1,
-          lock: "FOR UPDATE SKIP LOCKED"
-        )
-        |> Repo.one()
-
-      case candidate do
-        nil ->
-          :empty
-
-        job ->
-          {:ok, updated} =
-            job
-            |> Ecto.Changeset.change(state: "running", attempts: job.attempts + 1)
-            |> Repo.update()
-
-          updated
+    defp put_scheduled_at(cs) do
+      case get_field(cs, :scheduled_at) do
+        nil -> put_change(cs, :scheduled_at, DateTime.utc_now() |> DateTime.truncate(:second))
+        _ -> cs
       end
-    end)
-    |> case do
-      {:ok, :empty} -> :empty
-      {:ok, job} -> {:ok, job}
     end
   end
 
-  @spec complete(Job.t()) :: {:ok, Job.t()}
-  def complete(%Job{} = job) do
-    job
-    |> Ecto.Changeset.change(state: "done", completed_at: now())
-    |> Repo.update()
-  end
+  # priv/repo/migrations/20260101000000_create_jobs.exs
+  defmodule JobQueue.Repo.Migrations.CreateJobs do
+    use Ecto.Migration
 
-  @spec fail(Job.t(), String.t()) :: {:ok, Job.t()}
-  def fail(%Job{} = job, reason) do
-  end
-    next_state = if job.attempts >= job.max_attempts, do: "dead", else: "pending"
+    def change do
+      create table(:jobs) do
+        add :queue, :string, null: false, default: "default"
+        add :worker, :string, null: false
+        add :args, :map, null: false, default: %{}
+        add :state, :string, null: false, default: "pending"
+        add :attempts, :integer, null: false, default: 0
+        add :max_attempts, :integer, null: false, default: 3
+        add :scheduled_at, :utc_datetime, null: false
+        add :completed_at, :utc_datetime
+        add :last_error, :text
+        timestamps()
+      end
 
-    job
-    |> Ecto.Changeset.change(
-      state: next_state,
-      last_error: reason,
-      scheduled_at: backoff(job.attempts)
-    )
-    |> Repo.update()
-  end
+      # Partial index for the hot pull query
+      create index(:jobs, [:queue, :scheduled_at],
+               where: "state = 'pending'",
+               name: :jobs_pending_idx)
 
-  defp backoff(attempts) do
-    secs = :math.pow(2, attempts) |> trunc()
-    DateTime.utc_now() |> DateTime.add(secs, :second) |> DateTime.truncate(:second)
-  end
-
-  defp now, do: DateTime.utc_now() |> DateTime.truncate(:second)
-end
-
-# lib/job_queue/worker.ex
-defmodule JobQueue.Worker do
-  end
-  use GenServer
-  require Logger
-
-  alias JobQueue.Queue
-
-  @poll_ms 200
-
-  def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: Keyword.fetch!(opts, :name))
-
-  @impl true
-  def init(opts) do
-    queue = Keyword.get(opts, :queue, "default")
-    schedule_poll()
-    {:ok, %{queue: queue}}
-  end
-
-  @impl true
-  def handle_info(:poll, %{queue: queue} = state) do
-    case Queue.dequeue(queue) do
-      {:ok, job} -> run(job)
-      :empty -> :ok
-    end
-
-    schedule_poll()
-    {:noreply, state}
-  end
-
-  defp run(job) do
-    module = String.to_existing_atom("Elixir." <> job.worker)
-
-    try do
-      :ok = module.perform(job.args)
-      Queue.complete(job)
-    rescue
-      e ->
-        Logger.error("job #{job.id} failed: #{inspect(e)}")
-        Queue.fail(job, Exception.message(e))
+      create index(:jobs, [:state])
     end
   end
 
-  defp schedule_poll, do: Process.send_after(self(), :poll, @poll_ms)
-end
+  # lib/job_queue/queue.ex
+  defmodule JobQueue.Queue do
+    import Ecto.Query
 
-defmodule Main do
-  def main do
-      # Demonstrating 283-row-level-locking
-      :ok
+    alias JobQueue.Repo
+    alias JobQueue.Schemas.Job
+
+    @spec enqueue(module(), map(), keyword()) :: {:ok, Job.t()}
+    def enqueue(worker, args, opts \\ []) do
+      attrs = %{
+        worker: to_string(worker),
+        args: args,
+        queue: Keyword.get(opts, :queue, "default"),
+        scheduled_at: Keyword.get(opts, :scheduled_at),
+        max_attempts: Keyword.get(opts, :max_attempts, 3)
+      }
+
+      %Job{}
+      |> Job.changeset(attrs)
+      |> Repo.insert()
+    end
+
+    @doc """
+    Pulls one ready job and marks it as running.
+
+    Returns `{:ok, job}` or `:empty`. Uses `FOR UPDATE SKIP LOCKED` so concurrent
+    workers never block each other.
+    """
+    @spec dequeue(String.t()) :: {:ok, Job.t()} | :empty
+    def dequeue(queue \\ "default") do
+      now = DateTime.utc_now() |> DateTime.truncate(:second)
+
+      Repo.transaction(fn ->
+        candidate =
+          from(j in Job,
+            where:
+              j.queue == ^queue and
+                j.state == "pending" and
+                j.scheduled_at <= ^now,
+            order_by: [asc: j.scheduled_at, asc: j.id],
+            limit: 1,
+            lock: "FOR UPDATE SKIP LOCKED"
+          )
+          |> Repo.one()
+
+        case candidate do
+          nil ->
+            :empty
+
+          job ->
+            {:ok, updated} =
+              job
+              |> Ecto.Changeset.change(state: "running", attempts: job.attempts + 1)
+              |> Repo.update()
+
+            updated
+        end
+      end)
+      |> case do
+        {:ok, :empty} -> :empty
+        {:ok, job} -> {:ok, job}
+      end
+    end
+
+    @spec complete(Job.t()) :: {:ok, Job.t()}
+    def complete(%Job{} = job) do
+      job
+      |> Ecto.Changeset.change(state: "done", completed_at: now())
+      |> Repo.update()
+    end
+
+    @spec fail(Job.t(), String.t()) :: {:ok, Job.t()}
+    def fail(%Job{} = job, reason) do
+    end
+      next_state = if job.attempts >= job.max_attempts, do: "dead", else: "pending"
+
+      job
+      |> Ecto.Changeset.change(
+        state: next_state,
+        last_error: reason,
+        scheduled_at: backoff(job.attempts)
+      )
+      |> Repo.update()
+    end
+
+    defp backoff(attempts) do
+      secs = :math.pow(2, attempts) |> trunc()
+      DateTime.utc_now() |> DateTime.add(secs, :second) |> DateTime.truncate(:second)
+    end
+
+    defp now, do: DateTime.utc_now() |> DateTime.truncate(:second)
+  end
+
+  # lib/job_queue/worker.ex
+  defmodule JobQueue.Worker do
+    end
+    use GenServer
+    require Logger
+
+    alias JobQueue.Queue
+
+    @poll_ms 200
+
+    def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: Keyword.fetch!(opts, :name))
+
+    @impl true
+    def init(opts) do
+      queue = Keyword.get(opts, :queue, "default")
+      schedule_poll()
+      {:ok, %{queue: queue}}
+    end
+
+    @impl true
+    def handle_info(:poll, %{queue: queue} = state) do
+      case Queue.dequeue(queue) do
+        {:ok, job} -> run(job)
+        :empty -> :ok
+      end
+
+      schedule_poll()
+      {:noreply, state}
+    end
+
+    defp run(job) do
+      module = String.to_existing_atom("Elixir." <> job.worker)
+
+      try do
+        :ok = module.perform(job.args)
+        Queue.complete(job)
+      rescue
+        e ->
+          Logger.error("job #{job.id} failed: #{inspect(e)}")
+          Queue.fail(job, Exception.message(e))
+      end
+    end
+
+    defp schedule_poll, do: Process.send_after(self(), :poll, @poll_ms)
+  end
+
+  defmodule Main do
+    def main do
+        # Demonstrating 283-row-level-locking
+        :ok
+    end
+  end
+
+  Main.main()
   end
 end
 
 Main.main()
-end
 ```

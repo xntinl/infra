@@ -352,15 +352,19 @@ defmodule Main do
 
   def main do
     # Demo: get_env (runtime) vs compile_env (compile-time)
-    {:ok, _} = Application.ensure_all_started(:env_vs_compile)
+    # For this standalone example, we manually set the app config
+    Application.put_env(:env_vs_compile, :build_flavor, :vanilla)
+    Application.put_env(:env_vs_compile, :endpoint, "http://localhost:4000")
   
     # compile_env es evaluado en tiempo de compilación
-    compiled = Application.get_env(:env_vs_compile, :compiled_value)
-    runtime = Application.get_env(:env_vs_compile, :runtime_value)
+    compiled_value = EnvVsCompile.compile_time_build_flavor()
+    runtime_value = EnvVsCompile.runtime_build_flavor()
+    endpoint = EnvVsCompile.endpoint()
   
     IO.puts("EnvVsCompile: demostración exitosa")
-    IO.puts("  compiled_value: #{inspect(compiled)} (congelado)")
-    IO.puts("  runtime_value: #{inspect(runtime)} (dinámico)")
+    IO.puts("  compile_time: #{inspect(compiled_value)} (congelado)")
+    IO.puts("  runtime: #{inspect(runtime_value)} (dinámico)")
+    IO.puts("  endpoint: #{inspect(endpoint)}")
   end
 
 end

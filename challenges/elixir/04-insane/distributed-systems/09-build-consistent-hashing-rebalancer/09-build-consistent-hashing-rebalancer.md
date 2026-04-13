@@ -161,6 +161,32 @@ Failure mode: single data center failure loses data; availability is not true hi
 
 ---
 
+## Project Structure
+
+```
+chord_ring/
+├── lib/
+│   └── chord_ring/
+│       ├── application.ex           # OTP supervision: ring, shards, monitoring
+│       ├── ring.ex                  # ring data structure: sorted tokens, O(log N) lookup
+│       ├── node_manager.ex          # GenServer: node addition/removal FSM
+│       ├── shard.ex                 # GenServer per shard: owns token range
+│       ├── replication.ex           # quorum reads/writes across R consecutive rings
+│       ├── migration.ex             # FSM: lazy background migration, dual-write
+│       ├── hotspot.ex               # sliding-window detector, exponential smoothing
+│       └── api.ex                   # HTTP monitoring: ring state, progress, alerts
+├── test/
+│   └── chord_ring/
+│       ├── ring_test.exs            # distribution, routing determinism, minimal movement
+│       ├── migration_test.exs       # read availability during migration
+│       ├── replication_test.exs     # quorum correctness, fault tolerance
+│       ├── hotspot_test.exs         # detection accuracy, false positive rate
+│       └── consistency_test.exs     # reads never return stale data after migration
+├── bench/
+│   └── ring_bench.exs
+└── mix.exs
+```
+
 ## Implementation milestones
 
 ### Step 1: Create the project

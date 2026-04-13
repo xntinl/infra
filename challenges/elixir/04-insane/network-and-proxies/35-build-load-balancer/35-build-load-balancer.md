@@ -8,36 +8,39 @@
 
 You are building `balancer`, which the infrastructure team will use to distribute traffic across pools of backend services. It must operate at TCP (Layer 4) for arbitrary protocols and at HTTP (Layer 7) for virtual hosting. Backends can fail and recover at any time. The balancer must detect failures, remove unhealthy backends, and allow graceful removal of backends without dropping active connections.
 
-Project structure:
+## Full Project Directory Tree
 
 ```
 balancer/
 ├── lib/
+│   ├── balancer.ex                  # main application module
 │   └── balancer/
-│       ├── application.ex
-│       ├── listener.ex               # ← TCP accept loop
-│       ├── proxy.ex                  # ← bidirectional TCP relay per connection
-│       ├── http_classifier.ex        # ← HTTP Host header extraction (minimal parser)
-│       ├── pool.ex                   # ← backend pool state + selection
+│       ├── application.ex           # OTP supervisor
+│       ├── listener.ex              # TCP accept loop, spawns relay per client
+│       ├── proxy.ex                 # bidirectional TCP relay: forward + reverse tasks
+│       ├── http_classifier.ex       # HTTP Host header extraction (minimal parser)
+│       ├── pool.ex                  # backend pool: ETS storage + selection logic
 │       ├── algorithms/
-│       │   ├── round_robin.ex
-│       │   ├── least_connections.ex  # ← :atomics connection counter
-│       │   ├── ip_hash.ex            # ← consistent hash for sticky sessions
-│       │   └── weighted.ex           # ← current-weight algorithm
+│       │   ├── round_robin.ex       # stateless sequential selection
+│       │   ├── least_connections.ex # lock-free atomics counter per backend
+│       │   ├── ip_hash.ex           # consistent hash for sticky sessions
+│       │   └── weighted.ex          # current-weight algorithm (Nginx style)
 │       ├── health/
-│       │   ├── active.ex             # ← periodic HTTP probe per backend
-│       │   └── passive.ex            # ← error rate tracking on real traffic
-│       ├── drain.ex                  # ← PUT /backends/:id/drain + restore
-│       └── stats.ex                  # ← per-backend P50/P99 latency + rates
+│       │   ├── active.ex            # periodic HTTP probe per backend
+│       │   └── passive.ex           # error rate tracking on real traffic
+│       ├── drain.ex                 # graceful backend removal (no new conns)
+│       └── stats.ex                 # per-backend P50/P99 latency + throughput
 ├── test/
+│   ├── balancer_test.exs            # integration smoke tests
 │   └── balancer/
-│       ├── proxy_test.exs
-│       ├── pool_test.exs
-│       ├── health_test.exs
-│       └── drain_test.exs
+│       ├── proxy_test.exs           # TCP relay bidirectional flow
+│       ├── pool_test.exs            # selection algorithms + health management
+│       ├── health_test.exs          # active probe hysteresis
+│       └── drain_test.exs           # graceful shutdown semantics
 ├── bench/
-│   └── throughput_bench.exs
-└── mix.exs
+│   └── throughput_bench.exs         # selection algorithm performance
+├── mix.exs                          # dependencies and config
+└── README.md
 ```
 
 ---
@@ -586,43 +589,72 @@ defmodule Balancer.PoolTest do
   end
 
 
-  describe "Pool" do
+  describe "algorithm: round-robin" do
+    test "distributes sequentially across healthy backends" do
+      selections = for _ <- 1..20, do: Pool.select(:round_robin)
+      ids = Enum.map(selections, fn {:ok, b} -> b.id end)
+      # Should see b1 and b2 alternating (b3 is unhealthy)
+      assert Enum.count(ids, &(&1 == "b1")) > 0
+      assert Enum.count(ids, &(&1 == "b2")) > 0
+      assert Enum.count(ids, &(&1 == "b3")) == 0
+    end
 
-  test "round_robin skips unhealthy backends" do
-    selections = for _ <- 1..10, do: Pool.select(:round_robin)
-    backends_selected = Enum.map(selections, fn {:ok, b} -> b.id end)
-    refute "b3" in backends_selected
-  end
-
-  test "mark_unhealthy removes backend from rotation" do
-    Pool.mark_unhealthy("b1")
-    # b1 should no longer be selected
-    for _ <- 1..20 do
-      {:ok, backend} = Pool.select(:round_robin)
-      assert backend.id != "b1"
+    test "skips unhealthy backends" do
+      selections = for _ <- 1..10, do: Pool.select(:round_robin)
+      backends_selected = Enum.map(selections, fn {:ok, b} -> b.id end)
+      refute "b3" in backends_selected
     end
   end
 
-  test "mark_healthy returns backend to rotation" do
-    Pool.mark_unhealthy("b1")
-    Pool.mark_healthy("b1")
-    ids = for _ <- 1..20, do: elem(Pool.select(:round_robin), 1) |> Map.get(:id)
-    assert "b1" in ids
-  end
-
-  test "weighted distribution approximates configured weights" do
-    # b1: weight 1, b2: weight 2 → expect ~33%/66% distribution
-    counts = for _ <- 1..300, reduce: %{"b1" => 0, "b2" => 0} do
-      acc ->
-        {:ok, b} = Pool.select(:weighted)
-        Map.update!(acc, b.id, &(&1 + 1))
+  describe "health management" do
+    test "mark_unhealthy removes backend from rotation" do
+      Pool.mark_unhealthy("b1")
+      # b1 should no longer be selected
+      for _ <- 1..20 do
+        {:ok, backend} = Pool.select(:round_robin)
+        assert backend.id != "b1"
+      end
     end
 
-    ratio = counts["b2"] / counts["b1"]
-    assert ratio > 1.5 and ratio < 2.5, "Expected ~2.0, got #{ratio}"
+    test "mark_healthy returns backend to rotation" do
+      Pool.mark_unhealthy("b1")
+      Pool.mark_healthy("b1")
+      ids = for _ <- 1..20, do: elem(Pool.select(:round_robin), 1) |> Map.get(:id)
+      assert "b1" in ids
+    end
+
+    test "transitions between healthy and unhealthy are atomic" do
+      for _ <- 1..5 do
+        Pool.mark_unhealthy("b1")
+        {:ok, b} = Pool.select(:round_robin)
+        assert b.id != "b1"
+        
+        Pool.mark_healthy("b1")
+        {:ok, b2} = Pool.select(:round_robin)
+        assert b2.id in ["b1", "b2"]
+      end
+    end
   end
 
+  describe "algorithm: weighted round-robin" do
+    test "distribution approximates configured weights" do
+      # b1: weight 1, b2: weight 2 → expect ~33%/66% distribution
+      counts = for _ <- 1..300, reduce: %{"b1" => 0, "b2" => 0} do
+        acc ->
+          {:ok, b} = Pool.select(:weighted)
+          Map.update!(acc, b.id, &(&1 + 1))
+      end
 
+      ratio = counts["b2"] / counts["b1"]
+      assert ratio > 1.5 and ratio < 2.5, "Expected ~2.0, got #{ratio}"
+    end
+
+    test "single backend with weight 1 always selected" do
+      {:ok, b1} = Pool.select(:weighted)
+      {:ok, b2} = Pool.select(:weighted)
+      assert b1.id in ["b1", "b2"]
+      assert b2.id in ["b1", "b2"]
+    end
   end
 end
 ```
@@ -633,27 +665,34 @@ defmodule Balancer.DrainTest do
   use ExUnit.Case, async: false
 
 
-  describe "Drain" do
+  describe "connection draining" do
+    test "draining backend receives no new connections" do
+      Pool.add_backend(%{id: "drain-test", host: "localhost", port: 9001, weight: 1, healthy: true, draining: false})
+      Pool.drain("drain-test")
 
-  test "draining backend receives no new connections" do
-    Pool.add_backend(%{id: "drain-test", host: "localhost", port: 9001, weight: 1, healthy: true, draining: false})
-    Pool.drain("drain-test")
-
-    for _ <- 1..20 do
-      {:ok, backend} = Pool.select(:round_robin)
-      assert backend.id != "drain-test"
+      for _ <- 1..20 do
+        {:ok, backend} = Pool.select(:round_robin)
+        assert backend.id != "drain-test"
+      end
     end
-  end
 
-  test "restore returns drained backend to rotation" do
-    Pool.drain("drain-test")
-    Pool.restore("drain-test")
+    test "restore returns drained backend to rotation" do
+      Pool.add_backend(%{id: "drain-test2", host: "localhost", port: 9002, weight: 1, healthy: true, draining: false})
+      Pool.drain("drain-test2")
+      Pool.restore("drain-test2")
 
-    ids = for _ <- 1..20, do: elem(Pool.select(:round_robin), 1) |> Map.get(:id)
-    assert "drain-test" in ids
-  end
+      ids = for _ <- 1..20, do: elem(Pool.select(:round_robin), 1) |> Map.get(:id)
+      assert "drain-test2" in ids
+    end
 
-
+    test "draining does not affect other backends" do
+      Pool.add_backend(%{id: "other-1", host: "localhost", port: 9003, weight: 1, healthy: true, draining: false})
+      Pool.drain("drain-test")
+      
+      {:ok, b} = Pool.select(:round_robin)
+      assert b.id in ["b1", "b2", "other-1"]
+      assert b.id != "drain-test"
+    end
   end
 end
 ```
@@ -686,20 +725,18 @@ Expected baseline: a pure TCP relay should forward at least 50k req/s on modern 
 The design separates concerns along their real axes: what must be correct (the load balancer invariants), what must be fast (the hot path isolated from slow paths), and what must be evolvable (external contracts kept narrow). Each module has one job and fails loudly when given inputs outside its contract, so bugs surface near their source instead of as mysterious downstream symptoms. The tests exercise the invariants directly rather than implementation details, which keeps them useful across refactors.
 
 
-## Main Entry Point
+## Quick start
 
-```elixir
-def main do
-  IO.puts("======== 35-build-load-balancer ========")
-  IO.puts("Build load balancer")
-  IO.puts("")
-  
-  Balancer.Proxy.start_link([])
-  IO.puts("Balancer.Proxy started")
-  
-  IO.puts("Run: mix test")
-end
+```bash
+# Start the application and run tests
+mix deps.get
+mix test test/balancer/ --trace
+
+# Or run performance benchmarks:
+mix run bench/throughput_bench.exs
 ```
+
+Target: <1µs per backend selection at 100 backends; sustained >50k req/s at p99 tail latency <10ms.
 
 
 

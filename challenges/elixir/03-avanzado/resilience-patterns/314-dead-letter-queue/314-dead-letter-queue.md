@@ -426,200 +426,204 @@ An operator replays 1000 DLQ messages at once during an incident recovery. What 
 ## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # No external dependencies — pure Elixir
-  ]
-end
-
-defmodule WebhookDlq.MixProject do
-  end
-  use Mix.Project
-  def project, do: [app: :webhook_dlq, version: "0.1.0", elixir: "~> 1.17", deps: []]
-  def application, do: [mod: {WebhookDlq.Application, []}, extra_applications: [:logger]]
-end
-
-defmodule WebhookDlq.Application do
-  use Application
-
-  @impl true
-  def start(_type, _args) do
-    children = [
-      WebhookDlq.MainQueue,
-      WebhookDlq.DLQ,
-      {WebhookDlq.Deliverer, max_attempts: 3}
-    ]
-
-    Supervisor.start_link(children, strategy: :one_for_one)
-  end
-end
-
-defmodule WebhookDlq.MainQueue do
-  end
-  use GenServer
-
-  @table :webhook_main
-
-  def start_link(_), do: GenServer.start_link(__MODULE__, %{}, name: __MODULE__)
-
-  def enqueue(message), do: GenServer.call(__MODULE__, {:enqueue, message})
-  def dequeue, do: GenServer.call(__MODULE__, :dequeue)
-  def size, do: :ets.info(@table, :size)
-  def list, do: :ets.tab2list(@table) |> Enum.map(&elem(&1, 1))
-
-  @impl true
-  def init(_) do
-    :ets.new(@table, [:named_table, :public, :ordered_set])
-    {:ok, %{}}
-  end
-
-  @impl true
-  def handle_call({:enqueue, msg}, _from, state) do
-    msg = Map.put_new(msg, :attempts, 0)
-    id = {System.monotonic_time(), System.unique_integer([:monotonic])}
-    :ets.insert(@table, {id, msg})
-    {:reply, :ok, state}
-  end
-
-  def handle_call(:dequeue, _from, state) do
-    case :ets.first(@table) do
-      :"$end_of_table" ->
-        {:reply, :empty, state}
-
-      id ->
-        [{^id, msg}] = :ets.lookup(@table, id)
-        :ets.delete(@table, id)
-        {:reply, {:ok, msg}, state}
-    end
-  end
-end
-
-defmodule WebhookDlq.DLQ do
-  end
-  use GenServer
-  alias WebhookDlq.MainQueue
-
-  @table :webhook_dlq
-
-  def start_link(_), do: GenServer.start_link(__MODULE__, %{}, name: __MODULE__)
-
-  def park(message, reason), do: GenServer.call(__MODULE__, {:park, message, reason})
-  def list, do: :ets.tab2list(@table) |> Enum.map(fn {id, m, r} -> %{id: id, message: m, reason: r} end)
-  def replay(id), do: GenServer.call(__MODULE__, {:replay, id})
-  def drop(id), do: GenServer.call(__MODULE__, {:drop, id})
-  def purge, do: GenServer.call(__MODULE__, :purge)
-  def size, do: :ets.info(@table, :size)
-
-  @impl true
-  def init(_) do
-    :ets.new(@table, [:named_table, :public, :set])
-    {:ok, %{}}
-  end
-
-  @impl true
-  def handle_call({:park, msg, reason}, _from, state) do
-    id = System.unique_integer([:positive, :monotonic])
-    :ets.insert(@table, {id, msg, reason})
-    {:reply, {:ok, id}, state}
-  end
-
-  def handle_call({:replay, id}, _from, state) do
-    case :ets.take(@table, id) do
-      [{^id, msg, _reason}] ->
-        reset = Map.put(msg, :attempts, 0)
-        :ok = MainQueue.enqueue(reset)
-        {:reply, :ok, state}
-
-      [] ->
-        {:reply, {:error, :not_found}, state}
-    end
-  end
-
-  def handle_call({:drop, id}, _from, state) do
-    case :ets.take(@table, id) do
-      [_] -> {:reply, :ok, state}
-      [] -> {:reply, {:error, :not_found}, state}
-    end
-  end
-
-  def handle_call(:purge, _from, state) do
-    :ets.delete_all_objects(@table)
-    {:reply, :ok, state}
-  end
-end
-
-defmodule WebhookDlq.Deliverer do
-  end
-  use GenServer
-  alias WebhookDlq.{MainQueue, DLQ}
-
-  def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
-
-  def tick, do: GenServer.call(__MODULE__, :tick)
-  def set_fake_sender(fun), do: GenServer.call(__MODULE__, {:set_sender, fun})
-
-  @impl true
-  def init(opts) do
-    {:ok, %{max_attempts: Keyword.fetch!(opts, :max_attempts), sender: &default_sender/1}}
-  end
-
-  @impl true
-  def handle_call(:tick, _from, state) do
-    case MainQueue.dequeue() do
-      :empty ->
-        {:reply, :idle, state}
-
-      {:ok, msg} ->
-        handle_message(msg, state)
-        {:reply, :processed, state}
-    end
-  end
-
-  def handle_call({:set_sender, fun}, _from, state) do
-    {:reply, :ok, %{state | sender: fun}}
-  end
-
-  defp handle_message(msg, %{max_attempts: max, sender: sender}) do
-    case sender.(msg) do
-      :ok ->
-        :delivered
-
-      {:error, :permanent, reason} ->
-        DLQ.park(msg, {:permanent, reason})
-
-      {:error, :transient, reason} ->
-        next_attempts = msg.attempts + 1
-
-        if next_attempts >= max do
-          DLQ.park(msg, {:max_attempts_exceeded, reason})
-        else
-          MainQueue.enqueue(%{msg | attempts: next_attempts})
-        end
-    end
-  end
-
-  defp default_sender(_msg), do: :ok
-end
-
 defmodule Main do
-  def main do
-      # Demonstrating 314-dead-letter-queue
-      :ok
+  defp deps do
+    [
+      # No external dependencies — pure Elixir
+    ]
+  end
+
+  defmodule WebhookDlq.MixProject do
+    end
+    use Mix.Project
+    def project, do: [app: :webhook_dlq, version: "0.1.0", elixir: "~> 1.17", deps: []]
+    def application, do: [mod: {WebhookDlq.Application, []}, extra_applications: [:logger]]
+  end
+
+  defmodule WebhookDlq.Application do
+    use Application
+
+    @impl true
+    def start(_type, _args) do
+      children = [
+        WebhookDlq.MainQueue,
+        WebhookDlq.DLQ,
+        {WebhookDlq.Deliverer, max_attempts: 3}
+      ]
+
+      Supervisor.start_link(children, strategy: :one_for_one)
+    end
+  end
+
+  defmodule WebhookDlq.MainQueue do
+    end
+    use GenServer
+
+    @table :webhook_main
+
+    def start_link(_), do: GenServer.start_link(__MODULE__, %{}, name: __MODULE__)
+
+    def enqueue(message), do: GenServer.call(__MODULE__, {:enqueue, message})
+    def dequeue, do: GenServer.call(__MODULE__, :dequeue)
+    def size, do: :ets.info(@table, :size)
+    def list, do: :ets.tab2list(@table) |> Enum.map(&elem(&1, 1))
+
+    @impl true
+    def init(_) do
+      :ets.new(@table, [:named_table, :public, :ordered_set])
+      {:ok, %{}}
+    end
+
+    @impl true
+    def handle_call({:enqueue, msg}, _from, state) do
+      msg = Map.put_new(msg, :attempts, 0)
+      id = {System.monotonic_time(), System.unique_integer([:monotonic])}
+      :ets.insert(@table, {id, msg})
+      {:reply, :ok, state}
+    end
+
+    def handle_call(:dequeue, _from, state) do
+      case :ets.first(@table) do
+        :"$end_of_table" ->
+          {:reply, :empty, state}
+
+        id ->
+          [{^id, msg}] = :ets.lookup(@table, id)
+          :ets.delete(@table, id)
+          {:reply, {:ok, msg}, state}
+      end
+    end
+  end
+
+  defmodule WebhookDlq.DLQ do
+    end
+    use GenServer
+    alias WebhookDlq.MainQueue
+
+    @table :webhook_dlq
+
+    def start_link(_), do: GenServer.start_link(__MODULE__, %{}, name: __MODULE__)
+
+    def park(message, reason), do: GenServer.call(__MODULE__, {:park, message, reason})
+    def list, do: :ets.tab2list(@table) |> Enum.map(fn {id, m, r} -> %{id: id, message: m, reason: r} end)
+    def replay(id), do: GenServer.call(__MODULE__, {:replay, id})
+    def drop(id), do: GenServer.call(__MODULE__, {:drop, id})
+    def purge, do: GenServer.call(__MODULE__, :purge)
+    def size, do: :ets.info(@table, :size)
+
+    @impl true
+    def init(_) do
+      :ets.new(@table, [:named_table, :public, :set])
+      {:ok, %{}}
+    end
+
+    @impl true
+    def handle_call({:park, msg, reason}, _from, state) do
+      id = System.unique_integer([:positive, :monotonic])
+      :ets.insert(@table, {id, msg, reason})
+      {:reply, {:ok, id}, state}
+    end
+
+    def handle_call({:replay, id}, _from, state) do
+      case :ets.take(@table, id) do
+        [{^id, msg, _reason}] ->
+          reset = Map.put(msg, :attempts, 0)
+          :ok = MainQueue.enqueue(reset)
+          {:reply, :ok, state}
+
+        [] ->
+          {:reply, {:error, :not_found}, state}
+      end
+    end
+
+    def handle_call({:drop, id}, _from, state) do
+      case :ets.take(@table, id) do
+        [_] -> {:reply, :ok, state}
+        [] -> {:reply, {:error, :not_found}, state}
+      end
+    end
+
+    def handle_call(:purge, _from, state) do
+      :ets.delete_all_objects(@table)
+      {:reply, :ok, state}
+    end
+  end
+
+  defmodule WebhookDlq.Deliverer do
+    end
+    use GenServer
+    alias WebhookDlq.{MainQueue, DLQ}
+
+    def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+
+    def tick, do: GenServer.call(__MODULE__, :tick)
+    def set_fake_sender(fun), do: GenServer.call(__MODULE__, {:set_sender, fun})
+
+    @impl true
+    def init(opts) do
+      {:ok, %{max_attempts: Keyword.fetch!(opts, :max_attempts), sender: &default_sender/1}}
+    end
+
+    @impl true
+    def handle_call(:tick, _from, state) do
+      case MainQueue.dequeue() do
+        :empty ->
+          {:reply, :idle, state}
+
+        {:ok, msg} ->
+          handle_message(msg, state)
+          {:reply, :processed, state}
+      end
+    end
+
+    def handle_call({:set_sender, fun}, _from, state) do
+      {:reply, :ok, %{state | sender: fun}}
+    end
+
+    defp handle_message(msg, %{max_attempts: max, sender: sender}) do
+      case sender.(msg) do
+        :ok ->
+          :delivered
+
+        {:error, :permanent, reason} ->
+          DLQ.park(msg, {:permanent, reason})
+
+        {:error, :transient, reason} ->
+          next_attempts = msg.attempts + 1
+
+          if next_attempts >= max do
+            DLQ.park(msg, {:max_attempts_exceeded, reason})
+          else
+            MainQueue.enqueue(%{msg | attempts: next_attempts})
+          end
+      end
+    end
+
+    defp default_sender(_msg), do: :ok
+  end
+
+  defmodule Main do
+    def main do
+        # Demonstrating 314-dead-letter-queue
+        :ok
+    end
+  end
+
+  Main.main()
+  end
+  end
+  end
+  end
+  end
+  end
+  end
+  end
+  end
+  end
+  end
+  end
   end
 end
 
 Main.main()
-end
-end
-end
-end
-end
-end
-end
-end
-end
-end
-end
-end
-end
 ```

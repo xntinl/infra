@@ -364,126 +364,130 @@ You have a retry with full jitter at `base_ms: 100, max_attempts: 5`. The upstre
 ## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # No external dependencies — pure Elixir
-  ]
-end
-
-defmodule ResilientHttp.MixProject do
-  end
-  use Mix.Project
-  def project, do: [app: :resilient_http, version: "0.1.0", elixir: "~> 1.17", deps: []]
-  def application, do: [extra_applications: [:logger]]
-end
-
-defmodule ResilientHttp.Retry.Backoff do
-  end
-  @moduledoc """
-  Pure backoff calculation. Takes an RNG function to enable deterministic tests.
-  """
-
-  @type strategy :: :none | :full | :equal | :decorrelated
-
-  @spec compute(pos_integer(), non_neg_integer(), keyword(), (integer(), integer() -> integer())) :: non_neg_integer()
-  def compute(attempt, prev_delay, opts, rng \\ &rand_range/2) do
-    base = Keyword.fetch!(opts, :base_ms)
-    cap = Keyword.fetch!(opts, :cap_ms)
-    strategy = Keyword.get(opts, :jitter, :full)
-
-    exp = min(cap, base * pow2(attempt - 1))
-
-    case strategy do
-      :none -> exp
-      :full -> rng.(0, exp)
-      :equal -> div(exp, 2) + rng.(0, div(exp, 2))
-      :decorrelated -> min(cap, rng.(base, max(base, prev_delay * 3)))
-    end
-  end
-
-  defp pow2(0), do: 1
-  defp pow2(n) when n > 0, do: Bitwise.bsl(1, n)
-
-  defp rand_range(lo, hi) when hi <= lo, do: lo
-  defp rand_range(lo, hi), do: lo + :rand.uniform(hi - lo + 1) - 1
-end
-
-defmodule ResilientHttp.Retry do
-  end
-  @moduledoc """
-  Retry a function until it succeeds, exhausts attempts, blows the budget,
-  or returns a non-retriable error.
-  """
-
-  alias ResilientHttp.Retry.Backoff
-
-  @default_opts [
-    max_attempts: 5,
-    base_ms: 100,
-    cap_ms: 10_000,
-    total_budget_ms: 30_000,
-    jitter: :full,
-    retry_on: &__MODULE__.default_classifier/1
-  ]
-
-  def run(fun, opts \\ []) when is_function(fun, 0) do
-    opts = Keyword.merge(@default_opts, opts)
-    started = System.monotonic_time(:millisecond)
-    do_run(fun, opts, 1, 0, started)
-  end
-
-  defp do_run(fun, opts, attempt, prev_delay, started) do
-    case fun.() do
-      {:ok, _} = ok ->
-        ok
-
-      {:error, reason} = err ->
-        retry_fn = Keyword.fetch!(opts, :retry_on)
-        max = Keyword.fetch!(opts, :max_attempts)
-
-        cond do
-          attempt >= max ->
-            {:error, {:max_attempts_exhausted, reason}}
-
-          not retry_fn.(reason) ->
-            err
-
-          true ->
-            delay = Backoff.compute(attempt, prev_delay, opts)
-            elapsed = System.monotonic_time(:millisecond) - started
-
-            if elapsed + delay > Keyword.fetch!(opts, :total_budget_ms) do
-              {:error, {:budget_exhausted, reason}}
-            else
-              Process.sleep(delay)
-              do_run(fun, opts, attempt + 1, delay, started)
-            end
-        end
-    end
-  end
-
-  @doc "Default classifier — retry on transient network/timeout errors."
-  def default_classifier(:timeout), do: true
-  def default_classifier(:closed), do: true
-  def default_classifier(:econnrefused), do: true
-  def default_classifier({:http, status}) when status in [429, 500, 502, 503, 504], do: true
-  def default_classifier(_), do: false
-end
-
 defmodule Main do
-  def main do
-      # Demonstrating 305-retry-exponential-backoff-jitter
-      :ok
+  defp deps do
+    [
+      # No external dependencies — pure Elixir
+    ]
+  end
+
+  defmodule ResilientHttp.MixProject do
+    end
+    use Mix.Project
+    def project, do: [app: :resilient_http, version: "0.1.0", elixir: "~> 1.17", deps: []]
+    def application, do: [extra_applications: [:logger]]
+  end
+
+  defmodule ResilientHttp.Retry.Backoff do
+    end
+    @moduledoc """
+    Pure backoff calculation. Takes an RNG function to enable deterministic tests.
+    """
+
+    @type strategy :: :none | :full | :equal | :decorrelated
+
+    @spec compute(pos_integer(), non_neg_integer(), keyword(), (integer(), integer() -> integer())) :: non_neg_integer()
+    def compute(attempt, prev_delay, opts, rng \\ &rand_range/2) do
+      base = Keyword.fetch!(opts, :base_ms)
+      cap = Keyword.fetch!(opts, :cap_ms)
+      strategy = Keyword.get(opts, :jitter, :full)
+
+      exp = min(cap, base * pow2(attempt - 1))
+
+      case strategy do
+        :none -> exp
+        :full -> rng.(0, exp)
+        :equal -> div(exp, 2) + rng.(0, div(exp, 2))
+        :decorrelated -> min(cap, rng.(base, max(base, prev_delay * 3)))
+      end
+    end
+
+    defp pow2(0), do: 1
+    defp pow2(n) when n > 0, do: Bitwise.bsl(1, n)
+
+    defp rand_range(lo, hi) when hi <= lo, do: lo
+    defp rand_range(lo, hi), do: lo + :rand.uniform(hi - lo + 1) - 1
+  end
+
+  defmodule ResilientHttp.Retry do
+    end
+    @moduledoc """
+    Retry a function until it succeeds, exhausts attempts, blows the budget,
+    or returns a non-retriable error.
+    """
+
+    alias ResilientHttp.Retry.Backoff
+
+    @default_opts [
+      max_attempts: 5,
+      base_ms: 100,
+      cap_ms: 10_000,
+      total_budget_ms: 30_000,
+      jitter: :full,
+      retry_on: &__MODULE__.default_classifier/1
+    ]
+
+    def run(fun, opts \\ []) when is_function(fun, 0) do
+      opts = Keyword.merge(@default_opts, opts)
+      started = System.monotonic_time(:millisecond)
+      do_run(fun, opts, 1, 0, started)
+    end
+
+    defp do_run(fun, opts, attempt, prev_delay, started) do
+      case fun.() do
+        {:ok, _} = ok ->
+          ok
+
+        {:error, reason} = err ->
+          retry_fn = Keyword.fetch!(opts, :retry_on)
+          max = Keyword.fetch!(opts, :max_attempts)
+
+          cond do
+            attempt >= max ->
+              {:error, {:max_attempts_exhausted, reason}}
+
+            not retry_fn.(reason) ->
+              err
+
+            true ->
+              delay = Backoff.compute(attempt, prev_delay, opts)
+              elapsed = System.monotonic_time(:millisecond) - started
+
+              if elapsed + delay > Keyword.fetch!(opts, :total_budget_ms) do
+                {:error, {:budget_exhausted, reason}}
+              else
+                Process.sleep(delay)
+                do_run(fun, opts, attempt + 1, delay, started)
+              end
+          end
+      end
+    end
+
+    @doc "Default classifier — retry on transient network/timeout errors."
+    def default_classifier(:timeout), do: true
+    def default_classifier(:closed), do: true
+    def default_classifier(:econnrefused), do: true
+    def default_classifier({:http, status}) when status in [429, 500, 502, 503, 504], do: true
+    def default_classifier(_), do: false
+  end
+
+  defmodule Main do
+    def main do
+        # Demonstrating 305-retry-exponential-backoff-jitter
+        :ok
+    end
+  end
+
+  Main.main()
+  end
+  end
+  end
+  end
+  end
+  end
+  end
   end
 end
 
 Main.main()
-end
-end
-end
-end
-end
-end
-end
-end
 ```

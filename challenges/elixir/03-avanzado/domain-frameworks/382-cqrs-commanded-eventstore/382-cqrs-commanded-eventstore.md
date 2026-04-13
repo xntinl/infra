@@ -526,277 +526,281 @@ The `Transfer` process manager is driven by events; if the BEAM restarts between
 ## Executable Example
 
 ```elixir
-defp deps do
-  [
-    {:commanded, "~> 1.4"},
-    {:commanded_eventstore_adapter, "~> 1.4"},
-    {:commanded_ecto_projections, "~> 1.4"},
-    {:eventstore, "~> 1.4"},
-    {:ecto_sql, "~> 3.12"},
-    {:postgrex, "~> 0.19"},
-    {:jason, "~> 1.4"}
-  ]
-end
-
-defmodule LedgerCqrs.Write.Commands do
-  defmodule OpenAccount do
-    @enforce_keys [:account_id, :owner]
-    defstruct [:account_id, :owner]
+defmodule Main do
+  defp deps do
+    [
+      {:commanded, "~> 1.4"},
+      {:commanded_eventstore_adapter, "~> 1.4"},
+      {:commanded_ecto_projections, "~> 1.4"},
+      {:eventstore, "~> 1.4"},
+      {:ecto_sql, "~> 3.12"},
+      {:postgrex, "~> 0.19"},
+      {:jason, "~> 1.4"}
+    ]
   end
 
-  defmodule Debit do
-    @enforce_keys [:account_id, :amount_cents, :transfer_id]
-    defstruct [:account_id, :amount_cents, :transfer_id]
-  end
-
-  defmodule Credit do
-    @enforce_keys [:account_id, :amount_cents, :transfer_id]
-    defstruct [:account_id, :amount_cents, :transfer_id]
-  end
-
-  defmodule StartTransfer do
-    @enforce_keys [:transfer_id, :source_id, :target_id, :amount_cents]
-    defstruct [:transfer_id, :source_id, :target_id, :amount_cents]
-  end
-end
-
-defmodule LedgerCqrs.Write.Events do
-  defmodule AccountOpened do
-    @derive Jason.Encoder
-    defstruct [:account_id, :owner]
-  end
-
-  defmodule Debited do
-    @derive Jason.Encoder
-    defstruct [:account_id, :amount_cents, :transfer_id, :new_balance]
-  end
-
-  defmodule Credited do
-    @derive Jason.Encoder
-    defstruct [:account_id, :amount_cents, :transfer_id, :new_balance]
-  end
-
-  defmodule TransferRequested do
-    @derive Jason.Encoder
-    defstruct [:transfer_id, :source_id, :target_id, :amount_cents]
-  end
-
-  defmodule DebitFailed do
-    @derive Jason.Encoder
-    defstruct [:transfer_id, :account_id, :reason]
-  end
-end
-
-defmodule LedgerCqrs.Write.Account do
-  end
-  alias LedgerCqrs.Write.Commands.{OpenAccount, Debit, Credit}
-  alias LedgerCqrs.Write.Events.{AccountOpened, Debited, Credited, DebitFailed}
-
-  defstruct account_id: nil, owner: nil, balance: 0, opened?: false
-
-  def execute(%__MODULE__{opened?: false}, %OpenAccount{} = cmd),
-    do: %AccountOpened{account_id: cmd.account_id, owner: cmd.owner}
-
-  def execute(%__MODULE__{opened?: true}, %OpenAccount{}),
-    do: {:error, :account_already_open}
-
-  def execute(%__MODULE__{opened?: false}, _),
-    do: {:error, :account_not_open}
-
-  def execute(%__MODULE__{balance: bal}, %Debit{amount_cents: amt, transfer_id: tid, account_id: aid})
-      when amt > bal do
-    %DebitFailed{transfer_id: tid, account_id: aid, reason: :insufficient_funds}
-  end
-
-  def execute(%__MODULE__{} = state, %Debit{} = cmd) do
-    %Debited{
-      account_id: cmd.account_id,
-      amount_cents: cmd.amount_cents,
-      transfer_id: cmd.transfer_id,
-      new_balance: state.balance - cmd.amount_cents
-    }
-  end
-
-  def execute(%__MODULE__{} = state, %Credit{} = cmd) do
-    %Credited{
-      account_id: cmd.account_id,
-      amount_cents: cmd.amount_cents,
-      transfer_id: cmd.transfer_id,
-      new_balance: state.balance + cmd.amount_cents
-    }
-  end
-
-  # apply
-
-  def apply(%__MODULE__{} = state, %AccountOpened{} = ev),
-    do: %{state | account_id: ev.account_id, owner: ev.owner, opened?: true}
-
-  def apply(%__MODULE__{} = state, %Debited{new_balance: nb}),
-    do: %{state | balance: nb}
-
-  def apply(%__MODULE__{} = state, %Credited{new_balance: nb}),
-    do: %{state | balance: nb}
-
-  def apply(%__MODULE__{} = state, %DebitFailed{}), do: state
-end
-
-defmodule LedgerCqrs.Write.ProcessManagers.Transfer do
-  end
-  use Commanded.ProcessManagers.ProcessManager,
-    application: LedgerCqrs.App,
-    name: "TransferProcessManager"
-
-  alias LedgerCqrs.Write.Commands.{Debit, Credit}
-  alias LedgerCqrs.Write.Events.{TransferRequested, Debited, Credited, DebitFailed}
-
-  defstruct [:transfer_id, :source_id, :target_id, :amount_cents, :status]
-
-  # --- interested: start / continue / stop routing ---
-
-  def interested?(%TransferRequested{transfer_id: id}), do: {:start, id}
-  def interested?(%Debited{transfer_id: id}) when not is_nil(id), do: {:continue, id}
-  def interested?(%Credited{transfer_id: id}) when not is_nil(id), do: {:stop, id}
-  def interested?(%DebitFailed{transfer_id: id}), do: {:stop, id}
-  def interested?(_), do: false
-
-  # --- handle: event → command ---
-
-  def handle(%__MODULE__{}, %TransferRequested{} = ev) do
-    %Debit{
-      account_id: ev.source_id,
-      amount_cents: ev.amount_cents,
-      transfer_id: ev.transfer_id
-    }
-  end
-
-  def handle(%__MODULE__{} = pm, %Debited{}) do
-    %Credit{
-      account_id: pm.target_id,
-      amount_cents: pm.amount_cents,
-      transfer_id: pm.transfer_id
-    }
-  end
-
-  # --- apply: event → pm state ---
-
-  def apply(%__MODULE__{} = pm, %TransferRequested{} = ev) do
-    %{pm | transfer_id: ev.transfer_id, source_id: ev.source_id,
-           target_id: ev.target_id, amount_cents: ev.amount_cents, status: :requested}
-  end
-
-  def apply(%__MODULE__{} = pm, %Debited{}), do: %{pm | status: :debited}
-  def apply(%__MODULE__{} = pm, %Credited{}), do: %{pm | status: :completed}
-  def apply(%__MODULE__{} = pm, %DebitFailed{}), do: %{pm | status: :failed}
-end
-
-defmodule LedgerCqrs.Router do
-  use Commanded.Commands.Router
-
-  alias LedgerCqrs.Write.Account
-  alias LedgerCqrs.Write.Commands.{OpenAccount, Debit, Credit, StartTransfer}
-  alias LedgerCqrs.Write.Events.TransferRequested
-
-  identify(Account, by: :account_id, prefix: "account-")
-
-  dispatch([OpenAccount, Debit, Credit], to: Account)
-
-  # StartTransfer dispatches as an event on a "transfers" stream via a middleware or handler.
-  # For simplicity, we emit TransferRequested directly.
-  middleware(LedgerCqrs.Write.StartTransferMiddleware)
-
-  dispatch(StartTransfer, to: LedgerCqrs.Write.TransferEmitter, identity: :transfer_id)
-end
-
-defmodule LedgerCqrs.Read.BalanceProjector do
-  use Commanded.Projections.Ecto,
-    application: LedgerCqrs.App,
-    name: "balance_projector",
-    repo: LedgerCqrs.Repo
-
-  alias LedgerCqrs.Write.Events.{AccountOpened, Debited, Credited}
-
-  project(%AccountOpened{} = ev, _meta, fn multi ->
-    Ecto.Multi.insert_all(
-      multi,
-      :open,
-      "balances",
-      [%{account_id: ev.account_id, owner: ev.owner, balance_cents: 0,
-         updated_at: DateTime.utc_now()}],
-      on_conflict: :nothing,
-      conflict_target: [:account_id]
-    )
-  end)
-
-  project(%Debited{account_id: id, new_balance: nb}, _meta, fn multi ->
-    Ecto.Multi.update_all(
-      multi,
-      :debit,
-      from(b in "balances", where: b.account_id == ^id),
-      set: [balance_cents: nb, updated_at: DateTime.utc_now()]
-    )
-  end)
-
-  project(%Credited{account_id: id, new_balance: nb}, _meta, fn multi ->
-    Ecto.Multi.update_all(
-      multi,
-      :credit,
-      from(b in "balances", where: b.account_id == ^id),
-      set: [balance_cents: nb, updated_at: DateTime.utc_now()]
-    )
-  end)
-
-  import Ecto.Query
-end
-
-defmodule LedgerCqrs.Read.Queries do
-  import Ecto.Query
-  alias LedgerCqrs.Repo
-
-  def balance_of(account_id) do
-    Repo.one(from b in "balances", where: b.account_id == ^account_id, select: b.balance_cents)
-  end
-
-  def top_balances(limit \\ 10) do
-    Repo.all(
-      from b in "balances",
-        order_by: [desc: b.balance_cents],
-        limit: ^limit,
-        select: %{account_id: b.account_id, balance_cents: b.balance_cents}
-    )
-  end
-end
-
-defmodule LedgerCqrs.Repo.Migrations.CreateBalances do
-  use Ecto.Migration
-
-  def change do
-    create table(:balances, primary_key: false) do
-      add :account_id, :string, primary_key: true
-      add :owner, :string, null: false
-      add :balance_cents, :bigint, null: false, default: 0
-      add :updated_at, :utc_datetime_usec, null: false
+  defmodule LedgerCqrs.Write.Commands do
+    defmodule OpenAccount do
+      @enforce_keys [:account_id, :owner]
+      defstruct [:account_id, :owner]
     end
 
-    create index(:balances, [:balance_cents])
-  end
-end
+    defmodule Debit do
+      @enforce_keys [:account_id, :amount_cents, :transfer_id]
+      defstruct [:account_id, :amount_cents, :transfer_id]
+    end
 
-defmodule Main do
-  def main do
-      # Demonstrating 382-cqrs-commanded-eventstore
-      :ok
+    defmodule Credit do
+      @enforce_keys [:account_id, :amount_cents, :transfer_id]
+      defstruct [:account_id, :amount_cents, :transfer_id]
+    end
+
+    defmodule StartTransfer do
+      @enforce_keys [:transfer_id, :source_id, :target_id, :amount_cents]
+      defstruct [:transfer_id, :source_id, :target_id, :amount_cents]
+    end
+  end
+
+  defmodule LedgerCqrs.Write.Events do
+    defmodule AccountOpened do
+      @derive Jason.Encoder
+      defstruct [:account_id, :owner]
+    end
+
+    defmodule Debited do
+      @derive Jason.Encoder
+      defstruct [:account_id, :amount_cents, :transfer_id, :new_balance]
+    end
+
+    defmodule Credited do
+      @derive Jason.Encoder
+      defstruct [:account_id, :amount_cents, :transfer_id, :new_balance]
+    end
+
+    defmodule TransferRequested do
+      @derive Jason.Encoder
+      defstruct [:transfer_id, :source_id, :target_id, :amount_cents]
+    end
+
+    defmodule DebitFailed do
+      @derive Jason.Encoder
+      defstruct [:transfer_id, :account_id, :reason]
+    end
+  end
+
+  defmodule LedgerCqrs.Write.Account do
+    end
+    alias LedgerCqrs.Write.Commands.{OpenAccount, Debit, Credit}
+    alias LedgerCqrs.Write.Events.{AccountOpened, Debited, Credited, DebitFailed}
+
+    defstruct account_id: nil, owner: nil, balance: 0, opened?: false
+
+    def execute(%__MODULE__{opened?: false}, %OpenAccount{} = cmd),
+      do: %AccountOpened{account_id: cmd.account_id, owner: cmd.owner}
+
+    def execute(%__MODULE__{opened?: true}, %OpenAccount{}),
+      do: {:error, :account_already_open}
+
+    def execute(%__MODULE__{opened?: false}, _),
+      do: {:error, :account_not_open}
+
+    def execute(%__MODULE__{balance: bal}, %Debit{amount_cents: amt, transfer_id: tid, account_id: aid})
+        when amt > bal do
+      %DebitFailed{transfer_id: tid, account_id: aid, reason: :insufficient_funds}
+    end
+
+    def execute(%__MODULE__{} = state, %Debit{} = cmd) do
+      %Debited{
+        account_id: cmd.account_id,
+        amount_cents: cmd.amount_cents,
+        transfer_id: cmd.transfer_id,
+        new_balance: state.balance - cmd.amount_cents
+      }
+    end
+
+    def execute(%__MODULE__{} = state, %Credit{} = cmd) do
+      %Credited{
+        account_id: cmd.account_id,
+        amount_cents: cmd.amount_cents,
+        transfer_id: cmd.transfer_id,
+        new_balance: state.balance + cmd.amount_cents
+      }
+    end
+
+    # apply
+
+    def apply(%__MODULE__{} = state, %AccountOpened{} = ev),
+      do: %{state | account_id: ev.account_id, owner: ev.owner, opened?: true}
+
+    def apply(%__MODULE__{} = state, %Debited{new_balance: nb}),
+      do: %{state | balance: nb}
+
+    def apply(%__MODULE__{} = state, %Credited{new_balance: nb}),
+      do: %{state | balance: nb}
+
+    def apply(%__MODULE__{} = state, %DebitFailed{}), do: state
+  end
+
+  defmodule LedgerCqrs.Write.ProcessManagers.Transfer do
+    end
+    use Commanded.ProcessManagers.ProcessManager,
+      application: LedgerCqrs.App,
+      name: "TransferProcessManager"
+
+    alias LedgerCqrs.Write.Commands.{Debit, Credit}
+    alias LedgerCqrs.Write.Events.{TransferRequested, Debited, Credited, DebitFailed}
+
+    defstruct [:transfer_id, :source_id, :target_id, :amount_cents, :status]
+
+    # --- interested: start / continue / stop routing ---
+
+    def interested?(%TransferRequested{transfer_id: id}), do: {:start, id}
+    def interested?(%Debited{transfer_id: id}) when not is_nil(id), do: {:continue, id}
+    def interested?(%Credited{transfer_id: id}) when not is_nil(id), do: {:stop, id}
+    def interested?(%DebitFailed{transfer_id: id}), do: {:stop, id}
+    def interested?(_), do: false
+
+    # --- handle: event → command ---
+
+    def handle(%__MODULE__{}, %TransferRequested{} = ev) do
+      %Debit{
+        account_id: ev.source_id,
+        amount_cents: ev.amount_cents,
+        transfer_id: ev.transfer_id
+      }
+    end
+
+    def handle(%__MODULE__{} = pm, %Debited{}) do
+      %Credit{
+        account_id: pm.target_id,
+        amount_cents: pm.amount_cents,
+        transfer_id: pm.transfer_id
+      }
+    end
+
+    # --- apply: event → pm state ---
+
+    def apply(%__MODULE__{} = pm, %TransferRequested{} = ev) do
+      %{pm | transfer_id: ev.transfer_id, source_id: ev.source_id,
+             target_id: ev.target_id, amount_cents: ev.amount_cents, status: :requested}
+    end
+
+    def apply(%__MODULE__{} = pm, %Debited{}), do: %{pm | status: :debited}
+    def apply(%__MODULE__{} = pm, %Credited{}), do: %{pm | status: :completed}
+    def apply(%__MODULE__{} = pm, %DebitFailed{}), do: %{pm | status: :failed}
+  end
+
+  defmodule LedgerCqrs.Router do
+    use Commanded.Commands.Router
+
+    alias LedgerCqrs.Write.Account
+    alias LedgerCqrs.Write.Commands.{OpenAccount, Debit, Credit, StartTransfer}
+    alias LedgerCqrs.Write.Events.TransferRequested
+
+    identify(Account, by: :account_id, prefix: "account-")
+
+    dispatch([OpenAccount, Debit, Credit], to: Account)
+
+    # StartTransfer dispatches as an event on a "transfers" stream via a middleware or handler.
+    # For simplicity, we emit TransferRequested directly.
+    middleware(LedgerCqrs.Write.StartTransferMiddleware)
+
+    dispatch(StartTransfer, to: LedgerCqrs.Write.TransferEmitter, identity: :transfer_id)
+  end
+
+  defmodule LedgerCqrs.Read.BalanceProjector do
+    use Commanded.Projections.Ecto,
+      application: LedgerCqrs.App,
+      name: "balance_projector",
+      repo: LedgerCqrs.Repo
+
+    alias LedgerCqrs.Write.Events.{AccountOpened, Debited, Credited}
+
+    project(%AccountOpened{} = ev, _meta, fn multi ->
+      Ecto.Multi.insert_all(
+        multi,
+        :open,
+        "balances",
+        [%{account_id: ev.account_id, owner: ev.owner, balance_cents: 0,
+           updated_at: DateTime.utc_now()}],
+        on_conflict: :nothing,
+        conflict_target: [:account_id]
+      )
+    end)
+
+    project(%Debited{account_id: id, new_balance: nb}, _meta, fn multi ->
+      Ecto.Multi.update_all(
+        multi,
+        :debit,
+        from(b in "balances", where: b.account_id == ^id),
+        set: [balance_cents: nb, updated_at: DateTime.utc_now()]
+      )
+    end)
+
+    project(%Credited{account_id: id, new_balance: nb}, _meta, fn multi ->
+      Ecto.Multi.update_all(
+        multi,
+        :credit,
+        from(b in "balances", where: b.account_id == ^id),
+        set: [balance_cents: nb, updated_at: DateTime.utc_now()]
+      )
+    end)
+
+    import Ecto.Query
+  end
+
+  defmodule LedgerCqrs.Read.Queries do
+    import Ecto.Query
+    alias LedgerCqrs.Repo
+
+    def balance_of(account_id) do
+      Repo.one(from b in "balances", where: b.account_id == ^account_id, select: b.balance_cents)
+    end
+
+    def top_balances(limit \\ 10) do
+      Repo.all(
+        from b in "balances",
+          order_by: [desc: b.balance_cents],
+          limit: ^limit,
+          select: %{account_id: b.account_id, balance_cents: b.balance_cents}
+      )
+    end
+  end
+
+  defmodule LedgerCqrs.Repo.Migrations.CreateBalances do
+    use Ecto.Migration
+
+    def change do
+      create table(:balances, primary_key: false) do
+        add :account_id, :string, primary_key: true
+        add :owner, :string, null: false
+        add :balance_cents, :bigint, null: false, default: 0
+        add :updated_at, :utc_datetime_usec, null: false
+      end
+
+      create index(:balances, [:balance_cents])
+    end
+  end
+
+  defmodule Main do
+    def main do
+        # Demonstrating 382-cqrs-commanded-eventstore
+        :ok
+    end
+  end
+
+  Main.main()
+  end
+  end
+  end
+  end
+  end
+  end
+  end
+  end
+  end
   end
 end
 
 Main.main()
-end
-end
-end
-end
-end
-end
-end
-end
-end
-end
 ```

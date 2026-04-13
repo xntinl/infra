@@ -362,157 +362,159 @@ Target: operation should complete in the low-microsecond range on modern hardwar
 ## Executable Example
 
 ```elixir
-defp deps do
-  [
-    {:nx, "~> 0.7"},
-    {:exla, "~> 0.7", only: [:dev, :prod]},
-    {:benchee, "~> 1.3", only: :dev}
-  ]
-
-
-defmodule ApiGateway.Metrics.Analyzer do
-  @moduledoc """
-  Statistical analysis of gateway latency samples using Nx.
-
-  The public API works with plain Elixir lists (coming from ETS).
-  Internally converts to tensors, runs Nx operations, and returns
-  plain Elixir values. The Nx boundary is entirely inside this module.
-  """
-  import Nx.Defn
-
-  # ---------------------------------------------------------------------------
-  # Public API
-  # ---------------------------------------------------------------------------
-
-  @doc """
-  Computes mean and standard deviation over a list of float samples.
-  Returns `{mean, std_dev}` as plain floats.
-  """
-  @spec stats(list(float())) :: {float(), float()}
-  def stats(samples) when is_list(samples) and length(samples) > 0 do
-    tensor = Nx.tensor(samples, type: :f32)
-    mean = tensor |> Nx.mean() |> Nx.to_number()
-    std_dev = tensor |> Nx.standard_deviation() |> Nx.to_number()
-    {mean, std_dev}
-
-  @doc """
-  Returns indices of samples that deviate more than `threshold` standard
-  deviations from the mean. Returns a list of integer indices.
-  """
-  @spec anomaly_indices(list(float()), float()) :: list(non_neg_integer())
-  def anomaly_indices(samples, threshold \ 3.0) when is_list(samples) do
-    {mean, std_dev} = stats(samples)
-
-    if std_dev == 0.0 do
-      []
-    else
-      tensor = Nx.tensor(samples, type: :f32)
-
-      z_scores =
-        tensor
-        |> Nx.subtract(mean)
-        |> Nx.abs()
-        |> Nx.divide(std_dev)
-
-      mask = Nx.greater(z_scores, threshold) |> Nx.to_flat_list()
-
-      mask
-      |> Enum.with_index()
-
-  @doc """
-  Fits a linear trend y = a*x + b to the samples.
-  Returns `{slope, intercept}` as plain floats.
-
-  Uses closed-form least squares: a = cov(x,y) / var(x).
-  """
-  @spec linear_trend(list(float())) :: {float(), float()}
-  def linear_trend(samples) when length(samples) >= 2 do
-    n = length(samples)
-    x = Nx.tensor(Enum.to_list(0..(n - 1)), type: :f32)
-    y = Nx.tensor(samples, type: :f32)
-
-    mean_x = Nx.mean(x) |> Nx.to_number()
-    mean_y = Nx.mean(y) |> Nx.to_number()
-
-    # cov(x, y) = mean(x * y) - mean(x) * mean(y)
-    cov_xy =
-      Nx.multiply(x, y)
-      |> Nx.mean()
-      |> Nx.to_number()
-      |> Kernel.-(mean_x * mean_y)
-
-    # var(x) = mean(x^2) - mean(x)^2
-    var_x =
-      Nx.multiply(x, x)
-      |> Nx.mean()
-      |> Nx.to_number()
-      |> Kernel.-(mean_x * mean_x)
-
-    slope = if var_x == 0.0, do: 0.0, else: cov_xy / var_x
-    intercept = mean_y - slope * mean_x
-
-    {slope, intercept}
-  end
-
-  # ---------------------------------------------------------------------------
-  # defn hot path — compiled, called from batch processing
-  # ---------------------------------------------------------------------------
-
-  @doc """
-  Compiled rolling z-score computation for a batch of sample windows.
-  Each row in `windows` is a window of samples. Returns z-scores per element.
-
-  Shape: {batch, window_size} -> {batch, window_size}
-  """
-  defn rolling_zscore(windows) do
-    mean = Nx.mean(windows, axes: [1], keep_axes: true)
-    std_dev = Nx.standard_deviation(windows, axes: [1], keep_axes: true)
-    epsilon = 1.0e-7
-
-    (windows - mean) / (std_dev + epsilon)
-  end
-end
-
-
-# test/api_gateway/metrics_analyzer_test.exs
-defmodule ApiGateway.Metrics.AnalyzerTest do
-  use ExUnit.Case, async: true
-
-  alias ApiGateway.Metrics.Analyzer
-
-    test "handles single element" do
-      {mean, std_dev} = Analyzer.stats([42.0])
-      assert_in_delta mean, 42.0, 0.001
-      assert std_dev == 0.0 or is_float(std_dev)
-    end
-  end
-
-    test "returns empty list when no anomalies" do
-      samples = Enum.map(1..20, fn _ -> 10.0 + :rand.uniform() end)
-      indices = Analyzer.anomaly_indices(samples, 3.0)
-      assert indices == []
-    end
-  end
-
-    test "flat trend has slope ~0" do
-      samples = List.duplicate(5.0, 10)
-      {slope, _intercept} = Analyzer.linear_trend(samples)
-      assert_in_delta slope, 0.0, 0.01
-    end
-  end
-
-    test "center element of symmetric window has z-score ~0" do
-      windows = Nx.tensor([[1.0, 5.0, 9.0]], type: :f32)
-      result = Analyzer.rolling_zscore(windows)
-      center_zscore = result[0][1] |> Nx.to_number()
-      assert_in_delta center_zscore, 0.0, 0.01
-    end
-  end
-end
-
 defmodule Main do
-  def main do
-      :ok
+  defp deps do
+    [
+      {:nx, "~> 0.7"},
+      {:exla, "~> 0.7", only: [:dev, :prod]},
+      {:benchee, "~> 1.3", only: :dev}
+    ]
+
+
+  defmodule ApiGateway.Metrics.Analyzer do
+    @moduledoc """
+    Statistical analysis of gateway latency samples using Nx.
+
+    The public API works with plain Elixir lists (coming from ETS).
+    Internally converts to tensors, runs Nx operations, and returns
+    plain Elixir values. The Nx boundary is entirely inside this module.
+    """
+    import Nx.Defn
+
+    # ---------------------------------------------------------------------------
+    # Public API
+    # ---------------------------------------------------------------------------
+
+    @doc """
+    Computes mean and standard deviation over a list of float samples.
+    Returns `{mean, std_dev}` as plain floats.
+    """
+    @spec stats(list(float())) :: {float(), float()}
+    def stats(samples) when is_list(samples) and length(samples) > 0 do
+      tensor = Nx.tensor(samples, type: :f32)
+      mean = tensor |> Nx.mean() |> Nx.to_number()
+      std_dev = tensor |> Nx.standard_deviation() |> Nx.to_number()
+      {mean, std_dev}
+
+    @doc """
+    Returns indices of samples that deviate more than `threshold` standard
+    deviations from the mean. Returns a list of integer indices.
+    """
+    @spec anomaly_indices(list(float()), float()) :: list(non_neg_integer())
+    def anomaly_indices(samples, threshold \ 3.0) when is_list(samples) do
+      {mean, std_dev} = stats(samples)
+
+      if std_dev == 0.0 do
+        []
+      else
+        tensor = Nx.tensor(samples, type: :f32)
+
+        z_scores =
+          tensor
+          |> Nx.subtract(mean)
+          |> Nx.abs()
+          |> Nx.divide(std_dev)
+
+        mask = Nx.greater(z_scores, threshold) |> Nx.to_flat_list()
+
+        mask
+        |> Enum.with_index()
+
+    @doc """
+    Fits a linear trend y = a*x + b to the samples.
+    Returns `{slope, intercept}` as plain floats.
+
+    Uses closed-form least squares: a = cov(x,y) / var(x).
+    """
+    @spec linear_trend(list(float())) :: {float(), float()}
+    def linear_trend(samples) when length(samples) >= 2 do
+      n = length(samples)
+      x = Nx.tensor(Enum.to_list(0..(n - 1)), type: :f32)
+      y = Nx.tensor(samples, type: :f32)
+
+      mean_x = Nx.mean(x) |> Nx.to_number()
+      mean_y = Nx.mean(y) |> Nx.to_number()
+
+      # cov(x, y) = mean(x * y) - mean(x) * mean(y)
+      cov_xy =
+        Nx.multiply(x, y)
+        |> Nx.mean()
+        |> Nx.to_number()
+        |> Kernel.-(mean_x * mean_y)
+
+      # var(x) = mean(x^2) - mean(x)^2
+      var_x =
+        Nx.multiply(x, x)
+        |> Nx.mean()
+        |> Nx.to_number()
+        |> Kernel.-(mean_x * mean_x)
+
+      slope = if var_x == 0.0, do: 0.0, else: cov_xy / var_x
+      intercept = mean_y - slope * mean_x
+
+      {slope, intercept}
+    end
+
+    # ---------------------------------------------------------------------------
+    # defn hot path — compiled, called from batch processing
+    # ---------------------------------------------------------------------------
+
+    @doc """
+    Compiled rolling z-score computation for a batch of sample windows.
+    Each row in `windows` is a window of samples. Returns z-scores per element.
+
+    Shape: {batch, window_size} -> {batch, window_size}
+    """
+    defn rolling_zscore(windows) do
+      mean = Nx.mean(windows, axes: [1], keep_axes: true)
+      std_dev = Nx.standard_deviation(windows, axes: [1], keep_axes: true)
+      epsilon = 1.0e-7
+
+      (windows - mean) / (std_dev + epsilon)
+    end
+  end
+
+
+  # test/api_gateway/metrics_analyzer_test.exs
+  defmodule ApiGateway.Metrics.AnalyzerTest do
+    use ExUnit.Case, async: true
+
+    alias ApiGateway.Metrics.Analyzer
+
+      test "handles single element" do
+        {mean, std_dev} = Analyzer.stats([42.0])
+        assert_in_delta mean, 42.0, 0.001
+        assert std_dev == 0.0 or is_float(std_dev)
+      end
+    end
+
+      test "returns empty list when no anomalies" do
+        samples = Enum.map(1..20, fn _ -> 10.0 + :rand.uniform() end)
+        indices = Analyzer.anomaly_indices(samples, 3.0)
+        assert indices == []
+      end
+    end
+
+      test "flat trend has slope ~0" do
+        samples = List.duplicate(5.0, 10)
+        {slope, _intercept} = Analyzer.linear_trend(samples)
+        assert_in_delta slope, 0.0, 0.01
+      end
+    end
+
+      test "center element of symmetric window has z-score ~0" do
+        windows = Nx.tensor([[1.0, 5.0, 9.0]], type: :f32)
+        result = Analyzer.rolling_zscore(windows)
+        center_zscore = result[0][1] |> Nx.to_number()
+        assert_in_delta center_zscore, 0.0, 0.01
+      end
+    end
+  end
+
+  defmodule Main do
+    def main do
+        :ok
+    end
   end
 end
 

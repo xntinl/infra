@@ -20,6 +20,23 @@ You will build `TypeCheck`: a compile-time type annotation macro that raises `Co
 
 → Chose **B** because type errors are cheapest at compile time — anywhere later multiplies the feedback loop.
 
+
+## Quick start
+
+1. Create project:
+   ```bash
+   mix new <project_name>
+   cd <project_name>
+   ```
+
+2. Copy dependencies to `mix.exs`
+
+3. Implement modules following the project structure
+
+4. Run tests: `mix test`
+
+5. Benchmark: `mix run lib/benchmark.exs`
+
 ## Why build a type checker as macros and not as a Mix task
 
 A Mix task runs after compilation. The compilation has already succeeded. Macros run during compilation. A `CompileError` raised inside a macro stops the compilation of the current module immediately, with file path and line number from AST metadata.

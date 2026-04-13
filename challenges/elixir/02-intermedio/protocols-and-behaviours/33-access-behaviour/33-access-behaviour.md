@@ -302,6 +302,7 @@ objects, not for stateful or invariant-heavy types.
 Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
 
 ```elixir
+defmodule Main do
 defmodule User do
   @moduledoc """
   A small user struct that supports bracket-access (`user[:profile]`) and
@@ -385,6 +386,9 @@ assert_raise ArgumentError, fn -> pop_in(user, [:id]) end
 
 IO.puts("pop_in correctly raises on required field")
 IO.puts("All Access assertions passed!")
+end
+
+Main.main()
 ```
 
 

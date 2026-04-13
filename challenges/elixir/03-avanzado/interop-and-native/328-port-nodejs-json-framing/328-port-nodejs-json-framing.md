@@ -447,46 +447,48 @@ response times.
 ## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # No external dependencies — pure Elixir
-  ]
-end
-
-defmodule FrontendRender.MixProject do
-  end
-  use Mix.Project
-
-  def project do
+defmodule Main do
+  defp deps do
     [
-      app: :frontend_render,
-      version: "0.1.0",
-      elixir: "~> 1.17",
-      deps: [
-        {:jason, "~> 1.4"}
-      ]
+      # No external dependencies — pure Elixir
     ]
   end
 
-  def application,
-    do: [extra_applications: [:logger], mod: {FrontendRender.Application, []}]
-end
+  defmodule FrontendRender.MixProject do
+    end
+    use Mix.Project
+
+    def project do
+      [
+        app: :frontend_render,
+        version: "0.1.0",
+        elixir: "~> 1.17",
+        deps: [
+          {:jason, "~> 1.4"}
+        ]
+      ]
+    end
+
+    def application,
+      do: [extra_applications: [:logger], mod: {FrontendRender.Application, []}]
+  end
 
 
-### Step 2: Elixir port wrapper (`lib/frontend_render/node_port.ex`)
+  ### Step 2: Elixir port wrapper (`lib/frontend_render/node_port.ex`)
 
-**Objective**: Correlate async requests so N concurrent callers get parallel Node.js execution without blocking.
+  **Objective**: Correlate async requests so N concurrent callers get parallel Node.js execution without blocking.
 
 
 
-### Step 3: Supervision
+  ### Step 3: Supervision
 
-**Objective**: Boot Node.js interpreter so RPC framework is ready at startup.
+  **Objective**: Boot Node.js interpreter so RPC framework is ready at startup.
 
-defmodule Main do
-  def main do
-      # Demonstrating 328-port-nodejs-json-framing
-      :ok
+  defmodule Main do
+    def main do
+        # Demonstrating 328-port-nodejs-json-framing
+        :ok
+    end
   end
 end
 

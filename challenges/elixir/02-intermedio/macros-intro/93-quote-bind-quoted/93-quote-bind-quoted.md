@@ -390,13 +390,10 @@ passed). Those are code, not values — `unquote` is the right tool.
 
 ---
 
-## Executable Example
-
-Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
-
 ```elixir
 defmodule Main do
-  defmodule BindQuotedDemo do
+  import ExUnit.Assertions
+
     @moduledoc """
     Side-by-side patterns showing where `bind_quoted` is the right choice
     and where `unquote` remains necessary.

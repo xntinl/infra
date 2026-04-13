@@ -640,30 +640,32 @@ you have any concurrency at all.
 ## Executable Example
 
 ```elixir
-defp deps do
-  [
-    {:finch, "~> 0.18"},
-    {:req, "~> 0.5"},
-    {:jason, "~> 1.4"},
-    {:telemetry, "~> 1.2"},
-    {:bypass, "~> 2.1", only: :test}
-  ]
-end
-
-
-
-Finch matches the destination URL against these keys and picks the pool.
-
-### 4. Streaming vs buffered
-
-`Req.get!(url)` loads the full response into memory. For a 2GB CSV this is
-fatal. `Finch.stream/4` hands you chunks as they arrive so you can pipe them
-to disk or a parser:
-
 defmodule Main do
-  def main do
-      # Demonstrating 70-req-finch-http-clients
-      :ok
+  defp deps do
+    [
+      {:finch, "~> 0.18"},
+      {:req, "~> 0.5"},
+      {:jason, "~> 1.4"},
+      {:telemetry, "~> 1.2"},
+      {:bypass, "~> 2.1", only: :test}
+    ]
+  end
+
+
+
+  Finch matches the destination URL against these keys and picks the pool.
+
+  ### 4. Streaming vs buffered
+
+  `Req.get!(url)` loads the full response into memory. For a 2GB CSV this is
+  fatal. `Finch.stream/4` hands you chunks as they arrive so you can pipe them
+  to disk or a parser:
+
+  defmodule Main do
+    def main do
+        # Demonstrating 70-req-finch-http-clients
+        :ok
+    end
   end
 end
 

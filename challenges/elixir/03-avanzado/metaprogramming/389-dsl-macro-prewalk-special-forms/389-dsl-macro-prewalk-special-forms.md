@@ -91,18 +91,12 @@ Inside `quote do ... end`, `unquote(var)` injects a runtime value into the AST. 
 
 ### Dependencies (`mix.exs`)
 
-### Dependencies (mix.exs)
-
 ```elixir
 defp deps do
   [
     # No external dependencies — pure Elixir
   ]
 end
-```
-
-```elixir
-defp deps, do: []
 ```
 
 ### Step 1: Whitelist and errors

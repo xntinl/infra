@@ -327,6 +327,7 @@ process-level stability, not domain-level retry logic.
 Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
 
 ```elixir
+defmodule Main do
 defmodule RestartIntensityDemo.FlakyWorker do
   @moduledoc """
   A worker that can be made to crash on demand, to demonstrate restart intensity.
@@ -440,6 +441,9 @@ result =
 assert result == true
 IO.puts("Supervisor crashed from exceeding restart intensity (as expected)")
 IO.puts("All restart intensity assertions passed!")
+end
+
+Main.main()
 ```
 
 

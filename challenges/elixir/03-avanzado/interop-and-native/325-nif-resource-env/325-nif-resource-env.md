@@ -477,56 +477,58 @@ order is not deterministic?
 ## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # No external dependencies — pure Elixir
-  ]
-end
-
-defmodule CacheLmdb.MixProject do
-  end
-  use Mix.Project
-
-  def project do
+defmodule Main do
+  defp deps do
     [
-      app: :cache_lmdb,
-      version: "0.1.0",
-      elixir: "~> 1.17",
-      compilers: [:rustler] ++ Mix.compilers(),
-      rustler_crates: [
-        cache_lmdb_nif: [path: "native/cache_lmdb_nif", mode: :release]
-      ],
-      deps: [
-        {:rustler, "~> 0.34"}
-      ]
+      # No external dependencies — pure Elixir
     ]
   end
 
-  def application,
-    do: [extra_applications: [:logger], mod: {CacheLmdb.Application, []}]
-end
+  defmodule CacheLmdb.MixProject do
+    end
+    use Mix.Project
+
+    def project do
+      [
+        app: :cache_lmdb,
+        version: "0.1.0",
+        elixir: "~> 1.17",
+        compilers: [:rustler] ++ Mix.compilers(),
+        rustler_crates: [
+          cache_lmdb_nif: [path: "native/cache_lmdb_nif", mode: :release]
+        ],
+        deps: [
+          {:rustler, "~> 0.34"}
+        ]
+      ]
+    end
+
+    def application,
+      do: [extra_applications: [:logger], mod: {CacheLmdb.Application, []}]
+  end
 
 
-### Step 2: Rust NIF with resources (`native/cache_lmdb_nif/src/lib.rs`)
+  ### Step 2: Rust NIF with resources (`native/cache_lmdb_nif/src/lib.rs`)
 
-**Objective**: Serialize writes via Mutex so concurrent schedulers never deadlock on LMDB's single-writer constraint.
-
-
-
-### Step 3: Elixir wrapper (`lib/cache_lmdb/db.ex`)
-
-**Objective**: Provide opaque handle so LMDB env closes automatically when BEAM GC drops all references.
+  **Objective**: Serialize writes via Mutex so concurrent schedulers never deadlock on LMDB's single-writer constraint.
 
 
 
-### Step 4: Application wrapper
+  ### Step 3: Elixir wrapper (`lib/cache_lmdb/db.ex`)
 
-**Objective**: Minimal supervision since LMDB handles are owned by callers, not a central GenServer.
+  **Objective**: Provide opaque handle so LMDB env closes automatically when BEAM GC drops all references.
 
-defmodule Main do
-  def main do
-      # Demonstrating 325-nif-resource-env
-      :ok
+
+
+  ### Step 4: Application wrapper
+
+  **Objective**: Minimal supervision since LMDB handles are owned by callers, not a central GenServer.
+
+  defmodule Main do
+    def main do
+        # Demonstrating 325-nif-resource-env
+        :ok
+    end
   end
 end
 

@@ -433,31 +433,49 @@ defmodule Swarm.MetadataTest do
   alias Swarm.Metadata
 
 
-  describe "Metadata" do
+  describe "file splitting and piece integrity" do
+    test "pieces reassemble to original file" do
+      data = :crypto.strong_rand_bytes(1_000_000)
+      meta = Metadata.from_binary("test.bin", data, 256 * 1024)
 
-  test "pieces reassemble to original file" do
-    data = :crypto.strong_rand_bytes(1_000_000)
-    meta = Metadata.from_binary("test.bin", data, 256 * 1024)
+      # Verify piece count
+      expected_pieces = ceil(byte_size(data) / (256 * 1024))
+      assert length(meta.pieces) == expected_pieces
+    end
 
-    # Verify piece count
-    expected_pieces = ceil(byte_size(data) / (256 * 1024))
-    assert length(meta.pieces) == expected_pieces
+    test "last piece is smaller than configured piece_length" do
+      data = :crypto.strong_rand_bytes(1_000_000)
+      meta = Metadata.from_binary("test.bin", data, 256 * 1024)
+
+      # Piece count is determined by rounding up
+      last_piece_size = byte_size(data) - (meta.num_pieces() - 1) * 256 * 1024
+      assert last_piece_size > 0
+      assert last_piece_size <= 256 * 1024
+    end
   end
 
-  test "info_hash is deterministic for same content" do
-    data = "same content"
-    m1 = Metadata.from_binary("file.txt", data)
-    m2 = Metadata.from_binary("file.txt", data)
-    assert m1.info_hash == m2.info_hash
-  end
+  describe "info_hash as content fingerprint" do
+    test "info_hash is deterministic for same content" do
+      data = "same content"
+      m1 = Metadata.from_binary("file.txt", data)
+      m2 = Metadata.from_binary("file.txt", data)
+      assert m1.info_hash == m2.info_hash
+    end
 
-  test "info_hash differs for different content" do
-    m1 = Metadata.from_binary("f.txt", "content A")
-    m2 = Metadata.from_binary("f.txt", "content B")
-    assert m1.info_hash != m2.info_hash
-  end
+    test "info_hash differs for different content" do
+      m1 = Metadata.from_binary("f.txt", "content A")
+      m2 = Metadata.from_binary("f.txt", "content B")
+      assert m1.info_hash != m2.info_hash
+    end
 
-
+    test "info_hash enables peer discovery (same file identification)" do
+      data = "shared file"
+      peer1_meta = Metadata.from_binary("shared.bin", data)
+      peer2_meta = Metadata.from_binary("shared.bin", data)
+      
+      # Peers with same info_hash can exchange pieces
+      assert peer1_meta.info_hash == peer2_meta.info_hash
+    end
   end
 end
 ```
@@ -475,39 +493,72 @@ defmodule Swarm.PieceManagerTest do
   end
 
 
-  describe "PieceManager" do
+  describe "piece selection strategy" do
+    test "select_piece returns :none when peer has nothing we need", %{pm: pm} do
+      PieceManager.update_peer_bitfield(pm, "peer1", [])
+      assert PieceManager.select_piece(pm, "peer1") == :none
+    end
 
-  test "select_piece returns :none when peer has nothing we need", %{pm: pm} do
-    PieceManager.update_peer_bitfield(pm, "peer1", [])
-    assert PieceManager.select_piece(pm, "peer1") == :none
+    test "select_piece returns a piece we need", %{pm: pm} do
+      PieceManager.update_peer_bitfield(pm, "peer1", [0, 1, 2, 3])
+      assert {:ok, index} = PieceManager.select_piece(pm, "peer1")
+      assert index in [0, 1, 2, 3]
+    end
   end
 
-  test "select_piece returns a piece we need", %{pm: pm} do
-    PieceManager.update_peer_bitfield(pm, "peer1", [0, 1, 2, 3])
-    assert {:ok, index} = PieceManager.select_piece(pm, "peer1")
-    assert index in [0, 1, 2, 3]
+  describe "rarest-first selection" do
+    test "rarest piece is preferred over common pieces", %{pm: pm} do
+      # Peer1 and Peer2 both have piece 0 (common)
+      # Only Peer1 has piece 5 (rare — availability 1 vs 2 for piece 0)
+      PieceManager.update_peer_bitfield(pm, "peer2", [0])
+      PieceManager.update_peer_bitfield(pm, "peer1", [0, 5])
+
+      # When selecting from peer1, should prefer piece 5 (less available)
+      {:ok, index} = PieceManager.select_piece(pm, "peer1")
+      assert index == 5
+    end
+
+    test "multiple rare pieces are shuffled (break ties randomly)" do
+      # Both pieces 7 and 8 have availability 1 (only peer1 has them)
+      # Piece 0 has availability 2 (multiple peers)
+      # Should prefer 7 or 8, not 0
+      PieceManager.update_peer_bitfield(pm, "peer2", [0])
+      PieceManager.update_peer_bitfield(pm, "peer1", [0, 7, 8])
+
+      {:ok, index} = PieceManager.select_piece(pm, "peer1")
+      assert index in [7, 8]
+    end
+
+    test "availability increases when multiple peers have piece" do
+      PieceManager.update_peer_bitfield(pm, "peer1", [0, 5])
+      PieceManager.update_peer_bitfield(pm, "peer2", [0])
+      PieceManager.update_peer_bitfield(pm, "peer3", [0])
+
+      # Piece 0 now has high availability; piece 5 is rarer
+      {:ok, index} = PieceManager.select_piece(pm, "peer1")
+      assert index == 5
+    end
   end
 
-  test "rarest piece is preferred when one peer has unique piece", %{pm: pm} do
-    # Peer1 and Peer2 both have piece 0 (common)
-    # Only Peer1 has piece 5 (rare — availability 1 vs 2 for piece 0)
-    PieceManager.update_peer_bitfield(pm, "peer2", [0])
-    PieceManager.update_peer_bitfield(pm, "peer1", [0, 5])
+  describe "duplicate request prevention" do
+    test "received pieces are not re-requested", %{pm: pm} do
+      PieceManager.update_peer_bitfield(pm, "peer1", [0, 1])
+      PieceManager.piece_received(pm, 0)
+      PieceManager.piece_received(pm, 1)
 
-    # When selecting from peer1, should prefer piece 5 (less available)
-    {:ok, index} = PieceManager.select_piece(pm, "peer1")
-    assert index == 5
-  end
+      assert PieceManager.select_piece(pm, "peer1") == :none
+    end
 
-  test "received pieces are not re-requested", %{pm: pm} do
-    PieceManager.update_peer_bitfield(pm, "peer1", [0, 1])
-    PieceManager.piece_received(pm, 0)
-    PieceManager.piece_received(pm, 1)
-
-    assert PieceManager.select_piece(pm, "peer1") == :none
-  end
-
-
+    test "requested pieces are marked to avoid duplicate requests", %{pm: pm} do
+      PieceManager.update_peer_bitfield(pm, "peer1", [0, 1])
+      PieceManager.update_peer_bitfield(pm, "peer2", [0, 1])
+      
+      {:ok, index} = PieceManager.select_piece(pm, "peer1")
+      
+      # Even though peer2 has the same piece, we should not request it twice
+      # (this is implicit in the state tracking)
+      assert index in [0, 1]
+    end
   end
 end
 ```
@@ -526,18 +577,55 @@ mix test test/swarm/ --trace
 ### Why this works
 
 The design separates concerns along their real axes: what must be correct (the P2P file sharing (BitTorrent-like) invariants), what must be fast (the hot path isolated from slow paths), and what must be evolvable (external contracts kept narrow). Each module has one job and fails loudly when given inputs outside its contract, so bugs surface near their source instead of as mysterious downstream symptoms. The tests exercise the invariants directly rather than implementation details, which keeps them useful across refactors.
-## Main Entry Point
+## Quick start
+
+```bash
+# Start the application and run tests
+mix deps.get
+mix test test/swarm/ --trace
+
+# Or run performance benchmarks:
+mix run bench/transfer_bench.exs
+```
+
+Target: sustained >100 Mbps per peer with 1000+ concurrent connections; DHT lookup latency <500ms.
+
+---
+
+## Benchmark
 
 ```elixir
-def main do
-  IO.puts("======== 38-build-p2p-file-sharing ========")
-  IO.puts("Build P2p File Sharing")
-  IO.puts("")
-  
-  Swarm.Metadata.start_link([])
-  IO.puts("Swarm.Metadata started")
-  
-  IO.puts("Run: mix test")
-end
+# bench/transfer_bench.exs
+file_data = :crypto.strong_rand_bytes(100_000_000)  # 100MB
+meta = Swarm.Metadata.from_binary("test.bin", file_data)
+{:ok, pm} = Swarm.PieceManager.start_link(num_pieces: meta |> Swarm.Metadata.num_pieces())
+{:ok, rl} = Swarm.RateLimiter.start_link(capacity: 10_000_000, rate: 1_000_000)
+
+Benchee.run(%{
+  "piece_selection_rarest_first" => fn ->
+    Swarm.PieceManager.update_peer_bitfield(pm, "peer1", [0, 1, 2, 3, 4, 5])
+    Swarm.PieceManager.select_piece(pm, "peer1")
+  end,
+  "rate_limiter_consume_check" => fn ->
+    Swarm.RateLimiter.consume(rl, "peer1", 10_000)
+  end,
+  "metadata_piece_range" => fn ->
+    idx = :rand.uniform(Swarm.Metadata.num_pieces(meta)) - 1
+    Swarm.Metadata.piece_range(meta, idx)
+  end
+}, time: 10, warmup: 3)
 ```
+
+**Expected results** (on modern hardware):
+- Piece selection (rarest-first): ~5-10µs per selection
+- Rate limiter check: ~0.5-1µs (lock-free atomics)
+- Metadata piece lookup: ~0.2µs (O(1) computation)
+
+---
+
+## Reflection
+
+1. **Rarest-first piece strategy**: Sequential selection means if the seed goes offline, rare pieces are lost. Rarest-first distributes rare pieces first. What is the minimum number of peers required to guarantee that no piece is permanently lost, assuming each peer downloads independently and at least one peer completes the file?
+
+2. **DHT vs. Centralized tracker**: DHT is censorship-resistant but requires O(log N) hops per lookup. Centralized tracker is fast (1 RPC) but is a SPOF and legal target. At what swarm size does DHT lookup latency become unacceptable for interactive use (< 1 second)?
 

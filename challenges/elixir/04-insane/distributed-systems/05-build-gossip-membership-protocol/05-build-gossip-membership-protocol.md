@@ -4,7 +4,21 @@
 
 ---
 
-## Project context
+## Key Concepts
+
+**Gossip/epidemic protocol**: Nodes randomly select peers and exchange state (messages, membership lists, values). Each round, information spreads to ~log(N) new nodes. Converges in O(log N) rounds without a coordinator.
+
+**SWIM protocol**: Scalable Weakly-consistent Infection-style Membership protocol. Nodes periodically ping random members. If a ping times out, request other nodes to ping (indirect probe). Suspected dead members transition to confirmed dead after a grace period.
+
+**Lamport clock**: A logical clock incremented on every event. When receiving a message with a higher Lamport clock, adopt that value + 1. Enables causal ordering without synchronized system clocks.
+
+**Incarnation numbers**: A per-node counter. When a node receives a rumor that it is dead or suspect, it can increment its incarnation and broadcast alive with the new number. Higher incarnations refute lower ones.
+
+**False positive detection**: A node incorrectly suspected dead due to temporary network partition. Mitigated by grace periods and indirect probes before declaring dead.
+
+---
+
+## Project Context
 
 You are building `swimlane`, a gossip-based cluster membership protocol from scratch using UDP for communication. The protocol discovers, tracks, and maintains a consistent view of cluster membership across all nodes without a central coordinator. No Erlang's built-in node detection — every byte of the protocol is yours.
 
@@ -68,7 +82,7 @@ SWIM (Scalable Weakly-consistent Infection-style Membership) solves this by sepa
 
 ---
 
-## Implementation milestones
+## Implementation Roadmap
 
 ### Step 1: Create the project
 

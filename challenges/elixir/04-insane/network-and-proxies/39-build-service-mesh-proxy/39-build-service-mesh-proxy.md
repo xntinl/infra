@@ -597,32 +597,60 @@ defmodule Meshex.TracingTest do
   alias Meshex.Tracing
 
 
-  describe "Tracing" do
+  describe "trace context extraction and propagation" do
+    test "creates new trace when no traceparent header" do
+      {trace_id, span_id} = Tracing.extract_or_create(%{})
+      assert byte_size(trace_id) == 32  # 16 bytes hex = 32 chars
+      assert byte_size(span_id) == 16   # 8 bytes hex = 16 chars
+    end
 
-  test "creates new trace when no traceparent header" do
-    {trace_id, span_id} = Tracing.extract_or_create(%{})
-    assert byte_size(trace_id) == 32  # 16 bytes hex = 32 chars
-    assert byte_size(span_id) == 16   # 8 bytes hex = 16 chars
+    test "extracts existing trace from valid traceparent header" do
+      existing = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+      {trace_id, parent_span_id} = Tracing.extract_or_create(%{"traceparent" => existing})
+      assert trace_id == "4bf92f3577b34da6a3ce929d0e0e4736"
+      assert parent_span_id == "00f067aa0ba902b7"
+    end
+
+    test "propagates trace_id across service boundaries" do
+      # Simulating request chain: service A -> service B -> service C
+      incoming = "00-aaaa0000aaaa0000aaaa0000aaaa0000-bbbb0000bbbb0000-01"
+      {trace_id, parent_id} = Tracing.extract_or_create(%{"traceparent" => incoming})
+      
+      # Next hop generates new span_id but preserves trace_id
+      outgoing = Tracing.build_traceparent(trace_id, "cccc0000cccc0000")
+      assert String.contains?(outgoing, "aaaa0000aaaa0000aaaa0000aaaa0000")
+      assert String.contains?(outgoing, "cccc0000cccc0000")
+    end
   end
 
-  test "extracts existing trace from traceparent header" do
-    existing = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
-    {trace_id, parent_span_id} = Tracing.extract_or_create(%{"traceparent" => existing})
-    assert trace_id == "4bf92f3577b34da6a3ce929d0e0e4736"
-    assert parent_span_id == "00f067aa0ba902b7"
+  describe "traceparent header format" do
+    test "build_traceparent produces W3C compliant format" do
+      tp = Tracing.build_traceparent("abc123def456abc123def456abc123de", "0102030405060708")
+      assert String.starts_with?(tp, "00-abc123def456abc123def456abc123de-0102030405060708-01")
+      assert byte_size(tp) == 55  # "00-" + 32 + "-" + 16 + "-01"
+    end
+
+    test "traceparent includes sampled flag" do
+      tp = Tracing.build_traceparent("abc" <> String.duplicate("0", 29), "0102030405060708")
+      assert String.ends_with?(tp, "-01")
+    end
   end
 
-  test "build_traceparent produces correct format" do
-    tp = Tracing.build_traceparent("abc123def456abc123def456abc123de", "0102030405060708")
-    assert String.starts_with?(tp, "00-abc123def456abc123def456abc123de-0102030405060708-")
-  end
+  describe "traceparent error handling and recovery" do
+    test "malformed traceparent starts new trace" do
+      {trace_id, _} = Tracing.extract_or_create(%{"traceparent" => "invalid"})
+      assert byte_size(trace_id) == 32
+    end
 
-  test "malformed traceparent starts new trace" do
-    {trace_id, _} = Tracing.extract_or_create(%{"traceparent" => "invalid"})
-    assert byte_size(trace_id) == 32
-  end
+    test "missing parts in traceparent generates new trace" do
+      {trace_id, _} = Tracing.extract_or_create(%{"traceparent" => "00-abc123"})
+      assert byte_size(trace_id) == 32
+    end
 
-
+    test "empty traceparent header generates new trace" do
+      {trace_id, _} = Tracing.extract_or_create(%{"traceparent" => ""})
+      assert byte_size(trace_id) == 32
+    end
   end
 end
 ```
@@ -640,28 +668,56 @@ defmodule Meshex.CircuitBreakerTest do
   end
 
 
-  describe "CircuitBreaker" do
+  describe "per-(source, destination) isolation" do
+    test "starts closed" do
+      assert CircuitBreaker.check({"svc-a", "svc-b"}) == :allow
+    end
 
-  test "starts closed" do
-    assert CircuitBreaker.check({"svc-a", "svc-b"}) == :allow
+    test "different service pairs maintain independent state" do
+      {:ok, _} = start_supervised({CircuitBreaker, {"svc-a", "svc-c"}})
+      
+      # Trip breaker for svc-a → svc-b
+      for _ <- 1..10, do: CircuitBreaker.record_outcome({"svc-a", "svc-b"}, :error)
+      Process.sleep(10)
+      assert {:deny, :circuit_open} = CircuitBreaker.check({"svc-a", "svc-b"})
+
+      # svc-a → svc-c should still be closed (different pair)
+      assert CircuitBreaker.check({"svc-a", "svc-c"}) == :allow
+    end
+
+    test "source isolation: svc-b → svc-c independent of svc-a → svc-c" do
+      {:ok, _} = start_supervised({CircuitBreaker, {"svc-b", "svc-c"}})
+      
+      # Trip breaker for svc-a → svc-c
+      for _ <- 1..10, do: CircuitBreaker.record_outcome({"svc-a", "svc-c"}, :error)
+      Process.sleep(10)
+
+      # svc-b → svc-c should still work (different source)
+      assert CircuitBreaker.check({"svc-b", "svc-c"}) == :allow
+    end
   end
 
-  test "opens after error threshold" do
-    for _ <- 1..10, do: CircuitBreaker.record_outcome({"svc-a", "svc-b"}, :error)
-    Process.sleep(10)
-    assert {:deny, :circuit_open} = CircuitBreaker.check({"svc-a", "svc-b"})
-  end
+  describe "circuit breaker state transitions" do
+    test "opens after error threshold" do
+      for _ <- 1..10, do: CircuitBreaker.record_outcome({"svc-a", "svc-b"}, :error)
+      Process.sleep(10)
+      assert {:deny, :circuit_open} = CircuitBreaker.check({"svc-a", "svc-b"})
+    end
 
-  test "different service pairs are independent" do
-    {:ok, _} = start_supervised({CircuitBreaker, {"svc-a", "svc-c"}})
-    for _ <- 1..10, do: CircuitBreaker.record_outcome({"svc-a", "svc-b"}, :error)
-    Process.sleep(10)
+    test "requires minimum event count to transition (hysteresis)" do
+      # Single error should not open the breaker
+      CircuitBreaker.record_outcome({"svc-x", "svc-y"}, :error)
+      Process.sleep(10)
+      assert CircuitBreaker.check({"svc-x", "svc-y"}) == :allow
+    end
 
-    # svc-a → svc-c should still be closed
-    assert CircuitBreaker.check({"svc-a", "svc-c"}) == :allow
-  end
-
-
+    test "mixed success/error stays closed if below threshold" do
+      for _ <- 1..3, do: CircuitBreaker.record_outcome({"svc-p", "svc-q"}, :success)
+      for _ <- 1..2, do: CircuitBreaker.record_outcome({"svc-p", "svc-q"}, :error)
+      Process.sleep(10)
+      # 40% error rate, below 50% threshold
+      assert CircuitBreaker.check({"svc-p", "svc-q"}) == :allow
+    end
   end
 end
 ```
@@ -682,20 +738,58 @@ mix test test/meshex/ --trace
 The design separates concerns along their real axes: what must be correct (the service mesh proxy invariants), what must be fast (the hot path isolated from slow paths), and what must be evolvable (external contracts kept narrow). Each module has one job and fails loudly when given inputs outside its contract, so bugs surface near their source instead of as mysterious downstream symptoms. The tests exercise the invariants directly rather than implementation details, which keeps them useful across refactors.
 
 
-## Main Entry Point
+## Quick start
+
+```bash
+# Start the application and run tests
+mix deps.get
+mix test test/meshex/ --trace
+
+# Or run performance benchmarks:
+mix run bench/proxy_overhead_bench.exs
+```
+
+Target: <100µs per-request proxy latency at p99 with mTLS enabled; <1ms for circuit breaker state transition.
+
+---
+
+## Benchmark
 
 ```elixir
-def main do
-  IO.puts("======== 39-build-service-mesh-proxy ========")
-  IO.puts("Build service mesh proxy")
-  IO.puts("")
-  
-  Meshex.CircuitBreaker.start_link([])
-  IO.puts("Meshex.CircuitBreaker started")
-  
-  IO.puts("Run: mix test")
-end
+# bench/proxy_overhead_bench.exs
+{:ok, ca} = Meshex.MTLS.CertGenerator.generate_ca("mesh.local")
+Meshex.Retry.init_budget_table()
+
+Benchee.run(%{
+  "circuit_breaker_check_closed" => fn ->
+    Meshex.CircuitBreaker.check({"svc-a", "svc-b"})
+  end,
+  "circuit_breaker_record_outcome" => fn ->
+    Meshex.CircuitBreaker.record_outcome({"svc-a", "svc-b"}, :success)
+  end,
+  "retry_exponential_backoff" => fn ->
+    fun = fn -> {:ok, :result} end
+    Meshex.Retry.with_retry(fun, max_attempts: 3)
+  end,
+  "tracing_extract_or_create" => fn ->
+    Meshex.Tracing.extract_or_create(%{"traceparent" => "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"})
+  end,
+  "tracing_build_traceparent" => fn ->
+    Meshex.Tracing.build_traceparent("abc123def456abc123def456abc123de", "0102030405060708")
+  end,
+  "mtls_cert_generation" => fn ->
+    Meshex.MTLS.CertGenerator.generate_service_cert("spiffe://mesh.local/ns/default/sa/payment", ca)
+  end
+}, time: 10, warmup: 3)
 ```
+
+**Expected results** (on modern hardware):
+- Circuit breaker check: ~0.5-1µs (lock-free Registry lookup)
+- Record outcome: ~1-2µs (GenServer cast)
+- Retry (no retry): ~0.1-0.2µs (pure function)
+- Tracing extract: ~1-2µs (string parsing)
+- Tracing build: ~2-3µs (string formatting)
+- Cert generation: ~100-200µs (cryptographic operation)
 
 
 

@@ -311,6 +311,7 @@ that differ by 20 percent.
 Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
 
 ```elixir
+defmodule Main do
 defmodule LazyPipeline do
   @moduledoc """
   Side-by-side strict (`Enum`) vs lazy (`Stream`) pipelines over a range,
@@ -391,6 +392,9 @@ assert Enum.count(strict_result) == 10
 assert Enum.count(lazy_result) == 10
 IO.puts("\nBoth pipelines correctly limited to 10 elements via take/1")
 IO.puts("All lazy evaluation assertions passed!")
+end
+
+Main.main()
 ```
 
 

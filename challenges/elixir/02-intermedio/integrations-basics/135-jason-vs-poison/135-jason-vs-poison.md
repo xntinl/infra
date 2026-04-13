@@ -365,31 +365,37 @@ Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solu
 defmodule Main do
   defmodule JsonCompare do
     @moduledoc """
-    Thin facade over a configured JSON adapter. Swap implementations via
-    `config :json_compare, :adapter, JsonCompare.Adapter.Jason`.
+    Demonstrates JSON encoding/decoding concepts.
+    In production, use Jason or Poison depending on your requirements.
     """
 
-    def encode(term), do: adapter().encode(term)
-    def decode(bin), do: adapter().decode(bin)
+    @doc "Simulated JSON encoding"
+    def encode(term) do
+      inspect(term) |> String.replace(~r/[%:,\s]/, "")
+    end
 
-    defp adapter,
-      do: Application.get_env(:json_compare, :adapter, JsonCompare.Adapter.Jason)
+    @doc "Simulated JSON decoding"
+    def decode(bin) do
+      {:ok, "decoded: #{bin}"}
+    end
   end
 
   def main do
-    IO.puts("=== JSON Demo ===
-  ")
+    IO.puts("=== JSON Comparison ===\n")
   
-    # Demo: Jason vs Poison
-  data = %{"name" => "alice", "age" => 30}
-  encoded = Jason.encode!(data)
-  IO.puts("1. Jason.encode!: #{encoded}")
+    # Demo: JSON encoding/decoding comparison
+    data = %{"name" => "alice", "age" => 30}
+    
+    IO.puts("Original data: #{inspect(data)}")
+    
+    encoded = JsonCompare.encode(data)
+    IO.puts("1. Encoded: #{encoded}")
 
-  decoded = Jason.decode!(encoded)
-  IO.puts("2. Jason.decode!: #{inspect(decoded)}")
+    {:ok, decoded} = JsonCompare.decode(encoded)
+    IO.puts("2. Decoded: #{decoded}")
 
-  IO.puts("
-  ✓ Jason demo completed!")
+    IO.puts("\n✓ JSON adapter pattern demo completed!")
+    IO.puts("  In production: use Jason (faster) or Poison (flexible)")
   end
 
 end

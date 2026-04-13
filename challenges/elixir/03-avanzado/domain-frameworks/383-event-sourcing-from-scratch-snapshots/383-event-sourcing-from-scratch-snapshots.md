@@ -581,312 +581,316 @@ You wrote state into the snapshot as a JSON map derived from the aggregate struc
 ## Executable Example
 
 ```elixir
-defp deps do
-  [
-    {:ecto_sql, "~> 3.12"},
-    {:postgrex, "~> 0.19"},
-    {:jason, "~> 1.4"}
-  ]
-end
-
-defmodule InventoryEs.Repo.Migrations.CreateEvents do
-  use Ecto.Migration
-
-  def change do
-    create table(:events, primary_key: false) do
-      add :id, :bigserial, primary_key: true
-      add :stream_id, :string, null: false
-      add :version, :integer, null: false
-      add :type, :string, null: false
-      add :payload, :jsonb, null: false
-      add :inserted_at, :utc_datetime_usec, null: false, default: fragment("now()")
-    end
-
-    create unique_index(:events, [:stream_id, :version])
-    create index(:events, [:type])
+defmodule Main do
+  defp deps do
+    [
+      {:ecto_sql, "~> 3.12"},
+      {:postgrex, "~> 0.19"},
+      {:jason, "~> 1.4"}
+    ]
   end
-end
 
-defmodule InventoryEs.Repo.Migrations.CreateSnapshots do
-  use Ecto.Migration
+  defmodule InventoryEs.Repo.Migrations.CreateEvents do
+    use Ecto.Migration
 
-  def change do
-    create table(:snapshots, primary_key: false) do
-      add :stream_id, :string, primary_key: true
-      add :version, :integer, null: false
-      add :state, :jsonb, null: false
-      add :inserted_at, :utc_datetime_usec, null: false, default: fragment("now()")
+    def change do
+      create table(:events, primary_key: false) do
+        add :id, :bigserial, primary_key: true
+        add :stream_id, :string, null: false
+        add :version, :integer, null: false
+        add :type, :string, null: false
+        add :payload, :jsonb, null: false
+        add :inserted_at, :utc_datetime_usec, null: false, default: fragment("now()")
+      end
+
+      create unique_index(:events, [:stream_id, :version])
+      create index(:events, [:type])
     end
   end
-end
 
-defmodule InventoryEs.Repo do
-  use Ecto.Repo, otp_app: :inventory_es, adapter: Ecto.Adapters.Postgres
-end
+  defmodule InventoryEs.Repo.Migrations.CreateSnapshots do
+    use Ecto.Migration
 
-defmodule InventoryEs.Errors do
-  defmodule ConcurrencyError do
-    defexception [:stream_id, :expected_version, :message]
+    def change do
+      create table(:snapshots, primary_key: false) do
+        add :stream_id, :string, primary_key: true
+        add :version, :integer, null: false
+        add :state, :jsonb, null: false
+        add :inserted_at, :utc_datetime_usec, null: false, default: fragment("now()")
+      end
+    end
+  end
 
-    @impl true
-    def exception(opts) do
-      %__MODULE__{
-        stream_id: opts[:stream_id],
-        expected_version: opts[:expected_version],
-        message: "stream #{opts[:stream_id]} is at a different version than expected (#{opts[:expected_version]})"
+  defmodule InventoryEs.Repo do
+    use Ecto.Repo, otp_app: :inventory_es, adapter: Ecto.Adapters.Postgres
+  end
+
+  defmodule InventoryEs.Errors do
+    defmodule ConcurrencyError do
+      defexception [:stream_id, :expected_version, :message]
+
+      @impl true
+      def exception(opts) do
+        %__MODULE__{
+          stream_id: opts[:stream_id],
+          expected_version: opts[:expected_version],
+          message: "stream #{opts[:stream_id]} is at a different version than expected (#{opts[:expected_version]})"
+        }
+      end
+    end
+  end
+
+  defmodule InventoryEs.Stock.Events do
+    defmodule StockReceived do
+      @derive Jason.Encoder
+      defstruct [:sku, :quantity]
+    end
+
+    defmodule StockReserved do
+      @derive Jason.Encoder
+      defstruct [:sku, :reservation_id, :quantity]
+    end
+
+    defmodule ReservationCancelled do
+      @derive Jason.Encoder
+      defstruct [:sku, :reservation_id]
+    end
+  end
+
+  defmodule InventoryEs.Stock.Commands do
+    defmodule ReceiveStock do
+      @enforce_keys [:sku, :quantity]
+      defstruct [:sku, :quantity]
+    end
+
+    defmodule Reserve do
+      @enforce_keys [:sku, :reservation_id, :quantity]
+      defstruct [:sku, :reservation_id, :quantity]
+    end
+
+    defmodule CancelReservation do
+      @enforce_keys [:sku, :reservation_id]
+      defstruct [:sku, :reservation_id]
+    end
+  end
+
+  defmodule InventoryEs.Stock.Aggregate do
+    end
+    alias InventoryEs.Stock.Commands.{ReceiveStock, Reserve, CancelReservation}
+    alias InventoryEs.Stock.Events.{StockReceived, StockReserved, ReservationCancelled}
+
+    defstruct sku: nil, on_hand: 0, reservations: %{}
+
+    # --- decide: command → events or error ---
+
+    def decide(%__MODULE__{}, %ReceiveStock{quantity: q}) when q <= 0,
+      do: {:error, :quantity_must_be_positive}
+
+    def decide(%__MODULE__{} = _state, %ReceiveStock{} = cmd) do
+      {:ok, [%StockReceived{sku: cmd.sku, quantity: cmd.quantity}]}
+    end
+
+    def decide(%__MODULE__{}, %Reserve{quantity: q}) when q <= 0,
+      do: {:error, :quantity_must_be_positive}
+
+    def decide(%__MODULE__{reservations: r}, %Reserve{reservation_id: rid})
+        when is_map_key(r, rid),
+        do: {:error, :reservation_already_exists}
+
+    def decide(%__MODULE__{} = state, %Reserve{} = cmd) do
+      reserved_total = state.reservations |> Map.values() |> Enum.sum()
+      available = state.on_hand - reserved_total
+
+      if cmd.quantity > available do
+        {:error, {:insufficient_stock, available: available}}
+      else
+        {:ok,
+         [
+           %StockReserved{
+             sku: cmd.sku,
+             reservation_id: cmd.reservation_id,
+             quantity: cmd.quantity
+           }
+         ]}
+      end
+    end
+
+    def decide(%__MODULE__{reservations: r}, %CancelReservation{reservation_id: rid})
+        when not is_map_key(r, rid),
+        do: {:error, :reservation_not_found}
+
+    def decide(%__MODULE__{} = _state, %CancelReservation{} = cmd) do
+      {:ok, [%ReservationCancelled{sku: cmd.sku, reservation_id: cmd.reservation_id}]}
+    end
+
+    # --- apply: event → state ---
+
+    def apply(%__MODULE__{} = state, %StockReceived{sku: sku, quantity: q}),
+      do: %{state | sku: sku, on_hand: state.on_hand + q}
+
+    def apply(%__MODULE__{} = state, %StockReserved{reservation_id: rid, quantity: q}),
+      do: %{state | reservations: Map.put(state.reservations, rid, q)}
+
+    def apply(%__MODULE__{} = state, %ReservationCancelled{reservation_id: rid}),
+      do: %{state | reservations: Map.delete(state.reservations, rid)}
+  end
+
+  defmodule InventoryEs.EventStore do
+    import Ecto.Query
+    alias InventoryEs.Repo
+    alias InventoryEs.Errors.ConcurrencyError
+
+    @snapshot_every 100
+
+    def append(stream_id, expected_version, events) when is_list(events) do
+      Repo.transaction(fn ->
+        rows =
+          events
+          |> Enum.with_index(expected_version + 1)
+          |> Enum.map(fn {event, v} ->
+            %{
+              stream_id: stream_id,
+              version: v,
+              type: event.__struct__ |> Module.split() |> List.last(),
+              payload: Map.from_struct(event),
+              inserted_at: DateTime.utc_now()
+            }
+          end)
+
+        case Repo.insert_all("events", rows) do
+          {n, _} when n == length(rows) -> :ok
+          _ -> Repo.rollback(:append_failed)
+        end
+      end)
+      |> translate_conflict(stream_id, expected_version)
+    end
+
+    defp translate_conflict({:ok, :ok}, _stream_id, _expected), do: :ok
+
+    defp translate_conflict({:error, %Postgrex.Error{postgres: %{code: :unique_violation}}},
+           stream_id,
+           expected),
+         do: raise(ConcurrencyError, stream_id: stream_id, expected_version: expected)
+
+    defp translate_conflict({:error, reason}, _stream_id, _expected),
+      do: {:error, reason}
+
+    def read_stream(stream_id, from_version \\ 0) do
+      Repo.all(
+        from e in "events",
+          where: e.stream_id == ^stream_id and e.version > ^from_version,
+          order_by: [asc: e.version],
+          select: %{version: e.version, type: e.type, payload: e.payload}
+      )
+    end
+
+    def read_snapshot(stream_id) do
+      Repo.one(
+        from s in "snapshots",
+          where: s.stream_id == ^stream_id,
+          select: %{version: s.version, state: s.state}
+      )
+    end
+
+    def maybe_write_snapshot(stream_id, version, state) when rem(version, @snapshot_every) == 0 do
+      Repo.insert_all(
+        "snapshots",
+        [%{stream_id: stream_id, version: version, state: Map.from_struct(state),
+           inserted_at: DateTime.utc_now()}],
+        on_conflict: {:replace, [:version, :state, :inserted_at]},
+        conflict_target: [:stream_id]
+      )
+
+      :ok
+    end
+
+    def maybe_write_snapshot(_stream_id, _version, _state), do: :ok
+  end
+
+  defmodule InventoryEs.Stock.Repository do
+    end
+    alias InventoryEs.EventStore
+    alias InventoryEs.Stock.Aggregate
+    alias InventoryEs.Stock.Events.{StockReceived, StockReserved, ReservationCancelled}
+
+    def stream_id(sku), do: "stock-" <> sku
+
+    @doc "Load aggregate by replaying snapshot + tail events. Returns {state, current_version}."
+    def load(sku) do
+      stream = stream_id(sku)
+
+      {base_state, from_version} =
+        case EventStore.read_snapshot(stream) do
+          nil -> {%Aggregate{}, 0}
+          %{version: v, state: json} -> {deserialize_state(json), v}
+        end
+
+      events = EventStore.read_stream(stream, from_version)
+      final = Enum.reduce(events, base_state, fn e, acc -> Aggregate.apply(acc, rehydrate(e)) end)
+      version = if events == [], do: from_version, else: List.last(events).version
+      {final, version}
+    end
+
+    @doc "Execute a command, persist events, write snapshot if due."
+    def execute(sku, cmd) do
+      {state, version} = load(sku)
+
+      case Aggregate.decide(state, cmd) do
+        {:ok, events} ->
+          stream = stream_id(sku)
+          :ok = EventStore.append(stream, version, events)
+
+          new_state = Enum.reduce(events, state, &Aggregate.apply(&2, &1))
+          new_version = version + length(events)
+          EventStore.maybe_write_snapshot(stream, new_version, new_state)
+          {:ok, new_state, new_version}
+
+        {:error, _} = err ->
+          err
+      end
+    end
+
+    # --- helpers ---
+
+    defp rehydrate(%{type: "StockReceived", payload: p}),
+      do: %StockReceived{sku: p["sku"], quantity: p["quantity"]}
+
+    defp rehydrate(%{type: "StockReserved", payload: p}),
+      do: %StockReserved{sku: p["sku"], reservation_id: p["reservation_id"], quantity: p["quantity"]}
+
+    defp rehydrate(%{type: "ReservationCancelled", payload: p}),
+      do: %ReservationCancelled{sku: p["sku"], reservation_id: p["reservation_id"]}
+
+    defp deserialize_state(%{"sku" => sku, "on_hand" => on_hand, "reservations" => res}) do
+      %Aggregate{
+        sku: sku,
+        on_hand: on_hand,
+        reservations: for({k, v} <- res, into: %{}, do: {k, v})
       }
     end
   end
-end
 
-defmodule InventoryEs.Stock.Events do
-  defmodule StockReceived do
-    @derive Jason.Encoder
-    defstruct [:sku, :quantity]
-  end
-
-  defmodule StockReserved do
-    @derive Jason.Encoder
-    defstruct [:sku, :reservation_id, :quantity]
-  end
-
-  defmodule ReservationCancelled do
-    @derive Jason.Encoder
-    defstruct [:sku, :reservation_id]
-  end
-end
-
-defmodule InventoryEs.Stock.Commands do
-  defmodule ReceiveStock do
-    @enforce_keys [:sku, :quantity]
-    defstruct [:sku, :quantity]
-  end
-
-  defmodule Reserve do
-    @enforce_keys [:sku, :reservation_id, :quantity]
-    defstruct [:sku, :reservation_id, :quantity]
-  end
-
-  defmodule CancelReservation do
-    @enforce_keys [:sku, :reservation_id]
-    defstruct [:sku, :reservation_id]
-  end
-end
-
-defmodule InventoryEs.Stock.Aggregate do
-  end
-  alias InventoryEs.Stock.Commands.{ReceiveStock, Reserve, CancelReservation}
-  alias InventoryEs.Stock.Events.{StockReceived, StockReserved, ReservationCancelled}
-
-  defstruct sku: nil, on_hand: 0, reservations: %{}
-
-  # --- decide: command → events or error ---
-
-  def decide(%__MODULE__{}, %ReceiveStock{quantity: q}) when q <= 0,
-    do: {:error, :quantity_must_be_positive}
-
-  def decide(%__MODULE__{} = _state, %ReceiveStock{} = cmd) do
-    {:ok, [%StockReceived{sku: cmd.sku, quantity: cmd.quantity}]}
-  end
-
-  def decide(%__MODULE__{}, %Reserve{quantity: q}) when q <= 0,
-    do: {:error, :quantity_must_be_positive}
-
-  def decide(%__MODULE__{reservations: r}, %Reserve{reservation_id: rid})
-      when is_map_key(r, rid),
-      do: {:error, :reservation_already_exists}
-
-  def decide(%__MODULE__{} = state, %Reserve{} = cmd) do
-    reserved_total = state.reservations |> Map.values() |> Enum.sum()
-    available = state.on_hand - reserved_total
-
-    if cmd.quantity > available do
-      {:error, {:insufficient_stock, available: available}}
-    else
-      {:ok,
-       [
-         %StockReserved{
-           sku: cmd.sku,
-           reservation_id: cmd.reservation_id,
-           quantity: cmd.quantity
-         }
-       ]}
+  defmodule Main do
+    def main do
+        # Demonstrating 383-event-sourcing-from-scratch-snapshots
+        :ok
     end
   end
 
-  def decide(%__MODULE__{reservations: r}, %CancelReservation{reservation_id: rid})
-      when not is_map_key(r, rid),
-      do: {:error, :reservation_not_found}
-
-  def decide(%__MODULE__{} = _state, %CancelReservation{} = cmd) do
-    {:ok, [%ReservationCancelled{sku: cmd.sku, reservation_id: cmd.reservation_id}]}
+  Main.main()
   end
-
-  # --- apply: event → state ---
-
-  def apply(%__MODULE__{} = state, %StockReceived{sku: sku, quantity: q}),
-    do: %{state | sku: sku, on_hand: state.on_hand + q}
-
-  def apply(%__MODULE__{} = state, %StockReserved{reservation_id: rid, quantity: q}),
-    do: %{state | reservations: Map.put(state.reservations, rid, q)}
-
-  def apply(%__MODULE__{} = state, %ReservationCancelled{reservation_id: rid}),
-    do: %{state | reservations: Map.delete(state.reservations, rid)}
-end
-
-defmodule InventoryEs.EventStore do
-  import Ecto.Query
-  alias InventoryEs.Repo
-  alias InventoryEs.Errors.ConcurrencyError
-
-  @snapshot_every 100
-
-  def append(stream_id, expected_version, events) when is_list(events) do
-    Repo.transaction(fn ->
-      rows =
-        events
-        |> Enum.with_index(expected_version + 1)
-        |> Enum.map(fn {event, v} ->
-          %{
-            stream_id: stream_id,
-            version: v,
-            type: event.__struct__ |> Module.split() |> List.last(),
-            payload: Map.from_struct(event),
-            inserted_at: DateTime.utc_now()
-          }
-        end)
-
-      case Repo.insert_all("events", rows) do
-        {n, _} when n == length(rows) -> :ok
-        _ -> Repo.rollback(:append_failed)
-      end
-    end)
-    |> translate_conflict(stream_id, expected_version)
   end
-
-  defp translate_conflict({:ok, :ok}, _stream_id, _expected), do: :ok
-
-  defp translate_conflict({:error, %Postgrex.Error{postgres: %{code: :unique_violation}}},
-         stream_id,
-         expected),
-       do: raise(ConcurrencyError, stream_id: stream_id, expected_version: expected)
-
-  defp translate_conflict({:error, reason}, _stream_id, _expected),
-    do: {:error, reason}
-
-  def read_stream(stream_id, from_version \\ 0) do
-    Repo.all(
-      from e in "events",
-        where: e.stream_id == ^stream_id and e.version > ^from_version,
-        order_by: [asc: e.version],
-        select: %{version: e.version, type: e.type, payload: e.payload}
-    )
   end
-
-  def read_snapshot(stream_id) do
-    Repo.one(
-      from s in "snapshots",
-        where: s.stream_id == ^stream_id,
-        select: %{version: s.version, state: s.state}
-    )
   end
-
-  def maybe_write_snapshot(stream_id, version, state) when rem(version, @snapshot_every) == 0 do
-    Repo.insert_all(
-      "snapshots",
-      [%{stream_id: stream_id, version: version, state: Map.from_struct(state),
-         inserted_at: DateTime.utc_now()}],
-      on_conflict: {:replace, [:version, :state, :inserted_at]},
-      conflict_target: [:stream_id]
-    )
-
-    :ok
   end
-
-  def maybe_write_snapshot(_stream_id, _version, _state), do: :ok
-end
-
-defmodule InventoryEs.Stock.Repository do
   end
-  alias InventoryEs.EventStore
-  alias InventoryEs.Stock.Aggregate
-  alias InventoryEs.Stock.Events.{StockReceived, StockReserved, ReservationCancelled}
-
-  def stream_id(sku), do: "stock-" <> sku
-
-  @doc "Load aggregate by replaying snapshot + tail events. Returns {state, current_version}."
-  def load(sku) do
-    stream = stream_id(sku)
-
-    {base_state, from_version} =
-      case EventStore.read_snapshot(stream) do
-        nil -> {%Aggregate{}, 0}
-        %{version: v, state: json} -> {deserialize_state(json), v}
-      end
-
-    events = EventStore.read_stream(stream, from_version)
-    final = Enum.reduce(events, base_state, fn e, acc -> Aggregate.apply(acc, rehydrate(e)) end)
-    version = if events == [], do: from_version, else: List.last(events).version
-    {final, version}
   end
-
-  @doc "Execute a command, persist events, write snapshot if due."
-  def execute(sku, cmd) do
-    {state, version} = load(sku)
-
-    case Aggregate.decide(state, cmd) do
-      {:ok, events} ->
-        stream = stream_id(sku)
-        :ok = EventStore.append(stream, version, events)
-
-        new_state = Enum.reduce(events, state, &Aggregate.apply(&2, &1))
-        new_version = version + length(events)
-        EventStore.maybe_write_snapshot(stream, new_version, new_state)
-        {:ok, new_state, new_version}
-
-      {:error, _} = err ->
-        err
-    end
   end
-
-  # --- helpers ---
-
-  defp rehydrate(%{type: "StockReceived", payload: p}),
-    do: %StockReceived{sku: p["sku"], quantity: p["quantity"]}
-
-  defp rehydrate(%{type: "StockReserved", payload: p}),
-    do: %StockReserved{sku: p["sku"], reservation_id: p["reservation_id"], quantity: p["quantity"]}
-
-  defp rehydrate(%{type: "ReservationCancelled", payload: p}),
-    do: %ReservationCancelled{sku: p["sku"], reservation_id: p["reservation_id"]}
-
-  defp deserialize_state(%{"sku" => sku, "on_hand" => on_hand, "reservations" => res}) do
-    %Aggregate{
-      sku: sku,
-      on_hand: on_hand,
-      reservations: for({k, v} <- res, into: %{}, do: {k, v})
-    }
   end
-end
-
-defmodule Main do
-  def main do
-      # Demonstrating 383-event-sourcing-from-scratch-snapshots
-      :ok
+  end
+  end
   end
 end
 
 Main.main()
-end
-end
-end
-end
-end
-end
-end
-end
-end
-end
-end
-end
 ```

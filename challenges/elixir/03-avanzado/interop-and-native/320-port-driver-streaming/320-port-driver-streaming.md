@@ -573,56 +573,58 @@ do the fan-out in the driver (extra `driver_output` calls per subscriber) or in 
 ## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # No external dependencies — pure Elixir
-  ]
-end
-
-defmodule MarketTape.MixProject do
-  end
-  use Mix.Project
-
-  def project do
+defmodule Main do
+  defp deps do
     [
-      app: :market_tape,
-      version: "0.1.0",
-      elixir: "~> 1.17",
-      compilers: [:elixir_make] ++ Mix.compilers(),
-      make_makefile: "Makefile",
-      make_clean: ["clean"],
-      deps: [
-        {:elixir_make, "~> 0.8", runtime: false},
-        {:benchee, "~> 1.3", only: :dev}
-      ]
+      # No external dependencies — pure Elixir
     ]
   end
 
-  def application,
-    do: [extra_applications: [:logger], mod: {MarketTape.Application, []}]
-end
+  defmodule MarketTape.MixProject do
+    end
+    use Mix.Project
+
+    def project do
+      [
+        app: :market_tape,
+        version: "0.1.0",
+        elixir: "~> 1.17",
+        compilers: [:elixir_make] ++ Mix.compilers(),
+        make_makefile: "Makefile",
+        make_clean: ["clean"],
+        deps: [
+          {:elixir_make, "~> 0.8", runtime: false},
+          {:benchee, "~> 1.3", only: :dev}
+        ]
+      ]
+    end
+
+    def application,
+      do: [extra_applications: [:logger], mod: {MarketTape.Application, []}]
+  end
 
 
-### Step 2: The driver in C (`c_src/feed_driver.c`)
+  ### Step 2: The driver in C (`c_src/feed_driver.c`)
 
-**Objective**: Accumulate partial bytes across driver_output calls so unaligned feed chunks never lose frames.
-
-
-
-### Step 3: Elixir wrapper (`lib/market_tape/decoder_port.ex`)
-
-**Objective**: Use port_control/3 for side-channel ops so hot-path Port.command never waits for synchronous replies.
+  **Objective**: Accumulate partial bytes across driver_output calls so unaligned feed chunks never lose frames.
 
 
 
-### Step 4: Application supervision
+  ### Step 3: Elixir wrapper (`lib/market_tape/decoder_port.ex`)
 
-**Objective**: Supervise port owner so driver crash triggers stop/cleanup and per-port state rebuilds on restart.
+  **Objective**: Use port_control/3 for side-channel ops so hot-path Port.command never waits for synchronous replies.
 
-defmodule Main do
-  def main do
-      # Demonstrating 320-port-driver-streaming
-      :ok
+
+
+  ### Step 4: Application supervision
+
+  **Objective**: Supervise port owner so driver crash triggers stop/cleanup and per-port state rebuilds on restart.
+
+  defmodule Main do
+    def main do
+        # Demonstrating 320-port-driver-streaming
+        :ok
+    end
   end
 end
 

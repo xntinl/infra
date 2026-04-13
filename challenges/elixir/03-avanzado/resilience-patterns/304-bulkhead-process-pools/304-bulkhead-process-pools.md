@@ -374,155 +374,156 @@ What happens if you set `max_concurrent: 1`? Under what circumstances would that
 ## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # No external dependencies — pure Elixir
-  ]
-end
-
-defmodule ShippingBulkheads.MixProject do
-  end
-  use Mix.Project
-
-  def project do
-    [app: :shipping_bulkheads, version: "0.1.0", elixir: "~> 1.17", deps: deps()]
-  end
-
-  def application do
-    [mod: {ShippingBulkheads.Application, []}, extra_applications: [:logger]]
-  end
-
-  defp deps, do: [{:benchee, "~> 1.3", only: :dev}]
-end
-
-defmodule ShippingBulkheads.Application do
-  use Application
-
-  @impl true
-  def start(_type, _args) do
-    children = [
-      {ShippingBulkheads.Bulkhead.Pool, name: :ups, max_concurrent: 20},
-      {ShippingBulkheads.Bulkhead.Pool, name: :fedex, max_concurrent: 20},
-      {ShippingBulkheads.Bulkhead.Pool, name: :regional, max_concurrent: 5}
-    ]
-
-    Supervisor.start_link(children, strategy: :one_for_one)
-  end
-end
-
-defmodule ShippingBulkheads.Bulkhead.Pool do
-  @moduledoc """
-  Each pool is:
-    * a DynamicSupervisor that owns the worker processes
-    * a :counters atomic reference for lock-free checkout/checkin
-  The pair is registered under a name so callers can resolve both.
-  """
-  use Supervisor
-
-  def start_link(opts) do
-    name = Keyword.fetch!(opts, :name)
-    Supervisor.start_link(__MODULE__, opts, name: sup_name(name))
-  end
-
-  @impl true
-  def init(opts) do
-    name = Keyword.fetch!(opts, :name)
-    max = Keyword.fetch!(opts, :max_concurrent)
-
-    counter = :counters.new(1, [:atomics])
-    :persistent_term.put({__MODULE__, name}, %{counter: counter, max: max})
-
-    children = [
-      {DynamicSupervisor, strategy: :one_for_one, name: dynsup_name(name)}
-    ]
-
-    Supervisor.init(children, strategy: :one_for_one)
-  end
-
-  def checkout(name) do
-    %{counter: c, max: max} = :persistent_term.get({__MODULE__, name})
-    current = :counters.add(c, 1, 1) |> then(fn _ -> :counters.get(c, 1) end)
-
-    if current > max do
-      :counters.sub(c, 1, 1)
-      {:error, :pool_exhausted}
-    else
-      :ok
-    end
-  end
-
-  def checkin(name) do
-    %{counter: c} = :persistent_term.get({__MODULE__, name})
-    :counters.sub(c, 1, 1)
-    :ok
-  end
-
-  def dynsup_name(name), do: :"bulkhead_dynsup_#{name}"
-  def sup_name(name), do: :"bulkhead_sup_#{name}"
-
-  def in_flight(name) do
-    %{counter: c} = :persistent_term.get({__MODULE__, name})
-    :counters.get(c, 1)
-  end
-end
-
-defmodule ShippingBulkheads.Bulkhead.Worker do
-  use Task, restart: :temporary
-
-  def start_link({pool_name, fun, caller, ref}) do
-    Task.start_link(fn ->
-      result =
-        try do
-          {:ok, fun.()}
-        rescue
-          e -> {:error, e}
-        catch
-          kind, reason -> {:error, {kind, reason}}
-        after
-          ShippingBulkheads.Bulkhead.Pool.checkin(pool_name)
-        end
-
-      send(caller, {ref, result})
-    end)
-  end
-end
-
-defmodule ShippingBulkheads.Bulkhead do
-  alias ShippingBulkheads.Bulkhead.{Pool, Worker}
-
-  def run(pool, fun, timeout \\ 5_000) do
-    case Pool.checkout(pool) do
-      :ok ->
-        ref = make_ref()
-        caller = self()
-
-        {:ok, _pid} =
-          DynamicSupervisor.start_child(
-            Pool.dynsup_name(pool),
-            {Worker, {pool, fun, caller, ref}}
-          )
-
-        receive do
-          {^ref, {:ok, value}} -> {:ok, value}
-          {^ref, {:error, reason}} -> {:error, reason}
-        after
-          timeout ->
-            Pool.checkin(pool)
-            {:error, :timeout}
-        end
-
-      {:error, :pool_exhausted} = err ->
-        err
-    end
-  end
-end
-
 defmodule Main do
-  def main do
-      # Demonstrating 304-bulkhead-process-pools
-      :ok
+  defp deps do
+    [
+      # No external dependencies — pure Elixir
+    ]
   end
-end
+
+  defmodule ShippingBulkheads.MixProject do
+    end
+    use Mix.Project
+
+    def project do
+      [app: :shipping_bulkheads, version: "0.1.0", elixir: "~> 1.17", deps: deps()]
+    end
+
+    def application do
+      [mod: {ShippingBulkheads.Application, []}, extra_applications: [:logger]]
+    end
+
+    defp deps, do: [{:benchee, "~> 1.3", only: :dev}]
+  end
+
+  defmodule ShippingBulkheads.Application do
+    use Application
+
+    @impl true
+    def start(_type, _args) do
+      children = [
+        {ShippingBulkheads.Bulkhead.Pool, name: :ups, max_concurrent: 20},
+        {ShippingBulkheads.Bulkhead.Pool, name: :fedex, max_concurrent: 20},
+        {ShippingBulkheads.Bulkhead.Pool, name: :regional, max_concurrent: 5}
+      ]
+
+      Supervisor.start_link(children, strategy: :one_for_one)
+    end
+  end
+
+  defmodule ShippingBulkheads.Bulkhead.Pool do
+    @moduledoc """
+    Each pool is:
+      * a DynamicSupervisor that owns the worker processes
+      * a :counters atomic reference for lock-free checkout/checkin
+    The pair is registered under a name so callers can resolve both.
+    """
+    use Supervisor
+
+    def start_link(opts) do
+      name = Keyword.fetch!(opts, :name)
+      Supervisor.start_link(__MODULE__, opts, name: sup_name(name))
+    end
+
+    @impl true
+    def init(opts) do
+      name = Keyword.fetch!(opts, :name)
+      max = Keyword.fetch!(opts, :max_concurrent)
+
+      counter = :counters.new(1, [:atomics])
+      :persistent_term.put({__MODULE__, name}, %{counter: counter, max: max})
+
+      children = [
+        {DynamicSupervisor, strategy: :one_for_one, name: dynsup_name(name)}
+      ]
+
+      Supervisor.init(children, strategy: :one_for_one)
+    end
+
+    def checkout(name) do
+      %{counter: c, max: max} = :persistent_term.get({__MODULE__, name})
+      current = :counters.add(c, 1, 1) |> then(fn _ -> :counters.get(c, 1) end)
+
+      if current > max do
+        :counters.sub(c, 1, 1)
+        {:error, :pool_exhausted}
+      else
+        :ok
+      end
+    end
+
+    def checkin(name) do
+      %{counter: c} = :persistent_term.get({__MODULE__, name})
+      :counters.sub(c, 1, 1)
+      :ok
+    end
+
+    def dynsup_name(name), do: :"bulkhead_dynsup_#{name}"
+    def sup_name(name), do: :"bulkhead_sup_#{name}"
+
+    def in_flight(name) do
+      %{counter: c} = :persistent_term.get({__MODULE__, name})
+      :counters.get(c, 1)
+    end
+  end
+
+  defmodule ShippingBulkheads.Bulkhead.Worker do
+    use Task, restart: :temporary
+
+    def start_link({pool_name, fun, caller, ref}) do
+      Task.start_link(fn ->
+        result =
+          try do
+            {:ok, fun.()}
+          rescue
+            e -> {:error, e}
+          catch
+            kind, reason -> {:error, {kind, reason}}
+          after
+            ShippingBulkheads.Bulkhead.Pool.checkin(pool_name)
+          end
+
+        send(caller, {ref, result})
+      end)
+    end
+  end
+
+  defmodule ShippingBulkheads.Bulkhead do
+    alias ShippingBulkheads.Bulkhead.{Pool, Worker}
+
+    def run(pool, fun, timeout \\ 5_000) do
+      case Pool.checkout(pool) do
+        :ok ->
+          ref = make_ref()
+          caller = self()
+
+          {:ok, _pid} =
+            DynamicSupervisor.start_child(
+              Pool.dynsup_name(pool),
+              {Worker, {pool, fun, caller, ref}}
+            )
+
+          receive do
+            {^ref, {:ok, value}} -> {:ok, value}
+            {^ref, {:error, reason}} -> {:error, reason}
+          after
+            timeout ->
+              Pool.checkin(pool)
+              {:error, :timeout}
+          end
+
+        {:error, :pool_exhausted} = err ->
+          err
+      end
+    end
+  end
+
+  defmodule Main do
+    def main do
+        # Demonstrating 304-bulkhead-process-pools
+        :ok
+    end
+  end
 
 Main.main()
 ```

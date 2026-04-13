@@ -391,13 +391,10 @@ generation shines only when the data is static at compile time.
 
 ---
 
-## Executable Example
-
-Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
-
 ```elixir
 defmodule Main do
-  defmodule CompileTimeRoutes.Router do
+  import ExUnit.Assertions
+
     @moduledoc """
     A tiny Phoenix-style router DSL. Using this module:
 

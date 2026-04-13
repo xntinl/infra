@@ -510,34 +510,36 @@ A 5 ms blackout is usually fine. A 500 ms blackout (if your migration is expensi
 ## Executable Example
 
 ```elixir
-defp deps do
-  []
-end
-
-
-
-When OTP performs a release upgrade, it compares the new module's `@vsn` to the running one. If they differ, it calls `code_change/3` with the old version and the old state.
-
-### 2. `code_change/3` callback
-
-
-
-The callback is invoked synchronously during the upgrade. The new module is already loaded; the process is suspended; your job is to transform the state from the old shape to the new shape and return.
-
-### 3. The upgrade dance
-
-
-
-The mailbox keeps buffering during suspension; on resume, all queued messages are processed against the new shape. If your `code_change/3` is buggy, the process crashes and the supervisor decides what happens next — you may have just lost an entire pending queue.
-
-### 4. `.appup` and `.relup` files
-
-A hot upgrade requires a `.appup` describing module-level changes (upgrade/downgrade instructions per module) and a `.relup` describing the release-level transition. For a single GenServer upgrade the `.appup` looks like:
-
 defmodule Main do
-  def main do
-      # Demonstrating 05-genserver-hot-state-migration
-      :ok
+  defp deps do
+    []
+  end
+
+
+
+  When OTP performs a release upgrade, it compares the new module's `@vsn` to the running one. If they differ, it calls `code_change/3` with the old version and the old state.
+
+  ### 2. `code_change/3` callback
+
+
+
+  The callback is invoked synchronously during the upgrade. The new module is already loaded; the process is suspended; your job is to transform the state from the old shape to the new shape and return.
+
+  ### 3. The upgrade dance
+
+
+
+  The mailbox keeps buffering during suspension; on resume, all queued messages are processed against the new shape. If your `code_change/3` is buggy, the process crashes and the supervisor decides what happens next — you may have just lost an entire pending queue.
+
+  ### 4. `.appup` and `.relup` files
+
+  A hot upgrade requires a `.appup` describing module-level changes (upgrade/downgrade instructions per module) and a `.relup` describing the release-level transition. For a single GenServer upgrade the `.appup` looks like:
+
+  defmodule Main do
+    def main do
+        # Demonstrating 05-genserver-hot-state-migration
+        :ok
+    end
   end
 end
 

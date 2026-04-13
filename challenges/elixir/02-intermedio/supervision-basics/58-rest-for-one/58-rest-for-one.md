@@ -352,6 +352,7 @@ GenStage job, not a supervision strategy.
 Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
 
 ```elixir
+defmodule Main do
 defmodule RestForOneDemo.Stage do
   @moduledoc """
   A pipeline stage that, at init time, reads the pid of its upstream stage
@@ -484,6 +485,9 @@ IO.puts("  All three restarted")
 IO.puts("  New s2 has new s1 pid")
 IO.puts("  New s3 has new s2 pid")
 IO.puts("All :rest_for_one assertions passed!")
+end
+
+Main.main()
 ```
 
 

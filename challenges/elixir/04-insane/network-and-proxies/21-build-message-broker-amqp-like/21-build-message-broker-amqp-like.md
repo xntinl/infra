@@ -71,6 +71,38 @@ The hard part is the binary protocol. AMQP frames have a specific binary layout;
 
 → Chose **B** because AMQP's push model with prefetch is the shape that matches Elixir's process mailbox naturally — the prefetch window is exactly the backpressure mechanism we need.
 
+## Full Project Directory Tree
+
+```
+brokex/
+├── lib/
+│   ├── brokex.ex                    # main application module
+│   └── brokex/
+│       ├── application.ex           # OTP supervisor: listener, exchange registry, queue registry
+│       ├── listener.ex              # TCP accept loop, spawns connection handler per client
+│       ├── connection.ex            # GenServer: AMQP connection handshake, frame dispatch
+│       ├── channel.ex               # GenServer per AMQP channel: method dispatch, flow control
+│       ├── frame.ex                 # AMQP 0-9-1 frame parser: type, channel, size, payload
+│       ├── exchange.ex              # exchange types: direct, fanout, topic (trie routing)
+│       ├── queue.ex                 # GenServer: message store, consumer tracking, ack/nack
+│       ├── binding.ex               # exchange-to-queue binding registry
+│       ├── publisher_confirms.ex    # basic.ack/nack to producer after enqueue
+│       ├── dead_letter.ex           # DLX routing: rejected or expired messages
+│       └── persistence.ex           # DETS-backed durable message store
+├── test/
+│   ├── brokex_test.exs              # integration smoke tests
+│   └── brokex/
+│       ├── protocol_test.exs        # AMQP frame parsing correctness
+│       ├── routing_test.exs         # direct, fanout, topic exchange semantics
+│       ├── delivery_test.exs        # publisher confirms, consumer acks, requeue on nack
+│       ├── durability_test.exs      # restart recovery from DETS
+│       └── dead_letter_test.exs     # TTL expiry and rejection routing to DLX
+├── bench/
+│   └── brokex_bench.exs             # throughput benchmarks: publish, consume, confirm
+├── mix.exs                          # dependencies and build config
+└── README.md
+```
+
 ## Implementation milestones
 
 ### Step 1: Create the project
@@ -399,6 +431,27 @@ defmodule Brokex.Queue do
 end
 ```
 
+### ASCII Diagram: Message Flow Through AMQP Broker
+
+```
+Producer            Broker                    Consumer
+   │                  │                          │
+   │──publish────────>│                          │
+   │   (queue, msg)   │  [enqueue]              │
+   │                  │  [write DETS if durable]│
+   │<─────ack────────│                          │
+   │                  │  [push up to prefetch]  │
+   │                  │──deliver──────────────>│
+   │                  │                     [process]
+   │                  │<──ack (delivery_tag)───│
+   │                  │  [remove from in_flight]
+   │                  │
+   │                  │  [Consumer crashes]     ✗
+   │                  │  [requeue via :DOWN]    
+   │                  │──deliver (again)─────>│ [reconnect]
+   │                  │
+```
+
 ### Step 6: Given tests — must pass without modification
 
 **Objective**: Prove interop by running a real `:amqp` client against port 5673 — if they connect, the wire format is correct.
@@ -419,28 +472,67 @@ defmodule Brokex.RoutingTest do
     {:ok, chan: chan}
   end
 
-  test "direct exchange routes to correct queue", %{chan: chan} do
-    AMQP.Exchange.declare(chan, "test.direct", :direct)
-    AMQP.Queue.declare(chan, "q.orders")
-    AMQP.Queue.bind(chan, "q.orders", "test.direct", routing_key: "orders")
+  describe "direct exchange" do
+    test "routes message to exactly matching binding key", %{chan: chan} do
+      AMQP.Exchange.declare(chan, "test.direct", :direct)
+      AMQP.Queue.declare(chan, "q.orders")
+      AMQP.Queue.bind(chan, "q.orders", "test.direct", routing_key: "orders")
 
-    AMQP.Basic.publish(chan, "test.direct", "orders", "payload_1")
-    {:ok, msg, _meta} = AMQP.Basic.get(chan, "q.orders", no_ack: true)
-    assert msg.payload == "payload_1"
+      AMQP.Basic.publish(chan, "test.direct", "orders", "payload_1")
+      {:ok, msg, _meta} = AMQP.Basic.get(chan, "q.orders", no_ack: true)
+      assert msg.payload == "payload_1"
+    end
+
+    test "does not route to mismatched binding key", %{chan: chan} do
+      AMQP.Exchange.declare(chan, "test.direct", :direct)
+      AMQP.Queue.declare(chan, "q.orders")
+      AMQP.Queue.bind(chan, "q.orders", "test.direct", routing_key: "orders")
+
+      AMQP.Basic.publish(chan, "test.direct", "items", "payload_2")
+      :empty = AMQP.Basic.get(chan, "q.orders", no_ack: true)
+    end
   end
 
-  test "topic exchange wildcard routing", %{chan: chan} do
-    AMQP.Exchange.declare(chan, "test.topic", :topic)
-    AMQP.Queue.declare(chan, "q.eu_orders")
-    AMQP.Queue.bind(chan, "q.eu_orders", "test.topic", routing_key: "orders.eu.*")
+  describe "topic exchange" do
+    test "wildcard * matches single segment", %{chan: chan} do
+      AMQP.Exchange.declare(chan, "test.topic", :topic)
+      AMQP.Queue.declare(chan, "q.eu_orders")
+      AMQP.Queue.bind(chan, "q.eu_orders", "test.topic", routing_key: "orders.eu.*")
 
-    AMQP.Basic.publish(chan, "test.topic", "orders.eu.created", "eu_order")
-    AMQP.Basic.publish(chan, "test.topic", "orders.us.created", "us_order")
+      AMQP.Basic.publish(chan, "test.topic", "orders.eu.created", "eu_order")
+      {:ok, eu_msg, _} = AMQP.Basic.get(chan, "q.eu_orders", no_ack: true)
+      assert eu_msg.payload == "eu_order"
+    end
 
-    {:ok, eu_msg, _} = AMQP.Basic.get(chan, "q.eu_orders", no_ack: true)
-    assert eu_msg.payload == "eu_order"
+    test "wildcard * does not match zero or multiple segments", %{chan: chan} do
+      AMQP.Exchange.declare(chan, "test.topic", :topic)
+      AMQP.Queue.declare(chan, "q.eu_orders")
+      AMQP.Queue.bind(chan, "q.eu_orders", "test.topic", routing_key: "orders.eu.*")
 
-    :empty = AMQP.Basic.get(chan, "q.eu_orders", no_ack: true)
+      AMQP.Basic.publish(chan, "test.topic", "orders.us.created", "us_order")
+      AMQP.Basic.publish(chan, "test.topic", "orders.eu", "bare_order")
+      
+      :empty = AMQP.Basic.get(chan, "q.eu_orders", no_ack: true)
+    end
+
+    test "wildcard # matches zero or more segments", %{chan: chan} do
+      AMQP.Exchange.declare(chan, "test.topic", :topic)
+      AMQP.Queue.declare(chan, "q.all_orders")
+      AMQP.Queue.bind(chan, "q.all_orders", "test.topic", routing_key: "orders.#")
+
+      # All should match: orders.#
+      AMQP.Basic.publish(chan, "test.topic", "orders.created", "msg1")
+      AMQP.Basic.publish(chan, "test.topic", "orders.eu.refunded", "msg2")
+      AMQP.Basic.publish(chan, "test.topic", "orders", "msg3")
+      
+      {:ok, m1, _} = AMQP.Basic.get(chan, "q.all_orders", no_ack: true)
+      {:ok, m2, _} = AMQP.Basic.get(chan, "q.all_orders", no_ack: true)
+      {:ok, m3, _} = AMQP.Basic.get(chan, "q.all_orders", no_ack: true)
+      
+      assert m1.payload in ["msg1", "msg2", "msg3"]
+      assert m2.payload in ["msg1", "msg2", "msg3"]
+      assert m3.payload in ["msg1", "msg2", "msg3"]
+    end
   end
 end
 ```
@@ -520,55 +612,15 @@ The broker tracks each consumer's unacked set in ETS and only pushes up to `pref
 ---
 
 
-## Main Entry Point
-
-```elixir
-def main do
-  IO.puts("======== 21-build-message-broker-amqp-like ========")
-  IO.puts("Build message broker amqp like")
-  IO.puts("")
-  
-  Brokex.Frame.start_link([])
-  IO.puts("Brokex.Frame started")
-  
-  IO.puts("Run: mix test")
-end
-```
-
-
-
-## Benchmark
-
-```elixir
-# bench/brokex_bench.exs
-Benchee.run(%{
-  "publish_no_confirm" => fn ->
-    {:ok, conn} = AMQP.Connection.open(port: 5673)
-    {:ok, chan} = AMQP.Channel.open(conn)
-    AMQP.Queue.declare(chan, "bench.q")
-    AMQP.Basic.publish(chan, "", "bench.q", "payload")
-    AMQP.Connection.close(conn)
-  end,
-  "publish_confirmed" => fn ->
-    {:ok, conn} = AMQP.Connection.open(port: 5673)
-    {:ok, chan} = AMQP.Channel.open(conn)
-    AMQP.Queue.declare(chan, "bench.q")
-    AMQP.Confirm.select(chan)
-    AMQP.Basic.publish(chan, "", "bench.q", "payload")
-    AMQP.Confirm.wait_for_confirms(chan)
-    AMQP.Connection.close(conn)
-  end
-}, time: 10, warmup: 3)
-```
-
 ## Quick start
 
 ```bash
-# Start the application
+# Start the application and run tests
 mix deps.get
-mix test
+mix test test/brokex/ --trace
 
-# Or run the benchmark:
+# Or run the benchmark to measure throughput:
+mix deps.get
 mix run bench/brokex_bench.exs
 ```
 
@@ -576,19 +628,63 @@ Target: 50,000 messages/second routed end-to-end with 10 consumers and prefetch=
 
 ---
 
-## Key Concepts: Message Protocols and AMQP Framing
+## Benchmark
 
-AMQP (Advanced Message Queuing Protocol) 0-9-1 is a binary protocol layered on TCP. Understanding its frame structure is critical because every byte must align correctly for clients to parse.
+```elixir
+# bench/brokex_bench.exs
+{:ok, conn} = AMQP.Connection.open(port: 5673)
+{:ok, chan} = AMQP.Channel.open(conn)
 
-**Frame structure**: Each AMQP frame contains a type byte (1=METHOD, 2=HEADER, 3=BODY, 8=HEARTBEAT), a 16-bit channel ID, a 32-bit size field, the payload, and a frame-end byte (0xCE). A single off-by-one error in size calculation breaks all subsequent frames.
+Benchee.run(
+  %{
+    "publish_fire_and_forget" => fn ->
+      AMQP.Basic.publish(chan, "", "bench.q", "payload")
+    end,
+    "publish_with_confirms" => fn ->
+      AMQP.Confirm.select(chan)
+      AMQP.Basic.publish(chan, "", "bench.q", "payload")
+      AMQP.Confirm.wait_for_confirms(chan, timeout: 5000)
+    end,
+    "consumer_delivery_push" => fn ->
+      {:ok, msg, _meta} = AMQP.Basic.get(chan, "bench.q", no_ack: false)
+      AMQP.Basic.ack(chan, msg.delivery_tag) if msg
+    end
+  },
+  parallel: 2,
+  time: 10,
+  warmup: 3,
+  memory_time: 2
+)
 
-**Method framing**: METHOD frames contain a 16-bit class ID and 16-bit method ID followed by method-specific arguments. For example, `basic.publish` (class 60, method 40) includes the exchange name, routing key, and flags. The argument encoding follows strict AMQP type rules: strings are length-prefixed (4-byte big-endian length + UTF-8 data), booleans are single bits packed into flags fields.
+AMQP.Connection.close(conn)
+```
 
-**Prefetch window**: AMQP's push model delivers messages to consumers proactively. The `prefetch` parameter bounds how many unacked messages a consumer can hold. This prevents fast consumers from starving the broker's memory on a slow backend — backpressure is enforced by the prefetch limit, not by network flow control.
+**Expected results** (on modern hardware):
+- Fire-and-forget: ~100,000 ops/sec
+- With publisher confirms: ~20,000 ops/sec (confirms add latency)
+- Consumer delivery: ~80,000 ops/sec (includes network round-trip)
 
-**Publisher confirms**: A producer does not know if a message will be routed successfully. `basic.ack` sent back to the producer means "the message is enqueued (and persisted if durable)." The producer must track unacked messages and handle timeouts — if no ack arrives within timeout, the message is retransmitted.
+---
 
-**Production insight**: The AMQP wire format is unforgiving. Test with a real client library like the Elixir `:amqp` package against your broker — if they cannot interoperate, your implementation is wrong, not the test.
+## Key Concepts: AMQP Wire Protocol and Flow Control
+
+**AMQP 0-9-1 Frame Structure**: Each frame is binary: `<<type::8, channel::16, size::32, payload::binary, frame_end::8>>` where `frame_end = 0xCE`. The frame type determines payload interpretation:
+- `1 (METHOD)`: class_id + method_id + arguments
+- `2 (HEADER)`: properties and content length
+- `3 (BODY)`: raw message bytes
+- `8 (HEARTBEAT)`: no payload (keep-alive)
+
+A single off-by-one error in the size field corrupts the stream — all subsequent frames fail to parse.
+
+**Method Argument Encoding**: AMQP defines strict type rules. Strings are `<<length::32, utf8_data::binary>>`. Booleans pack into single bits within a flags byte. Tables are nested structures with type-tagged values. The protocol requires exact ordering and alignment.
+
+**Producer Acknowledgment**: When a producer publishes with `delivery_mode=2` (persistent), the broker writes to durable storage (DETS), then sends `basic.ack` to the producer. The producer's guarantee: "if I receive ack, the message survives a broker crash." If the ack is sent before DETS fsync, the guarantee is violated.
+
+**Consumer Prefetch and At-Least-Once Delivery**: The broker pushes up to `prefetch` messages to each consumer without waiting for acks. When a consumer crashes, unacked messages are requeued by monitoring the consumer process and calling `handle_info({:DOWN, ...})`. This ensures at-least-once: every message is delivered to some consumer.
+
+**Trie-Based Topic Matching**: `orders.#` must match `orders` (zero segments after the dot), `orders.created`, and `orders.eu.created`. A naive recursive pattern match can miss these cases. A trie with special `#` and `*` nodes avoids recomputation.
+
+**Production insight**: The AMQP protocol is legally binding — test against a real client (the Elixir `:amqp` library). Frame corruption, timing of acks, and rerouting behavior on nack are not implementation details; they are contract violations.
 
 ---
 
@@ -623,8 +719,17 @@ A `basic.ack` to the producer means "this message will survive a broker crash." 
 
 ## Reflection
 
-- If a consumer acks messages out of order, do you have any safety issue? What invariant does AMQP rely on?
-- When would you pick NATS/JetStream over an AMQP-style broker? Name the workload difference.
+1. **Message ordering and out-of-order acks**: AMQP allows acking messages out of order. If a consumer receives delivery_tags [5, 7, 6] and acks them as [7, 5, 6], what happens to unacked messages? The broker removes from `in_flight` based on tag, not order. If the consumer crashes before acking 6, message 6 is requeued but messages 5 and 7 are not — correct behavior. However, if a consumer keeps 6 unacked indefinitely, the message may age out of any TTL, causing data loss. What invariant must the client enforce to prevent this?
+
+2. **When NATS/JetStream is better**: AMQP's push model with prefetch means a slow consumer causes queue buildup. NATS's pull model (consumer fetches at its pace) avoids this. Choose NATS for workloads where:
+   - Consumer throughput varies wildly (some consume 100 msgs/sec, others 10,000)
+   - You need log replay (jump to any offset, replay history)
+   - You want to scale consumers independently of producers
+   
+   Choose AMQP for:
+   - Strict queue ordering with dead-letter routing
+   - Transactional guarantees (many implementations support 2PC)
+   - Legacy integration (many languages have AMQP clients)
 
 ---
 

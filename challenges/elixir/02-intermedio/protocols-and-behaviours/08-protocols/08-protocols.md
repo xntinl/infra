@@ -336,6 +336,7 @@ different design.
 Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
 
 ```elixir
+defmodule Main do
 defprotocol Jsonable do
   @moduledoc """
   Turns a value into a compact JSON string. Dispatches on the type of the
@@ -411,6 +412,9 @@ assert Jsonable.to_json([1, "two", true]) == ~s([1,"two",true])
 assert Jsonable.to_json(%{a: 1, b: 2}) in [~s({"a":1,"b":2}), ~s({"b":2,"a":1})]
 
 IO.puts("All protocol assertions passed!")
+end
+
+Main.main()
 ```
 
 

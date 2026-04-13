@@ -26,6 +26,23 @@ RLS enforces the filter at the database, so a forgotten filter in application co
 
 → Chose **B** because SaaS economics only work if the per-tenant cost is near zero — shared-schema with RLS is the standard.
 
+
+## Quick start
+
+1. Create project:
+   ```bash
+   mix new <project_name>
+   cd <project_name>
+   ```
+
+2. Copy dependencies to `mix.exs`
+
+3. Implement modules following the project structure
+
+4. Run tests: `mix test`
+
+5. Benchmark: `mix run lib/benchmark.exs`
+
 ## Why RLS over schema-per-tenant for most deployments
 
 Schema-per-tenant gives the strongest isolation: each tenant's data is in a separate PostgreSQL schema. But it has operational costs: running migrations requires iterating over N schemas, connection pooling by schema is complex, and at 10,000 tenants, the schema count becomes unwieldy.

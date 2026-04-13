@@ -352,6 +352,7 @@ ceremony for its own sake.
 Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
 
 ```elixir
+defmodule Main do
 defmodule CustomChildSpec.DurableWorker do
   @moduledoc """
   A worker that represents a durable resource (e.g., a file handle, a
@@ -449,6 +450,9 @@ IO.puts("Worker 1 ID: #{inspect(CustomChildSpec.DurableWorker.get_id(:writer))}"
 IO.puts("Worker 2 ID: #{inspect(CustomChildSpec.DurableWorker.get_id(:scratch))}")
 
 IO.puts("All custom child spec assertions passed!")
+end
+
+Main.main()
 ```
 
 

@@ -73,6 +73,35 @@ Writers create new row versions rather than updating in place. The old version g
 
 → Chose **B** because skiplists are what Redis and LevelDB use because they combine O(log N) ops with simple concurrent-insert logic — red-black trees require too much locking for our target workload.
 
+## Project Structure
+
+```
+memdb/
+├── lib/
+│   └── memdb/
+│       ├── application.ex           # database supervisor
+│       ├── database.ex              # public API: create_table, insert, select, update, delete, begin, commit, rollback
+│       ├── table.ex                 # schema definition, column types, constraint enforcement
+│       ├── mvcc.ex                  # row versioning: created_xid, expired_xid, visibility rules
+│       ├── btree.ex                 # B-tree index: insert, delete, range scan
+│       ├── query_planner.ex         # cost-based choice: index scan vs full table scan
+│       ├── transaction.ex           # BEGIN/COMMIT/ROLLBACK, snapshot XID, write set
+│       ├── lock_manager.ex          # row-level locking: acquire, release, wait
+│       ├── wait_for_graph.ex        # distributed wait-for graph, deadlock detection (DFS)
+│       └── gc.ex                    # background: prune versions invisible to all active txns
+├── test/
+│   └── memdb/
+│       ├── crud_test.exs            # insert, select, update, delete correctness
+│       ├── mvcc_test.exs            # snapshot isolation, no dirty reads, no lost updates
+│       ├── btree_test.exs           # index operations, range queries
+│       ├── deadlock_test.exs        # cycle detection, victim selection
+│       ├── gc_test.exs              # version pruning, dead row count
+│       └── benchmark_test.exs       # 1M reads/s, 100k writes/s
+├── bench/
+│   └── memdb_bench.exs
+└── mix.exs
+```
+
 ## Implementation milestones
 
 ### Step 1: Create the project

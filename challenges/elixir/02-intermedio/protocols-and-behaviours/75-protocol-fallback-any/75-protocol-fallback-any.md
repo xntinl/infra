@@ -309,6 +309,15 @@ Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solu
 
 ```elixir
 defmodule Main do
+  defprotocol Describable do
+    @moduledoc """
+    Protocol that describes a value in human-readable terms.
+    """
+    @fallback_to_any true
+    @doc "Returns a string describing the value"
+    def describe(value)
+  end
+
   defmodule Describable.Impls do
     @moduledoc false
 
@@ -351,7 +360,15 @@ defmodule Main do
   end
 
   def main do
-    IO.puts("Describable OK")
+    # Test specific implementations
+    IO.puts(Describable.describe(42))
+    IO.puts(Describable.describe("hello"))
+    IO.puts(Describable.describe([1, 2, 3]))
+    
+    # Test fallback to Any for a tuple
+    IO.puts(Describable.describe({:a, :b}))
+    
+    IO.puts("✓ Describable protocol with fallback to Any works correctly")
   end
 
 end

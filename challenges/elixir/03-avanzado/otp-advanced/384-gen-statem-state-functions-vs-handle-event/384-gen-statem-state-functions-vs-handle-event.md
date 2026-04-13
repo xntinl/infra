@@ -426,34 +426,36 @@ You implemented the same machine twice. Which file would you rather revisit six 
 ## Executable Example
 
 ```elixir
-defp deps do
-  [
-    {:benchee, "~> 1.3", only: [:dev, :test]}
-  ]
-end
-
-
-
-### Step 1: Shared PIN validator
-
-**Objective**: Extract PIN logic to pure module so state_functions vs handle_event_function comparison isolates dispatch overhead only.
-
-
-
-### Step 2: `:state_functions` implementation
-
-**Objective**: Dispatch by state function so each state colocates its legal transitions, illegal events raise FunctionClauseError.
-
-
-
-### Step 3: `:handle_event_function` implementation
-
-**Objective**: Centralize all event dispatch so cross-state logic instruments once, at cost of per-state readability.
-
 defmodule Main do
-  def main do
-      # Demonstrating 384-gen-statem-state-functions-vs-handle-event
-      :ok
+  defp deps do
+    [
+      {:benchee, "~> 1.3", only: [:dev, :test]}
+    ]
+  end
+
+
+
+  ### Step 1: Shared PIN validator
+
+  **Objective**: Extract PIN logic to pure module so state_functions vs handle_event_function comparison isolates dispatch overhead only.
+
+
+
+  ### Step 2: `:state_functions` implementation
+
+  **Objective**: Dispatch by state function so each state colocates its legal transitions, illegal events raise FunctionClauseError.
+
+
+
+  ### Step 3: `:handle_event_function` implementation
+
+  **Objective**: Centralize all event dispatch so cross-state logic instruments once, at cost of per-state readability.
+
+  defmodule Main do
+    def main do
+        # Demonstrating 384-gen-statem-state-functions-vs-handle-event
+        :ok
+    end
   end
 end
 

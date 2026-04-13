@@ -322,13 +322,10 @@ purely so you understand what's happening when you read Elixir source.
 
 ---
 
-## Executable Example
-
-Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
-
 ```elixir
 defmodule Main do
-  defmodule MyUnless do
+  import ExUnit.Assertions
+
     @moduledoc """
     A from-scratch implementation of `Kernel.unless/2`, intended as a
     teaching exercise. Do not use in production — `Kernel.unless` already

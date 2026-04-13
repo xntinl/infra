@@ -287,6 +287,14 @@ Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solu
 
 ```elixir
 defmodule Main do
+  defprotocol Shape do
+    @moduledoc """
+    Protocol for calculating area of shapes.
+    """
+    @doc "Returns the area of a shape"
+    def area(shape)
+  end
+
   defmodule Shape.Rectangle do
     @enforce_keys [:width, :height]
     defstruct [:width, :height]
@@ -308,7 +316,15 @@ defmodule Main do
   end
 
   def main do
-    IO.puts("Shape OK")
+    rect = %Shape.Rectangle{width: 4, height: 5}
+    circle = %Shape.Circle{radius: 3}
+    
+    rect_area = Shape.area(rect)
+    circle_area = Shape.area(circle)
+    
+    IO.puts("Rectangle area: #{rect_area}")
+    IO.puts("Circle area: #{circle_area}")
+    IO.puts("✓ Shape protocol works correctly")
   end
 
 end

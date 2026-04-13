@@ -367,142 +367,146 @@ A client sends 3 concurrent identical charge requests. The `fun.()` executes onc
 ## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # No external dependencies — pure Elixir
-  ]
-end
-
-defmodule ChargeIdempotency.MixProject do
-  end
-  use Mix.Project
-  def project, do: [app: :charge_idempotency, version: "0.1.0", elixir: "~> 1.17", deps: deps()]
-  def application, do: [mod: {ChargeIdempotency.Application, []}, extra_applications: [:logger]]
-  defp deps, do: [{:benchee, "~> 1.3", only: :dev}]
-end
-
-defmodule ChargeIdempotency.Application do
-  use Application
-
-  @impl true
-  def start(_type, _args) do
-    children = [
-      {ChargeIdempotency.Store, ttl_ms: 24 * 60 * 60 * 1_000, sweep_ms: 60_000}
-    ]
-
-    Supervisor.start_link(children, strategy: :one_for_one)
-  end
-end
-
-defmodule ChargeIdempotency.Store do
-  end
-  use GenServer
-
-  @table :charge_idempotency
-
-  def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
-
-  @doc """
-  Executes `fun` exactly once for the given key within the TTL.
-  Duplicates within TTL return the cached result without executing `fun`.
-  """
-  def ensure_once(key, timeout_ms, fun) when is_function(fun, 0) do
-    now = now_ms()
-    expires_at = now + ttl()
-
-    case :ets.insert_new(@table, {key, :in_flight, expires_at}) do
-      true ->
-        execute_and_store(key, fun, expires_at)
-
-      false ->
-        wait_for_completion(key, timeout_ms, now + timeout_ms)
-    end
-  end
-
-  defp execute_and_store(key, fun, expires_at) do
-    try do
-      result = fun.()
-      :ets.insert(@table, {key, {:done, result}, expires_at})
-      {:ok, result}
-    rescue
-      e ->
-        :ets.delete(@table, key)
-        reraise e, __STACKTRACE__
-    end
-  end
-
-  defp wait_for_completion(key, _timeout_ms, deadline) do
-  end
-    case :ets.lookup(@table, key) do
-      [{^key, {:done, result}, expires_at}] ->
-        if expires_at > now_ms(), do: {:ok, result}, else: {:error, :expired}
-
-      [{^key, :in_flight, _}] ->
-        if now_ms() >= deadline do
-          {:error, :timeout}
-        else
-          Process.sleep(10)
-          wait_for_completion(key, nil, deadline)
-        end
-
-      [] ->
-        {:error, :evicted}
-    end
-  end
-
-  # ---------- lifecycle ----------
-
-  @impl true
-  def init(opts) do
-    ttl = Keyword.fetch!(opts, :ttl_ms)
-    sweep = Keyword.fetch!(opts, :sweep_ms)
-
-    :ets.new(@table, [:named_table, :public, :set, read_concurrency: true, write_concurrency: true])
-    :persistent_term.put({__MODULE__, :ttl_ms}, ttl)
-    Process.send_after(self(), :sweep, sweep)
-
-    {:ok, %{ttl_ms: ttl, sweep_ms: sweep}}
-  end
-
-  @impl true
-  def handle_info(:sweep, state) do
-    now = now_ms()
-
-    # match_spec: delete entries where expires_at < now
-    spec = [{{:_, :_, :"$1"}, [{:<, :"$1", now}], [true]}]
-    :ets.select_delete(@table, spec)
-
-    Process.send_after(self(), :sweep, state.sweep_ms)
-    {:noreply, state}
-  end
-
-  defp now_ms, do: System.monotonic_time(:millisecond)
-  defp ttl, do: :persistent_term.get({__MODULE__, :ttl_ms})
-end
-
-defmodule ChargeIdempotency.Service do
-  alias ChargeIdempotency.Store
-
-  def charge(idempotency_key, amount) do
-    Store.ensure_once(idempotency_key, 5_000, fn ->
-      do_charge(amount)
-    end)
-  end
-
-  defp do_charge(amount) do
-    %{charged_at: System.system_time(:millisecond), amount: amount, status: :ok}
-  end
-end
-
 defmodule Main do
-  def main do
-      # Demonstrating 313-idempotency-keys-ets-ttl
-      :ok
+  defp deps do
+    [
+      # No external dependencies — pure Elixir
+    ]
+  end
+
+  defmodule ChargeIdempotency.MixProject do
+    end
+    use Mix.Project
+    def project, do: [app: :charge_idempotency, version: "0.1.0", elixir: "~> 1.17", deps: deps()]
+    def application, do: [mod: {ChargeIdempotency.Application, []}, extra_applications: [:logger]]
+    defp deps, do: [{:benchee, "~> 1.3", only: :dev}]
+  end
+
+  defmodule ChargeIdempotency.Application do
+    use Application
+
+    @impl true
+    def start(_type, _args) do
+      children = [
+        {ChargeIdempotency.Store, ttl_ms: 24 * 60 * 60 * 1_000, sweep_ms: 60_000}
+      ]
+
+      Supervisor.start_link(children, strategy: :one_for_one)
+    end
+  end
+
+  defmodule ChargeIdempotency.Store do
+    end
+    use GenServer
+
+    @table :charge_idempotency
+
+    def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
+
+    @doc """
+    Executes `fun` exactly once for the given key within the TTL.
+    Duplicates within TTL return the cached result without executing `fun`.
+    """
+    def ensure_once(key, timeout_ms, fun) when is_function(fun, 0) do
+      now = now_ms()
+      expires_at = now + ttl()
+
+      case :ets.insert_new(@table, {key, :in_flight, expires_at}) do
+        true ->
+          execute_and_store(key, fun, expires_at)
+
+        false ->
+          wait_for_completion(key, timeout_ms, now + timeout_ms)
+      end
+    end
+
+    defp execute_and_store(key, fun, expires_at) do
+      try do
+        result = fun.()
+        :ets.insert(@table, {key, {:done, result}, expires_at})
+        {:ok, result}
+      rescue
+        e ->
+          :ets.delete(@table, key)
+          reraise e, __STACKTRACE__
+      end
+    end
+
+    defp wait_for_completion(key, _timeout_ms, deadline) do
+    end
+      case :ets.lookup(@table, key) do
+        [{^key, {:done, result}, expires_at}] ->
+          if expires_at > now_ms(), do: {:ok, result}, else: {:error, :expired}
+
+        [{^key, :in_flight, _}] ->
+          if now_ms() >= deadline do
+            {:error, :timeout}
+          else
+            Process.sleep(10)
+            wait_for_completion(key, nil, deadline)
+          end
+
+        [] ->
+          {:error, :evicted}
+      end
+    end
+
+    # ---------- lifecycle ----------
+
+    @impl true
+    def init(opts) do
+      ttl = Keyword.fetch!(opts, :ttl_ms)
+      sweep = Keyword.fetch!(opts, :sweep_ms)
+
+      :ets.new(@table, [:named_table, :public, :set, read_concurrency: true, write_concurrency: true])
+      :persistent_term.put({__MODULE__, :ttl_ms}, ttl)
+      Process.send_after(self(), :sweep, sweep)
+
+      {:ok, %{ttl_ms: ttl, sweep_ms: sweep}}
+    end
+
+    @impl true
+    def handle_info(:sweep, state) do
+      now = now_ms()
+
+      # match_spec: delete entries where expires_at < now
+      spec = [{{:_, :_, :"$1"}, [{:<, :"$1", now}], [true]}]
+      :ets.select_delete(@table, spec)
+
+      Process.send_after(self(), :sweep, state.sweep_ms)
+      {:noreply, state}
+    end
+
+    defp now_ms, do: System.monotonic_time(:millisecond)
+    defp ttl, do: :persistent_term.get({__MODULE__, :ttl_ms})
+  end
+
+  defmodule ChargeIdempotency.Service do
+    alias ChargeIdempotency.Store
+
+    def charge(idempotency_key, amount) do
+      Store.ensure_once(idempotency_key, 5_000, fn ->
+        do_charge(amount)
+      end)
+    end
+
+    defp do_charge(amount) do
+      %{charged_at: System.system_time(:millisecond), amount: amount, status: :ok}
+    end
+  end
+
+  defmodule Main do
+    def main do
+        # Demonstrating 313-idempotency-keys-ets-ttl
+        :ok
+    end
+  end
+
+  Main.main()
+  end
+  end
   end
 end
 
 Main.main()
-end
-end
-end
 ```

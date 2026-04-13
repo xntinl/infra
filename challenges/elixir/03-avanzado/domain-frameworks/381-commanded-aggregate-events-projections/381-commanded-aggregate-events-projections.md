@@ -532,250 +532,252 @@ The projection is eventually consistent and may lag by seconds on a busy node. I
 ## Executable Example
 
 ```elixir
-defp deps do
-  [
-    {:commanded, "~> 1.4"},
-    {:commanded_eventstore_adapter, "~> 1.4"},
-    {:commanded_ecto_projections, "~> 1.4"},
-    {:eventstore, "~> 1.4"},
-    {:ecto_sql, "~> 3.12"},
-    {:postgrex, "~> 0.19"},
-    {:jason, "~> 1.4"}
-  ]
-
-
-defmodule ShoppingCartEs.CommandedApp do
-  use Commanded.Application,
-    otp_app: :shopping_cart_es,
-    event_store: [
-      adapter: Commanded.EventStore.Adapters.EventStore,
-      event_store: ShoppingCartEs.EventStore
+defmodule Main do
+  defp deps do
+    [
+      {:commanded, "~> 1.4"},
+      {:commanded_eventstore_adapter, "~> 1.4"},
+      {:commanded_ecto_projections, "~> 1.4"},
+      {:eventstore, "~> 1.4"},
+      {:ecto_sql, "~> 3.12"},
+      {:postgrex, "~> 0.19"},
+      {:jason, "~> 1.4"}
     ]
 
-  router ShoppingCartEs.Router
-end
 
-defmodule ShoppingCartEs.EventStore do
-  use EventStore, otp_app: :shopping_cart_es
-end
+  defmodule ShoppingCartEs.CommandedApp do
+    use Commanded.Application,
+      otp_app: :shopping_cart_es,
+      event_store: [
+        adapter: Commanded.EventStore.Adapters.EventStore,
+        event_store: ShoppingCartEs.EventStore
+      ]
 
-
-defmodule ShoppingCartEs.Cart.Commands do
-  defmodule AddItem do
-    @enforce_keys [:cart_id, :sku, :quantity, :unit_price_cents]
-    defstruct [:cart_id, :sku, :quantity, :unit_price_cents]
+    router ShoppingCartEs.Router
   end
 
-  defmodule RemoveItem do
-    @enforce_keys [:cart_id, :sku]
-    defstruct [:cart_id, :sku]
+  defmodule ShoppingCartEs.EventStore do
+    use EventStore, otp_app: :shopping_cart_es
   end
 
-  defmodule Checkout do
-    @enforce_keys [:cart_id]
-    defstruct [:cart_id]
-  end
-end
 
-defmodule ShoppingCartEs.Cart.Events do
-  defmodule ItemAdded do
-    @derive Jason.Encoder
-    defstruct [:cart_id, :sku, :quantity, :unit_price_cents]
-  end
+  defmodule ShoppingCartEs.Cart.Commands do
+    defmodule AddItem do
+      @enforce_keys [:cart_id, :sku, :quantity, :unit_price_cents]
+      defstruct [:cart_id, :sku, :quantity, :unit_price_cents]
+    end
 
-  defmodule ItemRemoved do
-    @derive Jason.Encoder
-    defstruct [:cart_id, :sku]
-  end
+    defmodule RemoveItem do
+      @enforce_keys [:cart_id, :sku]
+      defstruct [:cart_id, :sku]
+    end
 
-  defmodule CartCheckedOut do
-    @derive Jason.Encoder
-    defstruct [:cart_id, :total_cents, :item_count]
-  end
-end
-
-
-defmodule ShoppingCartEs.Cart.Aggregate do
-  alias ShoppingCartEs.Cart.Commands.{AddItem, RemoveItem, Checkout}
-  alias ShoppingCartEs.Cart.Events.{ItemAdded, ItemRemoved, CartCheckedOut}
-
-  defstruct cart_id: nil,
-            items: %{},
-            status: :open
-
-  # --- execute: command → event(s) or error ---
-
-  def execute(%__MODULE__{status: :checked_out}, _cmd),
-    do: {:error, :cart_already_checked_out}
-
-  def execute(%__MODULE__{}, %AddItem{quantity: q}) when q <= 0,
-    do: {:error, :quantity_must_be_positive}
-
-  def execute(%__MODULE__{} = _cart, %AddItem{} = cmd) do
-    %ItemAdded{
-      cart_id: cmd.cart_id,
-      sku: cmd.sku,
-      quantity: cmd.quantity,
-      unit_price_cents: cmd.unit_price_cents
-    }
-  end
-
-  def execute(%__MODULE__{items: items}, %RemoveItem{sku: sku}) when not is_map_key(items, sku),
-    do: {:error, :item_not_in_cart}
-
-  def execute(%__MODULE__{} = _cart, %RemoveItem{} = cmd) do
-    %ItemRemoved{cart_id: cmd.cart_id, sku: cmd.sku}
-  end
-
-  def execute(%__MODULE__{items: items}, %Checkout{}) when map_size(items) == 0,
-    do: {:error, :cart_is_empty}
-
-  def execute(%__MODULE__{items: items, cart_id: id}, %Checkout{}) do
-    total =
-      Enum.reduce(items, 0, fn {_sku, %{quantity: q, unit_price_cents: p}}, acc ->
-        acc + q * p
-      end)
-
-    %CartCheckedOut{cart_id: id, total_cents: total, item_count: map_size(items)}
-  end
-
-  # --- apply: event → new state ---
-
-  def apply(%__MODULE__{} = state, %ItemAdded{} = ev) do
-    %{
-      state
-      | cart_id: ev.cart_id,
-        items:
-          Map.update(
-            state.items,
-            ev.sku,
-            %{quantity: ev.quantity, unit_price_cents: ev.unit_price_cents},
-            fn existing -> %{existing | quantity: existing.quantity + ev.quantity} end
-          )
-    }
-  end
-
-  def apply(%__MODULE__{} = state, %ItemRemoved{} = ev) do
-    %{state | items: Map.delete(state.items, ev.sku)}
-  end
-
-  def apply(%__MODULE__{} = state, %CartCheckedOut{}) do
-    %{state | status: :checked_out}
-  end
-end
-
-
-defmodule ShoppingCartEs.Router do
-  use Commanded.Commands.Router
-
-  alias ShoppingCartEs.Cart.Aggregate
-  alias ShoppingCartEs.Cart.Commands.{AddItem, RemoveItem, Checkout}
-
-  identify(Aggregate, by: :cart_id, prefix: "cart-")
-
-  dispatch([AddItem, RemoveItem, Checkout],
-    to: Aggregate,
-    lifespan: ShoppingCartEs.Cart.Lifespan
-  )
-end
-
-defmodule ShoppingCartEs.Cart.Lifespan do
-  @behaviour Commanded.Aggregates.AggregateLifespan
-
-  # Hibernate the aggregate process after 5 minutes of inactivity
-  def after_event(_event), do: :timer.minutes(5)
-  def after_command(_command), do: :timer.minutes(5)
-  def after_error(_error), do: :stop
-end
-
-
-defmodule ShoppingCartEs.Projections.CartSummaryProjector do
-  use Commanded.Projections.Ecto,
-    application: ShoppingCartEs.CommandedApp,
-    name: "cart_summary_projector",
-    repo: ShoppingCartEs.Repo
-
-  alias ShoppingCartEs.Cart.Events.{ItemAdded, ItemRemoved, CartCheckedOut}
-
-  project(%ItemAdded{} = ev, _metadata, fn multi ->
-    Ecto.Multi.run(multi, :upsert, fn repo, _ ->
-      {:ok,
-       repo.insert_all(
-         "cart_summaries",
-         [
-           %{
-             cart_id: ev.cart_id,
-             item_count: ev.quantity,
-             total_cents: ev.quantity * ev.unit_price_cents,
-             status: "open",
-             updated_at: DateTime.utc_now()
-           }
-         ],
-         on_conflict: {:replace, [:item_count, :total_cents, :updated_at]},
-         conflict_target: [:cart_id]
-       )}
-    end)
-  end)
-
-  project(%ItemRemoved{cart_id: id}, _metadata, fn multi ->
-    Ecto.Multi.run(multi, :decrement, fn repo, _ ->
-      {count, _} =
-        repo.update_all(
-          "cart_summaries",
-          [set: [updated_at: DateTime.utc_now()]],
-          returning: false
-        )
-
-      {:ok, %{cart_id: id, touched: count}}
-    end)
-  end)
-
-  project(%CartCheckedOut{} = ev, _metadata, fn multi ->
-    Ecto.Multi.run(multi, :finalize, fn repo, _ ->
-      {:ok,
-       repo.update_all(
-         "cart_summaries",
-         [set: [status: "checked_out", total_cents: ev.total_cents]],
-         returning: false
-       )}
-    end)
-  end)
-end
-
-
-defmodule ShoppingCartEs.Repo.Migrations.CreateCartSummaries do
-  use Ecto.Migration
-
-  def change do
-    create table(:cart_summaries, primary_key: false) do
-      add :cart_id, :string, primary_key: true
-      add :item_count, :integer, null: false, default: 0
-      add :total_cents, :integer, null: false, default: 0
-      add :status, :string, null: false, default: "open"
-      add :updated_at, :utc_datetime_usec, null: false
+    defmodule Checkout do
+      @enforce_keys [:cart_id]
+      defstruct [:cart_id]
     end
   end
-end
+
+  defmodule ShoppingCartEs.Cart.Events do
+    defmodule ItemAdded do
+      @derive Jason.Encoder
+      defstruct [:cart_id, :sku, :quantity, :unit_price_cents]
+    end
+
+    defmodule ItemRemoved do
+      @derive Jason.Encoder
+      defstruct [:cart_id, :sku]
+    end
+
+    defmodule CartCheckedOut do
+      @derive Jason.Encoder
+      defstruct [:cart_id, :total_cents, :item_count]
+    end
+  end
 
 
-# config/config.exs
-import Config
+  defmodule ShoppingCartEs.Cart.Aggregate do
+    alias ShoppingCartEs.Cart.Commands.{AddItem, RemoveItem, Checkout}
+    alias ShoppingCartEs.Cart.Events.{ItemAdded, ItemRemoved, CartCheckedOut}
 
-config :shopping_cart_es,
-  ecto_repos: [ShoppingCartEs.Repo],
-  event_stores: [ShoppingCartEs.EventStore]
+    defstruct cart_id: nil,
+              items: %{},
+              status: :open
 
-config :shopping_cart_es, ShoppingCartEs.EventStore,
-  serializer: Commanded.Serialization.JsonSerializer,
-  username: "postgres",
-  password: "postgres",
-  database: "shopping_cart_es_eventstore_#{Mix.env()}",
-  hostname: "localhost",
-  pool_size: 10
+    # --- execute: command → event(s) or error ---
 
-defmodule Main do
-  def main do
-      :ok
+    def execute(%__MODULE__{status: :checked_out}, _cmd),
+      do: {:error, :cart_already_checked_out}
+
+    def execute(%__MODULE__{}, %AddItem{quantity: q}) when q <= 0,
+      do: {:error, :quantity_must_be_positive}
+
+    def execute(%__MODULE__{} = _cart, %AddItem{} = cmd) do
+      %ItemAdded{
+        cart_id: cmd.cart_id,
+        sku: cmd.sku,
+        quantity: cmd.quantity,
+        unit_price_cents: cmd.unit_price_cents
+      }
+    end
+
+    def execute(%__MODULE__{items: items}, %RemoveItem{sku: sku}) when not is_map_key(items, sku),
+      do: {:error, :item_not_in_cart}
+
+    def execute(%__MODULE__{} = _cart, %RemoveItem{} = cmd) do
+      %ItemRemoved{cart_id: cmd.cart_id, sku: cmd.sku}
+    end
+
+    def execute(%__MODULE__{items: items}, %Checkout{}) when map_size(items) == 0,
+      do: {:error, :cart_is_empty}
+
+    def execute(%__MODULE__{items: items, cart_id: id}, %Checkout{}) do
+      total =
+        Enum.reduce(items, 0, fn {_sku, %{quantity: q, unit_price_cents: p}}, acc ->
+          acc + q * p
+        end)
+
+      %CartCheckedOut{cart_id: id, total_cents: total, item_count: map_size(items)}
+    end
+
+    # --- apply: event → new state ---
+
+    def apply(%__MODULE__{} = state, %ItemAdded{} = ev) do
+      %{
+        state
+        | cart_id: ev.cart_id,
+          items:
+            Map.update(
+              state.items,
+              ev.sku,
+              %{quantity: ev.quantity, unit_price_cents: ev.unit_price_cents},
+              fn existing -> %{existing | quantity: existing.quantity + ev.quantity} end
+            )
+      }
+    end
+
+    def apply(%__MODULE__{} = state, %ItemRemoved{} = ev) do
+      %{state | items: Map.delete(state.items, ev.sku)}
+    end
+
+    def apply(%__MODULE__{} = state, %CartCheckedOut{}) do
+      %{state | status: :checked_out}
+    end
+  end
+
+
+  defmodule ShoppingCartEs.Router do
+    use Commanded.Commands.Router
+
+    alias ShoppingCartEs.Cart.Aggregate
+    alias ShoppingCartEs.Cart.Commands.{AddItem, RemoveItem, Checkout}
+
+    identify(Aggregate, by: :cart_id, prefix: "cart-")
+
+    dispatch([AddItem, RemoveItem, Checkout],
+      to: Aggregate,
+      lifespan: ShoppingCartEs.Cart.Lifespan
+    )
+  end
+
+  defmodule ShoppingCartEs.Cart.Lifespan do
+    @behaviour Commanded.Aggregates.AggregateLifespan
+
+    # Hibernate the aggregate process after 5 minutes of inactivity
+    def after_event(_event), do: :timer.minutes(5)
+    def after_command(_command), do: :timer.minutes(5)
+    def after_error(_error), do: :stop
+  end
+
+
+  defmodule ShoppingCartEs.Projections.CartSummaryProjector do
+    use Commanded.Projections.Ecto,
+      application: ShoppingCartEs.CommandedApp,
+      name: "cart_summary_projector",
+      repo: ShoppingCartEs.Repo
+
+    alias ShoppingCartEs.Cart.Events.{ItemAdded, ItemRemoved, CartCheckedOut}
+
+    project(%ItemAdded{} = ev, _metadata, fn multi ->
+      Ecto.Multi.run(multi, :upsert, fn repo, _ ->
+        {:ok,
+         repo.insert_all(
+           "cart_summaries",
+           [
+             %{
+               cart_id: ev.cart_id,
+               item_count: ev.quantity,
+               total_cents: ev.quantity * ev.unit_price_cents,
+               status: "open",
+               updated_at: DateTime.utc_now()
+             }
+           ],
+           on_conflict: {:replace, [:item_count, :total_cents, :updated_at]},
+           conflict_target: [:cart_id]
+         )}
+      end)
+    end)
+
+    project(%ItemRemoved{cart_id: id}, _metadata, fn multi ->
+      Ecto.Multi.run(multi, :decrement, fn repo, _ ->
+        {count, _} =
+          repo.update_all(
+            "cart_summaries",
+            [set: [updated_at: DateTime.utc_now()]],
+            returning: false
+          )
+
+        {:ok, %{cart_id: id, touched: count}}
+      end)
+    end)
+
+    project(%CartCheckedOut{} = ev, _metadata, fn multi ->
+      Ecto.Multi.run(multi, :finalize, fn repo, _ ->
+        {:ok,
+         repo.update_all(
+           "cart_summaries",
+           [set: [status: "checked_out", total_cents: ev.total_cents]],
+           returning: false
+         )}
+      end)
+    end)
+  end
+
+
+  defmodule ShoppingCartEs.Repo.Migrations.CreateCartSummaries do
+    use Ecto.Migration
+
+    def change do
+      create table(:cart_summaries, primary_key: false) do
+        add :cart_id, :string, primary_key: true
+        add :item_count, :integer, null: false, default: 0
+        add :total_cents, :integer, null: false, default: 0
+        add :status, :string, null: false, default: "open"
+        add :updated_at, :utc_datetime_usec, null: false
+      end
+    end
+  end
+
+
+  # config/config.exs
+  import Config
+
+  config :shopping_cart_es,
+    ecto_repos: [ShoppingCartEs.Repo],
+    event_stores: [ShoppingCartEs.EventStore]
+
+  config :shopping_cart_es, ShoppingCartEs.EventStore,
+    serializer: Commanded.Serialization.JsonSerializer,
+    username: "postgres",
+    password: "postgres",
+    database: "shopping_cart_es_eventstore_#{Mix.env()}",
+    hostname: "localhost",
+    pool_size: 10
+
+  defmodule Main do
+    def main do
+        :ok
+    end
   end
 end
 

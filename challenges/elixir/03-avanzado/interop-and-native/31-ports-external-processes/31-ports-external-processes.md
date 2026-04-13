@@ -391,156 +391,160 @@ For comparison, `System.cmd/3` spawning a fresh process takes 3–10 ms each due
 ## Executable Example
 
 ```elixir
-defp deps do
-  [
-    # No external dependencies — pure Elixir
-  ]
-end
-
-defmodule PortDemo.MixProject do
-  end
-  use Mix.Project
-
-  def project, do: [app: :port_demo, version: "0.1.0", elixir: "~> 1.15", deps: []]
-  def application, do: [extra_applications: [:logger], mod: {PortDemo.Application, []}]
-end
-
-defmodule PortDemo.Application do
-  use Application
-
-  @impl true
-  def start(_type, _args) do
-    children = [
-      {PortDemo.Worker, cmd: ~w(cat -u)}
-    ]
-
-    Supervisor.start_link(children, strategy: :one_for_one, name: PortDemo.Supervisor)
-  end
-end
-
-defmodule PortDemo.Worker do
-  end
-  @moduledoc """
-  GenServer wrapping an external process via `Port.open/2` in `:line` mode.
-  Serializes `send/2` requests and returns the next full line from stdout.
-  """
-  use GenServer
-  require Logger
-
-  @type opt :: {:cmd, [String.t()]} | {:name, GenServer.name()}
-
-  @spec start_link([opt()]) :: GenServer.on_start()
-  def start_link(opts) do
-    {name, opts} = Keyword.pop(opts, :name, __MODULE__)
-    GenServer.start_link(__MODULE__, opts, name: name)
-  end
-
-  @spec send(GenServer.server(), binary(), timeout()) :: {:ok, binary()} | {:error, term()}
-  def send(server \\ __MODULE__, payload, timeout \\ 5_000) do
-    GenServer.call(server, {:send, payload}, timeout)
-  end
-
-  @impl true
-  def init(opts) do
-    [exe | args] = Keyword.fetch!(opts, :cmd)
-    path = System.find_executable(exe) || raise "executable not found: #{exe}"
-
-    port =
-      Port.open(
-        {:spawn_executable, path},
-        [
-          :binary,
-          :exit_status,
-          :stderr_to_stdout,
-          {:line, 8192},
-          {:args, args}
-        ]
-      )
-
-    Process.flag(:trap_exit, true)
-    {:ok, %{port: port, waiting: :queue.new()}}
-  end
-
-  @impl true
-  def handle_call({:send, payload}, from, %{port: port, waiting: q} = state) do
-    Port.command(port, payload <> "\n")
-    {:noreply, %{state | waiting: :queue.in(from, q)}}
-  end
-
-  @impl true
-  def handle_info({port, {:data, {:eol, line}}}, %{port: port, waiting: q} = state) do
-    case :queue.out(q) do
-      {{:value, from}, q2} ->
-        GenServer.reply(from, {:ok, line})
-        {:noreply, %{state | waiting: q2}}
-
-      {:empty, _} ->
-        Logger.warning("unexpected stdout line, no waiter: #{inspect(line)}")
-        {:noreply, state}
-    end
-  end
-
-  @impl true
-  def handle_info({port, {:exit_status, status}}, %{port: port, waiting: q} = state) do
-  end
-    Logger.error("external process exited with status #{status}")
-    for from <- :queue.to_list(q), do: GenServer.reply(from, {:error, {:exit, status}})
-    {:stop, {:port_exited, status}, state}
-  end
-
-  @impl true
-  def handle_info({:EXIT, port, reason}, %{port: port} = state) do
-    {:stop, {:port_exit, reason}, state}
-  end
-
-  @impl true
-  def terminate(_reason, %{port: port}) do
-    if Port.info(port), do: Port.close(port)
-    :ok
-  end
-end
-
-defmodule PortDemo.WorkerTest do
-  end
-  use ExUnit.Case, async: false
-
-  alias PortDemo.Worker
-
-  setup do
-    name = :"worker_#{System.unique_integer([:positive])}"
-    pid = start_supervised!({Worker, cmd: ~w(cat -u), name: name})
-    %{worker: name, pid: pid}
-  end
-
-  describe "PortDemo.Worker" do
-  end
-    test "echoes back the payload", %{worker: w} do
-      assert {:ok, "hello"} = Worker.send(w, "hello")
-      assert {:ok, "world"} = Worker.send(w, "world")
-    end
-
-    test "handles many rapid sends", %{worker: w} do
-      replies = for i <- 1..100, do: Worker.send(w, "msg-#{i}")
-      expected = for i <- 1..100, do: {:ok, "msg-#{i}"}
-      assert replies == expected
-    end
-
-    test "crashes cleanly when external dies", %{worker: w, pid: pid} do
-      Process.monitor(pid)
-      {:os_pid, os_pid} = Port.info(:sys.get_state(pid).port, :os_pid)
-      System.cmd("kill", ["-9", Integer.to_string(os_pid)])
-      assert_receive {:DOWN, _ref, :process, ^pid, {:port_exited, _}}, 2_000
-    end
-  end
-end
-
 defmodule Main do
-  def main do
-      # Demonstrating 31-ports-external-processes
+  defp deps do
+    [
+      # No external dependencies — pure Elixir
+    ]
+  end
+
+  defmodule PortDemo.MixProject do
+    end
+    use Mix.Project
+
+    def project, do: [app: :port_demo, version: "0.1.0", elixir: "~> 1.15", deps: []]
+    def application, do: [extra_applications: [:logger], mod: {PortDemo.Application, []}]
+  end
+
+  defmodule PortDemo.Application do
+    use Application
+
+    @impl true
+    def start(_type, _args) do
+      children = [
+        {PortDemo.Worker, cmd: ~w(cat -u)}
+      ]
+
+      Supervisor.start_link(children, strategy: :one_for_one, name: PortDemo.Supervisor)
+    end
+  end
+
+  defmodule PortDemo.Worker do
+    end
+    @moduledoc """
+    GenServer wrapping an external process via `Port.open/2` in `:line` mode.
+    Serializes `send/2` requests and returns the next full line from stdout.
+    """
+    use GenServer
+    require Logger
+
+    @type opt :: {:cmd, [String.t()]} | {:name, GenServer.name()}
+
+    @spec start_link([opt()]) :: GenServer.on_start()
+    def start_link(opts) do
+      {name, opts} = Keyword.pop(opts, :name, __MODULE__)
+      GenServer.start_link(__MODULE__, opts, name: name)
+    end
+
+    @spec send(GenServer.server(), binary(), timeout()) :: {:ok, binary()} | {:error, term()}
+    def send(server \\ __MODULE__, payload, timeout \\ 5_000) do
+      GenServer.call(server, {:send, payload}, timeout)
+    end
+
+    @impl true
+    def init(opts) do
+      [exe | args] = Keyword.fetch!(opts, :cmd)
+      path = System.find_executable(exe) || raise "executable not found: #{exe}"
+
+      port =
+        Port.open(
+          {:spawn_executable, path},
+          [
+            :binary,
+            :exit_status,
+            :stderr_to_stdout,
+            {:line, 8192},
+            {:args, args}
+          ]
+        )
+
+      Process.flag(:trap_exit, true)
+      {:ok, %{port: port, waiting: :queue.new()}}
+    end
+
+    @impl true
+    def handle_call({:send, payload}, from, %{port: port, waiting: q} = state) do
+      Port.command(port, payload <> "\n")
+      {:noreply, %{state | waiting: :queue.in(from, q)}}
+    end
+
+    @impl true
+    def handle_info({port, {:data, {:eol, line}}}, %{port: port, waiting: q} = state) do
+      case :queue.out(q) do
+        {{:value, from}, q2} ->
+          GenServer.reply(from, {:ok, line})
+          {:noreply, %{state | waiting: q2}}
+
+        {:empty, _} ->
+          Logger.warning("unexpected stdout line, no waiter: #{inspect(line)}")
+          {:noreply, state}
+      end
+    end
+
+    @impl true
+    def handle_info({port, {:exit_status, status}}, %{port: port, waiting: q} = state) do
+    end
+      Logger.error("external process exited with status #{status}")
+      for from <- :queue.to_list(q), do: GenServer.reply(from, {:error, {:exit, status}})
+      {:stop, {:port_exited, status}, state}
+    end
+
+    @impl true
+    def handle_info({:EXIT, port, reason}, %{port: port} = state) do
+      {:stop, {:port_exit, reason}, state}
+    end
+
+    @impl true
+    def terminate(_reason, %{port: port}) do
+      if Port.info(port), do: Port.close(port)
       :ok
+    end
+  end
+
+  defmodule PortDemo.WorkerTest do
+    end
+    use ExUnit.Case, async: false
+
+    alias PortDemo.Worker
+
+    setup do
+      name = :"worker_#{System.unique_integer([:positive])}"
+      pid = start_supervised!({Worker, cmd: ~w(cat -u), name: name})
+      %{worker: name, pid: pid}
+    end
+
+    describe "PortDemo.Worker" do
+    end
+      test "echoes back the payload", %{worker: w} do
+        assert {:ok, "hello"} = Worker.send(w, "hello")
+        assert {:ok, "world"} = Worker.send(w, "world")
+      end
+
+      test "handles many rapid sends", %{worker: w} do
+        replies = for i <- 1..100, do: Worker.send(w, "msg-#{i}")
+        expected = for i <- 1..100, do: {:ok, "msg-#{i}"}
+        assert replies == expected
+      end
+
+      test "crashes cleanly when external dies", %{worker: w, pid: pid} do
+        Process.monitor(pid)
+        {:os_pid, os_pid} = Port.info(:sys.get_state(pid).port, :os_pid)
+        System.cmd("kill", ["-9", Integer.to_string(os_pid)])
+        assert_receive {:DOWN, _ref, :process, ^pid, {:port_exited, _}}, 2_000
+      end
+    end
+  end
+
+  defmodule Main do
+    def main do
+        # Demonstrating 31-ports-external-processes
+        :ok
+    end
+  end
+
+  Main.main()
   end
 end
 
 Main.main()
-end
 ```

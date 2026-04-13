@@ -464,34 +464,4 @@ An ETS equivalent (`ets:insert/2` on a `:set`) does ~5 M/sec — NIF resources w
 
 **Objective**: Provide opaque resource type so callers never inspect or serialize the backing BEAM reference directly.
 
-### Dependencies (mix.exs)
-
-
-
-
-
-### Step 4: `lib/nif_resources/store.ex`
-
-**Objective**: Normalize raw NIF atoms to typed tuples so application code never pattern-matches on foreign NIF result shapes.
-
-
-
-### Step 5: `mix.exs`
-
-**Objective**: Configure Rustler crates for release mode so optimized dylib rebuilds automatically when Rust sources change.
-
-
-
-### Step 6: `test/nif_resources_test.exs`
-
-**Objective**: Verify resource opaqueness, cross-process reference identity, concurrent write safety, and GC-driven resource cleanup.
-
-defmodule Main do
-  def main do
-      # Demonstrating 163-nif-resources
-      :ok
-  end
-end
-
-Main.main()
-```
+#

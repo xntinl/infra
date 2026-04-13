@@ -333,6 +333,7 @@ where later stages depend on earlier ones, you want `:rest_for_one`. Plain
 Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
 
 ```elixir
+defmodule Main do
 defmodule BasicSupervisor.Worker do
   @moduledoc """
   A trivial GenServer used to demonstrate supervision. Holds a counter and
@@ -416,6 +417,9 @@ IO.puts("Supervisor started both workers successfully!")
 IO.puts("Worker A counter: #{BasicSupervisor.Worker.value(:worker_a)}")
 IO.puts("Worker B counter: #{BasicSupervisor.Worker.value(:worker_b)}")
 IO.puts("All supervision assertions passed!")
+end
+
+Main.main()
 ```
 
 

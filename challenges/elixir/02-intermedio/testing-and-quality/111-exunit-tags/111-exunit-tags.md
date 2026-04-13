@@ -297,13 +297,10 @@ concerns (speed, externality), not organization.
 
 ---
 
-## Executable Example
-
-Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
-
 ```elixir
 defmodule Main do
-  defmodule FeatureFlags do
+  import ExUnit.Assertions
+
     @moduledoc """
     A deterministic feature-flag checker used to demonstrate tagged tests.
     """

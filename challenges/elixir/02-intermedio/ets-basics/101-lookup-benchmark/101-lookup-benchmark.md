@@ -432,13 +432,10 @@ access pattern (shared? mutable?) and code clarity, not by nanoseconds.
 
 ---
 
-## Executable Example
-
-Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solution.exs`:
-
 ```elixir
 defmodule Main do
-  defmodule EtsBenchmark do
+  import ExUnit.Assertions
+
     @moduledoc """
     Builds three equivalent in-memory stores (`Keyword`, `Map`, ETS `:set`)
     populated with `{i, i * 2}` for i in `1..n`, and exposes a lookup function

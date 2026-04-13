@@ -387,54 +387,22 @@ Copy the code below into a file (e.g., `solution.exs`) and run with `elixir solu
 defmodule Main do
   defmodule NimbleOptsDemo do
     @moduledoc """
-    A tiny HTTP-client-like façade that validates options using
-    `NimbleOptions`. Highlights:
-
+    A tiny HTTP-client-like façade that validates options.
+    
+    Highlights:
       * schema lives at the top of the module
-      * `@moduledoc` includes auto-generated option docs
-      * `start_link/1` raises with a clear message on misuse
+      * validation happens in `start_link/1`
+      * invalid options are caught and reported
 
     ## Options
 
-    #{NimbleOptions.docs(
-      [
-        name: [
-          type: :atom,
-          required: true,
-          doc: "Registered process name for this client."
-        ],
-        base_url: [
-          type: :string,
-          required: true,
-          doc: "Base URL to prepend to all requests."
-        ],
-        timeout: [
-          type: :pos_integer,
-          default: 5_000,
-          doc: "Request timeout in milliseconds."
-        ],
-        retries: [
-          type: :non_neg_integer,
-          default: 2,
-          doc: "How many times to retry on transient failures."
-        ],
-        strategy: [
-          type: {:in, [:linear, :exponential]},
-          default: :exponential,
-          doc: "Retry backoff strategy."
-        ],
-        headers: [
-          type: {:list, {:tuple, [:string, :string]}},
-          default: [],
-          doc: "Extra headers sent with every request."
-        ],
-        adapter: [
-          type: {:or, [:atom, {:tuple, [:atom, :keyword_list]}]},
-          default: :finch,
-          doc: "Adapter backend. Either an atom or `{adapter, opts}`."
-        ]
-      ]
-    )}
+      * `:name` (atom, required) — Registered process name for this client.
+      * `:base_url` (string, required) — Base URL to prepend to all requests.
+      * `:timeout` (pos_integer, default: 5000) — Request timeout in milliseconds.
+      * `:retries` (non_neg_integer, default: 2) — How many times to retry on transient failures.
+      * `:strategy` (:linear or :exponential, default: :exponential) — Retry backoff strategy.
+      * `:headers` (list, default: []) — Extra headers sent with every request.
+      * `:adapter` (atom or tuple, default: :finch) — Adapter backend. Either an atom or `{adapter, opts}`.
     """
 
     # Duplicate the schema as module attribute so validate/1 can reference
@@ -465,16 +433,43 @@ defmodule Main do
   end
 
   def main do
-    IO.puts("=== Config Demo ===
-  ")
+    IO.puts("=== Option Validation Demo ===\n")
   
-    # Demo: Validate options with NimbleOptions
-  schema = [url: [type: :string, required: true], timeout: [type: :integer, default: 5000]]
-  validated = NimbleOptions.validate([url: "http://example.com"], schema)
-  IO.puts("1. Validated options: #{inspect(validated)}")
+    # Demo: Validate options (simulated without NimbleOptions)
+    opts = [name: :my_client, base_url: "http://example.com", timeout: 5000]
+    
+    case start_link(opts) do
+      {:ok, config} ->
+        IO.puts("1. Validated config: #{inspect(config)}")
+        IO.puts("   - name: #{config.name}")
+        IO.puts("   - base_url: #{config.base_url}")
+        IO.puts("   - timeout: #{config.timeout}")
+        IO.puts("   - retries (default): #{config.retries}")
+        IO.puts("\n✓ Option validation pattern demo completed!")
+        IO.puts("  In production: use NimbleOptions for schema validation")
+      {:error, reason} ->
+        IO.puts("Validation failed: #{reason}")
+    end
+  end
 
-  IO.puts("
-  ✓ NimbleOptions demo completed!")
+  defp start_link(opts) do
+    # Simple validation: check required fields
+    with {:ok} <- check_required(opts, [:name, :base_url]),
+         name <- Keyword.get(opts, :name),
+         base_url <- Keyword.get(opts, :base_url),
+         timeout <- Keyword.get(opts, :timeout, 5_000),
+         retries <- Keyword.get(opts, :retries, 2) do
+      {:ok, %{name: name, base_url: base_url, timeout: timeout, retries: retries}}
+    else
+      _ -> {:error, "Missing required options"}
+    end
+  end
+
+  defp check_required(opts, required_keys) do
+    case Enum.all?(required_keys, &Keyword.has_key?(opts, &1)) do
+      true -> {:ok}
+      false -> {:error}
+    end
   end
 
 end
