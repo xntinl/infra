@@ -70,12 +70,13 @@ You need a durable, high-throughput message channel between services. Producers 
 
 → Chose **B** because the Kafka-style segmented log is the shape that actually scales write throughput — B-trees are the wrong structure for an append-dominated workload.
 
+---
+
 ## Implementation milestones
 
 ### Step 1: Create the project
 
 **Objective**: Separate segment storage, replication, and broker routing into modules so each durability invariant stays locally verifiable.
-
 
 ```bash
 mix new klog --sup
@@ -86,18 +87,6 @@ mkdir -p lib/klog test/klog bench
 ### Step 2: `mix.exs` — dependencies
 
 **Objective**: Pin only benchee and stream_data so segment layout and replication protocol stay free of Kafka-style library magic.
-
-
-```elixir
-defp deps do
-  [
-    {:msgpax, "~> 2.4"},     # msgpack encoding for the binary protocol
-    {:benchee, "~> 1.3", only: :dev}
-  ]
-end
-```
-
-### Dependencies (mix.exs)
 
 ```elixir
 defp deps do
@@ -112,7 +101,6 @@ end
 
 **Objective**: Append length-prefixed records with fsync boundaries and a sparse index so reads resolve offsets without scanning.
 
-
 ```elixir
 # lib/klog/segment.ex
 defmodule Klog.Segment do
@@ -122,12 +110,15 @@ defmodule Klog.Segment do
     <<offset::64, timestamp::64, key_len::32, key::binary,
       value_len::32, value::binary>>
 
-  Segment filenames are the base offset in zero-padded decimal:
+  **Segment filenames** are the base offset in zero-padded decimal:
     00000000000.log   (contains offsets 0, 1, 2, ...)
     00000001000.log   (contains offsets 1000, 1001, ...)
 
   This naming enables binary search to find the segment containing
   a given offset without reading any segment data.
+  
+  **Immutability:** once a segment is closed (rotated), it is never written to.
+  This allows compaction and retention cleanup without blocking active appends.
   """
 
   @doc "Opens or creates a segment with the given base offset."
@@ -212,7 +203,6 @@ end
 
 **Objective**: Advance the high-watermark only after ISR acks so consumers never observe entries that later disappear on failover.
 
-
 ```elixir
 # lib/klog/replication.ex
 defmodule Klog.Replication do
@@ -224,11 +214,15 @@ defmodule Klog.Replication do
     - hw: high-watermark — highest offset committed (all ISR members have it)
     - next_offset: %{follower => next offset to send}
 
-  A follower is removed from ISR if its lag (leader.last_offset - follower.offset)
-  exceeds max_lag_bytes OR if it misses max_lag_time_ms since last fetch.
+  **ISR membership:**
+  A follower is removed from ISR if:
+    - lag (leader.last_offset - follower.offset) exceeds max_lag_bytes OR
+    - time since last fetch exceeds max_lag_time_ms
 
+  **Commit semantics:**
   Commits require ALL ISR members to acknowledge. When a follower leaves ISR,
-  commits proceed without waiting for it.
+  commits proceed without waiting for it. This is key to preventing slow followers
+  from blocking writes.
   """
 
   @spec handle_fetch_response(map(), term(), non_neg_integer()) :: map()
@@ -271,13 +265,17 @@ end
 
 **Objective**: Assign partitions to leader brokers so produce and fetch paths stay partition-local and preserve per-partition offset order.
 
-
 ```elixir
 # lib/klog/broker.ex
 defmodule Klog.Broker do
   @moduledoc """
   Entry point for the Klog system. Manages topics, their partitions,
   and routes produce/consume requests to the correct partition.
+  
+  **Topic lifecycle:**
+  - create_topic: initialize N partitions, each with a segment file
+  - produce: append to partition's segment, fsync if acks=all
+  - consume: read from segment starting at offset
   """
 
   use GenServer
@@ -330,13 +328,17 @@ end
 
 **Objective**: Expose produce and consume as the single client entry point so callers never bypass leader routing or watermark checks.
 
-
 ```elixir
 # lib/klog.ex
 defmodule Klog do
   @moduledoc """
   Public API for the Klog distributed event log.
   Routes all operations through the broker GenServer.
+  
+  **Key guarantees:**
+  - Offsets are monotonically increasing per partition
+  - Consumed messages respect the high-watermark (no uncommitted reads)
+  - Ordering is strict within each partition (but not across partitions)
   """
 
   @spec create_topic(pid(), String.t(), keyword()) :: :ok
@@ -352,6 +354,7 @@ defmodule Klog do
     GenServer.call(broker, {:produce, topic, partition, key, value, opts})
   end
 
+  @doc "Consumes messages from a topic partition starting at from_offset."
   @spec consume(pid(), String.t(), non_neg_integer(), keyword()) :: [{non_neg_integer(), binary(), term()}]
   def consume(broker, topic, partition, opts \\ []) do
     from_offset = Keyword.get(opts, :from_offset, 0)
@@ -364,7 +367,6 @@ end
 ### Step 7: Test cluster helper
 
 **Objective**: Spin up in-process brokers with injectable partitions so replication and failover tests stay deterministic without real networking.
-
 
 ```elixir
 # lib/klog/test_cluster.ex
@@ -398,7 +400,6 @@ end
 ### Step 8: Given tests — must pass without modification
 
 **Objective**: Lock down durability, offset monotonicity, and ISR-based commit rules as executable specs the implementation cannot edit around.
-
 
 ```elixir
 # test/klog/produce_consume_test.exs
@@ -465,15 +466,30 @@ end
 
 **Objective**: Run the suite with tracing so replication races and fsync boundaries surface as observable order rather than silent flakes.
 
-
 ```bash
 mix test test/klog/ --trace
 ```
 
-### Step 10: Benchmark
+---
 
-**Objective**: Quantify produce throughput against fsync frequency so batching tradeoffs versus tail-latency stay measured rather than guessed.
+## Quick start
 
+For production deployment:
+
+1. **Durability**: add fsync on every append or batch fsyncs every N milliseconds
+2. **Replication**: implement pull-based replication from followers
+3. **Segment rotation**: rotate segments when they exceed max_segment_bytes
+4. **Offset indexing**: build sparse indices for faster offset lookup within large segments
+
+---
+
+## Benchmark
+
+**Target**: 500,000 messages/second write throughput (`acks=1`), 1M messages/second read throughput.
+
+```bash
+mix run bench/klog_bench.exs
+```
 
 ```elixir
 # bench/klog_bench.exs
@@ -496,27 +512,11 @@ Benchee.run(
 )
 ```
 
-Target: 500,000 messages/second write throughput (`acks=1`), 1M messages/second read throughput.
-
-### Why this works
-
-Each partition is a sequence of append-only segments; writes are serialized per partition via a GenServer, and offsets are monotonic by construction. Readers seek by offset into a segment index, so reads never contend with the active segment's writer.
-
 ---
 
-## Benchmark
+## Why this works
 
-```elixir
-# bench/log_bench.exs
-Benchee.run(%{"append_1kb" => fn -> EventLog.append("p1", :binary.copy("x", 1024)) end}, time: 10)
-def main do
-  IO.puts("[Klog.Broker] GenServer demo")
-  :ok
-end
-
-```
-
-Target: 100,000 1 KB appends/second per partition on local disk; fsync every 10 ms.
+Each partition is a sequence of append-only segments; writes are serialized per partition via a GenServer, and offsets are monotonic by construction. Readers seek by offset into a segment index, so reads never contend with the active segment's writer.
 
 ---
 
@@ -525,14 +525,14 @@ Target: 100,000 1 KB appends/second per partition on local disk; fsync every 10 
 The core challenge in distributed systems is reaching agreement across multiple nodes when some may fail, be slow, or partition from the network. Consensus algorithms formalize three properties:
 
 1. **Safety**: All nodes that decide must decide the same value.
-2. Liveness**: Every non-faulty node eventually decides.
-3. Fault tolerance**: The system tolerates up to F faulty nodes out of 2F+1 total.
+2. **Liveness**: Every non-faulty node eventually decides.
+3. **Fault tolerance**: The system tolerates up to F faulty nodes out of 2F+1 total.
 
 Raft achieves this via a leader-based approach: the leader serializes writes through a log, and quorum commit ensures no data loss across failures. The log-up-to-date vote rule prevents stale nodes from becoming leader, and the "commit only current-term entries" rule prevents committed entries from being overwritten.
 
 This contrasts with leaderless protocols (e.g., CRDTs) that sacrifice strong consistency for eventual consistency, enabling offline-first systems. For the BEAM, Raft fits naturally into the GenServer + OTP supervision model: each node is a GenServer with local state (log, term, vote), and RPCs are asynchronous messages that do not block the caller.
 
-**Production insight**: Raft's safety depends on three invariants holding simultaneously. A single violated invariant (e.g., committing an entry from a previous term by index alone) causes data loss on specific failure patterns that may never surface in testing. This is why production systems use formal verification or extensive failure injection (Jepsen tests) to validate safety, not just positive test cases.
+**Production insight**: The high-watermark is the critical invariant. Never return a message to a consumer unless it is below the HW. If you do, a failover can make that message disappear, breaking exactly-once semantics.
 
 ---
 
@@ -546,7 +546,7 @@ This contrasts with leaderless protocols (e.g., CRDTs) that sacrifice strong con
 | Min replicas for commit | 1 (ISR can shrink to leader only) | always majority | 1 |
 | Recovery after follower restart | follower catches up, re-joins ISR | automatic | n/a |
 
-Reflection: when ISR shrinks to just the leader (all followers are lagging), commits succeed but durability is zero — the leader holds the only copy. What is the correct production setting to prevent this?
+**Reflection**: when ISR shrinks to just the leader (all followers are lagging), commits succeed but durability is zero — the leader holds the only copy. What is the correct production setting to prevent this?
 
 ---
 
@@ -563,6 +563,8 @@ When a segment is rotated (a new segment file is created), the in-memory list of
 
 **4. Idempotent deduplication window too small**
 Deduplication by (producer_id, sequence) is only effective within a session. If the producer_id is recycled across restarts and the sequence resets, a retry that looks like a new message will be applied. Use a persistent producer_id (UUID at startup, stored to disk) rather than a generated PID.
+
+---
 
 ## Reflection
 

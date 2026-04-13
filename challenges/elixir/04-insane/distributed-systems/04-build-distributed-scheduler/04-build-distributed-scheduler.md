@@ -1,6 +1,6 @@
 # Distributed Job Scheduler with Bin-Packing and Preemption
 
-**Project**: `helios` -- a distributed job scheduler with resource-aware placement and fault tolerance
+**Project**: `helios` — a distributed job scheduler with resource-aware placement and fault tolerance
 
 ---
 
@@ -52,7 +52,7 @@ This is a variant of the bin-packing problem (NP-hard in the general case), solv
 
 **Best-fit decreasing heuristic**: sort nodes by remaining capacity descending, then pick the node where the job fits with the smallest remaining gap. This minimizes wasted capacity per node, leaving large blocks of free capacity on other nodes for large jobs. It is O(N log N) per placement decision.
 
-**Heartbeat-based failure detection**: each worker sends a heartbeat every 5 seconds. If the scheduler misses 3 consecutive heartbeats (15 seconds), it marks the node unavailable and requeues its jobs. This is not perfect -- a slow-but-alive node will generate false positives. The trade-off is between detection latency (low threshold) and false positive rate (high threshold).
+**Heartbeat-based failure detection**: each worker sends a heartbeat every 5 seconds. If the scheduler misses 3 consecutive heartbeats (15 seconds), it marks the node unavailable and requeues its jobs. This is not perfect — a slow-but-alive node will generate false positives. The trade-off is between detection latency (low threshold) and false positive rate (high threshold).
 
 **Fair-share over strict priority**: strict priority scheduling starves low-priority jobs indefinitely when high-priority work is constant. Fair-share caps each user's resource consumption at a configurable percentage of cluster capacity. A user exceeding their cap has new submissions queued, not rejected, and they drain the queue as other users release resources.
 
@@ -72,12 +72,13 @@ This is a variant of the bin-packing problem (NP-hard in the general case), solv
 
 → Chose **B** because the whole point of a *distributed* scheduler is to survive the loss of the dispatcher — sharding with a per-shard leader makes that explicit.
 
+---
+
 ## Implementation milestones
 
 ### Step 1: Create the project
 
 **Objective**: Scaffold the distributed scheduler Mix project with the required directory layout.
-
 
 ```bash
 mix new helios --sup
@@ -85,22 +86,9 @@ cd helios
 mkdir -p lib/helios/api test/helios bench
 ```
 
-### Step 2: `mix.exs` -- dependencies
+### Step 2: `mix.exs` — dependencies
 
 **Objective**: Declare the Mix project configuration and third-party dependencies.
-
-
-```elixir
-defp deps do
-  [
-    {:plug_cowboy, "~> 2.7"},
-    {:jason, "~> 1.4"},
-    {:benchee, "~> 1.3", only: :dev}
-  ]
-end
-```
-
-### Dependencies (mix.exs)
 
 ```elixir
 defp deps do
@@ -116,18 +104,26 @@ end
 
 **Objective**: Define the core structs and types used across every subsequent module.
 
-
 ```elixir
 # lib/helios/job.ex
 defmodule Helios.Job do
   @moduledoc """
-  Job lifecycle:
+  Job lifecycle FSM:
 
-    submitted -> queued -> scheduled -> running -> completed
-                                    \\-> preempted -> queued (requeued)
-                             \\-> failed -> dead_queue (after max_attempts)
+    submitted → queued → scheduled → running → completed
+                                   \\→ preempted → queued (requeued)
+                            \\→ failed → dead_queue (after max_attempts)
 
   Each transition is recorded in the audit log with a timestamp and node assignment.
+  
+  **State meanings:**
+  - submitted: just received from client
+  - queued: waiting for placement decision
+  - scheduled: placed on a node, awaiting execution
+  - running: executing on the node
+  - completed: finished successfully
+  - preempted: evicted by higher-priority job; moves back to queued
+  - failed: execution failed; after N retries, moves to dead_queue
   """
 
   @states [:submitted, :queued, :scheduled, :running, :completed, :failed, :preempted]
@@ -174,6 +170,7 @@ defmodule Helios.Job do
     }
   end
 
+  @doc "Transition a job to a new state if valid."
   @spec transition(%__MODULE__{}, atom()) :: {:ok, %__MODULE__{}} | {:error, :invalid_transition}
   def transition(%__MODULE__{state: current} = job, target) do
     allowed = Map.get(@valid_transitions, current, [])
@@ -191,7 +188,6 @@ end
 
 **Objective**: Implement the Bin-packing placement component required by the distributed scheduler system.
 
-
 ```elixir
 # lib/helios/bin_packer.ex
 defmodule Helios.BinPacker do
@@ -201,6 +197,14 @@ defmodule Helios.BinPacker do
   Given a list of available nodes and a job's resource request,
   returns the node that satisfies the request with the smallest
   remaining capacity gap (tightest fit).
+  
+  **Algorithm:**
+  1. Filter nodes that have enough CPU and memory
+  2. Sort by remaining capacity gap (ascending)
+  3. Return the first (tightest fit)
+  
+  This minimizes wasted space per placement and keeps large gaps
+  available for future large jobs.
   """
 
   @doc """
@@ -234,7 +238,6 @@ end
 
 **Objective**: Schedule jobs at the requested time using a timer wheel or priority queue.
 
-
 ```elixir
 # lib/helios/scheduler.ex
 defmodule Helios.Scheduler do
@@ -242,6 +245,12 @@ defmodule Helios.Scheduler do
 
   @moduledoc """
   Central scheduler that manages job placement, node tracking, and failure detection.
+  
+  **Responsibilities:**
+  1. Track live nodes and their available resources
+  2. Accept job submissions and place them on nodes
+  3. Monitor heartbeats; requeue jobs on dead nodes
+  4. Enforce fair-share quotas per user
   """
 
   defstruct [:nodes, :jobs, :heartbeat_tracker]
@@ -368,7 +377,6 @@ end
 
 **Objective**: Implement the REST resource conventions with conventional routes and verbs.
 
-
 ```elixir
 # lib/helios/api/router.ex
 defmodule Helios.API.Router do
@@ -419,7 +427,6 @@ end
 
 **Objective**: Expose the public API surface that clients use to drive the system.
 
-
 ```elixir
 # lib/helios.ex
 defmodule Helios do
@@ -439,7 +446,6 @@ end
 
 **Objective**: Implement the Test Helpers component required by the distributed scheduler system.
 
-
 ```elixir
 # lib/helios/test_helpers.ex
 defmodule Helios.TestHelpers do
@@ -449,10 +455,9 @@ defmodule Helios.TestHelpers do
 end
 ```
 
-### Step 9: Given tests -- must pass without modification
+### Step 9: Given tests — must pass without modification
 
 **Objective**: Validate behavior against the frozen test suite that must pass unmodified.
-
 
 ```elixir
 # test/helios/bin_packing_test.exs
@@ -525,15 +530,30 @@ end
 
 **Objective**: Execute the provided test suite to verify the implementation passes.
 
-
 ```bash
 mix test test/helios/ --trace
 ```
 
-### Step 11: Benchmark
+---
 
-**Objective**: Measure throughput and latency characteristics under representative load.
+## Quick start
 
+This is a single-dispatcher implementation. For distributed deployment:
+
+1. **Add sharding**: partition job queue by hash(job_id) across N shard leaders
+2. **Implement gossip**: each shard leader shares node state changes via gossip
+3. **Add preemption**: scan queue when a high-priority job can't fit; select low-priority victims
+4. **Add fair-share**: track per-user CPU/memory consumption and cap submissions
+
+---
+
+## Benchmark
+
+**Target**: 10,000 jobs/second enqueued and dispatched end-to-end on a 3-shard localhost cluster.
+
+```bash
+mix run bench/placement_bench.exs
+```
 
 ```elixir
 # bench/placement_bench.exs
@@ -557,28 +577,11 @@ Benchee.run(
 )
 ```
 
-### Why this works
-
-Each job is owned by exactly one shard (determined by consistent hashing on the job key), and each shard has exactly one leader that emits it. A leader lease tied to heartbeats guarantees that only one leader exists at a time, so a job is never executed twice.
-
 ---
 
-## Benchmark
+## Why this works
 
-```elixir
-# bench/scheduler_bench.exs
-Benchee.run(%{
-  "enqueue" => fn -> DistSched.enqueue(%{task: :noop}) end,
-  "dispatch" => fn -> DistSched.drain(1_000) end
-}, parallel: 10, time: 10)
-def main do
-  IO.puts("[Helios.Scheduler] GenServer demo")
-  :ok
-end
-
-```
-
-Target: 10,000 jobs/second enqueued and dispatched end-to-end on a 3-shard localhost cluster.
+Each job is owned by exactly one shard (determined by consistent hashing on the job key), and each shard has exactly one leader that emits it. A leader lease tied to heartbeats guarantees that only one leader exists at a time, so a job is never executed twice.
 
 ---
 
@@ -587,8 +590,8 @@ Target: 10,000 jobs/second enqueued and dispatched end-to-end on a 3-shard local
 The core challenge in distributed systems is reaching agreement across multiple nodes when some may fail, be slow, or partition from the network. Consensus algorithms formalize three properties:
 
 1. **Safety**: All nodes that decide must decide the same value.
-2. Liveness**: Every non-faulty node eventually decides.
-3. Fault tolerance**: The system tolerates up to F faulty nodes out of 2F+1 total.
+2. **Liveness**: Every non-faulty node eventually decides.
+3. **Fault tolerance**: The system tolerates up to F faulty nodes out of 2F+1 total.
 
 Raft achieves this via a leader-based approach: the leader serializes writes through a log, and quorum commit ensures no data loss across failures. The log-up-to-date vote rule prevents stale nodes from becoming leader, and the "commit only current-term entries" rule prevents committed entries from being overwritten.
 
@@ -610,7 +613,7 @@ This contrasts with leaderless protocols (e.g., CRDTs) that sacrifice strong con
 
 After running the benchmark, record your measured placement latency (p50, p99) for direct comparison across strategies.
 
-Architectural question: the Omega paper (Schwarzkopf et al.) proposes optimistic scheduling with conflict detection instead of pessimistic locking of the cluster state. Under what workload conditions does optimistic scheduling outperform the pessimistic approach you built?
+**Architectural question**: the Omega paper (Schwarzkopf et al.) proposes optimistic scheduling with conflict detection instead of pessimistic locking of the cluster state. Under what workload conditions does optimistic scheduling outperform the pessimistic approach you built?
 
 ---
 
@@ -628,6 +631,8 @@ A user's fair-share consumption should be measured over a rolling window, not in
 **4. Heartbeat timeout too aggressive**
 Setting the heartbeat timeout too low causes frequent false-positive node failures, triggering unnecessary job requeues and disrupting running work. Calibrate the timeout based on your network's p99 round-trip time, not its p50.
 
+---
+
 ## Reflection
 
 - If one shard leader is network-partitioned from the rest but still holds its lease, what guarantees do you lose? How would you shorten the blast radius?
@@ -637,7 +642,7 @@ Setting the heartbeat timeout too low causes frequent false-positive node failur
 
 ## Resources
 
-- Hindman, B. et al. (2011). *Mesos: A Platform for Fine-Grained Resource Sharing in the Data Center* -- section 3 (architecture) and section 4 (two-level scheduling)
-- Schwarzkopf, M. et al. (2013). *Omega: Flexible, Scalable Schedulers for Large Compute Clusters* -- shared-state scheduling and conflict resolution
-- Ghodsi, A. et al. (2011). *Dominant Resource Fairness: Fair Allocation of Multiple Resource Types* -- multi-resource fair sharing
-- [Plug documentation](https://hexdocs.pm/plug/) -- `Plug.Router`, `Plug.Parsers`, and the Plug specification
+- Hindman, B. et al. (2011). *Mesos: A Platform for Fine-Grained Resource Sharing in the Data Center* — section 3 (architecture) and section 4 (two-level scheduling)
+- Schwarzkopf, M. et al. (2013). *Omega: Flexible, Scalable Schedulers for Large Compute Clusters* — shared-state scheduling and conflict resolution
+- Ghodsi, A. et al. (2011). *Dominant Resource Fairness: Fair Allocation of Multiple Resource Types* — multi-resource fair sharing
+- [Plug documentation](https://hexdocs.pm/plug/) — `Plug.Router`, `Plug.Parsers`, and the Plug specification

@@ -1,12 +1,12 @@
 # Distributed Raft Consensus Engine
 
-**Project**: `raft_consensus` -- a complete, production-grade Raft implementation on the BEAM
+**Project**: `raft_consensus` — a complete, production-grade Raft implementation on the BEAM for linearizable, fault-tolerant state replication
 
 ---
 
 ## Project context
 
-You are building `raft_consensus`, a standalone distributed consensus engine in Elixir. The system is used as a foundation for any service that requires linearizable, fault-tolerant state -- a replicated key-value store, a distributed lock, a configuration service. No external consensus libraries. Every byte of the protocol is yours.
+You are building `raft_consensus`, a standalone distributed consensus engine in Elixir. The system is used as a foundation for any service that requires linearizable, fault-tolerant state: a replicated key-value store, a distributed lock, a configuration service. No external consensus libraries. Every byte of the protocol is yours.
 
 Project structure:
 
@@ -42,7 +42,7 @@ raft_consensus/
 
 ## The problem
 
-A distributed service needs to replicate state across multiple nodes so that any minority of nodes can fail without data loss and without downtime. The naive approach -- "write to all nodes, if any succeed, done" -- breaks under concurrent writes: two nodes may accept conflicting updates and diverge. Raft solves this by electing a single leader that serializes all writes. Every write is committed only after a majority of nodes acknowledge it.
+A distributed service needs to replicate state across multiple nodes so that any minority of nodes can fail without data loss and without downtime. The naive approach — "write to all nodes, if any succeed, done" — breaks under concurrent writes: two nodes may accept conflicting updates and diverge. Raft solves this by electing a single leader that serializes all writes. Every write is committed only after a majority of nodes acknowledge it.
 
 The hard part is not the happy path. The hard part is correctness under failure: what happens when the leader crashes mid-replication? What if network partitions create two groups, each believing it has a majority? What if a recovered node has a stale log? Raft's answer to these questions is a set of invariants with mathematical safety proofs. Your job is to implement those invariants exactly.
 
@@ -54,9 +54,9 @@ The hard part is not the happy path. The hard part is correctness under failure:
 
 **AppendEntries doubles as heartbeat**: the leader sends AppendEntries even when there are no new entries. This resets followers' election timers, preventing spurious elections. If the leader dies, no heartbeat arrives and a follower starts a new election. The timer is the only failure detector.
 
-**Quorum commit, not all-ack commit**: a log entry is committed once a majority of nodes have it in their log. The leader does not wait for every follower. This means a lagging follower does not degrade write latency -- it catches up asynchronously.
+**Quorum commit, not all-ack commit**: a log entry is committed once a majority of nodes have it in their log. The leader does not wait for every follower. This means a lagging follower does not degrade write latency — it catches up asynchronously.
 
-**Randomized election timeouts**: each follower picks a timeout uniformly at random from `[T, 2T]`. Under split-vote conditions (multiple candidates simultaneously), the randomness breaks ties within one or two rounds. This is not a theorem -- it is a probabilistic argument that works overwhelmingly well in practice.
+**Randomized election timeouts**: each follower picks a timeout uniformly at random from `[T, 2T]`. Under split-vote conditions (multiple candidates simultaneously), the randomness breaks ties within one or two rounds. This is not a theorem — it is a probabilistic argument that works overwhelmingly well in practice.
 
 ---
 
@@ -72,12 +72,13 @@ The hard part is not the happy path. The hard part is correctness under failure:
 
 → Chose **B** because the goal is a correct, auditable implementation; Raft's explicit rule set ("commit only current-term entries", "reset timer on every AppendEntries") is the whole point of picking Raft over Paxos.
 
+---
+
 ## Implementation milestones
 
 ### Step 1: Create the project
 
 **Objective**: Lay out the module boundaries that separate log, state machine, RPC, and membership so each invariant can be reasoned about in isolation.
-
 
 ```bash
 mix new raft_consensus --sup
@@ -85,21 +86,9 @@ cd raft_consensus
 mkdir -p lib/raft_consensus test/raft_consensus bench simulation
 ```
 
-### Step 2: `mix.exs` -- dependencies
+### Step 2: `mix.exs` — dependencies
 
 **Objective**: Pin only benchee and stream_data so the consensus core stays free of external libraries that could hide protocol details.
-
-
-```elixir
-defp deps do
-  [
-    {:benchee, "~> 1.3", only: :dev},
-    {:stream_data, "~> 0.6", only: :test}
-  ]
-end
-```
-
-### Dependencies (mix.exs)
 
 ```elixir
 defp deps do
@@ -114,7 +103,6 @@ end
 
 **Objective**: Encode the node state with the exact fields Raft Figure 2 requires so term, log, and voting rules remain checkable locally.
 
-
 Define these structs before writing any GenServer. Raft's correctness hinges on the exact fields each message carries.
 
 ```elixir
@@ -124,22 +112,40 @@ defmodule RaftConsensus.Node do
 
   alias RaftConsensus.{Log, RPC, StateMachine}
 
+  @moduledoc """
+  A Raft consensus node. Maintains term, log, and role state.
+  
+  **Persistent state (survives crashes):**
+  - current_term: highest term seen
+  - voted_for: candidate ID vote in current_term
+  - log: entries {term, index, command}
+
+  **Volatile state (reset on restart):**
+  - role: :follower | :candidate | :leader
+  - commit_index: highest log index applied to state machine
+  - last_applied: highest log index known to be committed
+
+  **Leader-only state:**
+  - next_index: %{peer => next log index to send}
+  - match_index: %{peer => highest index confirmed replicated}
+  """
+
   defstruct [
     :id,
     :peers,
-    :role,              # :follower | :candidate | :leader
+    :role,                    # :follower | :candidate | :leader
     :current_term,
     :voted_for,
-    :log,               # list of %{term: t, index: i, command: cmd}
+    :log,                     # list of %{term: t, index: i, command: cmd}
     :commit_index,
     :last_applied,
-    :next_index,        # leader only: %{peer_id => next log index to send}
-    :match_index,       # leader only: %{peer_id => highest replicated index confirmed}
-    :votes_received,    # candidate only
-    :election_timer,
-    :heartbeat_timer,
-    :state_machine,
-    :pending_requests   # %{index => from} for client request routing
+    :next_index,              # leader only: %{peer_id => next log index to send}
+    :match_index,             # leader only: %{peer_id => highest replicated index}
+    :votes_received,          # candidate only: MapSet of node IDs that voted YES
+    :election_timer,          # timer ref for election timeout
+    :heartbeat_timer,         # timer ref for leader heartbeat (leader only)
+    :state_machine,           # KV map, projection of committed log
+    :pending_requests          # %{index => {from, command}} for client reply routing
   ]
 
   @election_timeout_min 150
@@ -148,15 +154,21 @@ defmodule RaftConsensus.Node do
 
   # --- Public API ---
 
+  @doc "Starts a new Raft node with the given ID and peer list."
   def start_link(opts) do
     id = Keyword.fetch!(opts, :id)
     GenServer.start_link(__MODULE__, opts, name: via(id))
   end
 
+  @doc "Resolves a Raft node ID to its GenServer registry reference."
   def via(id), do: {:via, Registry, {RaftConsensus.Registry, id}}
 
+  @doc "Reads the current state (role, term, commit_index) of a node."
+  @spec get_state(term()) :: map()
   def get_state(id), do: GenServer.call(via(id), :get_state)
 
+  @doc "Submits a client command. Returns the reply from the state machine."
+  @spec client_request(term(), term()) :: term()
   def client_request(id, command), do: GenServer.call(via(id), {:client_request, command}, 10_000)
 
   # --- Callbacks ---
@@ -214,10 +226,19 @@ defmodule RaftConsensus.Node do
     {:noreply, new_state}
   end
 
-  def handle_call({:client_request, _command}, _from, state) do
-    {:reply, {:error, :not_leader}, state}
+  def handle_call({:client_request, _command}, from, state) do
+    GenServer.reply(from, {:error, :not_leader})
+    {:noreply, state}
   end
 
+  @doc """
+  RequestVote RPC handler. Implements Raft §5.1 voting rules.
+  
+  Vote granted if:
+  1. term >= my current_term (update term if higher)
+  2. haven't voted in this term OR voted for this candidate
+  3. candidate log is at least as up-to-date as mine
+  """
   def handle_call({:request_vote, args}, _from, state) do
     state = maybe_step_down(state, args.term)
 
@@ -237,6 +258,14 @@ defmodule RaftConsensus.Node do
     {:reply, %{term: new_state.current_term, vote_granted: vote_granted}, new_state}
   end
 
+  @doc """
+  AppendEntries RPC handler. Implements Raft §5.2 replication rules.
+  
+  - If prev_log_index exists but term doesn't match, reply false (log mismatch)
+  - Append new entries after prev_log_index
+  - Update commit_index if leader's is higher
+  - Apply newly committed entries to state machine
+  """
   def handle_call({:append_entries, args}, _from, state) do
     state = maybe_step_down(state, args.term)
 
@@ -287,6 +316,10 @@ defmodule RaftConsensus.Node do
 
   def handle_info(:heartbeat, state), do: {:noreply, state}
 
+  @doc """
+  Vote response handler. Implements the election protocol for candidates.
+  Collects votes and becomes leader if quorum is reached.
+  """
   def handle_info({:vote_response, from_id, response}, %{role: :candidate} = state) do
     state = maybe_step_down(state, response.term)
 
@@ -297,7 +330,6 @@ defmodule RaftConsensus.Node do
         if response.vote_granted do
           votes = MapSet.put(state.votes_received, from_id)
           s = %{state | votes_received: votes}
-
           if MapSet.size(votes) >= quorum_size(s) do
             become_leader(s)
           else
@@ -311,6 +343,10 @@ defmodule RaftConsensus.Node do
     end
   end
 
+  @doc """
+  AppendEntries response handler. Updates next_index and match_index.
+  Advances commit_index when quorum replication is achieved.
+  """
   def handle_info({:append_response, from_id, response}, %{role: :leader} = state) do
     state = maybe_step_down(state, response.term)
 
@@ -339,6 +375,10 @@ defmodule RaftConsensus.Node do
 
   # --- Private ---
 
+  @doc """
+  Start an election: increment term, vote for self, send RequestVote to all peers.
+  Reset election timer for the new term.
+  """
   defp start_election(state) do
     new_term = state.current_term + 1
     new_state = %{state |
@@ -377,6 +417,10 @@ defmodule RaftConsensus.Node do
     end
   end
 
+  @doc """
+  Transition to leader role: initialize next_index and match_index for all peers.
+  Send initial heartbeats immediately.
+  """
   defp become_leader(state) do
     last_index = Log.last_index(state.log)
 
@@ -392,6 +436,10 @@ defmodule RaftConsensus.Node do
     new_state
   end
 
+  @doc """
+  Send AppendEntries (or heartbeat if no new entries) to all followers.
+  Followers expect entries starting at next_index.
+  """
   defp send_append_entries(state) do
     for peer <- state.peers do
       next_idx = Map.get(state.next_index, peer, 1)
@@ -419,6 +467,10 @@ defmodule RaftConsensus.Node do
     end
   end
 
+  @doc """
+  Advance commit_index to the highest index replicated on a quorum.
+  Only commit entries from current term (safety rule).
+  """
   defp advance_commit_index(state) do
     indices =
       [Log.last_index(state.log) | Map.values(state.match_index)]
@@ -433,6 +485,10 @@ defmodule RaftConsensus.Node do
     end
   end
 
+  @doc """
+  Apply committed entries to the state machine.
+  Route client replies back to pending requests.
+  """
   defp apply_committed_entries(state) do
     if state.commit_index > state.last_applied do
       Enum.reduce((state.last_applied + 1)..state.commit_index, state, fn idx, acc ->
@@ -455,6 +511,10 @@ defmodule RaftConsensus.Node do
     end
   end
 
+  @doc """
+  Step down to follower if we see a higher term.
+  Cancel timers and clear transient state.
+  """
   defp maybe_step_down(state, term) do
     if term > state.current_term do
       %{state |
@@ -470,6 +530,10 @@ defmodule RaftConsensus.Node do
     end
   end
 
+  @doc """
+  Log is up-to-date if candidate's last term is higher,
+  or terms equal but candidate's last index is higher.
+  """
   defp log_up_to_date?(log, candidate_last_index, candidate_last_term) do
     my_last_index = Log.last_index(log)
     my_last_term = Log.term_at(log, my_last_index)
@@ -483,12 +547,14 @@ defmodule RaftConsensus.Node do
 
   defp quorum_size(state), do: div(length(state.peers) + 1, 2) + 1
 
+  @doc "Randomized election timeout [150, 300) ms."
   defp schedule_election_timeout(state) do
     timer = cancel_timer(state.election_timer)
     timeout = @election_timeout_min + :rand.uniform(@election_timeout_max - @election_timeout_min)
     %{state | election_timer: Process.send_after(self(), :election_timeout, timeout)}
   end
 
+  @doc "Leader heartbeat interval: 50 ms (should be << election timeout)."
   defp schedule_heartbeat(state) do
     timer = cancel_timer(state.heartbeat_timer)
     %{state | heartbeat_timer: Process.send_after(self(), :heartbeat, @heartbeat_interval)}
@@ -512,7 +578,6 @@ end
 ### Step 4: RPC layer
 
 **Objective**: Isolate RequestVote and AppendEntries behind a transport module so the protocol logic can be tested without touching the network.
-
 
 ```elixir
 # lib/raft_consensus/rpc.ex
@@ -565,7 +630,6 @@ end
 
 **Objective**: Model the log as the single source of truth so the state machine becomes a pure projection and snapshots can truncate safely.
 
-
 ```elixir
 # lib/raft_consensus/log.ex
 defmodule RaftConsensus.Log do
@@ -575,6 +639,11 @@ defmodule RaftConsensus.Log do
 
   In production, this would be backed by :dets or a file with :file.sync/1
   after each append for durability.
+  
+  **Invariants:**
+  - Entries are monotonically ordered by index
+  - No gaps in indices
+  - term_at(log, index) is monotone non-decreasing
   """
 
   @spec append(list(), map()) :: list()
@@ -583,11 +652,13 @@ defmodule RaftConsensus.Log do
   @spec append_entries(list(), list()) :: list()
   def append_entries(log, entries), do: log ++ entries
 
+  @doc "Truncate log from index (exclusive): remove all entries with index >= from_index."
   @spec truncate_from(list(), pos_integer()) :: list()
   def truncate_from(log, from_index) do
     Enum.filter(log, fn entry -> entry.index < from_index end)
   end
 
+  @doc "Get the term of the entry at index. Return 0 if index is 0 or not found."
   @spec term_at(list(), non_neg_integer()) :: non_neg_integer()
   def term_at(_log, 0), do: 0
   def term_at(log, index) do
@@ -597,19 +668,23 @@ defmodule RaftConsensus.Log do
     end
   end
 
+  @doc "Get the entry at index. Return nil if not found."
   @spec entry_at(list(), pos_integer()) :: map() | nil
   def entry_at(log, index) do
     Enum.find(log, fn e -> e.index == index end)
   end
 
+  @doc "Get the index of the last entry. Return 0 if log is empty."
   @spec last_index(list()) :: non_neg_integer()
   def last_index([]), do: 0
   def last_index(log), do: List.last(log).index
 
+  @doc "Get the term of the last entry. Return 0 if log is empty."
   @spec last_term(list()) :: non_neg_integer()
   def last_term([]), do: 0
   def last_term(log), do: List.last(log).term
 
+  @doc "Get all entries starting from from_index (inclusive)."
   @spec entries_from(list(), pos_integer()) :: list()
   def entries_from(log, from_index) do
     Enum.filter(log, fn e -> e.index >= from_index end)
@@ -621,13 +696,16 @@ end
 
 **Objective**: Keep the KV apply function pure and deterministic so every replica reaches identical state from the same committed log prefix.
 
-
 ```elixir
 # lib/raft_consensus/state_machine.ex
 defmodule RaftConsensus.StateMachine do
   @moduledoc """
   Pure key-value state machine. Applies commands deterministically
   to produce a reply and updated state.
+  
+  **Critical property:** apply_command must be deterministic.
+  Same command applied to same state must always produce same result.
+  This is what enables replicas to diverge and then converge.
   """
 
   @spec apply_command(term(), map()) :: {term(), map()}
@@ -653,7 +731,6 @@ end
 
 **Objective**: Route every client call through the current leader so linearizability holds even when callers talk to a stale follower.
 
-
 ```elixir
 # lib/raft_consensus/cluster.ex
 defmodule RaftConsensus.Cluster do
@@ -664,10 +741,11 @@ defmodule RaftConsensus.Cluster do
 
   defstruct [:node_ids, :supervisor]
 
+  @doc "Start a Raft cluster with N nodes."
   @spec start_cluster(keyword()) :: {:ok, %__MODULE__{}}
   def start_cluster(opts \\ []) do
     node_count = Keyword.get(opts, :nodes, 5)
-    {min_timeout, max_timeout} = Keyword.get(opts, :election_timeout_range, {150, 300})
+    {_min_timeout, _max_timeout} = Keyword.get(opts, :election_timeout_range, {150, 300})
 
     node_ids = for i <- 1..node_count, do: :"raft_node_#{i}"
 
@@ -692,6 +770,7 @@ defmodule RaftConsensus.Cluster do
     :ok
   end
 
+  @doc "Get all nodes currently in leader role."
   @spec get_leaders(%__MODULE__{}) :: [map()]
   def get_leaders(%__MODULE__{node_ids: ids}) do
     ids
@@ -706,18 +785,21 @@ defmodule RaftConsensus.Cluster do
     |> Enum.filter(fn info -> info.role == :leader end)
   end
 
+  @doc "Put a key-value pair. Routes to current leader."
   @spec put(%__MODULE__{}, term(), term()) :: :ok | {:error, term()}
   def put(cluster, key, value) do
     route_to_leader(cluster, {:put, key, value})
   end
 
+  @doc "Get a value by key. Routes to current leader for linearizability."
   @spec get(%__MODULE__{}, term()) :: {:ok, term()} | {:error, term()}
   def get(cluster, key) do
     route_to_leader(cluster, {:get, key})
   end
 
+  @doc "Terminate a node by ID (simulates crash)."
   @spec kill_node(%__MODULE__{}, atom()) :: :ok
-  def kill_node(%__MODULE__{supervisor: sup}, node_id) do
+  def kill_node(%__MODULE__{supervisor: _sup}, node_id) do
     case Registry.lookup(RaftConsensus.Registry, node_id) do
       [{pid, _}] -> Process.exit(pid, :kill)
       [] -> :ok
@@ -725,6 +807,7 @@ defmodule RaftConsensus.Cluster do
     :ok
   end
 
+  @doc "Read the state machine value on all nodes (for debugging)."
   @spec read_all(%__MODULE__{}, term()) :: [term()]
   def read_all(%__MODULE__{node_ids: ids}, key) do
     Enum.map(ids, fn id ->
@@ -739,6 +822,10 @@ defmodule RaftConsensus.Cluster do
     end)
   end
 
+  @doc """
+  Partition the cluster into minority and majority groups.
+  Used for testing resilience under partition.
+  """
   @spec partition(%__MODULE__{}, keyword()) :: {%__MODULE__{}, %__MODULE__{}}
   def partition(%__MODULE__{node_ids: ids} = cluster, opts) do
     minority_size = Keyword.get(opts, :minority_size, 2)
@@ -746,6 +833,7 @@ defmodule RaftConsensus.Cluster do
     {%{cluster | node_ids: minority_ids}, %{cluster | node_ids: majority_ids}}
   end
 
+  @doc "Heal a partition (no-op; client must route correctly)."
   def heal_partition(_cluster, _minority, _majority), do: :ok
 
   defp route_to_leader(%__MODULE__{node_ids: ids}, command) do
@@ -774,7 +862,6 @@ end
 
 **Objective**: Keep the application shell minimal so cluster wiring stays an explicit caller concern rather than a hidden startup side effect.
 
-
 ```elixir
 # lib/raft_consensus/application.ex
 defmodule RaftConsensus.Application do
@@ -789,10 +876,9 @@ defmodule RaftConsensus.Application do
 end
 ```
 
-### Step 9: Given tests -- must pass without modification
+### Step 9: Given tests — must pass without modification
 
 **Objective**: Lock down safety properties (single leader, majority-replicated commits, partition recovery) with tests the implementation cannot edit to pass.
-
 
 ```elixir
 # test/raft_consensus/election_test.exs
@@ -848,7 +934,6 @@ defmodule RaftConsensus.ReplicationTest do
 
   test "put returns :ok only after majority replication", %{cluster: cluster} do
     assert :ok = Cluster.put(cluster, "k1", "v1")
-    # Wait for all nodes to apply, then verify all 5 agree
     Process.sleep(200)
     values = Cluster.read_all(cluster, "k1")
     assert Enum.all?(values, fn v -> v == "v1" end), "divergent state: #{inspect(values)}"
@@ -867,13 +952,13 @@ defmodule RaftConsensus.ReplicationTest do
   end
 
   test "partitioned follower catches up after reconnect", %{cluster: cluster} do
-    {minority, majority} = Cluster.partition(cluster, minority_size: 2)
+    {_minority, majority} = Cluster.partition(cluster, minority_size: 2)
 
     for i <- 1..100 do
       Cluster.put(majority, "part_#{i}", i)
     end
 
-    Cluster.heal_partition(cluster, minority, majority)
+    Cluster.heal_partition(cluster, _minority, majority)
     Process.sleep(2_000)
 
     for i <- 1..100 do
@@ -887,28 +972,43 @@ end
 
 **Objective**: Run the full suite with tracing so election timing bugs surface as observable order, not as silently flaky tests.
 
-
 ```bash
 mix test test/raft_consensus/ --trace
 ```
 
-### Step 11: Throughput benchmark
+---
 
-**Objective**: Quantify the cost of quorum commit under parallel writes so the leader bottleneck and RTT tail are measured, not assumed.
+## Quick start
 
+This is a educational, single-node simulation. For distributed deployment:
+
+1. Replace RPC layer: use `:erpc` or `:rpc` for inter-node calls
+2. Persist state: use `:dets` for term, vote, and log durability
+3. Add snapshots: implement InstallSnapshot RPC to truncate old log entries
+4. Monitor production: instrument term transitions, election frequency, commit lag
+
+---
+
+## Benchmark
+
+**Target**: 10,000 linearizable writes/second on a 5-node localhost cluster; p99 < 20 ms.
+
+```bash
+mix run bench/raft_bench.exs
+```
 
 ```elixir
 # bench/raft_bench.exs
-{:ok, cluster} = RaftConsensus.Cluster.start_cluster(nodes: 3)
+{:ok, cluster} = RaftConsensus.Cluster.start_cluster(nodes: 5)
 Process.sleep(2_000)
 
 Benchee.run(
   %{
     "put — serialized" => fn ->
-      RaftConsensus.Cluster.put(cluster, "bench", :rand.uniform(1_000_000))
+      RaftConsensus.Cluster.put(cluster, "bench_#{:rand.uniform(100)}", :rand.uniform(1_000_000))
     end,
     "get — linearizable" => fn ->
-      RaftConsensus.Cluster.get(cluster, "bench")
+      RaftConsensus.Cluster.get(cluster, "bench_#{:rand.uniform(100)}")
     end
   },
   parallel: 10,
@@ -918,31 +1018,11 @@ Benchee.run(
 )
 ```
 
-```bash
-mix run bench/raft_bench.exs
-```
-
-Target: 10,000 linearizable writes/second on a 3-node cluster on localhost.
-
-### Why this works
-
-The leader serializes every write through a single log, so there is exactly one order of operations per term. Quorum commit guarantees that any future leader has every committed entry (by the log-up-to-date vote rule), so no committed data is ever lost. Randomized election timeouts make split votes self-correct in one or two rounds, and `maybe_step_down/2` keeps every node on the highest term it has seen — which is what makes the safety argument hold without a global clock.
-
 ---
 
-## Benchmark
+## Why this works
 
-```elixir
-# bench/raft_bench.exs — already defined in Step 11
-# mix run bench/raft_bench.exs
-def main do
-  IO.puts("[RaftConsensus.Cluster] GenServer demo")
-  :ok
-end
-
-```
-
-Target: 10,000 linearizable writes/second on a 3-node localhost cluster; p99 < 20 ms under `parallel: 10`.
+The leader serializes every write through a single log, so there is exactly one order of operations per term. Quorum commit guarantees that any future leader has every committed entry (by the log-up-to-date vote rule), so no committed data is ever lost. Randomized election timeouts make split votes self-correct in one or two rounds, and `maybe_step_down/2` keeps every node on the highest term it has seen — which is what makes the safety argument hold without a global clock.
 
 ---
 
@@ -951,8 +1031,8 @@ Target: 10,000 linearizable writes/second on a 3-node localhost cluster; p99 < 2
 The core challenge in distributed systems is reaching agreement across multiple nodes when some may fail, be slow, or partition from the network. Consensus algorithms formalize three properties:
 
 1. **Safety**: All nodes that decide must decide the same value.
-2. Liveness**: Every non-faulty node eventually decides.
-3. Fault tolerance**: The system tolerates up to F faulty nodes out of 2F+1 total.
+2. **Liveness**: Every non-faulty node eventually decides.
+3. **Fault tolerance**: The system tolerates up to F faulty nodes out of 2F+1 total.
 
 Raft achieves this via a leader-based approach: the leader serializes writes through a log, and quorum commit ensures no data loss across failures. The log-up-to-date vote rule prevents stale nodes from becoming leader, and the "commit only current-term entries" rule prevents committed entries from being overwritten.
 
@@ -966,23 +1046,23 @@ This contrasts with leaderless protocols (e.g., CRDTs) that sacrifice strong con
 
 | Aspect | Raft (your impl) | Multi-Paxos | Viewstamped Replication |
 |--------|-----------------|-------------|------------------------|
-| Leader election | log comparison vote | any quorum member | deterministic rotation (`view mod N`) |
+| Leader election | log comparison vote | any quorum member | deterministic rotation |
 | Log commit rule | quorum on current-term entries | phase 2 acceptance | commit_number broadcast |
 | View change | term + log comparison | ballot + accept | two-phase DO_VIEW_CHANGE |
 | Membership change | joint consensus | varies | reconfiguration op |
 | Snapshot protocol | InstallSnapshot RPC | implementation-defined | recovery RPC |
 | Understandability | designed for clarity | historically harder | comparable to Raft |
 
-After running the benchmark, record your measured latency (p50, p99) and throughput (ops/sec) in each column for direct comparison.
+After running the benchmark, record your measured latency (p50, p99) and throughput (ops/sec) for direct comparison across protocols.
 
-Architectural question: Raft forbids committing entries from previous terms by index alone. Why? Construct a 3-node scenario where doing so would violate safety. Draw the log state on each node step by step.
+**Architectural question**: Raft forbids committing entries from previous terms by index alone. Why? Construct a 3-node scenario where doing so would violate safety. Draw the log state on each node step by step.
 
 ---
 
 ## Common production mistakes
 
 **1. Committing entries from previous terms by index**
-The most commonly misimplemented rule. A new leader must not mark an old entry committed by seeing it on a majority -- it must first replicate and commit an entry from its own term, which transitively commits all previous entries. Violating this causes data loss after a specific sequence of leader crashes.
+The most commonly misimplemented rule. A new leader must not mark an old entry committed by seeing it on a majority — it must first replicate and commit an entry from its own term, which transitively commits all previous entries. Violating this causes data loss after a specific sequence of leader crashes.
 
 **2. Not resetting the election timer on AppendEntries**
 If the timer is only reset on non-empty AppendEntries, the node will call an election even though a live leader is sending heartbeats. The timer must reset on every valid AppendEntries, including no-op heartbeats.
@@ -1007,8 +1087,8 @@ Use `System.monotonic_time/1`. Wall-clock time can jump backward after NTP corre
 
 ## Resources
 
-- Ongaro, D. & Ousterhout, J. (2014). *In Search of an Understandable Consensus Algorithm (Extended Version)* -- Figure 2 is the complete specification; implement it exactly
-- Ongaro, D. (2014). *Consensus: Bridging Theory and Practice* (PhD dissertation) -- chapters 3-6 cover safety proofs and membership change
-- [etcd `raft/` package](https://github.com/etcd-io/etcd/tree/main/raft) -- the reference Go implementation; study the structure, not the wrapper
-- [TiKV Raft](https://github.com/tikv/raft-rs) -- Rust implementation with extensive correctness comments
-- [Jepsen analyses](https://jepsen.io) -- Kyle Kingsbury's linearizability violation reports; understand how violations are detected before you claim your implementation is safe
+- Ongaro, D. & Ousterhout, J. (2014). *In Search of an Understandable Consensus Algorithm (Extended Version)* — Figure 2 is the complete specification; implement it exactly
+- Ongaro, D. (2014). *Consensus: Bridging Theory and Practice* (PhD dissertation) — chapters 3-6 cover safety proofs and membership change
+- [etcd `raft/` package](https://github.com/etcd-io/etcd/tree/main/raft) — the reference Go implementation; study the structure, not the wrapper
+- [TiKV Raft](https://github.com/tikv/raft-rs) — Rust implementation with extensive correctness comments
+- [Jepsen analyses](https://jepsen.io) — Kyle Kingsbury's linearizability violation reports; understand how violations are detected before you claim your implementation is safe

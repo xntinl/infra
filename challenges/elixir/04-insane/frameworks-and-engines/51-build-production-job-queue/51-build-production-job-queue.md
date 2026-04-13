@@ -707,55 +707,87 @@ defmodule JobQueue.Bench.Throughput do
   end
 
   def run do
+    IO.puts("=== Job Queue Throughput Benchmark ===")
+    IO.puts("Duration: #{@duration_s}s, Concurrency: #{@concurrency} workers\n")
+    
     count = @concurrency * @duration_s * 2
-    IO.puts("Pre-inserting #{count} noop jobs...")
+    IO.write("Pre-inserting #{count} noop jobs... ")
+    
     for _ <- 1..count, do: NoopWorker.enqueue(%{})
+    IO.puts("done")
 
     completed = Agent.start_link(fn -> 0 end) |> elem(1)
+    started = Agent.start_link(fn -> 0 end) |> elem(1)
+    
     :telemetry.attach("bench-complete", [:job_queue, :job, :stop], fn _, _, _, _ ->
       Agent.update(completed, &(&1 + 1))
     end, nil)
+    
+    :telemetry.attach("bench-start", [:job_queue, :job, :start], fn _, _, _, _ ->
+      Agent.update(started, &(&1 + 1))
+    end, nil)
 
+    IO.write("Running benchmark")
     start = System.monotonic_time(:millisecond)
-    Process.sleep(@duration_s * 1000)
+    
+    for _ <- 1..(@duration_s) do
+      Process.sleep(1000)
+      IO.write(".")
+    end
+    
     elapsed_s = (System.monotonic_time(:millisecond) - start) / 1000.0
+    total_completed = Agent.get(completed, & &1)
+    total_started = Agent.get(started, & &1)
+    throughput = total_completed / elapsed_s
 
-    total = Agent.get(completed, & &1)
-    throughput = total / elapsed_s
-
-    IO.puts("Completed: #{total} jobs in #{Float.round(elapsed_s, 1)}s")
-    IO.puts("Throughput: #{Float.round(throughput, 0)} jobs/s")
-    IO.puts("Target:     500 jobs/s")
-    IO.puts("Pass:       #{if throughput >= 500, do: "YES", else: "NO"}")
+    IO.puts("\n\nResults:")
+    IO.puts("  Jobs started:  #{total_started}")
+    IO.puts("  Jobs completed: #{total_completed}")
+    IO.puts("  Time elapsed:   #{Float.round(elapsed_s, 1)}s")
+    IO.puts("  Throughput:     #{Float.round(throughput, 0)} jobs/s")
+    IO.puts("  Target:         >= 500 jobs/s")
+    IO.puts("  Status:         #{if throughput >= 500, do: "PASS", else: "FAIL"}")
+    
     :telemetry.detach("bench-complete")
+    :telemetry.detach("bench-start")
   end
 end
 
 JobQueue.Bench.Throughput.run()
-def main do
-  IO.puts("[NoopWorker] GenServer demo")
-  :ok
-end
-
 ```
 
-## Key Concepts: Event Sourcing and Immutable Logs
+## Key Concepts: Distributed Consensus y Transactional Atomicity en Job Queues
 
-Event sourcing inverts the traditional database model: instead of storing current state, store every state-changing event in an immutable log. The current state is derived by replaying events from the start.
+Las job queues distribuidas requieren resolver conflictos imposibles:
 
-This shift has profound implications:
-- **Audit trail is free**: Every change is a named event with timestamp and actor.
-- **Temporal queries are simple**: Replay events up to a past date to see historical state.
-- **Concurrency is safe**: Events are immutable and append-only, eliminating race conditions on state mutations.
-- **Testability is easier**: Given a sequence of events, the state is deterministic; no mocks needed.
+1. **Pérdida de datos vs. Duplicación**: Si un worker muere después de ejecutar `perform/1` pero antes de marcar el job como `completed`, el job queda en `executing`. ¿Qué pasa?
+   - Si NO lo recuperas: pérdida de datos (re-enviar email nunca ocurre).
+   - Si lo recuperas: duplicación (dos emails enviados).
+   
+   La solución es **at-least-once** con **idempotencia**: cada job se ejecuta 1+ veces, pero el `perform/1` es idempotent (mismo resultado si ejecutas 2 veces). Para emails, usa un `unique_key` en la base de datos para evitar duplicar.
 
-The BEAM is naturally suited for this pattern. Each aggregate (e.g., Account) is a GenServer that receives commands, validates them against current state, publishes an event if valid, then applies the event to update local state. The OTP supervision tree ensures persistence across restarts; the event log (in a database) survives the entire system.
+2. **SELECT FOR UPDATE SKIP LOCKED**: PostgreSQL provee select-for-update a nivel de fila, no de tabla. Cuando un worker reclama un job:
+   ```sql
+   SELECT id FROM jobs WHERE state = 'available' AND queue = ? 
+   ORDER BY priority LIMIT 1 
+   FOR UPDATE SKIP LOCKED
+   ```
+   Postgres bloquea la fila. Otros workers que intenten la misma query ven la fila como bloqueada y la saltan (SKIP LOCKED). Sin esto:
+   - Advisory locks: requieren cleanup manual en crash.
+   - Redis: no es transactional con el estado del negocio.
 
-The downside: evolving schemas is hard. If you rename a field or split an event type, old events still use the old structure. Solutions include versioning (introduce `withdrew_v2` alongside `withdrew_v1`) or upcasting (projection functions that translate old events to new). Frameworks like Commanded automate this.
+3. **Transactional Enqueue**: Cuando insertas un job, debe estar en la MISMA transacción que el evento del negocio:
+   ```elixir
+   Repo.transaction(fn ->
+     Repo.insert!(order, state: "confirmed")  # Negocio
+     Repo.insert!(job)                         # Job
+   end)
+   ```
+   Si la transacción hace rollback, ambos desaparecen. Si solo haces `Repo.insert!(order)` entonces `Repo.insert!(job)` en secuencia sin transacción, hay una ventana donde la orden está confirmada pero el job no existe.
 
-Another challenge: reads require replaying events, which is slow for 10-year-old aggregates with millions of events. Solution: snapshots. Periodically serialize current state; replay only events after the snapshot. This trades disk space for query speed, a worthwhile tradeoff for most systems.
+4. **LISTEN/NOTIFY para latencia**: Polling a 1 segundo = 500ms latencia promedio. PostgreSQL NOTIFY dispara un trigger en INSERT, enviando un mensaje al cliente en ~5ms. Los clientes corren un "listener" que recibe notificaciones y dispara un poll inmediato. Si el listener se cae, el polling fallback captura los jobs perdidos.
 
-**Production insight**: Event sourcing is powerful for audit-heavy systems (banking, compliance), but unnecessary overhead for simple CRUD apps. Choose event sourcing when the audit trail or temporal queries justify the implementation complexity.
+**Insight de producción**: La única cola a prueba de fallos es una respaldada por una base de datos transaccional. Memoria pura = pérdida en restart. Redis sin Ecto.Multi = ventana de pérdida de datos. Postgres + transacciones = correcto.
 
 ---
 

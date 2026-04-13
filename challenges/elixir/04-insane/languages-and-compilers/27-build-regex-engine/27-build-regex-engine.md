@@ -701,19 +701,55 @@ The compiler turns the pattern into an NFA with ε-transitions; the VM maintains
 
 ---
 
-## Benchmark
+## Benchmark workload
+
+El benchmark contrasta:
+1. **Catastrophic backtracking pattern** `(a+)+b`: PCRE engines explotan exponencialmente en `aaaa...aaab` porque intentan todas las particiones de los `+`. El NFA/DFA lo resuelve en O(n).
+2. **Simple literal matching**: Baseline de rendimiento en el caso más favorable.
+3. **Character class with quantifiers**: Patrón práctico que expone DFA state explosion.
 
 ```elixir
-# bench/regex_bench.exs
-Benchee.run(%{"match" => fn -> Regex2.match?(nfa, "aaab") end}, time: 10)
-def main do
-  IO.puts("[Rexa.ExecutorTest.build] demo")
-  :ok
+# bench/rexa_bench.exs
+alias Rexa.{Lexer, Parser, NFA, DFA}
+
+defp compile_pattern(pattern) do
+  {:ok, ast} = Parser.parse(pattern)
+  nfa = NFA.build(ast)
+  DFA.build(nfa)
 end
 
+# Patterns: simple, quantified, alternation, catastrophic
+simple_dfa = compile_pattern("hello")
+quantified_dfa = compile_pattern("[a-z]+")
+alternation_dfa = compile_pattern("cat|dog|bird")
+catastrophic_dfa = compile_pattern("(a+)+b")
+
+# Inputs
+simple_input = "hello world " <> String.duplicate("test ", 100)
+quantified_input = String.duplicate("abc123def456", 100)
+catastrophic_match = String.duplicate("a", 30) <> "b"
+catastrophic_no_match = String.duplicate("a", 30)
+
+Benchee.run(
+  %{
+    "literal 'hello' x1000" => fn -> Rexa.scan(simple_dfa, simple_input) end,
+    "[a-z]+ x100" => fn -> Rexa.scan(quantified_dfa, quantified_input) end,
+    "cat|dog|bird alternation" => fn -> Rexa.scan(alternation_dfa, quantified_input) end,
+    "(a+)+b catastrophic match (30a + b)" => fn -> Rexa.match(catastrophic_dfa, catastrophic_match) end,
+    "(a+)+b catastrophic no-match (30a, no b)" => fn -> Rexa.match(catastrophic_dfa, catastrophic_no_match) end
+  },
+  time: 5,
+  warmup: 2,
+  formatters: [Benchee.Formatters.Console]
+)
 ```
 
-Target: Match of a 20-char pattern against a 10 KB input in < 100 µs; no catastrophic cases on `(a+)+$`-style inputs.
+**Key insight**: The catastrophic case must complete in < 100 µs even with 30 `a`s. PCRE engines would take seconds.
+
+**Targets**:
+- Literal matching: < 10 µs per 100-char input segment
+- Character classes with `+` or `*`: < 50 µs per 100-char input
+- Catastrophic pattern (fixed): < 100 µs (O(n), not O(2^n))
 
 ---
 
@@ -743,6 +779,78 @@ pub fn expensive_operation_nif(a: u32) -> u32 { expensive_operation(a) }
 ```
 
 **Production pattern**: Reserve dirty schedulers for truly blocking I/O. Measure scheduler utilization to confirm no starvation under load. Prefer Elixir async processes for I/O when possible; they are more observable and composable.
+
+---
+
+## Key Concepts: Thompson Construction and DFA Minimization
+
+**Thompson's NFA construction**: Cada operator regex se convierte a un fragmento NFA con exactamente un state de entrada y uno de salida:
+
+```
+char 'a'         atom()          alt(L, R)
+────────────     ──────         ──────────
+q0 --a--> q1    q0 --ε--> q1    q0 --ε--> q2(L) --ε--> q5
+                     (q0=q1)      └--ε--> q3(R) --ε--> q5
+
+concat(L, R)     star(E)         plus(E)
+────────────     ────────        ────────
+q0(L) --> q2 --ε--> q3(R) --> q5
+                q0 --ε--> q1(E) --ε--> q4
+                └--------ε----- q4 --ε--> q0
+                         (loop)
+
+                q0 --ε--> q1(E) --ε--> q4 --ε--> q0
+                                      (at least once)
+```
+
+Composición: conectar la salida de un fragmento a la entrada del siguiente con una epsilon-transición.
+
+**Epsilon closure computation**: El closure de un set de estados es el set de todos los estados alcanzables sin consumir input. Algoritmo BFS:
+
+```
+epsilon_closure(nfa, {q0, q1}) =
+  visited = {q0, q1}
+  worklist = [q0, q1]
+  while worklist not empty:
+    s = worklist.pop()
+    for t in epsilon_transitions(s):
+      if t not in visited:
+        visited.add(t)
+        worklist.push(t)
+  return visited
+```
+
+Esto es **crítico**: una closure incompleta produce un DFA incorrecto que rechaza strings válidos.
+
+**Subset construction (Rabin-Scott)**: Convierte NFA a DFA. Cada DFA state es un set de NFA states. El algoritmo:
+
+1. `q0_dfa = epsilon_closure(nfa.start)`  — estado inicial del DFA es el epsilon-closure del start del NFA.
+2. Worklist = [`q0_dfa`]
+3. Para cada DFA state `S` y símbolo `c`:
+   - Compute todos los NFA states reachables desde `S` consumiendo `c`
+   - Toma su epsilon-closure → nuevo DFA state `T`
+   - Añade transición `S --c--> T`
+   - Si `T` es nuevo, añádelo a worklist
+
+Complejidad: O(2^|NFA states|) en el peor caso porque hay 2^n posibles subsets.
+
+**Hopcroft's DFA minimization algorithm**: Reduce DFA states by merging indistinguishable states. Two states are indistinguishable if:
+
+1. Both are accepting or both are non-accepting.
+2. For every symbol, they transition to indistinguishable states (or both have no transition).
+
+El algoritmo:
+
+```
+1. Partition = {accepting_states, non_accepting_states}
+2. Repeat until stable:
+   For each partition P in Partition:
+     For each symbol c:
+       Split P based on which partition the c-transition targets
+3. Return: merged states within each final partition
+```
+
+Result: minimal DFA with fewest states, still equivalent to original.
 
 ---
 

@@ -99,20 +99,9 @@ cd dsl_kit
 mkdir -p test/dsl_kit bench
 ```
 
-### Step 2: `mix.exs`
+### Step 2: `mix.exs` — dependencies
 
 **Objective**: Keep dependencies to Benchee alone, proving the DSL can be built on stdlib macros without third-party metaprogramming helpers.
-
-
-```elixir
-defp deps do
-  [
-    {:benchee, "~> 1.3", only: :dev}
-  ]
-end
-```
-
-### Dependencies (mix.exs)
 
 ```elixir
 defp deps do
@@ -526,39 +515,56 @@ The design separates concerns along their real axes: what must be correct (the m
 ## Benchmark
 
 ```elixir
-# Minimal timing harness — replace with Benchee for production measurement.
-{time_us, _result} = :timer.tc(fn ->
-  # exercise the hot path N times
-  for _ <- 1..10_000, do: :ok
-end)
+# bench/dispatch_bench.exs (complete benchmark harness)
+defmodule BenchFSM do
+  use DslKit.StateMachine
 
-IO.puts("average: #{time_us / 10_000} µs per op")
-def main do
-  IO.puts("[DslKit.StateMachineTest] GenServer demo")
-  :ok
+  initial :draft
+  state :draft
+  state :submitted
+  state :approved
+  state :shipped
+  state :delivered
+  state :cancelled
+
+  transition :draft, :submitted, on: :submit
+  transition :submitted, :approved, on: :approve
+  transition :approved, :shipped, on: :ship
+  transition :shipped, :delivered, on: :deliver
+  transition :draft, :cancelled, on: :cancel
+  transition :submitted, :cancelled, on: :cancel
 end
 
+Benchee.run(
+  %{
+    "state machine dispatch (7 states, 6 transitions)" => fn ->
+      BenchFSM.transition(:draft, :submit)
+    end,
+    "validation (5 fields, 20 rules)" => fn ->
+      UserSchema.validate(%{
+        "name" => "Alice",
+        "email" => "alice@example.com",
+        "age" => 30,
+        "role" => "admin"
+      })
+    end
+  },
+  time: 5,
+  warmup: 2
+)
 ```
 
 Target: DSL compilation should add <50ms to a module with 1000 DSL statements.
 
-## Key Concepts: Event Sourcing and Immutable Logs
+## Key Concepts: Compile-Time Code Generation via Macros
 
-Event sourcing inverts the traditional database model: instead of storing current state, store every state-changing event in an immutable log. The current state is derived by replaying events from the start.
+A DSL (Domain-Specific Language) is a declarative interface for encoding domain concepts. DslKit's approach uses three compile-time patterns:
 
-This shift has profound implications:
-- **Audit trail is free**: Every change is a named event with timestamp and actor.
-- **Temporal queries are simple**: Replay events up to a past date to see historical state.
-- **Concurrency is safe**: Events are immutable and append-only, eliminating race conditions on state mutations.
-- **Testability is easier**: Given a sequence of events, the state is deterministic; no mocks needed.
+1. **Attribute accumulation** (`@myattr` with `accumulate: true`): each DSL declaration (`state :name`, `validates :field, [...]`) adds to a module attribute.
+2. **`__before_compile__` hooks**: after the module body is parsed but before compilation, extract accumulated attributes, validate consistency, and generate function clauses.
+3. **Pattern-matched dispatch**: generated functions use guards and function-head patterns for O(1) dispatch, not runtime conditionals.
 
-The BEAM is naturally suited for this pattern. Each aggregate (e.g., Account) is a GenServer that receives commands, validates them against current state, publishes an event if valid, then applies the event to update local state. The OTP supervision tree ensures persistence across restarts; the event log (in a database) survives the entire system.
-
-The downside: evolving schemas is hard. If you rename a field or split an event type, old events still use the old structure. Solutions include versioning (introduce `withdrew_v2` alongside `withdrew_v1`) or upcasting (projection functions that translate old events to new). Frameworks like Commanded automate this.
-
-Another challenge: reads require replaying events, which is slow for 10-year-old aggregates with millions of events. Solution: snapshots. Periodically serialize current state; replay only events after the snapshot. This trades disk space for query speed, a worthwhile tradeoff for most systems.
-
-**Production insight**: Event sourcing is powerful for audit-heavy systems (banking, compliance), but unnecessary overhead for simple CRUD apps. Choose event sourcing when the audit trail or temporal queries justify the implementation complexity.
+This approach — used by Ecto, Phoenix, Absinthe — defers error detection to compile time when the fix is cheapest. A user learns invalid configuration at `mix compile`, not at 3 AM in production.
 
 ---
 

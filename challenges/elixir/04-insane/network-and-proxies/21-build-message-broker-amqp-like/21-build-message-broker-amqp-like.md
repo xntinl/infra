@@ -522,36 +522,51 @@ The broker tracks each consumer's unacked set in ETS and only pushes up to `pref
 ## Benchmark
 
 ```elixir
-# bench/broker_bench.exs
-Benchee.run(%{"publish_consume" => fn -> Broker.publish(q, msg); Broker.consume(q) end}, time: 10)
+# bench/brokex_bench.exs
+Benchee.run(%{
+  "publish_no_confirm" => fn ->
+    {:ok, conn} = AMQP.Connection.open(port: 5673)
+    {:ok, chan} = AMQP.Channel.open(conn)
+    AMQP.Queue.declare(chan, "bench.q")
+    AMQP.Basic.publish(chan, "", "bench.q", "payload")
+    AMQP.Connection.close(conn)
+  end,
+  "publish_confirmed" => fn ->
+    {:ok, conn} = AMQP.Connection.open(port: 5673)
+    {:ok, chan} = AMQP.Channel.open(conn)
+    AMQP.Queue.declare(chan, "bench.q")
+    AMQP.Confirm.select(chan)
+    AMQP.Basic.publish(chan, "", "bench.q", "payload")
+    AMQP.Confirm.wait_for_confirms(chan)
+    AMQP.Connection.close(conn)
+  end
+}, time: 10, warmup: 3)
+
 def main do
-  IO.puts("[Brokex.DurabilityTest] GenServer demo")
+  IO.puts("[Brokex] AMQP 0-9-1 message broker")
+  IO.puts("Publisher confirms enable at-least-once delivery semantics")
+  IO.puts("Pre-segmented storage and durable queues provide recovery guarantees")
   :ok
 end
-
 ```
 
 Target: 50,000 messages/second routed end-to-end with 10 consumers and prefetch=100.
 
 ---
 
-## Key Concepts: Load Balancing Under Tail Latency
+## Key Concepts: Message Protocols and AMQP Framing
 
-Load balancers distribute requests across backends. The choice of algorithm affects both latency distribution and fairness.
+AMQP (Advanced Message Queuing Protocol) 0-9-1 is a binary protocol layered on TCP. Understanding its frame structure is critical because every byte must align correctly for clients to parse.
 
-**Round-robin**: Request i goes to backend (i % N). Simple and fair on average, but ignores backend state. If one backend is slow (e.g., garbage collection pause), clients hitting that backend wait, skewing the p99 latency.
+**Frame structure**: Each AMQP frame contains a type byte (1=METHOD, 2=HEADER, 3=BODY, 8=HEARTBEAT), a 16-bit channel ID, a 32-bit size field, the payload, and a frame-end byte (0xCE). A single off-by-one error in size calculation breaks all subsequent frames.
 
-**Least connections**: Track open connections per backend; send the next request to the backend with fewest connections. Better than round-robin, but still ignores request complexity (a short read and a 10-second compute job are both "1 connection").
+**Method framing**: METHOD frames contain a 16-bit class ID and 16-bit method ID followed by method-specific arguments. For example, `basic.publish` (class 60, method 40) includes the exchange name, routing key, and flags. The argument encoding follows strict AMQP type rules: strings are length-prefixed (4-byte big-endian length + UTF-8 data), booleans are single bits packed into flags fields.
 
-**Power of two choices**: Pick two random backends and assign the request to the one with fewer connections. With minimal overhead, this reduces tail latency from O(log N) to O(log log N) because load is balanced more evenly without the cost of globally tracking all backends.
+**Prefetch window**: AMQP's push model delivers messages to consumers proactively. The `prefetch` parameter bounds how many unacked messages a consumer can hold. This prevents fast consumers from starving the broker's memory on a slow backend — backpressure is enforced by the prefetch limit, not by network flow control.
 
-**Latency-aware (p99-driven)**: Track recent p99 latency per backend; prefer the backend with lowest p99. Powerful for SLA-driven systems, but can oscillate if multiple backends are competing for shared resources.
+**Publisher confirms**: A producer does not know if a message will be routed successfully. `basic.ack` sent back to the producer means "the message is enqueued (and persisted if durable)." The producer must track unacked messages and handle timeouts — if no ack arrives within timeout, the message is retransmitted.
 
-On a 100-node cluster, round-robin assigns 1% of traffic to each backend. If one is 10x slower, clients hitting it see 10x latency. With 1000 req/sec, that's 10 reqs/sec hitting the slow node, and each sees 10x latency, affecting the fleet's p99. Least connections or power-of-two reduces affected clients to a single one per decision.
-
-The BEAM's `:poolboy` or `:connection_pool` naturally implement least-connections: each pool process tracks queue depth. A dispatcher sends new requests to the pool with the shortest queue. This is "power of two" with full visibility into actual queue depth, making it extremely effective.
-
-**Production insight**: Measuring load balancing on a single machine is misleading. Test against realistic backend variability (e.g., one slow backend, cascading failures) to see how your algorithm's tail latency behaves.
+**Production insight**: The AMQP wire format is unforgiving. Test with a real client library like the Elixir `:amqp` package against your broker — if they cannot interoperate, your implementation is wrong, not the test.
 
 ---
 

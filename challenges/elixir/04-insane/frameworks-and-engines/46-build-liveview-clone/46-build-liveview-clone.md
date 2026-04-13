@@ -941,9 +941,13 @@ end
 defmodule Vivo.Bench.Connections do
   @target_connections 10_000
   @duration_s 60
+  @update_rate_hz 10
 
   def run do
-    IO.puts("Opening #{@target_connections} connections...")
+    IO.puts("=== Vivo Server-Driven UI Benchmark ===")
+    IO.puts("Testing #{@target_connections} concurrent connections\n")
+    
+    IO.write("Opening connections... ")
     baseline_memory = :erlang.memory(:total)
 
     pids = Enum.map(1..@target_connections, fn i ->
@@ -954,26 +958,42 @@ defmodule Vivo.Bench.Connections do
       )
       pid
     end)
+    IO.puts("done")
 
     connected_memory = :erlang.memory(:total)
     overhead_mb = (connected_memory - baseline_memory) / (1024 * 1024)
-    IO.puts("Memory overhead: #{Float.round(overhead_mb, 1)} MB (target: < 10 MB)")
+    overhead_per_conn_kb = (overhead_mb * 1024) / @target_connections
+    
+    IO.puts("Memory overhead: #{Float.round(overhead_mb, 1)} MB (#{Float.round(overhead_per_conn_kb, 1)} KB per connection)")
+    IO.puts("Target:          < 10 MB total (< 1 KB per connection)\n")
 
-    IO.puts("Sending updates for #{@duration_s}s...")
-    latencies = measure_latencies(pids, @duration_s)
+    IO.write("Running latency benchmark (#{@duration_s}s @ #{@update_rate_hz} Hz)... ")
+    latencies = measure_latencies(pids, @duration_s, @update_rate_hz)
+    IO.puts("done\n")
 
     sorted = Enum.sort(latencies)
     n = length(sorted)
+    p50 = Enum.at(sorted, trunc(n * 0.50))
+    p95 = Enum.at(sorted, trunc(n * 0.95))
     p99 = Enum.at(sorted, trunc(n * 0.99))
+    avg = Enum.sum(latencies) / length(latencies)
 
-    IO.puts("P99 diff latency: #{Float.round(p99, 2)} ms (target: < 50 ms)")
-    IO.puts("Pass: #{if overhead_mb < 10 and p99 < 50, do: "YES", else: "NO"}")
+    IO.puts("=== Results ===")
+    IO.puts("P50 diff latency: #{Float.round(p50, 2)} ms")
+    IO.puts("P95 diff latency: #{Float.round(p95, 2)} ms")
+    IO.puts("P99 diff latency: #{Float.round(p99, 2)} ms")
+    IO.puts("Avg diff latency: #{Float.round(avg, 2)} ms")
+    IO.puts("Target P99:       < 50 ms")
+    IO.puts("Target Memory:    < 10 MB total")
+    IO.puts("Status:           #{if overhead_mb < 10 and p99 < 50, do: "PASS", else: "FAIL"}")
 
     Enum.each(pids, &GenServer.stop/1)
   end
 
-  defp measure_latencies(pids, duration_s) do
+  defp measure_latencies(pids, duration_s, update_rate_hz) do
+    interval_ms = div(1000, update_rate_hz)
     end_time = System.monotonic_time(:millisecond) + duration_s * 1000
+    num_updates = duration_s * update_rate_hz
 
     Stream.repeatedly(fn ->
       pid = Enum.random(pids)
@@ -982,7 +1002,7 @@ defmodule Vivo.Bench.Connections do
       receive do
         {:diff, _} -> System.monotonic_time(:millisecond) - t0
       after
-        100 -> 100
+        200 -> 200
       end
     end)
     |> Stream.take_while(fn _ -> System.monotonic_time(:millisecond) < end_time end)
@@ -991,30 +1011,42 @@ defmodule Vivo.Bench.Connections do
 end
 
 Vivo.Bench.Connections.run()
-def main do
-  IO.puts("[Vivo.Channel] GenServer demo")
-  :ok
-end
-
 ```
 
-## Key Concepts: Event Sourcing and Immutable Logs
+## Key Concepts: Server-Driven UI vs. Client-Side SPAs
 
-Event sourcing inverts the traditional database model: instead of storing current state, store every state-changing event in an immutable log. The current state is derived by replaying events from the start.
+La arquitectura **server-driven UI** (LiveView, Vivo) es fundamentalmente diferente a una SPA:
 
-This shift has profound implications:
-- **Audit trail is free**: Every change is a named event with timestamp and actor.
-- **Temporal queries are simple**: Replay events up to a past date to see historical state.
-- **Concurrency is safe**: Events are immutable and append-only, eliminating race conditions on state mutations.
-- **Testability is easier**: Given a sequence of events, the state is deterministic; no mocks needed.
+### SPA (Single-Page Application - React, Vue, etc.)
 
-The BEAM is naturally suited for this pattern. Each aggregate (e.g., Account) is a GenServer that receives commands, validates them against current state, publishes an event if valid, then applies the event to update local state. The OTP supervision tree ensures persistence across restarts; the event log (in a database) survives the entire system.
+- Cliente descarga JavaScript (~500KB de código, frameworks, deps).
+- Cliente mantiene estado en memoria.
+- Cambios de estado se renderizan localmente.
+- Para datos frescos: cliente hace polling (10k clientes x 1 req/sec = 10k req/sec) o WebSocket push.
+- El servidor es un API stateless.
+- **Ventaja**: UX responsivo, sin latency de network.
+- **Desventaja**: El cliente es un ordenador — 10k clientes ejecutando lógica = 10k computas. Seguridad basada en cliente.
 
-The downside: evolving schemas is hard. If you rename a field or split an event type, old events still use the old structure. Solutions include versioning (introduce `withdrew_v2` alongside `withdrew_v1`) or upcasting (projection functions that translate old events to new). Frameworks like Commanded automate this.
+### Server-Driven UI (LiveView, Vivo)
 
-Another challenge: reads require replaying events, which is slow for 10-year-old aggregates with millions of events. Solution: snapshots. Periodically serialize current state; replay only events after the snapshot. This trades disk space for query speed, a worthwhile tradeoff for most systems.
+- Cliente descarga HTML + ~5KB JavaScript runtime.
+- Servidor mantiene estado **en un GenServer por conexión**.
+- Cambios de estado se renderizan **en el servidor**.
+- Servidor difunde solo el **delta de HTML** al cliente.
+- Cliente aplica el delta al DOM.
+- **Ventaja**: Servidor es fuente de verdad. Lógica centralizada. Seguridad en el servidor. Memoria por cliente = 3KB (GenServer) + assigns (típicamente <100KB).
+- **Desventaja**: Input latency = network round-trip (~100ms). No offline-capable.
 
-**Production insight**: Event sourcing is powerful for audit-heavy systems (banking, compliance), but unnecessary overhead for simple CRUD apps. Choose event sourcing when the audit trail or temporal queries justify the implementation complexity.
+### El trade-off de la arquitectura de difusión
+
+Un cambio en el servidor puede afectar a múltiples clientes. En una SPA, cada cliente re-computa independientemente. En server-driven UI:
+- **Mensaje único**: Servidor difunde un cambio una sola vez.
+- **Múltiples clientes**: Si 10k clientes ven la misma tabla, el servidor computa el diff una sola vez y lo envía 10k veces (broadcast).
+- Compare con SPA: 10k clientes hacen polling, 10k requests.
+
+### LiveView evita LiveComponent en producción
+
+La ventaja clave de LiveView/Vivo es la **reactividad automática**: cuando assigns cambia, Phoenix difunde automáticamente a todos los sockets. Los componentes (LiveComponent) rompem esto — requieren manual push. En producción, la mayoría de apps usan LiveView puro.
 
 ---
 

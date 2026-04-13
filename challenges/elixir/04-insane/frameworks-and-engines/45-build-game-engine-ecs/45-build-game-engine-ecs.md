@@ -789,39 +789,80 @@ end
 ## Benchmark
 
 ```elixir
-# Minimal timing harness — replace with Benchee for production measurement.
-{time_us, _result} = :timer.tc(fn ->
-  # exercise the hot path N times
-  for _ <- 1..10_000, do: :ok
-end)
+# bench/ecs_throughput.exs
+# Run with: mix escript.build && ./game_engine bench/ecs_throughput.exs
 
-IO.puts("average: #{time_us / 10_000} µs per op")
-def main do
-  IO.puts("[GameEngine.WorldTest] GenServer demo")
-  :ok
+defmodule GameEngine.Bench do
+  def run_benchmark do
+    IO.puts("=== ECS Throughput Benchmark ===")
+    IO.puts("Setup: #{10_000} entities, 4 components per entity, 3 systems (Physics, Render, Input)")
+    
+    # Initialize world and populate
+    world = GameEngine.World.new()
+    
+    IO.write("Populating 10k entities... ")
+    world = Enum.reduce(1..10_000, world, fn _i, w ->
+      {w, eid} = GameEngine.World.spawn_entity(w)
+      w = GameEngine.World.add_component(w, eid, %GameEngine.Components.Position{x: :rand.uniform() * 100, y: :rand.uniform() * 100})
+      w = GameEngine.World.add_component(w, eid, %GameEngine.Components.Velocity{vx: :rand.uniform() - 0.5, vy: :rand.uniform() - 0.5})
+      w = GameEngine.World.add_component(w, eid, %GameEngine.Components.Collider{w: 1, h: 1})
+      GameEngine.World.add_component(w, eid, %GameEngine.Components.Sprite{char: "*", fg: 2})
+    end)
+    IO.puts("Done")
+    
+    # Warm up
+    IO.write("Warmup (100 frames)... ")
+    for _ <- 1..100 do
+      GameEngine.Systems.Physics.update(world, 0.01667)
+      GameEngine.Systems.Render.update(world, 0)
+    end
+    IO.puts("Done")
+    
+    # Benchmark: measure time to run 1000 frames
+    IO.write("Benchmarking (1000 frames)... ")
+    {total_us, _} = :timer.tc(fn ->
+      Enum.reduce(1..1000, world, fn _frame, w ->
+        GameEngine.Systems.Physics.update(w, 0.01667)
+      end)
+    end)
+    
+    total_ms = total_us / 1000.0
+    per_frame_ms = total_ms / 1000.0
+    entities_per_sec = 10_000_000 / total_us
+    
+    IO.puts("Done\n")
+    IO.puts("Results:")
+    IO.puts("  Total time: #{Float.round(total_ms, 2)} ms")
+    IO.puts("  Per-frame:  #{Float.round(per_frame_ms, 3)} ms")
+    IO.puts("  Throughput: #{Float.round(entities_per_sec, 0)} entities/sec")
+    IO.puts("  Target:     <1.67 ms per frame @ 60 FPS")
+    
+    if per_frame_ms < 1.67 do
+      IO.puts("  Result:     PASS")
+    else
+      IO.puts("  Result:     FAIL (#{Float.round(per_frame_ms / 1.67, 1)}x too slow)")
+    end
+  end
 end
 
+GameEngine.Bench.run_benchmark()
 ```
 
-Target: <5ms to update 10k entities across 20 systems at 60 FPS.
+**Target**: <1.67ms per frame para actualizar 10k entidades @ 60 FPS (16.67ms presupuesto total).
 
-## Key Concepts: Event Sourcing and Immutable Logs
+## Key Concepts: Cache-Friendly Data Layouts and SIMD-Ready Structures
 
-Event sourcing inverts the traditional database model: instead of storing current state, store every state-changing event in an immutable log. The current state is derived by replaying events from the start.
+La disposición de datos en memoria determina la velocidad de caché y la capacidad de vectorización. Un motor ECS con arquitectura struct-of-arrays (SoA) es dramáticamente más rápido que array-of-structs (AoS) porque:
 
-This shift has profound implications:
-- **Audit trail is free**: Every change is a named event with timestamp and actor.
-- **Temporal queries are simple**: Replay events up to a past date to see historical state.
-- **Concurrency is safe**: Events are immutable and append-only, eliminating race conditions on state mutations.
-- **Testability is easier**: Given a sequence of events, the state is deterministic; no mocks needed.
+1. **Coherencia de caché**: Cuando un sistema (Physics) itera sobre Position y Velocity, la CPU carga ambos campos consecutivos en caché. Con AoS, los campos están dispersos entre entidades — memoria fragmentada, fallos de caché costosos.
 
-The BEAM is naturally suited for this pattern. Each aggregate (e.g., Account) is a GenServer that receives commands, validates them against current state, publishes an event if valid, then applies the event to update local state. The OTP supervision tree ensures persistence across restarts; the event log (in a database) survives the entire system.
+2. **Predicción de rama**: Los datos homogéneos permiten desenrollamiento de bucles (`for i in 0..n { positions[i] += velocities[i] * dt }`). Con structs heterogéneos, el compilador no sabe qué tamaño usar per loop.
 
-The downside: evolving schemas is hard. If you rename a field or split an event type, old events still use the old structure. Solutions include versioning (introduce `withdrew_v2` alongside `withdrew_v1`) or upcasting (projection functions that translate old events to new). Frameworks like Commanded automate this.
+3. **Vectorización SIMD**: Una operación `_mm256_add_pd` suma 4 doubles simultáneamente. Con datos contiguos, el compilador puede generar SIMD automáticamente. Con structs entrelazados, imposible.
 
-Another challenge: reads require replaying events, which is slow for 10-year-old aggregates with millions of events. Solution: snapshots. Periodically serialize current state; replay only events after the snapshot. This trades disk space for query speed, a worthwhile tradeoff for most systems.
+**En Elixir**: ETS con claves de la forma `{entity_id, ComponentType}` y un índice secundario por tipo es SoA: todas las Position están juntas en la tabla. Cuando Query itera sobre archetype, recupera 100 Position en secuencia — una sola llamada a `:ets.match/2` trae el bloque caché.
 
-**Production insight**: Event sourcing is powerful for audit-heavy systems (banking, compliance), but unnecessary overhead for simple CRUD apps. Choose event sourcing when the audit trail or temporal queries justify the implementation complexity.
+**Tradeoff**: SoA requiere más lógica para manejar jerarquías (una entidad es un map de componentes). AoS es más intuitivo pero pierde rendimiento por caché. Para juegos donde "60 FPS = 16.67ms de presupuesto", SoA es obligatorio.
 
 ---
 

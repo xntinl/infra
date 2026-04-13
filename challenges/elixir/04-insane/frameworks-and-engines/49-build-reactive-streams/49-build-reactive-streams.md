@@ -933,23 +933,45 @@ defmodule RStreams.Bench.Pipeline do
   alias RStreams.{Sources.FromList, Operators.Map, Operators.Filter, Subscription}
 
   @element_count 100_000
+  @iterations 5
 
   def run do
-    data = Enum.to_list(1..@element_count)
+    IO.puts("=== Reactive Streams Pipeline Throughput Benchmark ===")
+    IO.puts("Elements per run: #{@element_count}, Iterations: #{@iterations}\n")
+    
+    times = Enum.map(1..@iterations, fn i ->
+      IO.write("Iteration #{i}/#{@iterations}... ")
+      data = Enum.to_list(1..@element_count)
 
-    {time_us, results} =
-      :timer.tc(fn ->
-        {:ok, source} = FromList.start_link(data)
-        {:ok, mapped} = Map.start_link(source, &(&1 * 2))
-        {:ok, filtered} = Filter.start_link(mapped, &(rem(&1, 4) == 0))
-        collect_all_timed(filtered)
-      end)
+      {time_us, results} =
+        :timer.tc(fn ->
+          {:ok, source} = FromList.start_link(data)
+          {:ok, mapped} = Map.start_link(source, &(&1 * 2))
+          {:ok, filtered} = Filter.start_link(mapped, &(rem(&1, 4) == 0))
+          collect_all_timed(filtered)
+        end)
 
-    throughput = @element_count / (time_us / 1_000_000)
-    IO.puts("Elements:   #{@element_count}")
-    IO.puts("Time:       #{Float.round(time_us / 1000, 1)} ms")
-    IO.puts("Throughput: #{Float.round(throughput, 0)} elements/s")
-    IO.puts("Results:    #{length(results)} elements passed filter")
+      result_count = length(results)
+      expected_count = div(@element_count, 4)  # ~25k elements pass the filter
+      
+      if result_count == expected_count do
+        IO.puts("done (#{Float.round(time_us / 1000, 1)} ms)")
+      else
+        IO.puts("FAIL (got #{result_count}, expected #{expected_count})")
+      end
+      
+      time_us
+    end)
+
+    avg_time_us = Enum.sum(times) / @iterations
+    avg_time_ms = avg_time_us / 1000.0
+    throughput = @element_count / (avg_time_us / 1_000_000)
+    
+    IO.puts("\n=== Results ===")
+    IO.puts("Average time:  #{Float.round(avg_time_ms, 2)} ms")
+    IO.puts("Throughput:    #{Float.round(throughput, 0)} elements/sec")
+    IO.puts("Target:        >= 100k elements/sec (< 1ms for 100k)")
+    IO.puts("Status:        #{if throughput >= 100_000, do: "PASS", else: "FAIL"}")
   end
 
   defp collect_all_timed(publisher) do
@@ -969,7 +991,7 @@ defmodule RStreams.Bench.Pipeline do
     receive do
       {:done, results} -> results
     after
-      30_000 -> raise "Benchmark timeout"
+      30_000 -> raise "Benchmark timeout after 30s"
     end
   end
 
@@ -982,30 +1004,50 @@ defmodule RStreams.Bench.Pipeline do
 end
 
 RStreams.Bench.Pipeline.run()
-def main do
-  IO.puts("[RStreams.TCK.PublisherTest] GenServer demo")
-  :ok
-end
-
 ```
 
-## Key Concepts: Event Sourcing and Immutable Logs
+## Key Concepts: Demand-Driven Backpressure en Streaming
 
-Event sourcing inverts the traditional database model: instead of storing current state, store every state-changing event in an immutable log. The current state is derived by replaying events from the start.
+**Reactive Streams** resuelve un problema fundamental del streaming: qué pasa cuando el consumidor es lento.
 
-This shift has profound implications:
-- **Audit trail is free**: Every change is a named event with timestamp and actor.
-- **Temporal queries are simple**: Replay events up to a past date to see historical state.
-- **Concurrency is safe**: Events are immutable and append-only, eliminating race conditions on state mutations.
-- **Testability is easier**: Given a sequence of events, the state is deterministic; no mocks needed.
+### El problema: Push vs. Pull
 
-The BEAM is naturally suited for this pattern. Each aggregate (e.g., Account) is a GenServer that receives commands, validates them against current state, publishes an event if valid, then applies the event to update local state. The OTP supervision tree ensures persistence across restarts; the event log (in a database) survives the entire system.
+**Push (push-based)**: El productor emite datos cuando quiere. El consumidor tiene un buffer.
+- Si el productor es rápido: buffer crece → memory leak.
+- Si el consumidor desconecta: productor sigue enviando al vacío.
 
-The downside: evolving schemas is hard. If you rename a field or split an event type, old events still use the old structure. Solutions include versioning (introduce `withdrew_v2` alongside `withdrew_v1`) or upcasting (projection functions that translate old events to new). Frameworks like Commanded automate this.
+**Pull (pull-based)**: El consumidor solicita datos cuando está listo.
+- Memoria acotada: buffer = demanda pendiente.
+- Pausa automática: productor pausa si consumidor no solicita.
 
-Another challenge: reads require replaying events, which is slow for 10-year-old aggregates with millions of events. Solution: snapshots. Periodically serialize current state; replay only events after the snapshot. This trades disk space for query speed, a worthwhile tradeoff for most systems.
+**Reactive Streams**: Híbrido — el consumidor **señala demanda**, el productor **respeta esa demanda**.
 
-**Production insight**: Event sourcing is powerful for audit-heavy systems (banking, compliance), but unnecessary overhead for simple CRUD apps. Choose event sourcing when the audit trail or temporal queries justify the implementation complexity.
+### Mechanics de la demanda
+
+```
+1. Subscriber: request(3)   // "Dame 3 items"
+2. Producer:   on_next(a)   // Envío 1
+3. Producer:   on_next(b)   // Envío 2
+4. Producer:   on_next(c)   // Envío 3
+5. Producer:   [pausa]      // Demanda agotada, espero más request()
+6. Subscriber: request(2)   // "Dame 2 más"
+7. Producer:   on_next(d)   // Envío 4
+8. Producer:   on_next(e)   // Envío 5
+9. Producer:   [pausa]
+```
+
+**Invariante**: `emit_count <= accumulated_request_count` — nunca emites más de lo que se solicitó.
+
+### GenStage para BEAM
+
+Elixir implementa esto con **GenStage**, que mapea:
+- `Consumer.demand` ↔ RS `request(n)`.
+- `Producer.emit` ↔ RS `on_next`.
+- Stage como intermediario entre múltiples productores/consumidores.
+
+**Diferencia clave**: GenStage es **BEAM-idiomatic** (GenServer, supervition, etc.). RS es **portable** (misma semántica en JavaScript, Java, Python).
+
+Para compatibilidad cruzada (ej. conectar un Elixir producer a un Java consumer), implementas la especificación RS. Para puro BEAM, GenStage es más simple.
 
 ---
 

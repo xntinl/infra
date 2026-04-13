@@ -578,39 +578,100 @@ end
 ## Benchmark
 
 ```elixir
-# Minimal timing harness — replace with Benchee for production measurement.
-{time_us, _result} = :timer.tc(fn ->
-  # exercise the hot path N times
-  for _ <- 1..10_000, do: :ok
-end)
+# bench/concurrent_edits.exs
+defmodule Collab.Bench.ConcurrentEdits do
+  alias Collab.OT.{Operation, Transform, Apply}
 
-IO.puts("average: #{time_us / 10_000} µs per op")
-def main do
-  IO.puts("[Collab.OT.Apply] GenServer demo")
-  :ok
+  def run do
+    IO.puts("=== OT Convergence Throughput Benchmark ===\n")
+    
+    # Test 1: Apply operations on growing document
+    IO.write("Test 1: Document growth (100 inserts)... ")
+    {us1, final_doc1} = :timer.tc(fn ->
+      Enum.reduce(1..100, "", fn i, doc ->
+        op = %Operation{type: :insert, pos: String.length(doc), text: "x", clock: i, user_id: "u1"}
+        Apply.apply(doc, op)
+      end)
+    end)
+    IO.puts("done (#{us1} µs)")
+
+    # Test 2: Transform 1000 concurrent operation pairs
+    IO.write("Test 2: Transform 1k concurrent pairs... ")
+    {us2, _} = :timer.tc(fn ->
+      for i <- 1..1_000 do
+        op1 = %Operation{type: :insert, pos: 5, text: "A", clock: i, user_id: "user_a"}
+        op2 = %Operation{type: :insert, pos: 5, text: "B", clock: i, user_id: "user_b"}
+        _transformed = Transform.transform(op1, op2)
+      end
+    end)
+    IO.puts("done (#{us2} µs)")
+
+    # Test 3: Apply 10k remote operations on 10k-char document
+    IO.write("Test 3: Apply 10k ops on 10k-char doc... ")
+    base_doc = String.duplicate("x", 10_000)
+    {us3, _} = :timer.tc(fn ->
+      Enum.reduce(1..10_000, base_doc, fn i, doc ->
+        op = %Operation{type: :insert, pos: :rand.uniform(String.length(doc)), text: "y", clock: i, user_id: "remote"}
+        Apply.apply(doc, op)
+      end)
+    end)
+    per_op_us = us3 / 10_000.0
+    IO.puts("done (#{us3} µs total, #{Float.round(per_op_us, 2)} µs per op)")
+
+    # Results
+    IO.puts("\n=== Results ===")
+    IO.puts("Document growth:       #{us1} µs")
+    IO.puts("Transform throughput:  #{Float.round(1_000_000 / us2, 0)} pairs/sec")
+    IO.puts("Apply throughput:      #{Float.round(1_000_000 / per_op_us, 0)} ops/sec")
+    IO.puts("Per-op latency:        #{Float.round(per_op_us, 3)} µs")
+    IO.puts("Target:                < 1000 µs per op (1ms) on 10k-char doc")
+    
+    if per_op_us < 1000 do
+      IO.puts("Status:                PASS")
+    else
+      IO.puts("Status:                FAIL (#{Float.round(per_op_us / 1000, 1)}x slower)")
+    end
+  end
 end
 
+Collab.Bench.ConcurrentEdits.run()
 ```
 
-Target: <1ms to apply a remote op on a 10k-character document.
+**Target**: <1ms para aplicar una operación remota en documento de 10k caracteres.
 
-## Key Concepts: Event Sourcing and Immutable Logs
+## Key Concepts: Operational Transformation vs. CRDTs - Convergence Proofs
 
-Event sourcing inverts the traditional database model: instead of storing current state, store every state-changing event in an immutable log. The current state is derived by replaying events from the start.
+Los dos algoritmos fundamentales para edición colaborativa tienen semántica dramáticamente diferente:
 
-This shift has profound implications:
-- **Audit trail is free**: Every change is a named event with timestamp and actor.
-- **Temporal queries are simple**: Replay events up to a past date to see historical state.
-- **Concurrency is safe**: Events are immutable and append-only, eliminating race conditions on state mutations.
-- **Testability is easier**: Given a sequence of events, the state is deterministic; no mocks needed.
+### Operational Transformation (OT)
 
-The BEAM is naturally suited for this pattern. Each aggregate (e.g., Account) is a GenServer that receives commands, validates them against current state, publishes an event if valid, then applies the event to update local state. The OTP supervision tree ensures persistence across restarts; the event log (in a database) survives the entire system.
+Un servidor central recibe operaciones concurrentes de clientes y las **transforma** para que converjan:
+- Usuario A inserta "hello" @ pos 0.
+- Usuario B inserta "world" @ pos 0.
+- Servidor aplica A, luego transforma B para obtener pos = len("hello") = 5.
+- Resultado: "helloworld" determinístico.
 
-The downside: evolving schemas is hard. If you rename a field or split an event type, old events still use the old structure. Solutions include versioning (introduce `withdrew_v2` alongside `withdrew_v1`) or upcasting (projection functions that translate old events to new). Frameworks like Commanded automate this.
+**Matemática**: Hay dos propiedades:
+- **TP1 (Transformation Property 1)**: `apply(apply(doc, OP1), transform(OP2, OP1)) == apply(apply(doc, OP2), transform(OP1, OP2))` — ambos órdenes llegan al mismo resultado.
+- **TP2**: Identidad funcional — si OP1 y OP2 no se solapan, `transform(OP2, OP1) == OP2`.
 
-Another challenge: reads require replaying events, which is slow for 10-year-old aggregates with millions of events. Solution: snapshots. Periodically serialize current state; replay only events after the snapshot. This trades disk space for query speed, a worthwhile tradeoff for most systems.
+**Problema**: La implementación de `transform/2` es notoriamente frágil. Cada par (insert, insert), (insert, delete), (delete, delete) requiere caseado manual. Un error aquí causa divergencia permanente entre clientes. Múltiples papers han encontrado bugs en algoritmos "correctos" publicados.
 
-**Production insight**: Event sourcing is powerful for audit-heavy systems (banking, compliance), but unnecessary overhead for simple CRUD apps. Choose event sourcing when the audit trail or temporal queries justify the implementation complexity.
+### CRDT (Conflict-Free Replicated Data Type)
+
+Cada carácter lleva un identificador único que codifica orden causal:
+- User A inserta "h" @ (A, 1).
+- User B inserta "w" @ (B, 1).
+- Ambos clientes simplemente ordenan por ID: `(A,1):"h" < (B,1):"w"` si A < B lexicográficamente.
+- **No hay transformación**: solo aplicar y ordenar.
+
+**Ventaja**: Convergencia es **probada matemáticamente** — cualquier ordenamiento de los mismos operations lleva al mismo estado. No hay `transform/2` para bugear.
+
+**Desventaja**: Cada carácter requiere metadatos (user_id, clock) — 16+ bytes per char. Un documento de 10k caracteres = 160k+ overhead.
+
+### Trade-off para este ejercicio
+
+Para **enseñar**, implementamos OT porque requiere entender convergencia. Para **producción**, CRDT (Yjs, Automerge) es más seguro — la matemática garantiza corrección, no el caseado manual.
 
 ---
 

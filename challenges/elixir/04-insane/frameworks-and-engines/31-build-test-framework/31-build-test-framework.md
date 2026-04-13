@@ -130,10 +130,9 @@ mkdir -p lib/mytest/{formatter,property}
 mkdir -p test/mytest bench
 ```
 
-### Step 2: `mix.exs`
+### Step 2: `mix.exs` — dependencies
 
 **Objective**: Stay stdlib-only for the framework itself, proving we can rebuild ExUnit's surface without leaning on any test library.
-
 
 ```elixir
 defp deps do
@@ -143,55 +142,7 @@ defp deps do
 end
 ```
 
-### Dependencies (mix.exs)
-
-```elixir
-defmacro assert(expr) do
-  quote do
-    unless unquote(expr), do: raise "assertion failed"
-  end
-end
-```
-
-produces unhelpful errors: `assertion failed`. ExUnit's `assert` decomposes the expression AST to extract left-hand and right-hand sides:
-
-```
-assert 1 + 1 == 3
-  left: 2
-  right: 3
-```
-
-This requires pattern-matching on the quoted AST inside the macro:
-
-```elixir
-defmacro assert({:==, _, [left, right]}) do
-  quote do
-    lv = unquote(left)
-    rv = unquote(right)
-    unless lv == rv do
-      raise MyTest.AssertionError,
-        message: "Expected #{inspect(lv)} == #{inspect(rv)}",
-        left: lv, right: rv,
-        file: unquote(__CALLER__.file),
-        line: unquote(__CALLER__.line)
-    end
-  end
-end
-```
-
-Your `assert` must handle at minimum: `==`, `!=`, `<`, `>`, `<=`, `>=`, and bare boolean expressions.
-
----
-
-## Why property-based testing needs shrinking
-
-A generator finds a failing input `[99, -3, 0, 42]` for your sort function. Without shrinking, you debug a 4-element list. With shrinking, the framework finds the minimal failing case: `[-3]` or `[0, -1]`. Shrinking is what makes property-based testing practical.
-
-Each generator must implement a `shrink/1` function that returns a list of "smaller" values to try. Integers shrink toward 0. Lists shrink by removing elements and by shrinking elements individually. The shrinker tries each candidate in order, keeps the first that still fails, and recurses until no smaller failing case exists.
-
----
-
-## Implementation
+### Step 3: `lib/mytest/assertion.ex`
 
 ### Step 1: Create the project
 
@@ -966,39 +917,49 @@ The design separates concerns along their real axes: what must be correct (the t
 ## Benchmark
 
 ```elixir
-# Minimal timing harness — replace with Benchee for production measurement.
-{time_us, _result} = :timer.tc(fn ->
-  # exercise the hot path N times
-  for _ <- 1..10_000, do: :ok
-end)
+# bench/runner_bench.exs (complete benchmark harness)
+{:ok, _supervisor} = Task.Supervisor.start_link(name: :bench_supervisor)
 
-IO.puts("average: #{time_us / 10_000} µs per op")
-def main do
-  IO.puts("[MyTest.Runner.run] demo")
-  :ok
+defmodule BenchTest do
+  use MyTest.Case
+
+  for i <- 1..100 do
+    test "benchmark #{i}" do
+      assert 1 == 1
+    end
+  end
 end
 
+Benchee.run(
+  %{
+    "run 100 tests" => fn ->
+      MyTest.Runner.run([BenchTest])
+    end
+  },
+  time: 5,
+  warmup: 2
+)
 ```
 
 Target: <10ms to compile and run a 100-test file.
 
-## Key Concepts: Event Sourcing and Immutable Logs
+## Key Concepts: Compile-Time Test Accumulation and Isolation
 
-Event sourcing inverts the traditional database model: instead of storing current state, store every state-changing event in an immutable log. The current state is derived by replaying events from the start.
+A test framework's core responsibilities are:
 
-This shift has profound implications:
-- **Audit trail is free**: Every change is a named event with timestamp and actor.
-- **Temporal queries are simple**: Replay events up to a past date to see historical state.
-- **Concurrency is safe**: Events are immutable and append-only, eliminating race conditions on state mutations.
-- **Testability is easier**: Given a sequence of events, the state is deterministic; no mocks needed.
+1. **Test discovery** — find all test definitions without evaluating code.
+2. **Test isolation** — run each test in its own process so crashes don't leak.
+3. **Rich failure reporting** — show what was expected vs. what was observed.
+4. **Configurability** — support setup/teardown, tagging, filtering, and multiple formatters.
 
-The BEAM is naturally suited for this pattern. Each aggregate (e.g., Account) is a GenServer that receives commands, validates them against current state, publishes an event if valid, then applies the event to update local state. The OTP supervision tree ensures persistence across restarts; the event log (in a database) survives the entire system.
+MyTest implements these via:
 
-The downside: evolving schemas is hard. If you rename a field or split an event type, old events still use the old structure. Solutions include versioning (introduce `withdrew_v2` alongside `withdrew_v1`) or upcasting (projection functions that translate old events to new). Frameworks like Commanded automate this.
+- **Compile-time accumulation** (`@mytest_tests` attribute): tests are stored in the module beam file at compile time, not registered at runtime via a GenServer.
+- **Process-per-test** (`spawn` + `monitor`): each test runs in its own isolated process. Crashes, timeouts, and exceptions are captured without affecting other tests.
+- **AST introspection** (`assert`): macro decomposition extracts left/right operands from the quoted AST, enabling error messages like "Expected 2 == 3" instead of just "false".
+- **Shrinking** (`Shrinker`): property-based testing finds failing inputs, then shrinks to the minimal case for faster debugging.
 
-Another challenge: reads require replaying events, which is slow for 10-year-old aggregates with millions of events. Solution: snapshots. Periodically serialize current state; replay only events after the snapshot. This trades disk space for query speed, a worthwhile tradeoff for most systems.
-
-**Production insight**: Event sourcing is powerful for audit-heavy systems (banking, compliance), but unnecessary overhead for simple CRUD apps. Choose event sourcing when the audit trail or temporal queries justify the implementation complexity.
+Phoenix and ExUnit both use compile-time test accumulation via `__before_compile__`, proving this pattern's soundness at scale. MyTest rebuilds it from scratch to understand why.
 
 ---
 

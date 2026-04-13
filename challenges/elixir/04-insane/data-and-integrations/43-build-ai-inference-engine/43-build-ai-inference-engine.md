@@ -1293,28 +1293,43 @@ IO.puts("Median: #{Float.round(median, 1)} ms")
 IO.puts("P95:    #{Float.round(p95, 1)} ms")
 IO.puts("Target: < 100 ms")
 IO.puts("Pass:   #{if median < 100, do: "YES", else: "NO — consider NIF for matmul"}")
-def main do
-  IO.puts("[InferenceEngine.OpsTest.from_list] demo")
-  :ok
-end
-
 ```
 
-## Deep Dive: Conflict-Free Replicated Data Types (CRDTs) and Eventual Consistency
+## Quick start
 
-CRDTs are data structures designed so that concurrent updates from multiple replicas always converge to the same state without explicit coordination or consensus.
+To run the inference engine:
 
-**How it works**: Traditional merge requires agreement: if replica A says "x = 5" and replica B says "x = 10", which is correct? A CRDT avoids this by defining a merge operation that is commutative, associative, and idempotent. Given these properties, nodes can merge state in any order and always converge.
+```bash
+# Set up the project
+mix new inference_engine
+cd inference_engine
+mkdir -p lib/inference_engine test bench
 
-**Example: G-Counter (grow-only counter)**. Each node maintains a vector of counters, one per node. To increment, increment your own entry. Total is the sum of all entries. To merge two G-Counters, take element-wise max. This is commutative, associative, and idempotent: two nodes incrementing independently then merging always produce the same total, regardless of merge order.
+# Install dependencies
+mix deps.get
 
-**Trade-off: state size**. A G-Counter with 100 nodes is a 100-element vector. Decrement support (PN-Counter) requires 100 elements for increments and 100 for decrements (200 total). As the cluster grows, CRDT state balloons. Compaction (summing old entries into a delta) is necessary.
+# Run tests
+mix test
 
-**CRDT vs. Consensus**: Raft is strong consistency (all nodes agree on exact state, ordered updates). CRDTs are eventual consistency (nodes may disagree temporarily, then converge). CRDTs excel in offline-first scenarios (mobile app syncing later); Raft is better for systems requiring immediate agreement (bank transfers).
+# Run benchmark
+mix run bench/forward_pass.exs
+```
 
-**Gotcha**: Just because a CRDT converges does not mean it is correct for your application. A multi-user text document where two users edit the same location must use a CRDT that preserves intent (e.g., CRDT with unique node IDs). A naive counter cannot distinguish "User A inserted at position 10" from "User B inserted at position 10"—they both see increments and may converge to the wrong document.
+Expected output: All tests pass, including Conv2D correctness against NumPy baseline, quantization error under 1% on CIFAR-10, and forward pass of a 5-layer CNN on a 224×224×3 image in under 100ms.
 
-**Production patterns**: CRDTs shine for collaborative editing (Google Docs, Figma) and offline-first apps (mobile). For backends requiring strong consistency (databases, ledgers), Raft or other consensus is necessary. Many systems use both: CRDTs for user-facing edits, Raft for backend state.
+## Deep Dive: Neural Network Inference in Pure Elixir
+
+Building an ML inference engine in Elixir means threading the needle between correctness (tensors must match NumPy exactly), performance (100ms for a forward pass is tight), and maintainability (the code must be self-contained and auditable for safety-critical fraud detection).
+
+**Why not just call Python?** Every network call adds 30–80ms latency. In Elixir, the model and inference logic live in the same BEAM process, sharing memory. This eliminates serialization, TCP round-trips, and the operational complexity of managing two runtimes.
+
+**Why not use Nx/EXLA?** Nx is powerful and the path to production TensorFlow integration. For a learning exercise and a fraud detector that must ship in a single Elixir cluster, a focused implementation of five operators (Conv2D, Dense, BatchNorm, ReLU, Softmax) is more auditable and faster to debug than wrestling with the Nx/EXLA stack. Trade-off: you give up automatic differentiation (but inference does not need it) and GPU support (but int8 matmul on CPU with cache locality can keep up).
+
+**Why im2col?** A naive Conv2D is four nested loops. `im2col` transforms it into a single matrix multiply, which benefits from cache locality and parallelization. The cost: 3–5× memory during the forward pass. For a single inference request, this is acceptable.
+
+**Why int8 quantization?** Float32 weights are 4 bytes each. Int8 weights are 1 byte. A 500MB model becomes 125MB. More weights fit in L3 cache, so fewer RAM round-trips. Integer multiply is cheaper than float multiply on most CPUs. Accuracy loss is typically under 1% on calibration data. For a fraud detector that relies on confidence thresholds, this trade-off is favorable.
+
+**Key invariant**: the output of a forward pass must match NumPy's output to within floating-point rounding error. If your Conv2D produces a different result than PyTorch given the same weights and input, quantization error will compound through layers and destroy accuracy. Tests lock this down.
 
 ---
 

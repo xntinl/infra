@@ -755,24 +755,56 @@ mix test test/wasmex/ --exclude wasm_fixtures --trace
 
 The design separates concerns along their real axes: what must be correct (the WebAssembly interpreter invariants), what must be fast (the hot path isolated from slow paths), and what must be evolvable (external contracts kept narrow). Each module has one job and fails loudly when given inputs outside its contract, so bugs surface near their source instead of as mysterious downstream symptoms. The tests exercise the invariants directly rather than implementation details, which keeps them useful across refactors.
 
-## Benchmark
+## Benchmark workload
+
+El benchmark mide:
+1. **LEB128 decoding**: parsing overhead (codec is on the hot path).
+2. **Machine instruction dispatch**: evaluación de cada instrucción.
+3. **Recursive function calls**: frame stack overhead vs. BEAM call stack.
 
 ```elixir
-# Minimal timing harness — replace with Benchee for production measurement.
-{time_us, _result} = :timer.tc(fn ->
-  # exercise the hot path N times
-  for _ <- 1..10_000, do: :ok
-end)
+# bench/wasmex_bench.exs
+alias Wasmex.Parser.{Binary, LEB128}
+alias Wasmex.Runtime.Machine
+alias Wasmex.Module
 
-IO.puts("average: #{time_us / 10_000} µs per op")
-def main do
-  IO.puts("[Wasmex.Runtime.Frame.decode_unsigned] demo")
-  :ok
+# Pre-load test fixtures
+{:ok, fib_wasm} = File.read(Path.join(__DIR__, "../priv/fixtures/fib.wasm"))
+{:ok, fib_module} = Binary.parse(fib_wasm)
+{:ok, fib_instance} = Module.instantiate(fib_module, %{})
+
+# LEB128 codec performance
+leb_unsigned_1byte = <<42>>
+leb_unsigned_2byte = <<0xAC, 0x02>>
+leb_unsigned_5byte = <<0xFF, 0xFF, 0xFF, 0xFF, 0x0F>>
+
+defp call_fib(instance, n) do
+  {:ok, [{:i32, _result}]} = Machine.call(instance, "fib", [{:i32, n}])
 end
 
+Benchee.run(
+  %{
+    "LEB128 decode unsigned (1 byte)" => fn -> LEB128.decode_unsigned(leb_unsigned_1byte) end,
+    "LEB128 decode unsigned (2 bytes)" => fn -> LEB128.decode_unsigned(leb_unsigned_2byte) end,
+    "LEB128 decode unsigned (5 bytes)" => fn -> LEB128.decode_unsigned(leb_unsigned_5byte) end,
+    "LEB128 encode unsigned (128)" => fn -> LEB128.encode_unsigned(128) end,
+    "fib(10) recursive calls, 177 function invocations" => fn -> call_fib(fib_instance, 10) end,
+    "fib(15) recursive calls, 1973 function invocations" => fn -> call_fib(fib_instance, 15) end,
+    "fib(20) recursive calls, 21891 function invocations" => fn -> call_fib(fib_instance, 20) end
+  },
+  time: 5,
+  warmup: 2,
+  formatters: [Benchee.Formatters.Console]
+)
 ```
 
-Target: <10x slowdown vs native for an integer-heavy benchmark (fib, sha256).
+**Key metrics**:
+- LEB128 1-byte: < 1 µs (must be sub-microsecond)
+- LEB128 multi-byte: < 5 µs (parsing overhead acceptable)
+- fib(10): < 1 ms (frame overhead acceptable for plugin use case)
+- fib(20): < 100 ms (tree recursion is expensive, but predictable)
+
+**Acceptable slowdown**: 30-100x vs. native V8 (tree-walking interpreter vs. JIT). At this point, the interpreter is suitable for validation logic but not for compute-heavy plugins.
 
 ## Deep Dive: NIF Callbacks and BEAM Scheduling Implications
 
@@ -800,6 +832,74 @@ pub fn expensive_operation_nif(a: u32) -> u32 { expensive_operation(a) }
 ```
 
 **Production pattern**: Reserve dirty schedulers for truly blocking I/O. Measure scheduler utilization to confirm no starvation under load. Prefer Elixir async processes for I/O when possible; they are more observable and composable.
+
+---
+
+## Key Concepts: LEB128 Encoding and Stack Machine Semantics
+
+**LEB128 (Little Endian Base 128)**: Codificación variable-length que usa 7 bits de datos por byte, con el bit alto indicando si hay más bytes. Ejemplo: el número 300 (0x12C = 0b100101100):
+
+```
+300 en binario: 0b100101100 (9 bits)
+Dividir en grupos de 7 bits desde el LSB:
+  grupo 1: 0b0101100 (44 = 0x2C)
+  grupo 2: 0b0000010 (2 = 0x02)
+
+LEB128 encoding:
+  byte 1: 1 (continuation) | 0b0101100 = 0xAC
+  byte 2: 0 (final)        | 0b0000010 = 0x02
+  resultado: 0xAC 0x02
+
+Ventaja: números < 128 ocupan 1 byte (muy común en Wasm). Números grandes usan 2-5 bytes.
+```
+
+Para signed LEB128, el sign-extend se aplica si el MSB del último grupo está establecido:
+
+```
+-1 en signed LEB128:
+  -1 = 0xFFFFFFFF en 32-bit, pero en LEB128 se codifica compactamente:
+  7 bits de -1 es 0b1111111 = 0x7F (con MSB set)
+  → sign-extend → -1
+```
+
+**Stack machine execution model**: La máquina Wasm mantiene una pila de valores y un stack de frames de activación. Cada instrucción:
+
+1. **Pop** los argumentos de la pila
+2. **Compute** el resultado
+3. **Push** el resultado de vuelta
+
+Ejemplo: `i32.add`:
+
+```
+Stack antes: [a, b, ...]
+Operación: pop b, pop a, push (a + b) & 0xFFFFFFFF
+Stack después: [(a+b) & 0xFFFFFFFF, ...]
+```
+
+Las instrucciones de control (`if`, `block`, `loop`, `br`) manipulan el frame stack, no la pila de valores. Esto permite:
+
+- **Bloques estructurados**: nested control flow con un exit point explícito.
+- **Branches etiquetadas**: `br N` salta al label N (0 = bloque más interno, 1 = uno arriba, etc).
+
+**Frame stack vs. value stack**:
+
+```
+Frame stack (control flow):
+  [Frame3 (local vars), Frame2 (local vars), Frame1 (local vars)]
+     ↓
+     └── instructions para Frame1
+
+Value stack (data):
+  [v0, v1, v2, ...] ← top (se manipula por instrucciones)
+```
+
+Separar frames y valores permite que un `call` pushee un nuevo frame sin afectar los datos que están siendo computados.
+
+**Type system invariants (pre-execution validation)**:
+
+1. **All values are explicitly typed**: `:i32`, `:i64`, `:f32`, `:f64`. No hay conversiones implícitas.
+2. **Stack must be balanced at block boundaries**: El validator comprueba que antes de exit de un bloque, la pila tiene exactamente el número de resultados declarados.
+3. **Locals are typed and bounds-checked**: Acceso a un local fuera de rango es una trap.
 
 ---
 

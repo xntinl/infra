@@ -684,39 +684,58 @@ The design separates concerns along their real axes: what must be correct (the s
 ## Benchmark
 
 ```elixir
-# Minimal timing harness — replace with Benchee for production measurement.
-{time_us, _result} = :timer.tc(fn ->
-  # exercise the hot path N times
-  for _ <- 1..10_000, do: :ok
-end)
+# bench/meshex_bench.exs
+{:ok, _} = Meshex.MTLS.CertGenerator.generate_ca("mesh.local")
+Meshex.Retry.init_budget_table()
 
-IO.puts("average: #{time_us / 10_000} µs per op")
+Benchee.run(%{
+  "mtls_cert_extract_spiffe" => fn ->
+    cert = <<0, 0, 0, 0>>  # Placeholder for cert_der
+    Meshex.MTLS.CertGenerator.extract_spiffe_id(cert)
+  end,
+  "circuit_breaker_check" => fn ->
+    Meshex.CircuitBreaker.check({"svc-a", "svc-b"})
+  end,
+  "retry_exponential_backoff" => fn ->
+    fun = fn -> {:ok, :result} end
+    Meshex.Retry.with_retry(fun, max_attempts: 3)
+  end,
+  "tracing_extract_or_create" => fn ->
+    headers = %{"traceparent" => "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"}
+    Meshex.Tracing.extract_or_create(headers)
+  end,
+  "tracing_build_traceparent" => fn ->
+    Meshex.Tracing.build_traceparent("abc123def456abc123def456abc123de", "0102030405060708")
+  end
+}, time: 10, warmup: 3)
+
 def main do
-  IO.puts("[Meshex.CircuitBreaker] GenServer demo")
+  IO.puts("[Meshex] Service mesh sidecar proxy with mTLS, circuit breaking, retries, tracing")
+  IO.puts("Per-(source, destination) circuit breakers isolate failure domains")
+  IO.puts("Retry budget prevents amplification during cascading failures")
+  IO.puts("SPIFFE ephemeral certificates eliminate revocation overhead")
+  IO.puts("W3C TraceContext propagation enables distributed tracing across the mesh")
   :ok
 end
-
 ```
 
 Target: <100µs per-request proxy latency at p99 with mTLS enabled.
 
-## Key Concepts: Load Balancing Under Tail Latency
+## Key Concepts: Proxy Forwarding and Service Identity
 
-Load balancers distribute requests across backends. The choice of algorithm affects both latency distribution and fairness.
+A sidecar proxy sits between services, intercepting all inbound and outbound traffic. It enforces policy without code changes.
 
-**Round-robin**: Request i goes to backend (i % N). Simple and fair on average, but ignores backend state. If one backend is slow (e.g., garbage collection pause), clients hitting that backend wait, skewing the p99 latency.
+**mTLS (mutual TLS)**: Both client and server authenticate each other via X.509 certificates. Each service carries a certificate with a SPIFFE SVID (Service Partition Identity) in the Subject Alternative Name. The proxy verifies the peer's certificate before relaying traffic. This is stronger than single-direction TLS (where only the server authenticates).
 
-**Least connections**: Track open connections per backend; send the next request to the backend with fewest connections. Better than round-robin, but still ignores request complexity (a short read and a 10-second compute job are both "1 connection").
+**SPIFFE SVID format**: `spiffe://trust-domain/ns/namespace/sa/service-name`. Example: `spiffe://mesh.local/ns/default/sa/payment-api`. The trust domain is the mesh's identity root. Namespaces isolate services. The service account is the identity. Sidecars that can verify a peer's SPIFFE SVID know they are talking to the exact service they intended.
 
-**Power of two choices**: Pick two random backends and assign the request to the one with fewer connections. With minimal overhead, this reduces tail latency from O(log N) to O(log log N) because load is balanced more evenly without the cost of globally tracking all backends.
+**Per-(source, destination) circuit breakers**: A global circuit breaker per destination means one bad backend affects all callers. A per-pair breaker isolates: if `service-a → service-b` has high error rate but `service-c → service-b` is healthy, service-c continues normally. Cost: O(source × destination) breakers, which is manageable for most meshes.
 
-**Latency-aware (p99-driven)**: Track recent p99 latency per backend; prefer the backend with lowest p99. Powerful for SLA-driven systems, but can oscillate if multiple backends are competing for shared resources.
+**Retry budget**: Naive retries amplify failures. A global budget limits retries to X% of total traffic. When failures are widespread, retries are blocked to give the backend room to recover. Track retried requests and total requests per service pair; block retries if `retried / total > budget`.
 
-On a 100-node cluster, round-robin assigns 1% of traffic to each backend. If one is 10x slower, clients hitting it see 10x latency. With 1000 req/sec, that's 10 reqs/sec hitting the slow node, and each sees 10x latency, affecting the fleet's p99. Least connections or power-of-two reduces affected clients to a single one per decision.
+**W3C TraceContext propagation**: Each request carries a `traceparent: 00-{trace_id}-{span_id}-{flags}` header. The trace ID identifies the entire distributed transaction. Each proxy hop creates a new span ID while preserving the trace ID. This builds a trace tree across services. Without propagation, you lose visibility into multi-service transactions.
 
-The BEAM's `:poolboy` or `:connection_pool` naturally implement least-connections: each pool process tracks queue depth. A dispatcher sends new requests to the pool with the shortest queue. This is "power of two" with full visibility into actual queue depth, making it extremely effective.
-
-**Production insight**: Measuring load balancing on a single machine is misleading. Test against realistic backend variability (e.g., one slow backend, cascading failures) to see how your algorithm's tail latency behaves.
+**Production insight**: Proxies add latency (~1-5ms per hop). In a chain of 10 services, that's 10-50ms of overhead just from proxying. The mesh must justify this cost with reliability (circuit breaking, retries) and observability (tracing, metrics) benefits.
 
 ---
 

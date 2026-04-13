@@ -530,39 +530,55 @@ The design separates concerns along their real axes: what must be correct (the P
 ## Benchmark
 
 ```elixir
-# Minimal timing harness — replace with Benchee for production measurement.
-{time_us, _result} = :timer.tc(fn ->
-  # exercise the hot path N times
-  for _ <- 1..10_000, do: :ok
-end)
+# bench/swarm_bench.exs
+data = :crypto.strong_rand_bytes(10_000_000)  # 10MB file
+meta = Swarm.Metadata.from_binary("test.bin", data, 256 * 1024)
 
-IO.puts("average: #{time_us / 10_000} µs per op")
+{:ok, pm} = Swarm.PieceManager.start_link(num_pieces: Swarm.Metadata.num_pieces(meta))
+{:ok, rl} = Swarm.RateLimiter.start_link(capacity: 5_000_000, rate: 1_000_000)
+
+Benchee.run(%{
+  "rarest_piece_selection_10peers" => fn ->
+    for i <- 0..9 do
+      pieces = MapSet.new([i, i+1, i+2])
+      Swarm.PieceManager.update_peer_bitfield(pm, "peer#{i}", pieces)
+    end
+    Swarm.PieceManager.select_piece(pm, "peer0")
+  end,
+  "rate_limiter_token_bucket" => fn ->
+    Swarm.RateLimiter.consume(rl, "peer0", 65536)
+  end,
+  "metadata_piece_range" => fn ->
+    Swarm.Metadata.piece_range(meta, rem(:rand.uniform(1000), Swarm.Metadata.num_pieces(meta)))
+  end
+}, time: 10, warmup: 3)
+
 def main do
-  IO.puts("[Swarm.PieceManagerTest] GenServer demo")
+  IO.puts("[Swarm] BitTorrent-inspired P2P file sharing with DHT")
+  IO.puts("Rarest-first piece selection maximizes swarm distribution")
+  IO.puts("Kademlia DHT enables peer discovery without a central tracker")
+  IO.puts("Token bucket rate limiting prevents peer saturation and balances uploads")
   :ok
 end
-
 ```
 
 Target: swarm of 100 peers should saturate available bandwidth within 30s of first-piece exchange.
 
-## Key Concepts: Load Balancing Under Tail Latency
+## Key Concepts: P2P Protocols and Distributed Hash Tables
 
-Load balancers distribute requests across backends. The choice of algorithm affects both latency distribution and fairness.
+P2P systems have no central authority. Peers discover each other through a DHT and negotiate transfers using message protocols.
 
-**Round-robin**: Request i goes to backend (i % N). Simple and fair on average, but ignores backend state. If one backend is slow (e.g., garbage collection pause), clients hitting that backend wait, skewing the p99 latency.
+**Kademlia DHT**: A distributed hash table organizing nodes in a 160-bit keyspace. Each node has a unique 160-bit ID. Distance between nodes is XOR (not geographic). The routing table has 160 k-buckets; bucket i holds contacts whose IDs differ in the i-th bit. Lookups are iterative: ask the closest nodes for closer contacts, halving distance each step. O(log n) hops to find any key in a network of n nodes.
 
-**Least connections**: Track open connections per backend; send the next request to the backend with fewest connections. Better than round-robin, but still ignores request complexity (a short read and a 10-second compute job are both "1 connection").
+**XOR metric and triangle inequality**: XOR distance is critical. For any three points A, B, C, the XOR triangle inequality `dist(A,C) ≤ dist(A,B) ⊕ dist(B,C)` holds. This guarantees that each lookup step halves the maximum remaining distance, preventing dead ends.
 
-**Power of two choices**: Pick two random backends and assign the request to the one with fewer connections. With minimal overhead, this reduces tail latency from O(log N) to O(log log N) because load is balanced more evenly without the cost of globally tracking all backends.
+**Rarest-first piece selection**: Pieces that fewer peers have are downloaded first. This maximizes piece diversity. If 90% of peers request popular pieces first, rare pieces become extremely scarce, and peers cannot bootstrap off each other. Rarest-first distributes rare pieces first, enabling the swarm to propagate all pieces.
 
-**Latency-aware (p99-driven)**: Track recent p99 latency per backend; prefer the backend with lowest p99. Powerful for SLA-driven systems, but can oscillate if multiple backends are competing for shared resources.
+**Tit-for-tat choking algorithm**: Upload to peers who upload to you. This incentivizes contribution and prevents free-riding. Every 10 seconds, unchoke the top N uploaders (measured by recent download rate) and one random peer (optimistic unchoking, for exploration). Choke peers with low upload rate.
 
-On a 100-node cluster, round-robin assigns 1% of traffic to each backend. If one is 10x slower, clients hitting it see 10x latency. With 1000 req/sec, that's 10 reqs/sec hitting the slow node, and each sees 10x latency, affecting the fleet's p99. Least connections or power-of-two reduces affected clients to a single one per decision.
+**Token bucket for rate limiting**: Tokens accumulate at a fixed rate. Each transfer consumes tokens proportional to bytes sent. With capacity C and rate R tokens/sec, sustained throughput is capped at R, but bursts up to C are allowed. If rate is 1MB/s and capacity is 5MB, a peer can send 5MB immediately, then must wait 4 seconds for the next 5MB batch.
 
-The BEAM's `:poolboy` or `:connection_pool` naturally implement least-connections: each pool process tracks queue depth. A dispatcher sends new requests to the pool with the shortest queue. This is "power of two" with full visibility into actual queue depth, making it extremely effective.
-
-**Production insight**: Measuring load balancing on a single machine is misleading. Test against realistic backend variability (e.g., one slow backend, cascading failures) to see how your algorithm's tail latency behaves.
+**Production insight**: P2P systems are vulnerable to sybil attacks (one attacker runs many peers), eclipse attacks (attacker becomes the only neighbor), and free-riding. Rarest-first, tit-for-tat, and diversity in k-bucket selection mitigate these but don't eliminate them.
 
 ---
 

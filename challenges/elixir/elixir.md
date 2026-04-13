@@ -330,7 +330,7 @@ Elixir añade sobre Erlang una sintaxis moderna y expresiva, metaprogramación p
       
       
       
-      
+      * solo ingles
 ⏺ 1. Proyecto independiente por ejercicio con explicación corta de qué trata
   2. Estructura de proyecto al inicio (árbol de directorios completo)
   3. Código 100% resuelto, sin TODO, sin HINT

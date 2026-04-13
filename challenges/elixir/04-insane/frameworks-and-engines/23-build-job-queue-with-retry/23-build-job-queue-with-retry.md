@@ -86,18 +86,6 @@ mkdir -p lib/jobqueue test/jobqueue bench
 
 **Objective**: Pull in Benchee for throughput measurements and StreamData for property-based invariants over retry and cron logic.
 
-
-```elixir
-defp deps do
-  [
-    {:benchee, "~> 1.3", only: :dev},
-    {:stream_data, "~> 0.6", only: :test}
-  ]
-end
-```
-
-### Dependencies (mix.exs)
-
 ```elixir
 defp deps do
   [
@@ -579,36 +567,42 @@ Jobs enqueue into ETS and append to a WAL before acknowledging; workers claim jo
 ## Benchmark
 
 ```elixir
-# bench/queue_bench.exs
-Benchee.run(%{"enqueue" => fn -> Queue.enqueue(job()) end}, time: 10)
-def main do
-  IO.puts("[Jobqueue.RetryTest] GenServer demo")
-  :ok
+# bench/jobqueue_bench.exs (complete benchmark harness)
+{:ok, jq} = Jobqueue.start_link()
+
+defmodule NullWorker do
+  def perform(_args), do: :ok
 end
 
+Benchee.run(
+  %{
+    "enqueue + complete (no persistence)" => fn ->
+      {:ok, job} = Jobqueue.enqueue(jq, NullWorker, %{})
+      Jobqueue.run_now(jq, job.id)
+    end
+  },
+  parallel: 4,
+  time: 5,
+  warmup: 2,
+  formatters: [Benchee.Formatters.Console]
+)
 ```
 
 Target: 10,000 jobs/second processed end-to-end with retry and persistence enabled.
 
 ---
 
-## Key Concepts: Event Sourcing and Immutable Logs
+## Key Concepts: Job Queue Design with Retries and Scheduling
 
-Event sourcing inverts the traditional database model: instead of storing current state, store every state-changing event in an immutable log. The current state is derived by replaying events from the start.
+A job queue bridges synchronous request processing and asynchronous work execution. Its core responsibilities are:
 
-This shift has profound implications:
-- **Audit trail is free**: Every change is a named event with timestamp and actor.
-- **Temporal queries are simple**: Replay events up to a past date to see historical state.
-- **Concurrency is safe**: Events are immutable and append-only, eliminating race conditions on state mutations.
-- **Testability is easier**: Given a sequence of events, the state is deterministic; no mocks needed.
+1. **Durable persistence** — jobs are written to storage (WAL, database) before acknowledgment; crashes don't lose work.
+2. **Ordered dequeue** — jobs are claimed via optimistic locking or compare-and-swap to prevent duplicate execution.
+3. **Exponential backoff with jitter** — failed jobs retry with increasing delays plus randomization to avoid thundering-herd effects.
+4. **Dependency resolution** — jobs can depend on other jobs; dependents wait in `waiting` state until prerequisites complete.
+5. **Scheduling** — jobs with `run_at` timestamps are polled and moved to `queued` only when ready.
 
-The BEAM is naturally suited for this pattern. Each aggregate (e.g., Account) is a GenServer that receives commands, validates them against current state, publishes an event if valid, then applies the event to update local state. The OTP supervision tree ensures persistence across restarts; the event log (in a database) survives the entire system.
-
-The downside: evolving schemas is hard. If you rename a field or split an event type, old events still use the old structure. Solutions include versioning (introduce `withdrew_v2` alongside `withdrew_v1`) or upcasting (projection functions that translate old events to new). Frameworks like Commanded automate this.
-
-Another challenge: reads require replaying events, which is slow for 10-year-old aggregates with millions of events. Solution: snapshots. Periodically serialize current state; replay only events after the snapshot. This trades disk space for query speed, a worthwhile tradeoff for most systems.
-
-**Production insight**: Event sourcing is powerful for audit-heavy systems (banking, compliance), but unnecessary overhead for simple CRUD apps. Choose event sourcing when the audit trail or temporal queries justify the implementation complexity.
+Jobqueue trades Postgres-backed durability (used by Oban) for an in-memory queue with a write-ahead log (WAL). This design scales to 10k jobs/second because WAL appends are faster than SQL inserts, and in-memory lookup avoids database round trips.
 
 ---
 

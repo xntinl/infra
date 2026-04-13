@@ -83,15 +83,6 @@ mkdir -p lib/poolex test/poolex bench
 
 **Objective**: Only `benchee` — the pool mechanics, monitors, and queue must come from you, not from poolboy or NimblePool.
 
-
-```elixir
-defp deps do
-  [
-    {:benchee, "~> 1.3", only: :dev}
-  ]
-end
-```
-
 ### Dependencies (mix.exs)
 
 ```elixir
@@ -470,10 +461,28 @@ defmodule Poolex.CrashTest do
 end
 ```
 
+---
+
+## Quick start
+
+**Prerequisites**: Elixir 1.14+, OTP 25+
+
+**Setup and run**:
+```bash
+mix test test/poolex/ --trace
+mix run -e "IO.puts(\"Poolex module loaded\")"
+```
+
+**Run benchmarks**:
+```bash
+mix run bench/poolex_bench.exs
+```
+
+---
+
 ### Step 7: Run the tests
 
 **Objective**: Tests are `async: false` because the pool is a named singleton — parallel runs cross-contaminate checked-out worker state.
-
 
 ```bash
 mix test test/poolex/ --trace
@@ -518,17 +527,31 @@ Workers register with the pool when idle and deregister when busy; `checkout/1` 
 
 ## Benchmark
 
-```elixir
-# bench/pool_bench.exs
-Benchee.run(%{"checkout" => fn -> Pool.transaction(fn _ -> :ok end) end}, parallel: 50, time: 10)
-def main do
-  IO.puts("[Poolex.PoolServer] GenServer demo")
-  :ok
-end
+**Objective**: Measure checkout+checkin throughput under sustained concurrent load and verify priority queue fairness.
 
-```
+**Expected results**:
+- `checkout/1` latency (idle pool): 10–20 microseconds
+- `checkout/1` latency (saturated pool, queued): 100–500 microseconds
+- Throughput (100 workers, 200 concurrent callers): 50,000–100,000 ops/sec
+- Overflow worker creation overhead: < 1 millisecond per overflow
 
-Target: 50,000 checkouts/second on a 100-worker pool; p99 checkout latency < 200 µs.
+**Test scenarios**:
+1. Baseline: single worker, repeated checkout/checkin
+2. Saturation: 100 workers, 200 concurrent checkout requests
+3. Priority skew: 50% high, 30% normal, 20% low priority callers
+4. Crash injection: random worker deaths, verify replacement latency
+
+**Measurement methodology**:
+- Warmup: 500 ops to stabilize pool state
+- Measure: 10,000 ops per scenario
+- Report: p50, p99, p99.9 latencies
+- Pool size: 10–100 workers
+- Caller concurrency: 4–200 parallel tasks
+
+**Interpretation**:
+Baseline latency scales with GenServer mailbox contention. Saturation latency reflects queue-draining and worker dispatch. Priority queue should reduce p99 for high-priority callers by 50–70% relative to FIFO under mixed workloads.
+
+If p99 > 1 ms: investigate whether GenServer is accumulating too many pending messages or whether the priority queue is being drained inefficiently.
 
 ---
 

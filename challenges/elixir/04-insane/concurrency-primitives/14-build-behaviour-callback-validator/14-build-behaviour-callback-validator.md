@@ -338,10 +338,29 @@ defmodule BehaviourCheck.InheritanceTest do
 end
 ```
 
+---
+
+## Quick start
+
+**Prerequisites**: Elixir 1.14+, OTP 25+
+
+**Setup and run**:
+```bash
+mix test test/behaviour_check/ --trace
+mix behaviour.check
+```
+
+**Validate your implementation**:
+```bash
+mix compile
+echo "Exit code: $?"
+```
+
+---
+
 ### Step 7: Run the tests
 
 **Objective**: Run with `--trace` so per-test timing surfaces any accidental full-PLT-style analysis that would break the "fast metadata" design goal.
-
 
 ```bash
 mix test test/behaviour_check/ --trace
@@ -367,17 +386,31 @@ The `@after_compile` callback inspects the module's `__info__(:functions)` and c
 
 ## Benchmark
 
-```elixir
-# bench/validator_bench.exs
-:timer.tc(fn -> Code.compile_file("lib/sample.ex") end)
-def main do
-  IO.puts("[BehaviourCheck.Compiler.load] demo")
-  :ok
-end
+**Objective**: Measure validation overhead on project compile and verify it scales linearly.
 
-```
+**Expected results**:
+- 10-module project: < 5 ms validation overhead
+- 50-module project: < 20 ms validation overhead
+- 200-module project: < 100 ms validation overhead
+- Per-module callback loading: < 1 ms (ETS + introspection cost)
+- Diagnostic emission: < 100 microseconds per violation
 
-Target: Validation adds < 100 ms to `mix compile` even on a 200-module project.
+**Test scenarios**:
+1. Zero violations: establish baseline validation time
+2. 10% modules with required callbacks missing: measure error accumulation
+3. 20% modules with optional callbacks missing: measure warning volume
+4. Mixed violations: test filtering and reporting throughput
+5. Recursive behaviour inheritance: 5 levels deep (A extends B extends C...)
+
+**Measurement methodology**:
+- Time from `@after_compile` entry to `:ok` or `{:error, diagnostics}` return
+- Use `:timer.tc/1` to capture wall-clock time
+- Report compilation speed: modules/second (target: > 100 modules/sec)
+
+**Interpretation**:
+The validator should be sublinear in modules because each module's validation is independent. If compile time grows quadratically, investigate whether the callback loader is re-reading beam files instead of caching or whether diagnostic printing is blocking.
+
+If validation adds > 200 ms on a 200-module project: the design has regressed. Profile to determine whether the bottleneck is `:beam_lib` I/O, spec parsing, or diagnostic formatting.
 
 ---
 

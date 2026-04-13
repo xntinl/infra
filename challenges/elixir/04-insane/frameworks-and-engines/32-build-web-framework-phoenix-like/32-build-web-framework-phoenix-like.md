@@ -119,62 +119,9 @@ mkdir -p lib/nova/{transport,template,websocket}
 mkdir -p test/nova bench
 ```
 
-### Step 2: `mix.exs`
+### Step 2: `mix.exs` — dependencies
 
 **Objective**: Declare the Mix project configuration and third-party dependencies.
-
-
-```elixir
-defp deps do
-  [
-    {:jason, "~> 1.4"},
-    {:benchee, "~> 1.3", only: :dev}
-  ]
-end
-```
-
-### Dependencies (mix.exs)
-
-```elixir
-def match("GET", ["users", id], conn), do: UserController.show(conn, %{id: id})
-def match("GET", ["users"], conn),     do: UserController.index(conn, %{})
-def match(_, _, conn),                 do: send_resp(conn, 404, "Not Found")
-```
-
-BEAM's pattern matching dispatches in O(1) — the compiler generates a hash-based jump table for function clause dispatch. A router with 1000 routes performs identically to one with 10 routes.
-
----
-
-## Why WebSocket key derivation uses SHA-1 (and why that's fine)
-
-The `Sec-WebSocket-Accept` header is computed as:
-
-```
-Base64(SHA-1(client_key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))
-```
-
-SHA-1 is considered cryptographically broken for general use but is safe here: the magic GUID makes length-extension attacks irrelevant, and the purpose is not confidentiality — it is handshake verification to prevent non-browser HTTP clients from accidentally connecting to WebSocket endpoints. TLS provides the actual confidentiality.
-
----
-
-## Implementation
-
-### Step 1: Create the project
-
-**Objective**: Scaffold the web framework phoenix like Mix project with the required directory layout.
-
-
-```bash
-mix new nova --sup
-cd nova
-mkdir -p lib/nova/{transport,template,websocket}
-mkdir -p test/nova bench
-```
-
-### Step 2: `mix.exs`
-
-**Objective**: Declare the Mix project configuration and third-party dependencies.
-
 
 ```elixir
 defp deps do
@@ -799,39 +746,45 @@ The design separates concerns along their real axes: what must be correct (the P
 ## Benchmark
 
 ```elixir
-# Minimal timing harness — replace with Benchee for production measurement.
-{time_us, _result} = :timer.tc(fn ->
-  # exercise the hot path N times
-  for _ <- 1..10_000, do: :ok
-end)
-
-IO.puts("average: #{time_us / 10_000} µs per op")
-def main do
-  IO.puts("[Nova.Conn.send_resp] demo")
-  :ok
+# bench/router_bench.exs (complete example)
+defmodule BenchRouter do
+  use Nova.Router
+  for i <- 1..100 do
+    get "/resource#{i}/:id", FakeController, :show
+  end
 end
 
+Benchee.run(
+  %{
+    "route dispatch (100 routes)" => fn ->
+      conn = %Nova.Conn{method: "GET", path_segments: ["resource50", "99"]}
+      BenchRouter.match("GET", ["resource50", "99"], conn)
+    end
+  },
+  time: 5,
+  warmup: 2
+)
 ```
 
 Target: <1µs dispatch for a 100-route application.
 
-## Key Concepts: Event Sourcing and Immutable Logs
+## Key Concepts: Web Framework Routing and Middleware
 
-Event sourcing inverts the traditional database model: instead of storing current state, store every state-changing event in an immutable log. The current state is derived by replaying events from the start.
+A web framework's core responsibility is to:
 
-This shift has profound implications:
-- **Audit trail is free**: Every change is a named event with timestamp and actor.
-- **Temporal queries are simple**: Replay events up to a past date to see historical state.
-- **Concurrency is safe**: Events are immutable and append-only, eliminating race conditions on state mutations.
-- **Testability is easier**: Given a sequence of events, the state is deterministic; no mocks needed.
+1. **Parse HTTP requests** — convert raw TCP bytes into structured request objects (method, path, headers, body).
+2. **Route to handlers** — match incoming paths against declared routes and dispatch to the appropriate controller action.
+3. **Execute middleware pipeline** — intercept requests before they reach handlers and responses before they are sent.
+4. **Send HTTP responses** — serialize response data into valid HTTP bytes.
 
-The BEAM is naturally suited for this pattern. Each aggregate (e.g., Account) is a GenServer that receives commands, validates them against current state, publishes an event if valid, then applies the event to update local state. The OTP supervision tree ensures persistence across restarts; the event log (in a database) survives the entire system.
+Nova implements these four layers in a single codebase, starting from raw sockets:
 
-The downside: evolving schemas is hard. If you rename a field or split an event type, old events still use the old structure. Solutions include versioning (introduce `withdrew_v2` alongside `withdrew_v1`) or upcasting (projection functions that translate old events to new). Frameworks like Commanded automate this.
+- **Transport layer** (`tcp_server.ex`, `http_parser.ex`): Accept TCP connections and parse HTTP/1.1 syntax.
+- **Routing layer** (`router.ex`): Use compile-time macros to generate pattern-match function clauses, achieving O(1) dispatch.
+- **Middleware layer** (`plug.ex`): Chain request-response transformations as module functions, each aware of the connection struct.
+- **Response layer** (`conn.ex`): Provide helpers to set status, headers, and body; render templates via EEx compilation.
 
-Another challenge: reads require replaying events, which is slow for 10-year-old aggregates with millions of events. Solution: snapshots. Periodically serialize current state; replay only events after the snapshot. This trades disk space for query speed, a worthwhile tradeoff for most systems.
-
-**Production insight**: Event sourcing is powerful for audit-heavy systems (banking, compliance), but unnecessary overhead for simple CRUD apps. Choose event sourcing when the audit trail or temporal queries justify the implementation complexity.
+Phoenix's architecture follows this same pattern but adds Cowboy (socket management), Plug (middleware standardization), and LiveView (real-time state sync). Nova's challenge is to build the essentials without those transitive dependencies.
 
 ---
 

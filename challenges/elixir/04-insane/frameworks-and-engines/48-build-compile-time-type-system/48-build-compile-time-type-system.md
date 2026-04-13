@@ -783,30 +783,47 @@ end
 # Run with: mix run bench/compile_overhead.exs
 defmodule TypeCheck.Bench.CompileOverhead do
   @num_functions 50
+  @num_iterations 5
 
   def run do
-    baseline_code = generate_module(false)
-    annotated_code = generate_module(true)
+    IO.puts("=== TypeCheck Compile Overhead Benchmark ===")
+    IO.puts("Testing #{@num_functions} functions, #{@num_iterations} iterations per config\n")
+    
+    baseline_times = measure_baseline()
+    annotated_times = measure_annotated()
 
-    baseline_times = Enum.map(1..5, fn _ ->
+    baseline_avg = Enum.sum(baseline_times) / @num_iterations
+    annotated_avg = Enum.sum(annotated_times) / @num_iterations
+    overhead_pct = (annotated_avg - baseline_avg) / baseline_avg * 100
+
+    IO.puts("\n=== Results ===")
+    IO.puts("Baseline avg:  #{Float.round(baseline_avg / 1000, 2)} ms")
+    IO.puts("Annotated avg: #{Float.round(annotated_avg / 1000, 2)} ms")
+    IO.puts("Overhead:      #{Float.round(overhead_pct, 1)}%")
+    IO.puts("Target:        < 10% overhead")
+    IO.puts("Status:        #{if overhead_pct < 10, do: "PASS", else: "FAIL"}")
+  end
+
+  defp measure_baseline do
+    IO.write("Baseline runs:  ")
+    Enum.map(1..@num_iterations, fn i ->
+      IO.write(".")
+      baseline_code = generate_module(false)
       {us, _} = :timer.tc(fn -> Code.eval_string(baseline_code) end)
       us
     end)
+    IO.puts(" done")
+  end
 
-    annotated_times = Enum.map(1..5, fn _ ->
+  defp measure_annotated do
+    IO.write("TypeCheck runs: ")
+    Enum.map(1..@num_iterations, fn i ->
+      IO.write(".")
+      annotated_code = generate_module(true)
       {us, _} = :timer.tc(fn -> Code.eval_string(annotated_code) end)
       us
     end)
-
-    baseline_avg = Enum.sum(baseline_times) / 5
-    annotated_avg = Enum.sum(annotated_times) / 5
-    overhead_pct = (annotated_avg - baseline_avg) / baseline_avg * 100
-
-    IO.puts("Baseline avg:  #{Float.round(baseline_avg / 1000, 1)} ms")
-    IO.puts("Annotated avg: #{Float.round(annotated_avg / 1000, 1)} ms")
-    IO.puts("Overhead:      #{Float.round(overhead_pct, 1)}%")
-    IO.puts("Target:        < 10%")
-    IO.puts("Pass:          #{if overhead_pct < 10, do: "YES", else: "NO"}")
+    IO.puts(" done")
   end
 
   defp generate_module(with_type_check) do
@@ -840,30 +857,23 @@ defmodule TypeCheck.Bench.CompileOverhead do
 end
 
 TypeCheck.Bench.CompileOverhead.run()
-def main do
-  IO.puts("[TypeCheck.union] demo")
-  :ok
-end
-
 ```
 
-## Key Concepts: Event Sourcing and Immutable Logs
+## Key Concepts: Compile-Time Type Inference y Macro Expansion Phases
 
-Event sourcing inverts the traditional database model: instead of storing current state, store every state-changing event in an immutable log. The current state is derived by replaying events from the start.
+Los type checkers basados en macros ejecutan en **tiempo de compilación**, no runtime. Esto tiene implicaciones profundas:
 
-This shift has profound implications:
-- **Audit trail is free**: Every change is a named event with timestamp and actor.
-- **Temporal queries are simple**: Replay events up to a past date to see historical state.
-- **Concurrency is safe**: Events are immutable and append-only, eliminating race conditions on state mutations.
-- **Testability is easier**: Given a sequence of events, the state is deterministic; no mocks needed.
+1. **Recolección de errores sin costo latency**: Un mismatch `x + 1` cuando `x: string` se captura durante `mix compile`, no después de `mix test` o peor, en producción.
 
-The BEAM is naturally suited for this pattern. Each aggregate (e.g., Account) is a GenServer that receives commands, validates them against current state, publishes an event if valid, then applies the event to update local state. The OTP supervision tree ensures persistence across restarts; the event log (in a database) survives the entire system.
+2. **Zero runtime overhead**: El type checker emite un CompileError y detiene el build. El código compilado no contiene ningún runtime check, ninguna instrucción BEAM. El tiempo de ejecución es idéntico al código sin types.
 
-The downside: evolving schemas is hard. If you rename a field or split an event type, old events still use the old structure. Solutions include versioning (introduce `withdrew_v2` alongside `withdrew_v1`) or upcasting (projection functions that translate old events to new). Frameworks like Commanded automate this.
+3. **Type erasure**: Al igual que TypeScript, los tipos existen solo en la compilación. El BEAM bytecode final no sabe nada de tipos. Dialyzer, por otro lado, ejecuta un análisis **post-hoc** — después de que el código ya está compilado.
 
-Another challenge: reads require replaying events, which is slow for 10-year-old aggregates with millions of events. Solution: snapshots. Periodically serialize current state; replay only events after the snapshot. This trades disk space for query speed, a worthwhile tradeoff for most systems.
+4. **Alcance limitado pero confiable**: Un macro ve solo la AST del módulo actual. No puede rastrear tipos a través de module boundaries sin una base de datos global (Dialyzer sí). Pero lo que sí puede hacer es 100% correcto: si infiere una posición en el AST, esa es la ubicación exacta del error.
 
-**Production insight**: Event sourcing is powerful for audit-heavy systems (banking, compliance), but unnecessary overhead for simple CRUD apps. Choose event sourcing when the audit trail or temporal queries justify the implementation complexity.
+5. **Macro expansion order**: Las fases Elixir corren en orden: `expand_macros` → `compile_def` → `bytecode`. Un macro que ocurre en fase 1 puede rechazar un `def` antes de que alcance la fase 2. Pero si el macro está dentro de otro macro que corre después, se pierde. Siempre usa `@before_compile` para garantizar último-en-correr.
+
+**Trade-off clave**: Ganamos detectabilidad temprana + zero overhead. Perdemos capacidad de capturar errores en boundaries entre módulos sin metadatos compartidos. Para un sistema en una codebase, es suficiente.
 
 ---
 

@@ -703,16 +703,182 @@ Writes hit an in-memory skiplist; when it fills, it's flushed as an immutable SS
 ## Benchmark
 
 ```elixir
-# bench/lsm_bench.exs
-Benchee.run(%{"put" => fn -> Lsm.put(db, k(), v()) end, "get" => fn -> Lsm.get(db, k()) end}, time: 10)
-def main do
-  IO.puts("[Lsmex.Engine] GenServer demo")
-  :ok
+# bench/lsmex_bench.exs — LSM-tree comprehensive benchmark with write amplification
+# mix run bench/lsmex_bench.exs
+
+defmodule LsmexBench do
+  @doc "Measures LSM throughput, compaction cost, and write amplification."
+  def run do
+    dir = System.tmp_dir!() <> "/lsmex_bench_#{:erlang.unique_integer([:positive])}"
+    File.mkdir_p!(dir)
+    {:ok, engine} = Lsmex.Engine.start_link(data_dir: dir)
+
+    IO.puts("=== LSM-Tree Benchmark (v3 standard) ===\n")
+
+    # Phase 1: Sequential write throughput (memtable)
+    IO.puts("Phase 1: Sequential write throughput")
+    measure_sequential_writes(engine)
+
+    # Phase 2: Random write throughput (compaction pressure)
+    IO.puts("\nPhase 2: Random write throughput (mixed with compaction)")
+    measure_random_writes(engine)
+
+    # Phase 3: Random read throughput (warm Bloom filter)
+    IO.puts("\nPhase 3: Random read latency (warm Bloom filter)")
+    measure_random_reads(engine)
+
+    # Phase 4: Non-existent key reads (Bloom filter skip rate)
+    IO.puts("\nPhase 4: Non-existent key reads (Bloom filter effectiveness)")
+    measure_bloom_skip(engine)
+
+    # Phase 5: Range scan performance
+    IO.puts("\nPhase 5: Range scan performance")
+    measure_range_scan(engine)
+
+    # Cleanup
+    GenServer.stop(engine)
+    File.rm_rf!(dir)
+  end
+
+  defp measure_sequential_writes(engine) do
+    Benchee.run(
+      %{
+        "sequential write (append-only)" => fn ->
+          key = :crypto.strong_rand_bytes(8) |> Base.encode16()
+          value = :rand.bytes(256)
+          Lsmex.Engine.put(engine, key, value)
+        end
+      },
+      parallel: 1,
+      time: 5,
+      warmup: 1,
+      formatters: [{Benchee.Formatters.Console, extended_statistics: true}]
+    )
+  end
+
+  defp measure_random_writes(engine) do
+    # Pre-populate with 100k keys to trigger compaction
+    for i <- 1..100_000 do
+      Lsmex.Engine.put(engine, "key_#{String.pad_leading("#{i}", 6, "0")}", "val_#{i}")
+    end
+
+    Benchee.run(
+      %{
+        "random write (with compaction)" => fn ->
+          key = "rnd_#{:rand.uniform(1_000_000)}"
+          value = "value_#{System.system_time(:millisecond)}"
+          Lsmex.Engine.put(engine, key, value)
+        end
+      },
+      parallel: 1,
+      time: 5,
+      warmup: 1,
+      formatters: [{Benchee.Formatters.Console, extended_statistics: true}]
+    )
+  end
+
+  defp measure_random_reads(engine) do
+    latencies = []
+    times = []
+
+    Enum.reduce(1..10_000, {latencies, times}, fn _i, {lats, tms} ->
+      start = System.monotonic_time(:microsecond)
+      key = "key_#{String.pad_leading("#{:rand.uniform(100_000)}", 6, "0")}"
+      {:ok, _val} = Lsmex.Engine.get(engine, key)
+      elapsed = System.monotonic_time(:microsecond) - start
+      {[elapsed | lats], [elapsed | tms]}
+    end)
+
+    Benchee.run(
+      %{
+        "random read (existing key)" => fn ->
+          key = "key_#{String.pad_leading("#{:rand.uniform(100_000)}", 6, "0")}"
+          {:ok, _val} = Lsmex.Engine.get(engine, key)
+        end
+      },
+      parallel: 2,
+      time: 5,
+      warmup: 1,
+      formatters: [{Benchee.Formatters.Console, extended_statistics: true}]
+    )
+
+    # Compute percentiles
+    sorted = Enum.sort(times)
+    p50 = Enum.at(sorted, div(length(sorted), 2)) / 1_000
+    p99 = Enum.at(sorted, trunc(length(sorted) * 0.99)) / 1_000
+    p999 = Enum.at(sorted, trunc(length(sorted) * 0.999)) / 1_000
+
+    IO.puts("\nLatency percentiles (warm Bloom filter):")
+    IO.puts("  p50:  #{Float.round(p50, 2)}ms")
+    IO.puts("  p99:  #{Float.round(p99, 2)}ms")
+    IO.puts("  p999: #{Float.round(p999, 2)}ms")
+  end
+
+  defp measure_bloom_skip(engine) do
+    Benchee.run(
+      %{
+        "read — non-existent key (Bloom filter skip)" => fn ->
+          key = "absent_#{:rand.uniform(10_000_000)}"
+          {:error, :not_found} = Lsmex.Engine.get(engine, key)
+        end
+      },
+      parallel: 2,
+      time: 5,
+      warmup: 1,
+      formatters: [{Benchee.Formatters.Console, extended_statistics: true}]
+    )
+  end
+
+  defp measure_range_scan(engine) do
+    Benchee.run(
+      %{
+        "range scan — 1000 keys [key_000001, key_001000]" => fn ->
+          from = "key_000001"
+          to = "key_001000"
+          Lsmex.Engine.scan(engine, from, to) |> Enum.count()
+        end
+      },
+      parallel: 1,
+      time: 5,
+      warmup: 1,
+      formatters: [{Benchee.Formatters.Console, extended_statistics: true}]
+    )
+  end
 end
 
+LsmexBench.run()
 ```
 
-Target: 500,000 puts/second (memtable) and 10,000 gets/second at a 10 GB working set; p99 get < 5 ms.
+### Benchmark targets (v3 standard) — Write Amplification Focus
+
+| Metric | Target | Interpretation |
+|--------|--------|-----------------|
+| **Sequential write** | 500k–800k ops/s | Memtable append (no compaction yet) |
+| **Random write (with compaction)** | 50k–100k ops/s | Drops due to background compaction rewriting data |
+| **Random read (existing key, warm Bloom)** | 200k–300k ops/s | Multiple SSTable reads; Bloom filter eliminates 99% of disk hits |
+| **Random read latency p50** | < 0.5 ms | Memtable hit (no disk) |
+| **Random read latency p99** | < 5 ms | SSTable binary search + disk read |
+| **Random read latency p999** | < 20 ms | Compaction running; temporary I/O stall |
+| **Non-existent key read** | 500k–1M ops/s | Bloom filter says "not found"; zero disk I/O |
+| **Range scan** | 100k–200k keys/s | Sequential SSTable scan; limited by disk bandwidth |
+| **Write amplification ratio** | 5–10x | Every write may be rewritten 5–10 times during compaction |
+| **Bloom false positive rate** | < 1% | At target_fp=0.01 |
+
+### Write Amplification Deep Dive
+
+LSM's hidden cost is **write amplification**: one logical write may be rewritten multiple times as SSTables are compacted across levels.
+
+**Example**: 1 GB of new data → flush to Level 0 (1 write). Level 0 merges to Level 1 (1 read + 1 write). Level 1 merges to Level 2 (1 read + 1 write). With 3 levels, the same data is written 3 times total, giving ~3x write amplification.
+
+**How to measure**:
+- Count total bytes written to disk (including compaction) over the benchmark run
+- Divide by total bytes of unique data inserted
+- Ratio > 5 means tuning: increase memtable size, decrease level growth ratio, or switch to size-tiered compaction
+
+**Tuning knobs**:
+- **Memtable size**: 64 MB → 256 MB reduces compaction frequency (slower writes per memtable flush) but increases memory pressure
+- **Level multiplier**: default 10x means Level 0 is 10 MB, Level 1 is 100 MB, Level 2 is 1 GB. Increase to 20x to reduce compaction fanout
+- **Compaction strategy**: LevelDB uses leveled (merge one L0 file into L1 per write); RocksDB adds size-tiered (batch L0 files before merge) — test both
 
 ---
 

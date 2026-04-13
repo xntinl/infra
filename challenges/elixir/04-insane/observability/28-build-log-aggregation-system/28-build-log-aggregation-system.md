@@ -756,43 +756,87 @@ The design separates concerns along their real axes: what must be correct (the l
 ## Benchmark
 
 ```elixir
-# Minimal timing harness — replace with Benchee for production measurement.
-{time_us, _result} = :timer.tc(fn ->
-  # exercise the hot path N times
-  for _ <- 1..10_000, do: :ok
-end)
+# bench/logplex_bench.exs
+alias Logplex
 
-IO.puts("average: #{time_us / 10_000} µs per op")
-def main do
-  IO.puts("[Logplex] GenServer demo")
-  :ok
+# Warm up: populate a realistic dataset
+IO.puts("Populating benchmark data...")
+for i <- 1..50_000 do
+  Logplex.ingest("prod_app", %{
+    level: Enum.random(["debug", "info", "warn", "error"]),
+    message: "request_#{i} path=/api/users status=#{Enum.random([200, 400, 500])} duration=#{:rand.uniform(5000)}ms",
+    timestamp: DateTime.utc_now()
+  })
 end
 
+IO.puts("Running benchmarks...")
+
+Benchee.run(
+  %{
+    "ingest single entry (ETS insert + tokenize)" => fn ->
+      Logplex.ingest("prod_app", %{
+        level: "info",
+        message: "request #{:rand.uniform(100_000)} path=/api/resource status=#{Enum.random([200, 404, 500])}",
+        timestamp: DateTime.utc_now()
+      })
+    end,
+    "full-text search (1 term) over 50k" => fn ->
+      Logplex.search("prod_app", "error")
+    end,
+    "full-text search (2 terms) over 50k" => fn ->
+      Logplex.search("prod_app", "request error")
+    end,
+    "aggregate p99 latency via T-Digest" => fn ->
+      Logplex.aggregate("prod_app", :p99, :duration_ms)
+    end,
+    "T-Digest add 10k values + quantile" => fn ->
+      digest = Enum.reduce(1..10_000, Logplex.TDigest.new(100), fn i, d ->
+        Logplex.TDigest.add(d, :rand.uniform(10000))
+      end)
+      Logplex.TDigest.quantile(digest, 0.99)
+    end,
+    "merge two T-Digests with 5k values each" => fn ->
+      d1 = Enum.reduce(1..5_000, Logplex.TDigest.new(100), fn i, d ->
+        Logplex.TDigest.add(d, :rand.uniform(10000))
+      end)
+      d2 = Enum.reduce(1..5_000, Logplex.TDigest.new(100), fn i, d ->
+        Logplex.TDigest.add(d, :rand.uniform(10000))
+      end)
+      Logplex.TDigest.merge(d1, d2)
+    end
+  },
+  parallel: 4,
+  time: 10,
+  warmup: 3,
+  formatters: [Benchee.Formatters.Console]
+)
+
+IO.puts("\nBenchmark complete. Expected:")
+IO.puts("  - ingest: < 50 µs")
+IO.puts("  - 1-term search: < 1 ms")
+IO.puts("  - 2-term search: < 2 ms (smaller result set)")
+IO.puts("  - T-Digest p99: < 500 µs")
 ```
 
-Target: ingest path <50µs per entry and 2-term search <1ms over 10k entries on modern hardware.
+Target: ingest path <50µs per entry; 2-term search <2ms over 50k entries; T-Digest quantile < 500µs with bounded memory (< 200 centroids regardless of input size).
 
-## Key Concepts: Distributed Tracing and Causal Ordering
+## Key Concepts: Log Parsing, Indexing, and Streaming Quantiles
 
-Distributed tracing reconstructs the request flow across services. A request hits service A, which calls B, which calls C. A trace shows this dependency graph and timing at each step.
+**Log parsing and pattern extraction**: Raw logs are unstructured text. To make them queryable, parse them into structured fields using regex patterns. The grok format (popularized by Logstash) defines named captures: `(?<field_name>pattern)`. When a line matches, extract field values into a map. Non-matching lines fall through to a default "raw message" entry.
 
-**Trace structure**:
-- **Trace ID**: Unique identifier for the entire user request, propagated in headers from A → B → C.
-- **Span**: A single operation (e.g., "handle POST /users", "query database"). Spans have start time, duration, and metadata (service, endpoint, user ID).
-- **Parent-child**: If A calls B, the B span references the A span's ID as its parent.
+- **Built-in patterns**: `nginx_access`, `postgres`, `json` autodetect HTTP and database logs without configuration.
+- **Custom patterns**: Register domain-specific regexes at runtime for business logs.
+- **Auto-detection**: If the line is JSON, parse as JSON. Else try built-in patterns. Else store as raw message.
 
-On a single server, request tracing (e.g., `Logger.metadata(request_id: id)`) shows which logs belong to which request. Across multiple services, distributed tracing shows the entire dependency graph and where time is spent.
+**Inverted index for full-text search**: A naive search that scans every log line is O(n). An inverted index pre-computes which log entries contain each word (token). Search becomes set intersection: find entries containing "error" AND "database" by intersecting their posting lists. Trade memory (one entry per token occurrence) for query speed (sub-millisecond searches).
 
-**Sampling**: Tracing every request is expensive at high traffic. Common strategies:
-- **Always-on for errors**: Every failed request is traced.
-- **Tail-based sampling**: If a request exceeds SLA (e.g., > 1 second), retroactively trace all spans.
-- **Head-based sampling**: At request entry, decide with probability p whether to sample. Risk: you may sample only fast requests if not careful.
+- **Tokenization**: Lowercase, split on non-word chars, filter stopwords (the, a, and).
+- **Per-tenant isolation**: One ETS table per tenant for raw logs, one for the index. Cross-tenant queries are structurally impossible because they reference different tables.
 
-**Vector clocks**: Distributed timestamps rely on synchronized clocks, which is fragile. Vector clocks track causality independently: if event A happened before event B, the vector clock at A is ≤ the vector clock at B. Tracing can use vector clocks to detect ordering even if wall-clock times disagree.
-
-The BEAM provides `:trace` and `:redbug` for capturing process message sequences. To integrate with external tracing systems (Jaeger, Datadog), use `:telemetry` to emit events, then forward to external collectors. The challenge is maintaining trace context across process boundaries and RPC calls without manual propagation.
-
-**Production insight**: Tracing is most valuable when latency is unexpected. If you know requests usually take 50 ms, tracing a 5-second request immediately shows if the bottleneck is queuing (high wait time), serialization (high handler time), or RPC latency. Without traces, you just see "5 seconds" and must guess.
+**Streaming quantile estimation (T-Digest)**: Computing exact percentiles requires storing every value. On unbounded streams (50k logs/min forever), this is infeasible. T-Digest maintains a small sorted list of weighted centroids that approximate the full distribution. Key properties:
+- **Bounded memory**: O(compression_factor) centroids regardless of input size. Compression=100 typically yields 100-200 centroids.
+- **Accuracy**: P50/P99 estimates are within 1% of the true percentile over realistic (non-adversarial) data.
+- **Mergeability**: Two T-Digests can be merged into one, enabling multi-node percentile aggregation.
 
 ---
 

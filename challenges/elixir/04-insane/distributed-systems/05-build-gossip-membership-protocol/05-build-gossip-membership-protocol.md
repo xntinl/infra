@@ -66,12 +66,13 @@ SWIM (Scalable Weakly-consistent Infection-style Membership) solves this by sepa
 
 → Chose **B** because SWIM is the only protocol in this family that scales past a few dozen nodes while preserving a tunable bound on detection accuracy.
 
+---
+
 ## Implementation milestones
 
 ### Step 1: Create the project
 
 **Objective**: Separate membership state, failure detection, and gossip transport into distinct modules so each convergence invariant stays testable in isolation.
-
 
 ```bash
 mix new swimlane --sup
@@ -82,18 +83,6 @@ mkdir -p lib/swimlane test/swimlane bench
 ### Step 2: `mix.exs` — dependencies
 
 **Objective**: Pin only benchee and stream_data so the protocol core never hides dissemination behavior behind an external library.
-
-
-```elixir
-defp deps do
-  [
-    {:benchee, "~> 1.3", only: :dev},
-    {:stream_data, "~> 0.6", only: :test}
-  ]
-end
-```
-
-### Dependencies (mix.exs)
 
 ```elixir
 defp deps do
@@ -108,7 +97,6 @@ end
 
 **Objective**: Resolve concurrent updates by (incarnation, state-priority) so every replica converges to the same membership view regardless of message order.
 
-
 ```elixir
 # lib/swimlane/membership.ex
 defmodule Swimlane.Membership do
@@ -118,11 +106,15 @@ defmodule Swimlane.Membership do
     - incarnation: integer — the node's own monotonic counter
     - last_updated_at: monotonic timestamp
 
-  State transition rules:
-    alive(inc N)  → suspect if probe fails
-    suspect(inc N) → dead if suspicion timeout elapses
-    suspect(inc N) → alive if a refutation with incarnation > N arrives
-    dead  → removed from view after cleanup_timeout
+  **State transition rules:**
+    - alive(inc N)  → suspect if direct probe fails and indirect probes fail
+    - suspect(inc N) → dead if suspicion timeout elapses
+    - suspect(inc N) → alive if a refutation with incarnation > N arrives
+    - dead  → removed from view after cleanup_timeout
+  
+  **Conflict resolution:** when two versions of the same node arrive:
+    - Higher incarnation wins
+    - Same incarnation: alive > suspect > dead (state priority)
   """
 
   defstruct [:node_id, :state, :incarnation, :address, :last_updated_at]
@@ -161,7 +153,7 @@ defmodule Swimlane.Membership do
     Enum.reduce(updates, local_view, fn update, acc -> merge(acc, update) end)
   end
 
-  @doc "Returns nodes that should receive the next probe."
+  @doc "Returns nodes that should receive the next probe (alive or suspect, excluding self)."
   @spec probe_candidates(map(), [term()]) :: [%__MODULE__{}]
   def probe_candidates(view, exclude \\ []) do
     view
@@ -177,13 +169,13 @@ end
 
 **Objective**: Confirm suspected failures via K indirect probes so transient network loss does not trigger false-positive dead declarations.
 
-
 ```elixir
 # lib/swimlane/failure_detector.ex
 defmodule Swimlane.FailureDetector do
   @moduledoc """
-  Implements the SWIM probe protocol:
+  Implements the SWIM probe protocol. This is the core failure detection engine.
 
+  **Algorithm:**
   1. Pick a random node B from the membership list.
   2. Send a direct probe to B; wait probe_timeout_ms.
   3. If B responds: mark B alive, done.
@@ -192,6 +184,8 @@ defmodule Swimlane.FailureDetector do
   5. If any indirect prober succeeds: mark B alive, done.
   6. If all K indirect probes fail: mark B :suspect.
   7. After suspicion_timeout_ms with no refutation: mark B :dead.
+  
+  This dramatically reduces false positives from transient network loss.
   """
 
   @spec probe(term(), map(), keyword()) :: :alive | :suspect
@@ -232,7 +226,6 @@ end
 
 **Objective**: Select peers randomly and cap disseminations at ceil(log N) so bandwidth stays O(N) while latency stays O(log N).
 
-
 ```elixir
 # lib/swimlane/disseminator.ex
 defmodule Swimlane.Disseminator do
@@ -240,9 +233,12 @@ defmodule Swimlane.Disseminator do
   Gossip fanout: on each round, select K random peers and send
   the most recent membership deltas.
 
-  Delta selection: prioritize events with the fewest disseminations so far.
+  **Delta selection:** prioritize events with the fewest disseminations so far.
   Each event carries a dissemination count; events are dropped after
   ceil(log(N)) disseminations (they have likely reached all nodes).
+  
+  **Bandwidth:** O(K) outgoing messages per round per node = O(N) aggregate.
+  **Latency:** O(log_K(N)) rounds to reach all nodes with high probability.
   """
 
   @spec next_round(map(), term(), pos_integer()) :: {[term()], [map()]}
@@ -273,7 +269,6 @@ end
 ### Step 6: Transport stub
 
 **Objective**: Hide ping and indirect-ping behind a behaviour so tests swap UDP for process messages without touching protocol logic.
-
 
 ```elixir
 # lib/swimlane/transport.ex
@@ -315,7 +310,6 @@ end
 
 **Objective**: Drive in-process nodes through controlled rounds so convergence time and fanout tradeoffs become observable and reproducible.
 
-
 ```elixir
 # lib/swimlane/simulation.ex
 defmodule Swimlane.Simulation do
@@ -323,6 +317,9 @@ defmodule Swimlane.Simulation do
   In-process simulation of a SWIM cluster. Each simulated node is a GenServer
   that maintains its own membership view and participates in gossip rounds.
   No real UDP — all communication is via process messages.
+  
+  Use this to measure convergence bounds and test the protocol under
+  controlled failure scenarios without network flakiness.
   """
 
   use GenServer
@@ -570,7 +567,6 @@ end
 
 **Objective**: Lock down convergence bounds, suspicion refutation, and indirect-probe correctness in tests the implementation cannot edit to pass.
 
-
 ```elixir
 # test/swimlane/propagation_test.exs
 defmodule Swimlane.PropagationTest do
@@ -585,7 +581,7 @@ defmodule Swimlane.PropagationTest do
     # Measure rounds until all 100 nodes see the event
     rounds_to_converge = Swimlane.Simulation.measure_convergence(sim, :new_node_x, timeout_ms: 5_000)
 
-    # O(log2(100)) * 2 = 14 rounds max
+    # O(log2(100)) * 2 = 14 rounds max (with margin)
     assert rounds_to_converge <= 14,
       "took #{rounds_to_converge} rounds, expected ≤14 for N=100, K=3"
 
@@ -638,15 +634,30 @@ end
 
 **Objective**: Run the suite with seeded randomness so probabilistic convergence failures surface as reproducible traces rather than flaky noise.
 
-
 ```bash
 mix test test/swimlane/ --trace
 ```
 
-### Step 10: Benchmark
+---
 
-**Objective**: Quantify convergence rounds versus cluster size so the log-N dissemination claim is measured, not assumed, under churn.
+## Quick start
 
+For production deployment:
+
+1. **UDP transport**: replace process messages with real UDP sockets in transport.ex
+2. **Persistence**: store membership view to disk for recovery on restart
+3. **Suspicion tuning**: adjust suspicion_timeout_ms based on measured p99 latency
+4. **Fanout tuning**: set K based on desired convergence rounds and N
+
+---
+
+## Benchmark
+
+**Target**: Convergence under 2 seconds for a 100-node localhost cluster after a single join; O(log N) round count.
+
+```bash
+mix run bench/gossip_bench.exs
+```
 
 ```elixir
 # bench/gossip_bench.exs
@@ -668,25 +679,11 @@ Benchee.run(
 )
 ```
 
-### Why this works
-
-Each node probes one peer per period; if the direct probe fails, it asks K peers for indirect probes before marking the peer suspect. Suspicion is itself gossiped, so every live node converges on the membership view in expected O(log N) rounds.
-
 ---
 
-## Benchmark
+## Why this works
 
-```elixir
-# bench/gossip_bench.exs
-:timer.tc(fn -> Gossip.seed_cluster(100) |> Gossip.wait_convergence() end)
-def main do
-  IO.puts("[Swimlane.PropagationTest] GenServer demo")
-  :ok
-end
-
-```
-
-Target: Convergence under 2 seconds for a 100-node localhost cluster after a single join; O(log N) round count.
+Each node probes one peer per period; if the direct probe fails, it asks K peers for indirect probes before marking the peer suspect. Suspicion is itself gossiped, so every live node converges on the membership view in expected O(log N) rounds.
 
 ---
 
@@ -695,14 +692,14 @@ Target: Convergence under 2 seconds for a 100-node localhost cluster after a sin
 The core challenge in distributed systems is reaching agreement across multiple nodes when some may fail, be slow, or partition from the network. Consensus algorithms formalize three properties:
 
 1. **Safety**: All nodes that decide must decide the same value.
-2. Liveness**: Every non-faulty node eventually decides.
-3. Fault tolerance**: The system tolerates up to F faulty nodes out of 2F+1 total.
+2. **Liveness**: Every non-faulty node eventually decides.
+3. **Fault tolerance**: The system tolerates up to F faulty nodes out of 2F+1 total.
 
 Raft achieves this via a leader-based approach: the leader serializes writes through a log, and quorum commit ensures no data loss across failures. The log-up-to-date vote rule prevents stale nodes from becoming leader, and the "commit only current-term entries" rule prevents committed entries from being overwritten.
 
 This contrasts with leaderless protocols (e.g., CRDTs) that sacrifice strong consistency for eventual consistency, enabling offline-first systems. For the BEAM, Raft fits naturally into the GenServer + OTP supervision model: each node is a GenServer with local state (log, term, vote), and RPCs are asynchronous messages that do not block the caller.
 
-**Production insight**: Raft's safety depends on three invariants holding simultaneously. A single violated invariant (e.g., committing an entry from a previous term by index alone) causes data loss on specific failure patterns that may never surface in testing. This is why production systems use formal verification or extensive failure injection (Jepsen tests) to validate safety, not just positive test cases.
+**Production insight**: SWIM gives you eventually consistent membership, not strongly consistent. What applications can tolerate a 2-round window where a node is incorrectly marked suspect before being refuted?
 
 ---
 
@@ -717,7 +714,7 @@ This contrasts with leaderless protocols (e.g., CRDTs) that sacrifice strong con
 | Partition behavior | eventual consistency | BEAM node isolation | blocks minority |
 | Suitable scale | thousands of nodes | hundreds of nodes | dozens of nodes |
 
-Reflection: SWIM gives you eventually consistent membership, not strongly consistent. What applications can tolerate a 2-round window where a node is incorrectly marked suspect before being refuted?
+**Reflection**: SWIM gives you eventually consistent membership, not strongly consistent. What applications can tolerate a 2-round window where a node is incorrectly marked suspect before being refuted?
 
 ---
 
@@ -737,6 +734,8 @@ Gossip events accumulate indefinitely if not pruned. After `ceil(log(N))` dissem
 
 **5. Using wall-clock time for suspicion timeouts**
 Use `System.monotonic_time/1` for all timeout calculations. NTP adjustments can cause wall-clock time to jump backward, extending or collapsing suspicion windows unexpectedly.
+
+---
 
 ## Reflection
 

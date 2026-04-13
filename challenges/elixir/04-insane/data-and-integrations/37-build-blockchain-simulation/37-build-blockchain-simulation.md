@@ -678,40 +678,127 @@ Expected: difficulty=2 (hash starts with "00") requires on average ~256 nonce it
 
 The design separates concerns along their real axes: what must be correct (the blockchain simulation invariants), what must be fast (the hot path isolated from slow paths), and what must be evolvable (external contracts kept narrow). Each module has one job and fails loudly when given inputs outside its contract, so bugs surface near their source instead of as mysterious downstream symptoms. The tests exercise the invariants directly rather than implementation details, which keeps them useful across refactors.
 
+## Quick start
+
+To run the blockchain simulator:
+
+```bash
+# Set up the project
+mix new chainex --sup
+cd chainex
+mkdir -p test/chainex bench
+
+# Install dependencies (minimal — :crypto is built-in)
+mix deps.get
+
+# Run the consensus tests
+mix test test/chainex/ --trace
+
+# Run mining benchmarks
+mix run bench/mining_bench.exs
+```
+
+Expected output: All cryptographic tests pass (genesis consistency, signature round-trips, deterministic hashing), wallet generation produces unique addresses, and the consensus test shows two nodes converging to the same chain after a fork within 100ms.
+
 ## Benchmark
 
 ```elixir
-# Minimal timing harness — replace with Benchee for production measurement.
-{time_us, _result} = :timer.tc(fn ->
-  # exercise the hot path N times
-  for _ <- 1..10_000, do: :ok
-end)
+# bench/mining_bench.exs — comprehensive mining and validation benchmarks
 
-IO.puts("average: #{time_us / 10_000} µs per op")
-def main do
-  IO.puts("[Chainex.Mempool] GenServer demo")
-  :ok
-end
-
+Benchee.run(
+  %{
+    "genesis block creation" => fn ->
+      Chainex.Block.genesis()
+    end,
+    "block hash computation (empty txs)" => fn ->
+      block = %Chainex.Block{
+        index: 1,
+        timestamp: System.system_time(:second),
+        transactions: [],
+        previous_hash: String.duplicate("0", 64),
+        nonce: 0
+      }
+      Chainex.Block.compute_hash(block)
+    end,
+    "PoW validation (difficulty 2)" => fn ->
+      block = Chainex.Block.genesis()
+      Chainex.Block.valid_pow?(block, 2)
+    end,
+    "wallet generation (ECDSA secp256k1)" => fn ->
+      Chainex.Wallet.generate()
+    end,
+    "transaction signing and verification" => fn ->
+      w = Chainex.Wallet.generate()
+      data = "transaction_data"
+      sig = Chainex.Wallet.sign(w, data)
+      Chainex.Wallet.verify(data, sig, w.public_key)
+    end,
+    "mine block (difficulty 2, ~256 avg iterations)" => fn ->
+      Chainex.Miner.mine_block(%{
+        index: 1,
+        transactions: [],
+        previous_hash: String.duplicate("0", 64),
+        difficulty: 2
+      })
+    end,
+    "mine block (difficulty 3, ~4096 avg iterations)" => fn ->
+      Chainex.Miner.mine_block(%{
+        index: 1,
+        transactions: [],
+        previous_hash: String.duplicate("0", 64),
+        difficulty: 3
+      })
+    end,
+    "mine block (difficulty 4, ~65536 avg iterations)" => fn ->
+      Chainex.Miner.mine_block(%{
+        index: 1,
+        transactions: [],
+        previous_hash: String.duplicate("0", 64),
+        difficulty: 4
+      })
+    end,
+    "block validation pipeline (hash, PoW, linkage)" => fn ->
+      genesis = Chainex.Block.genesis()
+      block = %Chainex.Block{
+        index: 1,
+        timestamp: System.system_time(:second),
+        transactions: [],
+        previous_hash: genesis.hash,
+        nonce: 0
+      }
+      hash = Chainex.Block.compute_hash(block)
+      block_with_hash = %{block | hash: hash}
+      Chainex.Block.valid_pow?(block_with_hash, 2)
+    end,
+    "node receives and broadcasts block" => fn ->
+      # Measure block propagation cost (not mining time)
+      {:ok, node} = Chainex.Node.start_link(difficulty: 1)
+      block = Chainex.Block.genesis()
+      Chainex.Node.receive_block(node, block)
+      GenServer.stop(node)
+    end
+  },
+  time: 5,
+  warmup: 2,
+  memory_time: 2,
+  formatters: [
+    Benchee.Formatters.Console,
+    {Benchee.Formatters.JSON, file: "bench/results.json"}
+  ]
+)
 ```
 
-Target: <5ms to validate and insert a block with 1000 transactions.
-
-## Deep Dive: Conflict-Free Replicated Data Types (CRDTs) and Eventual Consistency
-
-CRDTs are data structures designed so that concurrent updates from multiple replicas always converge to the same state without explicit coordination or consensus.
-
-**How it works**: Traditional merge requires agreement: if replica A says "x = 5" and replica B says "x = 10", which is correct? A CRDT avoids this by defining a merge operation that is commutative, associative, and idempotent. Given these properties, nodes can merge state in any order and always converge.
-
-**Example: G-Counter (grow-only counter)**. Each node maintains a vector of counters, one per node. To increment, increment your own entry. Total is the sum of all entries. To merge two G-Counters, take element-wise max. This is commutative, associative, and idempotent: two nodes incrementing independently then merging always produce the same total, regardless of merge order.
-
-**Trade-off: state size**. A G-Counter with 100 nodes is a 100-element vector. Decrement support (PN-Counter) requires 100 elements for increments and 100 for decrements (200 total). As the cluster grows, CRDT state balloons. Compaction (summing old entries into a delta) is necessary.
-
-**CRDT vs. Consensus**: Raft is strong consistency (all nodes agree on exact state, ordered updates). CRDTs are eventual consistency (nodes may disagree temporarily, then converge). CRDTs excel in offline-first scenarios (mobile app syncing later); Raft is better for systems requiring immediate agreement (bank transfers).
-
-**Gotcha**: Just because a CRDT converges does not mean it is correct for your application. A multi-user text document where two users edit the same location must use a CRDT that preserves intent (e.g., CRDT with unique node IDs). A naive counter cannot distinguish "User A inserted at position 10" from "User B inserted at position 10"—they both see increments and may converge to the wrong document.
-
-**Production patterns**: CRDTs shine for collaborative editing (Google Docs, Figma) and offline-first apps (mobile). For backends requiring strong consistency (databases, ledgers), Raft or other consensus is necessary. Many systems use both: CRDTs for user-facing edits, Raft for backend state.
+**Benchmark targets:**
+- Genesis block: <100 µs (deterministic, no hashing iterations)
+- Block hash computation (empty): <1 ms (double SHA-256 is fast)
+- PoW validation: <1 µs (string prefix check only, hash already computed)
+- Wallet generation: <10 ms (ECDSA key generation is the bottleneck)
+- Signing + verification round-trip: <50 ms (ECDSA operations on secp256k1)
+- Mining difficulty 2: <5 ms avg (256 nonce iterations at SHA-256 speed)
+- Mining difficulty 3: <100 ms avg (4,096 iterations)
+- Mining difficulty 4: <2 sec avg (65,536 iterations)
+- Block validation pipeline: <2 ms (hash + PoW check + linkage)
+- **Fork resolution**: two mining nodes on different chains converge within 100ms of receiving the longest valid chain
 
 ---
 

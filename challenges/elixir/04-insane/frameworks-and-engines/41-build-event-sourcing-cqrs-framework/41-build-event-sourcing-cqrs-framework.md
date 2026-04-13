@@ -93,21 +93,9 @@ mkdir -p lib/eventsource/store
 mkdir -p test/eventsource bench
 ```
 
-### Step 2: `mix.exs`
+### Step 2: `mix.exs` — dependencies
 
 **Objective**: Pin Jason for serialization and Benchee for append-throughput benchmarks, keeping production dependencies minimal.
-
-
-```elixir
-defp deps do
-  [
-    {:jason, "~> 1.4"},
-    {:benchee, "~> 1.3", only: :dev}
-  ]
-end
-```
-
-### Dependencies (mix.exs)
 
 ```elixir
 defp deps do
@@ -550,18 +538,35 @@ The design separates concerns along their real axes: what must be correct (the e
 ## Benchmark
 
 ```elixir
-# Minimal timing harness — replace with Benchee for production measurement.
-{time_us, _result} = :timer.tc(fn ->
-  # exercise the hot path N times
-  for _ <- 1..10_000, do: :ok
-end)
+# bench/replay_bench.exs (complete benchmark harness)
+{:ok, _} = Eventsource.Store.EventStore.start_link()
 
-IO.puts("average: #{time_us / 10_000} µs per op")
-def main do
-  IO.puts("[Eventsource.Aggregate] GenServer demo")
-  :ok
+defmodule Counter do
+  @behaviour Eventsource.Aggregate
+
+  def init, do: %{count: 0}
+
+  def handle(state, %{type: :increment, by: amount}) do
+    {:ok, [%{type: :incremented, payload: %{by: amount}}]}
+  end
+
+  def apply(state, %{event_type: :incremented, payload: %{by: amount}}) do
+    %{state | count: state.count + amount}
+  end
 end
 
+Benchee.run(
+  %{
+    "event append" => fn ->
+      {:ok, _} = Eventsource.CommandHandler.execute(Counter, "c1", %{type: :increment, by: 1})
+    end,
+    "load aggregate (no snapshot)" => fn ->
+      Eventsource.CommandHandler.load_aggregate(Counter, "c1")
+    end
+  },
+  time: 5,
+  warmup: 2
+)
 ```
 
 Target: <50µs per event append and >100k events/s projection throughput.

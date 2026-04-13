@@ -639,39 +639,62 @@ The design separates concerns along their real axes: what must be correct (the A
 ## Benchmark
 
 ```elixir
-# Minimal timing harness — replace with Benchee for production measurement.
-{time_us, _result} = :timer.tc(fn ->
-  # exercise the hot path N times
-  for _ <- 1..10_000, do: :ok
-end)
+# bench/apigw_bench.exs
+{:ok, _cache} = Apigw.Cache.start_link()
+{:ok, pool} = Apigw.Pool.start_link(
+  backends: [
+    %{id: "b1", host: "localhost", port: 8001, healthy: true, draining: false},
+    %{id: "b2", host: "localhost", port: 8002, healthy: true, draining: false}
+  ]
+)
 
-IO.puts("average: #{time_us / 10_000} µs per op")
-def main do
-  IO.puts("[Apigw.Cache] GenServer demo")
-  :ok
+Benchee.run(%{
+  "auth_verify_jwt" => fn ->
+    token = make_test_jwt()
+    Apigw.Auth.JWT.verify(token, "test_secret")
+  end,
+  "cache_hit_etag" => fn ->
+    Apigw.Cache.get("/api/users", %{"if-none-match" => "abc123"})
+  end,
+  "circuit_breaker_check" => fn ->
+    Apigw.CircuitBreaker.check("b1")
+  end,
+  "rate_limiter_consume" => fn ->
+    {:ok, _} = Apigw.RateLimiter.consume("key_1", 1024)
+  end
+}, time: 10, warmup: 3)
+
+defp make_test_jwt do
+  header = Base.url_encode64(~s({"alg":"HS256"}), padding: false)
+  payload = Base.url_encode64(~s({"sub":"user1"}), padding: false)
+  sig = :crypto.mac(:hmac, :sha256, "secret", "#{header}.#{payload}") |> Base.url_encode64(padding: false)
+  "#{header}.#{payload}.#{sig}"
 end
 
+def main do
+  IO.puts("[Apigw] Production API gateway with discovery, auth, rate limiting, circuit breaking")
+  IO.puts("Circuit breakers prevent cascading failures across backends")
+  IO.puts("Lease-based rate limiting scales across multiple gateway nodes")
+  IO.puts("JWT verification with constant-time comparison prevents timing attacks")
+  :ok
+end
 ```
 
 Target: <500µs gateway overhead per request at p99 excluding upstream latency.
 
-## Key Concepts: Load Balancing Under Tail Latency
+## Key Concepts: Gateway Routing and Rate Limiting Protocols
 
-Load balancers distribute requests across backends. The choice of algorithm affects both latency distribution and fairness.
+An API gateway is the composition of independent middleware layers. Each layer can short-circuit the request (auth failure → 401, rate limited → 429, circuit open → 503) without invoking subsequent layers.
 
-**Round-robin**: Request i goes to backend (i % N). Simple and fair on average, but ignores backend state. If one backend is slow (e.g., garbage collection pause), clients hitting that backend wait, skewing the p99 latency.
+**Sliding-window rate limiting**: A naive fixed-window counter allows a burst at boundaries. With limit=100 req/s and a 1-second window, the first 100 requests at 0.999s and the next 100 at 1.001s consume 100 req/sec over a 2ms window. Sliding-window counting avoids this: track a list of request timestamps and drop requests older than the window size when counting. More precise but higher memory cost.
 
-**Least connections**: Track open connections per backend; send the next request to the backend with fewest connections. Better than round-robin, but still ignores request complexity (a short read and a 10-second compute job are both "1 connection").
+**Lease-based rate limiting**: A single rate limiter process serializes all requests through a call. To scale, distribute the limit: each gateway node acquires a lease of `quota / N` from a central coordinator every few seconds. Within a lease period, the node enforces the limit locally with `:atomics`. Trade-off: short leases mean frequent coordinator hits; long leases mean a crashed node forfeits its tokens.
 
-**Power of two choices**: Pick two random backends and assign the request to the one with fewer connections. With minimal overhead, this reduces tail latency from O(log N) to O(log log N) because load is balanced more evenly without the cost of globally tracking all backends.
+**Circuit breaker half-open state**: Two-state breakers (open/closed) re-open immediately on timeout, causing thundering herd. The half-open state allows exactly one probe request through. Success closes the breaker for all instances; failure keeps it open. This "single probe" invariant prevents overwhelming a recovering backend.
 
-**Latency-aware (p99-driven)**: Track recent p99 latency per backend; prefer the backend with lowest p99. Powerful for SLA-driven systems, but can oscillate if multiple backends are competing for shared resources.
+**Cache validation with ETags**: ETag headers allow resumable downloads and conditional GET. A client sends `If-None-Match: "abc"` and if the ETag matches, the server returns 304 (Not Modified) without the body. This saves bandwidth for large responses. ETags must be opaque to clients — any stable hash of the content is valid.
 
-On a 100-node cluster, round-robin assigns 1% of traffic to each backend. If one is 10x slower, clients hitting it see 10x latency. With 1000 req/sec, that's 10 reqs/sec hitting the slow node, and each sees 10x latency, affecting the fleet's p99. Least connections or power-of-two reduces affected clients to a single one per decision.
-
-The BEAM's `:poolboy` or `:connection_pool` naturally implement least-connections: each pool process tracks queue depth. A dispatcher sends new requests to the pool with the shortest queue. This is "power of two" with full visibility into actual queue depth, making it extremely effective.
-
-**Production insight**: Measuring load balancing on a single machine is misleading. Test against realistic backend variability (e.g., one slow backend, cascading failures) to see how your algorithm's tail latency behaves.
+**Production insight**: Gateways are strict about HTTP compliance. Missing Rate-Limit headers on a 429 leaves clients guessing when to retry. Wrong Cache-Control directives break browser caching. Missing CORS headers block web clients. Test your gateway against real browsers and clients, not just curl.
 
 ---
 

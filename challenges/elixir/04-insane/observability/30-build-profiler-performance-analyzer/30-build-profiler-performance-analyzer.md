@@ -670,43 +670,100 @@ The design separates concerns along their real axes: what must be correct (the B
 ## Benchmark
 
 ```elixir
-# Minimal timing harness — replace with Benchee for production measurement.
-{time_us, _result} = :timer.tc(fn ->
-  # exercise the hot path N times
-  for _ <- 1..10_000, do: :ok
-end)
+# bench/overhead_bench.exs
+alias BeamProfiler.{Sampler, CallGraph, Flamegraph}
 
-IO.puts("average: #{time_us / 10_000} µs per op")
-def main do
-  IO.puts("[BeamProfiler.CallGraphTest] GenServer demo")
-  :ok
+# Setup: simulate production workload with N concurrent processes
+spawn_load = fn n ->
+  for _ <- 1..n do
+    spawn(fn ->
+      for _ <- 1..10_000 do
+        _ = :math.sin(:rand.uniform()) + :math.cos(:rand.uniform())
+        # Simulate I/O wait
+        :timer.sleep(1)
+      end
+    end)
+  end
 end
 
+IO.puts("Spawning 100 worker processes...")
+pids = spawn_load.(100)
+
+IO.puts("Benchmarking sampler overhead...")
+
+Benchee.run(
+  %{
+    "sample 100 processes at 100 Hz" => fn ->
+      {:ok, session} = Sampler.start_session(hz: 100, duration_ms: 1000)
+      :timer.sleep(1_010)
+      {:ok, samples} = Sampler.collect(session)
+      samples
+    end,
+    "sample 500 processes at 100 Hz" => fn ->
+      pids2 = spawn_load.(400)
+      {:ok, session} = Sampler.start_session(hz: 100, duration_ms: 1000)
+      :timer.sleep(1_010)
+      {:ok, samples} = Sampler.collect(session)
+      Enum.each(pids2, &Process.exit(&1, :kill))
+      samples
+    end,
+    "build call graph from 1000 samples" => fn ->
+      {:ok, session} = Sampler.start_session(hz: 100, duration_ms: 100)
+      :timer.sleep(110)
+      {:ok, samples} = Sampler.collect(session)
+      if length(samples) > 0 do
+        CallGraph.build(samples)
+      end
+    end,
+    "export flame graph (1000 samples)" => fn ->
+      {:ok, session} = Sampler.start_session(hz: 100, duration_ms: 100)
+      :timer.sleep(110)
+      {:ok, samples} = Sampler.collect(session)
+      path = System.tmp_dir!() |> Path.join("bench_flame_#{:erlang.unique_integer()}.txt")
+      if length(samples) > 0 do
+        Flamegraph.export(path, samples)
+      end
+      File.rm!(path)
+    end
+  },
+  parallel: 1,
+  time: 10,
+  warmup: 2,
+  formatters: [Benchee.Formatters.Console]
+)
+
+Enum.each(pids, &Process.exit(&1, :kill))
+
+IO.puts("\nOverhead analysis:")
+IO.puts("  - Sampling 100 processes at 100 Hz = 10ms/s = <1% CPU overhead")
+IO.puts("  - Sampling 500 processes at 100 Hz = 50ms/s = <5% CPU overhead (production limit)")
+IO.puts("  - Call graph build should be sub-millisecond")
+IO.puts("  - Flame graph export should be sub-millisecond")
 ```
 
-Target: <2% throughput overhead at 99 Hz sampling on a node doing 50k req/s.
+Target: <2% throughput overhead at 99 Hz sampling on a node doing 50k req/s (100 processes sampling = 1ms/s = 0.1% CPU). At 500 processes (production scale) sampling should stay under 5% CPU overhead.
 
-## Key Concepts: Distributed Tracing and Causal Ordering
+## Key Concepts: Stack Sampling, Instrumentation, and Flame Graphs
 
-Distributed tracing reconstructs the request flow across services. A request hits service A, which calls B, which calls C. A trace shows this dependency graph and timing at each step.
+**Stack sampling vs. instrumentation**: Two complementary profiling techniques, different answers.
+- **Sampling** (statistical): Freeze all processes every N milliseconds, record current stacks. Low overhead (< 1% CPU), representative, but short-lived functions may be missed.
+- **Instrumentation** (exact): Wrap function entry/exit with timers. Every call is measured. High overhead (5-30% CPU), but all calls are seen. Use for targeted deep-dive into specific functions.
 
-**Trace structure**:
-- **Trace ID**: Unique identifier for the entire user request, propagated in headers from A → B → C.
-- **Span**: A single operation (e.g., "handle POST /users", "query database"). Spans have start time, duration, and metadata (service, endpoint, user ID).
-- **Parent-child**: If A calls B, the B span references the A span's ID as its parent.
+Together they form a profiler strategy: sample globally to find hot modules, then instrument the hottest function to get exact timing.
 
-On a single server, request tracing (e.g., `Logger.metadata(request_id: id)`) shows which logs belong to which request. Across multiple services, distributed tracing shows the entire dependency graph and where time is spent.
+**Flame graph semantics**: A flame graph collapses identical stack paths across all samples. Each unique path is one bar; the bar's width is the number of samples. Reading a flame graph:
+- Wide bar = function is always on the stack (may be a hot loop or a caller of hot code).
+- Narrow bar = function rarely sampled (either truly fast or rarely called).
+- Tall stack = deep call chain (each row is a caller, top row is leaf/hottest function).
 
-**Sampling**: Tracing every request is expensive at high traffic. Common strategies:
-- **Always-on for errors**: Every failed request is traced.
-- **Tail-based sampling**: If a request exceeds SLA (e.g., > 1 second), retroactively trace all spans.
-- **Head-based sampling**: At request entry, decide with probability p whether to sample. Risk: you may sample only fast requests if not careful.
+The key insight: a function appearing in every sample but never as a leaf (not the topmost frame) is expensive because it calls other expensive functions, not because of its own code.
 
-**Vector clocks**: Distributed timestamps rely on synchronized clocks, which is fragile. Vector clocks track causality independently: if event A happened before event B, the vector clock at A is ≤ the vector clock at B. Tracing can use vector clocks to detect ordering even if wall-clock times disagree.
+**Production profiling constraints**: Attaching a profiler to a live production node has strict budgets.
+- **Overhead budget**: < 5% CPU overhead for profiling. At 100 Hz sampling of 500 processes, expect ~50ms/s = 0.05 CPU time.
+- **Memory budget**: Do not buffer unbounded samples. Flush/discard old samples periodically.
+- **Detach safety**: `:dbg.stop()` must completely remove all tracing instrumentation. A leaked trace handler consumes memory silently.
 
-The BEAM provides `:trace` and `:redbug` for capturing process message sequences. To integrate with external tracing systems (Jaeger, Datadog), use `:telemetry` to emit events, then forward to external collectors. The challenge is maintaining trace context across process boundaries and RPC calls without manual propagation.
-
-**Production insight**: Tracing is most valuable when latency is unexpected. If you know requests usually take 50 ms, tracing a 5-second request immediately shows if the bottleneck is queuing (high wait time), serialization (high handler time), or RPC latency. Without traces, you just see "5 seconds" and must guess.
+**GC correlation**: Garbage collection pauses show up in flame graphs as wide stacks of `:erts_internal` functions. The correlation problem: if you see `:erts_internal:garbage_collection` in many samples, you know GC is taking CPU time, but not which user code triggered it. Solve by logging GC events separately and correlating by timestamp.
 
 ---
 

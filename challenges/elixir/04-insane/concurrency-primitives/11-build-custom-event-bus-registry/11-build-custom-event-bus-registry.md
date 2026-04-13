@@ -86,16 +86,6 @@ mkdir -p lib/nexus test/nexus bench
 
 **Objective**: Pull in only `benchee` and `stream_data` — the trie and QoS protocol must be hand-rolled, not borrowed from Phoenix.PubSub or `:pg`.
 
-
-```elixir
-defp deps do
-  [
-    {:benchee, "~> 1.3", only: :dev},
-    {:stream_data, "~> 0.6", only: :test}
-  ]
-end
-```
-
 ### Dependencies (mix.exs)
 
 ```elixir
@@ -502,10 +492,28 @@ defmodule Nexus.DeliveryTest do
 end
 ```
 
+---
+
+## Quick start
+
+**Prerequisites**: Elixir 1.14+, OTP 25+
+
+**Setup and run**:
+```bash
+mix test test/nexus/ --trace
+mix run -e "IO.puts(\"Nexus module loaded\")"
+```
+
+**Run benchmarks**:
+```bash
+mix run bench/nexus_bench.exs
+```
+
+---
+
 ### Step 8: Run the tests
 
 **Objective**: Run serially (`async: false` on registry/delivery) because the bus and ETS table are named singletons that cross-contaminate parallel tests.
-
 
 ```bash
 mix test test/nexus/ --trace
@@ -548,17 +556,22 @@ Subscriptions are rows in an ETS `:bag` keyed by topic, so lookup is O(1) and co
 
 ## Benchmark
 
-```elixir
-# bench/bus_bench.exs
-Benchee.run(%{"publish_1000_subs" => fn -> Bus.publish(:topic, msg) end}, time: 10)
-def main do
-  IO.puts("[Nexus.Trie] GenServer demo")
-  :ok
-end
+**Objective**: Measure publisher throughput with increasing fan-out and validate ETS lookup performance.
 
-```
+**Expected results**:
+- Registry `lookup/1` (O(1) ETS): 400,000–800,000 ops/second
+- Trie `match/2` with 1,000 subscriptions: 50,000–100,000 ops/second
+- `publish/2` with 10 matching subscribers: 100,000–200,000 ops/second
+- `publish/2` with 100 matching subscribers: 20,000–50,000 ops/second
 
-Target: 200,000 messages/second published to a 1000-subscriber topic on a single node.
+**Test scenarios**:
+1. Single subscriber, repeated publish (baseline)
+2. 1,000 subscriptions, one matching (trie overhead)
+3. 1,000 subscriptions, 100 matching (fan-out cost)
+4. Wildcard patterns at varying depths ("a.*.*", "a.b.#")
+
+**Interpretation**:
+Registry lookup dominates for small subscriber counts. As fan-out grows, trie traversal and message-send batching become visible. Wildcard matching cost depends on pattern complexity and matching subscription density.
 
 ---
 

@@ -628,43 +628,88 @@ The design separates concerns along their real axes: what must be correct (the P
 ## Benchmark
 
 ```elixir
-# Minimal timing harness — replace with Benchee for production measurement.
-{time_us, _result} = :timer.tc(fn ->
-  # exercise the hot path N times
-  for _ <- 1..10_000, do: :ok
+# bench/counter_bench.exs
+alias MetricsCollector.Types.{Counter, Histogram, Gauge}
+
+# Setup: create realistic metric sets
+counter = Counter.new(:http_requests_total, "HTTP requests", [:method, :status])
+histogram = Histogram.new(:http_latency_ms, "Latency", [:endpoint])
+gauge = Gauge.new(:queue_size, "Queue length", [])
+
+label_sets = [
+  %{method: "GET", status: "200"},
+  %{method: "GET", status: "404"},
+  %{method: "POST", status: "201"},
+  %{method: "POST", status: "400"},
+  %{method: "DELETE", status: "204"}
+]
+
+endpoints = ["GET /users", "POST /users", "GET /users/:id", "DELETE /users/:id"]
+
+IO.puts("Warming up...")
+# Warm up with 100k operations
+Enum.each(1..100_000, fn _ ->
+  Counter.inc(counter, Enum.random(label_sets), 1)
+  Histogram.observe(histogram, :rand.uniform(5000), %{endpoint: Enum.random(endpoints)})
 end)
 
-IO.puts("average: #{time_us / 10_000} µs per op")
-def main do
-  IO.puts("[MetricsCollector.PromQLTest] GenServer demo")
-  :ok
-end
+IO.puts("Running throughput benchmarks...")
 
+Benchee.run(
+  %{
+    "counter.inc (no labels)" => fn ->
+      Counter.inc(counter, %{}, 1)
+    end,
+    "counter.inc (5-label set)" => fn ->
+      Counter.inc(counter, Enum.random(label_sets), 1)
+    end,
+    "counter.get (no labels)" => fn ->
+      Counter.get(counter, %{})
+    end,
+    "histogram.observe" => fn ->
+      Histogram.observe(histogram, :rand.uniform(5000), %{endpoint: Enum.random(endpoints)})
+    end,
+    "histogram.get (10 buckets)" => fn ->
+      Histogram.get(histogram, %{endpoint: "GET /users"})
+    end,
+    "gauge.set" => fn ->
+      Gauge.set(gauge, :rand.uniform(1000))
+    end,
+    "gauge.get" => fn ->
+      Gauge.get(gauge)
+    end
+  },
+  parallel: 8,
+  time: 10,
+  warmup: 3,
+  formatters: [Benchee.Formatters.Console]
+)
+
+IO.puts("\nExpected performance targets:")
+IO.puts("  - counter.inc: < 50 ns (single atomic CAS)")
+IO.puts("  - counter.get: < 50 ns")
+IO.puts("  - histogram.observe: < 2 µs (O(bucket_count) atomics ops)")
+IO.puts("  - histogram.get: < 500 ns")
+IO.puts("  - throughput: > 5M inc/s on modern hardware at parallel:8")
 ```
 
-Target: <50ns per counter increment and <2µs per histogram observation.
+Target: <50ns per counter increment (single atomic compare-and-swap); <2µs per histogram observation; >5M increments/second at parallel:8 proving `:atomics` scales across scheduler threads.
 
-## Key Concepts: Distributed Tracing and Causal Ordering
+## Key Concepts: Time-Series Metrics, Cardinality, and Label Dimensions
 
-Distributed tracing reconstructs the request flow across services. A request hits service A, which calls B, which calls C. A trace shows this dependency graph and timing at each step.
+**The four metric types**: Each type answers a different question.
+- **Counter**: monotonically increasing value. Query: "how many requests total?" or rate. Example: `http_requests_total`. Cannot decrease; reset is a restart counter or a new time series.
+- **Gauge**: arbitrary value, can go up or down. Query: "current queue depth?" Example: `queue_size`, `memory_usage_bytes`, `temperature_celsius`.
+- **Histogram**: samples a distribution across buckets. Query: "what is the p99 latency?" Stores `_bucket`, `_count`, `_sum` variants automatically. Example: `http_latency_ms_bucket{le="1.0"}`.
+- **Summary**: streaming quantile approximation (like T-Digest). Loses histogram buckets but cheaper to compute. Example: older Prometheus clients.
 
-**Trace structure**:
-- **Trace ID**: Unique identifier for the entire user request, propagated in headers from A → B → C.
-- **Span**: A single operation (e.g., "handle POST /users", "query database"). Spans have start time, duration, and metadata (service, endpoint, user ID).
-- **Parent-child**: If A calls B, the B span references the A span's ID as its parent.
+**Cardinality explosion**: A metric with N label names can have M values per label, yielding M^N distinct time series. If a service labels requests with user_id and request_id (which are unbounded), you get M^2 time series per API endpoint. At 1M users and 1k requests per user, that is 1 billion time series, which OOMs the node. Guard cardinality at registration time by enforcing a max label set count per metric.
 
-On a single server, request tracing (e.g., `Logger.metadata(request_id: id)`) shows which logs belong to which request. Across multiple services, distributed tracing shows the entire dependency graph and where time is spent.
+**Time-series database (TSDB) storage**: Floats are 8 bytes each. A service producing 100 metrics at 100 Hz over 1 year is 100 × 100 × 86400 × 365 = 315 billion samples = 2.5 TB uncompressed. Compression is mandatory:
+- Gorilla/XOR encoding: exploit the fact that real-world samples are correlated. Encode deltas (sample N - sample N-1) in variable-width bits. Decode at memory-bandwidth speed.
+- Time-series chunks: group samples into immutable blocks (e.g., 2-hour chunks) for compaction and compression. Old chunks are never updated, only read or deleted by retention policy.
 
-**Sampling**: Tracing every request is expensive at high traffic. Common strategies:
-- **Always-on for errors**: Every failed request is traced.
-- **Tail-based sampling**: If a request exceeds SLA (e.g., > 1 second), retroactively trace all spans.
-- **Head-based sampling**: At request entry, decide with probability p whether to sample. Risk: you may sample only fast requests if not careful.
-
-**Vector clocks**: Distributed timestamps rely on synchronized clocks, which is fragile. Vector clocks track causality independently: if event A happened before event B, the vector clock at A is ≤ the vector clock at B. Tracing can use vector clocks to detect ordering even if wall-clock times disagree.
-
-The BEAM provides `:trace` and `:redbug` for capturing process message sequences. To integrate with external tracing systems (Jaeger, Datadog), use `:telemetry` to emit events, then forward to external collectors. The challenge is maintaining trace context across process boundaries and RPC calls without manual propagation.
-
-**Production insight**: Tracing is most valuable when latency is unexpected. If you know requests usually take 50 ms, tracing a 5-second request immediately shows if the bottleneck is queuing (high wait time), serialization (high handler time), or RPC latency. Without traces, you just see "5 seconds" and must guess.
+**Lock-free counters via `:atomics`**: A naïve counter is a GenServer that serializes every increment. Under high load (50k req/s), the counter becomes a bottleneck before the application logic. Erlang's `:atomics` primitive uses CPU compare-and-swap instructions to allow millions of concurrent increments without process context switching. Trade-off: limited to 64-bit integers, no persistence, no cross-node aggregation without a central query layer.
 
 ---
 

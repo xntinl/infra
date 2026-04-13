@@ -451,16 +451,103 @@ Each key maps to exactly one primary owner on the ring, and replicas follow the 
 ## Benchmark
 
 ```elixir
-# bench/cache_bench.exs — see Implementation Step for full script
-# mix run bench/cache_bench.exs
-def main do
-  IO.puts("[Krebs.Ring.parse] demo")
-  :ok
+# bench/cache_bench.exs — Distributed cache benchmark with latency percentiles
+# Prerequisites: iex -S mix (starts krebs server)
+# Then: mix run bench/cache_bench.exs
+
+defmodule KrebsBench do
+  @doc "Measures cache operations with latency percentiles (p50, p99)."
+  def run do
+    # Warm up: ensure TCP connection and ring are populated
+    for i <- 1..1_000 do
+      Redix.command!(:redix, ["SET", "warmup_#{i}", "val"])
+    end
+
+    Benchee.run(
+      %{
+        "GET — cache hit (single node)" => fn ->
+          key = "key_#{:rand.uniform(10_000)}"
+          {:ok, _val} = Redix.command(:redix, ["GET", key])
+        end,
+        "SET — no replication (single write)" => fn ->
+          key = "key_#{:rand.uniform(10_000)}"
+          {:ok, _} = Redix.command(:redix, ["SET", key, "value_#{System.system_time(:millisecond)}"])
+        end,
+        "SET — with R=2 quorum (replicated write)" => fn ->
+          key = "key_#{:rand.uniform(10_000)}"
+          {:ok, _} = Redix.command(:redix, ["SET", key, "replicated_#{System.system_time(:millisecond)}", "EX", "3600"])
+        end,
+        "DEL — delete with hinted handoff" => fn ->
+          key = "key_#{:rand.uniform(10_000)}"
+          {:ok, _} = Redix.command(:redix, ["DEL", key])
+        end,
+        "MGET — batch read (10 keys)" => fn ->
+          keys = for i <- 1..10, do: "key_#{:rand.uniform(10_000)}"
+          {:ok, _vals} = Redix.command(:redix, ["MGET" | keys])
+        end,
+        "SUBSCRIBE — pub/sub subscription" => fn ->
+          Redix.command(:redix, ["SUBSCRIBE", "channel_#{:rand.uniform(100)}"])
+        end
+      },
+      parallel: 8,
+      time: 10,
+      warmup: 3,
+      pre_check: true,
+      memory_time: 2,
+      formatters: [
+        {Benchee.Formatters.Console, extended_statistics: true},
+        {Benchee.Formatters.JSON, file: "bench_results.json"}
+      ]
+    )
+
+    IO.puts("\n=== Latency Percentiles (measured separately) ===")
+    measure_latencies()
+  end
+
+  defp measure_latencies do
+    latencies = for _ <- 1..100_000 do
+      start = System.monotonic_time(:millisecond)
+      {:ok, _} = Redix.command(:redix, ["GET", "key_#{:rand.uniform(10_000)}"])
+      System.monotonic_time(:millisecond) - start
+    end
+
+    sorted = Enum.sort(latencies)
+    p50 = Enum.at(sorted, div(length(sorted), 2))
+    p99 = Enum.at(sorted, trunc(length(sorted) * 0.99))
+    p999 = Enum.at(sorted, trunc(length(sorted) * 0.999))
+    max_latency = Enum.max(sorted)
+
+    IO.puts("GET latency — p50: #{p50}ms, p99: #{p99}ms, p999: #{p999}ms, max: #{max_latency}ms")
+  end
 end
 
+KrebsBench.run()
 ```
 
-Target: 100k GETs/s and 50k PUTs/s aggregate across 3 nodes on localhost; p99 < 2 ms.
+### Benchmark targets (v3 standard)
+
+| Metric | Target | Notes |
+|--------|--------|-------|
+| **GET throughput (cache hit)** | 100,000 ops/s | Single-node lookup via consistent hash ring |
+| **SET throughput (no replication)** | 50,000 ops/s | WAL write + memtable insert |
+| **SET with R=2 quorum** | 30,000 ops/s | Quorum writes to R replicas, slower due to coordination |
+| **GET latency p50** | < 0.5 ms | In-memory lookup, no disk I/O |
+| **GET latency p99** | < 2 ms | Handles occasional ring rebalance or GC pause |
+| **GET latency p999** | < 5 ms | Worst-case: cache eviction triggered |
+| **Memory per entry** | < 200 bytes | 16-byte key + 16-byte value + LRU overhead |
+| **Replication lag (hinted handoff)** | < 100 ms | Time for hint to forward after replica recovery |
+
+### Interpretation guide
+
+**Throughput baseline (100k GET/s)**: This assumes:
+- 8 parallel clients (connection pooling)
+- Keys uniformly distributed across 150 vnodes
+- Zero cache evictions (working set fits in memory)
+- Network latency negligible (localhost)
+
+**With eviction pressure**: Throughput drops when the LRU list needs to scan for victims. If working set > memory, monitor eviction rate and tune shard size / vnode count.
+
+**Replication cost**: R=2 quorum writes are ~2–3x slower than single-node because the handler must wait for a replica ACK. Use R=1 (no replication) for throughput-critical caches, R=2+ only where durability matters.
 
 ---
 

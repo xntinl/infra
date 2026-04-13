@@ -611,19 +611,90 @@ Each replica tracks a vector clock of its local updates and ships deltas since t
 
 ---
 
+## Quick start
+
+To run the CRDT library and tests:
+
+```bash
+# Set up the project
+mix new crdts --sup
+cd crdts
+mkdir -p lib/crdts test/crdts bench
+
+# Install dependencies
+mix deps.get
+
+# Run the full test suite
+mix test test/crdts/ --trace
+
+# Run benchmarks
+mix run bench/crdts_bench.exs
+```
+
+Expected output: All lattice law tests pass (commutativity, associativity, idempotency), and the 5-node convergence test completes within 1 second after network healing.
+
 ## Benchmark
 
 ```elixir
-# bench/crdt_bench.exs
-Benchee.run(%{"merge_10k_updates" => fn -> Crdt.merge(a, b) end}, time: 10)
-def main do
-  IO.puts("[CRDTs.GCounter] GenServer demo")
-  :ok
-end
+# bench/crdts_bench.exs
+# Full Benchee harness for CRDT operations at scale
 
+Benchee.run(
+  %{
+    "GCounter increment (1k existing)" => fn ->
+      counter = Enum.reduce(1..1_000, CRDTs.GCounter.new(), fn _, c ->
+        CRDTs.GCounter.increment(c, :node_a)
+      end)
+      CRDTs.GCounter.increment(counter, :node_b)
+    end,
+    "GCounter merge (1k per node, 5 nodes)" => fn ->
+      c1 = Enum.reduce(1..1_000, CRDTs.GCounter.new(), fn _, c ->
+        CRDTs.GCounter.increment(c, :node_a)
+      end)
+      c2 = Enum.reduce(1..1_000, CRDTs.GCounter.new(), fn _, c ->
+        CRDTs.GCounter.increment(c, :node_b)
+      end)
+      CRDTs.GCounter.merge(c1, c2)
+    end,
+    "ORSet add (1k existing)" => fn ->
+      or_set = Enum.reduce(1..1_000, CRDTs.ORSet.new(), fn i, s ->
+        CRDTs.ORSet.add(s, "item_#{i}", :node_a)
+      end)
+      CRDTs.ORSet.add(or_set, "new_item", :node_b)
+    end,
+    "ORSet merge (1k per set)" => fn ->
+      s1 = Enum.reduce(1..1_000, CRDTs.ORSet.new(), fn i, s ->
+        CRDTs.ORSet.add(s, "item_a_#{i}", :node_a)
+      end)
+      s2 = Enum.reduce(1..1_000, CRDTs.ORSet.new(), fn i, s ->
+        CRDTs.ORSet.add(s, "item_b_#{i}", :node_b)
+      end)
+      CRDTs.ORSet.merge(s1, s2)
+    end,
+    "LWW register merge (HLC ordering)" => fn ->
+      r1 = CRDTs.LWWRegister.new("value_1", :node_a)
+      r1_updated = CRDTs.LWWRegister.update(r1, "value_2")
+      r2 = CRDTs.LWWRegister.new("value_3", :node_b)
+      CRDTs.LWWRegister.merge(r1_updated, r2)
+    end
+  },
+  time: 5,
+  warmup: 2,
+  memory_time: 2,
+  formatters: [
+    Benchee.Formatters.Console,
+    {Benchee.Formatters.JSON, file: "bench/results.json"}
+  ]
+)
 ```
 
-Target: Merge of two 10k-element OR-sets in < 100 µs; convergence under 50 ms across 5 replicas.
+**Benchmark targets:**
+- GCounter increment: <1 µs (map update is O(1) amortized)
+- GCounter merge (1k nodes): <50 µs (slot-wise max is O(N) per node count)
+- ORSet add: <10 µs (MapSet insertion is O(log n))
+- ORSet merge (1k elements): <200 µs (union of dot sets per element)
+- LWW register merge: <1 µs (HLC comparison is O(1))
+- **Convergence**: 5-node network reaches consensus within 50 ms after partition heals (gossip interval 50 ms, 1-2 rounds sufficient)
 
 ---
 

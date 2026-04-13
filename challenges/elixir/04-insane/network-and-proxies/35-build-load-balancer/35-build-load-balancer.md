@@ -688,39 +688,59 @@ The design separates concerns along their real axes: what must be correct (the l
 ## Benchmark
 
 ```elixir
-# Minimal timing harness — replace with Benchee for production measurement.
-{time_us, _result} = :timer.tc(fn ->
-  # exercise the hot path N times
-  for _ <- 1..10_000, do: :ok
-end)
+# bench/balancer_bench.exs
+{:ok, pool} = Balancer.Pool.start_link(
+  backends: for i <- 1..100 do
+    %{
+      id: "b#{i}",
+      host: "localhost",
+      port: 8000 + i,
+      healthy: true,
+      draining: false,
+      weight: if(rem(i, 10) == 0, do: 2, else: 1)
+    }
+  end,
+  algorithm: :round_robin
+)
 
-IO.puts("average: #{time_us / 10_000} µs per op")
+Benchee.run(%{
+  "round_robin_100_backends" => fn ->
+    {:ok, _} = Balancer.Pool.select(:round_robin)
+  end,
+  "weighted_distribution_100_backends" => fn ->
+    {:ok, _} = Balancer.Pool.select(:weighted)
+  end,
+  "least_connections_100_backends" => fn ->
+    {:ok, _} = Balancer.Pool.select(:least_connections)
+  end
+}, time: 10, warmup: 3)
+
 def main do
-  IO.puts("[Balancer.Pool] GenServer demo")
+  IO.puts("[Balancer] TCP/HTTP load balancer with health checking")
+  IO.puts("Power-of-two-choices achieves near-optimal load balance with O(1) overhead")
+  IO.puts("Weighted round-robin using current-weight algorithm scales to large weights")
+  IO.puts("Active + passive health checks prevent cascading failures")
   :ok
 end
-
 ```
 
 Target: <1µs per backend selection at 100 backends.
 
-## Key Concepts: Load Balancing Under Tail Latency
+## Key Concepts: Load Balancing Algorithms and Connection Draining
 
-Load balancers distribute requests across backends. The choice of algorithm affects both latency distribution and fairness.
+Load balancers distribute traffic across backends using algorithms that balance latency, fairness, and operational simplicity.
 
-**Round-robin**: Request i goes to backend (i % N). Simple and fair on average, but ignores backend state. If one backend is slow (e.g., garbage collection pause), clients hitting that backend wait, skewing the p99 latency.
+**Round-robin**: Sequential selection (backend i % N). Simple, fair on average, but blind to backend state. If one backend GC-pauses, that backend's clients stall. No state per backend, minimal CPU cost.
 
-**Least connections**: Track open connections per backend; send the next request to the backend with fewest connections. Better than round-robin, but still ignores request complexity (a short read and a 10-second compute job are both "1 connection").
+**Least connections**: Select the backend with fewest active connections. Better than round-robin because it accounts for actual load. Cost: O(N) per selection to find the minimum. With 100 backends, finding the minimum is still fast, but the cost is 100x higher than round-robin.
 
-**Power of two choices**: Pick two random backends and assign the request to the one with fewer connections. With minimal overhead, this reduces tail latency from O(log N) to O(log log N) because load is balanced more evenly without the cost of globally tracking all backends.
+**Power-of-two choices (P2C)**: Pick two random backends, select the one with fewer connections. Statistically (via the coupon collector problem), this achieves ~95% of the benefit of global least-connections with O(1) cost. The key insight: with randomness, tail latency improves dramatically. Even with 100 backends, picking two random ones and comparing is faster and more effective than sequential scan.
 
-**Latency-aware (p99-driven)**: Track recent p99 latency per backend; prefer the backend with lowest p99. Powerful for SLA-driven systems, but can oscillate if multiple backends are competing for shared resources.
+**Weighted round-robin**: Some backends have more capacity. Assign weights (e.g., backend A=5, B=1) so A gets 5x more traffic. Naive implementation: `List.duplicate(a, 5) ++ [b]` creates a 6-element list per selection. Current-weight algorithm: maintain `current_weight[i]` per backend; each round, increment by configured weight, select max, subtract total_weight. This avoids list allocation.
 
-On a 100-node cluster, round-robin assigns 1% of traffic to each backend. If one is 10x slower, clients hitting it see 10x latency. With 1000 req/sec, that's 10 reqs/sec hitting the slow node, and each sees 10x latency, affecting the fleet's p99. Least connections or power-of-two reduces affected clients to a single one per decision.
+**Connection draining**: During deployment, old backends must release active connections gracefully. Mark as "draining" so no new connections route to it. Existing connections complete normally. Active health checks continue to test the backend. Once all connections close, shut it down. This avoids request failures during rolling deploys.
 
-The BEAM's `:poolboy` or `:connection_pool` naturally implement least-connections: each pool process tracks queue depth. A dispatcher sends new requests to the pool with the shortest queue. This is "power of two" with full visibility into actual queue depth, making it extremely effective.
-
-**Production insight**: Measuring load balancing on a single machine is misleading. Test against realistic backend variability (e.g., one slow backend, cascading failures) to see how your algorithm's tail latency behaves.
+**Production insight**: Load balancer algorithms on paper are not what matters. What matters is tail latency under realistic failure modes: one slow backend, cascading failures where recovery produces spikes, connection pools at different stages of lifecycle.
 
 ---
 

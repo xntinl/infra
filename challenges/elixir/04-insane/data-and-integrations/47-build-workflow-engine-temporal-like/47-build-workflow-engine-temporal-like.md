@@ -788,30 +788,60 @@ end
 end)
 
 IO.puts("average: #{time_us / 10_000} µs per op")
-def main do
-  IO.puts("[WorkflowEngine.ActivityTest] GenServer demo")
-  :ok
-end
-
 ```
 
-Target: <10ms to resume a workflow from a 1k-event history.
+## Quick start
 
-## Deep Dive: Conflict-Free Replicated Data Types (CRDTs) and Eventual Consistency
+To run the workflow engine:
 
-CRDTs are data structures designed so that concurrent updates from multiple replicas always converge to the same state without explicit coordination or consensus.
+```bash
+# Set up the project
+mix new workflow_engine
+cd workflow_engine
+mkdir -p lib/workflow_engine test bench
 
-**How it works**: Traditional merge requires agreement: if replica A says "x = 5" and replica B says "x = 10", which is correct? A CRDT avoids this by defining a merge operation that is commutative, associative, and idempotent. Given these properties, nodes can merge state in any order and always converge.
+# Install dependencies (no external deps — pure Elixir)
+mix deps.get
 
-**Example: G-Counter (grow-only counter)**. Each node maintains a vector of counters, one per node. To increment, increment your own entry. Total is the sum of all entries. To merge two G-Counters, take element-wise max. This is commutative, associative, and idempotent: two nodes incrementing independently then merging always produce the same total, regardless of merge order.
+# Run tests
+mix test
 
-**Trade-off: state size**. A G-Counter with 100 nodes is a 100-element vector. Decrement support (PN-Counter) requires 100 elements for increments and 100 for decrements (200 total). As the cluster grows, CRDT state balloons. Compaction (summing old entries into a delta) is necessary.
+# Observe a workflow's durability across simulated restarts
+iex> WorkflowEngine.History.init()
+iex> {:ok, pid} = WorkflowEngine.Worker.start_link(
+  workflow_id: "test-1",
+  module: MyWorkflow,
+  args: %{amount: 100}
+)
+iex> Process.exit(pid, :kill)
+iex> {:ok, pid2} = WorkflowEngine.Worker.start_link(
+  workflow_id: "test-1",
+  module: MyWorkflow,
+  args: %{amount: 100}
+)
+# Worker reads history, replays deterministically, resumes where it left off
+iex> Process.sleep(500)
+iex> WorkflowEngine.History.read("test-1") |> Enum.map(& &1.type)
+[:workflow_started, :activity_scheduled, :activity_completed, :workflow_completed]
+```
 
-**CRDT vs. Consensus**: Raft is strong consistency (all nodes agree on exact state, ordered updates). CRDTs are eventual consistency (nodes may disagree temporarily, then converge). CRDTs excel in offline-first scenarios (mobile app syncing later); Raft is better for systems requiring immediate agreement (bank transfers).
+Expected output: Workflow resumes at the exact point it crashed and produces the same result; no activities are re-executed (their results come from history); on process restart, deterministic replay handles all non-determinism.
 
-**Gotcha**: Just because a CRDT converges does not mean it is correct for your application. A multi-user text document where two users edit the same location must use a CRDT that preserves intent (e.g., CRDT with unique node IDs). A naive counter cannot distinguish "User A inserted at position 10" from "User B inserted at position 10"—they both see increments and may converge to the wrong document.
+## Deep Dive: Durable Workflow Orchestration via Event Sourcing and Deterministic Replay
 
-**Production patterns**: CRDTs shine for collaborative editing (Google Docs, Figma) and offline-first apps (mobile). For backends requiring strong consistency (databases, ledgers), Raft or other consensus is necessary. Many systems use both: CRDTs for user-facing edits, Raft for backend state.
+A workflow engine's job is deceptively hard: coordinate multiple external services (payment processors, inventory systems, email), survive crashes and restarts, retry failed steps, and guarantee the workflow completes exactly once even if the orchestrator process dies mid-flow.
+
+**Why not just call the services directly?** Direct calls lose state on crash. If a charge succeeds but inventory fails, you must refund the charge — but if the orchestrator crashes, you lose the fact that the charge succeeded and might double-charge the customer.
+
+**Why event sourcing?** Every side effect (call to a service, timer firing, signal receipt) is recorded as an immutable event. When the process crashes and restarts, it reads the event history, replays the workflow function, and resumes from the last recorded event. The replay is deterministic — it returns the same results as the original run — so decisions made during replay are correct without re-executing activities.
+
+**Why deterministic replay requires banning wall-clock time?** If workflow code calls `DateTime.utc_now()`, replay returns a different time than the original run. The workflow may take a different branch (e.g., if deadline_exceeded?). The solution: workflow code gets time from the `WorkflowStarted` event, guaranteeing the same value on every replay.
+
+**Why durable timers without live processes?** You cannot hold a BEAM process open for 7 days. Instead, `Workflow.sleep(days: 7)` records a `TimerStarted` event with a deadline, releases the process, and a timer service fires a `TimerFired` event when the deadline passes. The workflow resumes on the next heartbeat and continues from the timer-fired event.
+
+**Key invariant**: replay is idempotent. Running a workflow that has already completed (reading all its events and replaying) must not re-execute activities or produce duplicate side effects. Activities are idempotent on the server side (e.g., charge-with-idempotency-key), and the engine does not re-execute activities whose result is already in history.
+
+**Trade-off against Temporal**: Temporal persists to Cassandra and PostgreSQL, handles server-side scalability, and offers a polyglot SDK. This implementation uses ETS and is single-node. For a learning exercise and a system that must be self-contained in the Elixir cluster, that trade-off is acceptable.
 
 ---
 

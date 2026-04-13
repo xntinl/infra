@@ -100,23 +100,9 @@ mkdir -p lib/restkit/{pagination,openapi}
 mkdir -p test/restkit bench
 ```
 
-### Step 2: `mix.exs`
+### Step 2: `mix.exs` — dependencies
 
 **Objective**: Declare the Mix project configuration and third-party dependencies.
-
-
-```elixir
-defp deps do
-  [
-    {:plug_cowboy, "~> 2.7"},
-    {:jason, "~> 1.4"},
-    {:benchee, "~> 1.3", only: :dev},
-    {:stream_data, "~> 1.1", only: :test}
-  ]
-end
-```
-
-### Dependencies (mix.exs)
 
 ```elixir
 defp deps do
@@ -814,39 +800,47 @@ The design separates concerns along their real axes: what must be correct (the R
 ## Benchmark
 
 ```elixir
-# Minimal timing harness — replace with Benchee for production measurement.
-{time_us, _result} = :timer.tc(fn ->
-  # exercise the hot path N times
-  for _ <- 1..10_000, do: :ok
-end)
+# bench/validation_bench.exs (complete benchmark harness)
+schema = %{
+  name: %{type: :string, required: true},
+  email: %{type: :string, required: true},
+  role: %{type: :string, required: false, enum: ["admin", "user", "viewer"]},
+  age: %{type: :integer, required: false, min: 0, max: 150}
+}
 
-IO.puts("average: #{time_us / 10_000} µs per op")
-def main do
-  IO.puts("[Restkit.Pagination.Cursor.validate] demo")
-  :ok
-end
+valid_params = %{
+  "name" => "Alice",
+  "email" => "alice@example.com",
+  "role" => "admin",
+  "age" => "30"
+}
 
+Benchee.run(
+  %{
+    "validation: valid params" => fn ->
+      Restkit.Validation.validate(valid_params, schema)
+    end,
+    "validation: invalid params" => fn ->
+      Restkit.Validation.validate(%{"role" => "superadmin"}, schema)
+    end
+  },
+  time: 5,
+  warmup: 2
+)
 ```
 
 Target: <200µs per validated request including JSON decode and schema check.
 
-## Key Concepts: Event Sourcing and Immutable Logs
+## Key Concepts: Resource-Oriented API Design and OpenAPI Generation
 
-Event sourcing inverts the traditional database model: instead of storing current state, store every state-changing event in an immutable log. The current state is derived by replaying events from the start.
+A REST API's purpose is to expose domain resources as addressable, manipulable entities. RESTkit's design centers on:
 
-This shift has profound implications:
-- **Audit trail is free**: Every change is a named event with timestamp and actor.
-- **Temporal queries are simple**: Replay events up to a past date to see historical state.
-- **Concurrency is safe**: Events are immutable and append-only, eliminating race conditions on state mutations.
-- **Testability is easier**: Given a sequence of events, the state is deterministic; no mocks needed.
+1. **Single source of truth** — a resource declaration (fields, types, constraints, relationships) is used to generate routes, validation schemas, and API documentation automatically.
+2. **Cursor-based pagination** — opaque, signed cursors prevent clients from constructing arbitrary database queries while supporting efficient deep pagination.
+3. **Compile-time OpenAPI generation** — the spec is derived at application startup, never at request time, ensuring stability and performance.
+4. **Accumulated validation errors** — all schema violations are reported in a single response, not fail-fast, reducing round trips.
 
-The BEAM is naturally suited for this pattern. Each aggregate (e.g., Account) is a GenServer that receives commands, validates them against current state, publishes an event if valid, then applies the event to update local state. The OTP supervision tree ensures persistence across restarts; the event log (in a database) survives the entire system.
-
-The downside: evolving schemas is hard. If you rename a field or split an event type, old events still use the old structure. Solutions include versioning (introduce `withdrew_v2` alongside `withdrew_v1`) or upcasting (projection functions that translate old events to new). Frameworks like Commanded automate this.
-
-Another challenge: reads require replaying events, which is slow for 10-year-old aggregates with millions of events. Solution: snapshots. Periodically serialize current state; replay only events after the snapshot. This trades disk space for query speed, a worthwhile tradeoff for most systems.
-
-**Production insight**: Event sourcing is powerful for audit-heavy systems (banking, compliance), but unnecessary overhead for simple CRUD apps. Choose event sourcing when the audit trail or temporal queries justify the implementation complexity.
+By embedding validation rules, sort constraints, and filter definitions in the resource declaration, RESTkit eliminates drift between code and documentation.
 
 ---
 

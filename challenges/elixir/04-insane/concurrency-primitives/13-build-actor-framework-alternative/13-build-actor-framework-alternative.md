@@ -84,15 +84,6 @@ mkdir -p lib/typed_actors test/typed_actors bench
 
 **Objective**: Keep deps to `benchee` alone — the macro, dispatch, and ActorRef must be hand-rolled, not borrowed from GenStage or `:gen_statem`.
 
-
-```elixir
-defp deps do
-  [
-    {:benchee, "~> 1.3", only: :dev}
-  ]
-end
-```
-
 ### Dependencies (mix.exs)
 
 ```elixir
@@ -380,10 +371,28 @@ defmodule TypedActors.HotUpdateTest do
 end
 ```
 
+---
+
+## Quick start
+
+**Prerequisites**: Elixir 1.14+, OTP 25+
+
+**Setup and run**:
+```bash
+mix test test/typed_actors/ --trace
+mix run -e "IO.puts(\"TypedActors module loaded\")"
+```
+
+**Run benchmarks**:
+```bash
+mix run bench/actors_bench.exs
+```
+
+---
+
 ### Step 6: Run the tests
 
 **Objective**: Use `--trace` so dispatch order and hot-swap transitions print per test, exposing any macro-generated clause ordering bugs.
-
 
 ```bash
 mix test test/typed_actors/ --trace
@@ -439,17 +448,32 @@ Each actor runs a custom `:proc_lib` process with a hand-written receive loop th
 
 ## Benchmark
 
-```elixir
-# bench/actor_bench.exs
-Benchee.run(%{"ping_pong" => fn -> send(actor, {:ping, self()}); receive do _ -> :ok end end}, time: 10)
-def main do
-  IO.puts("[MyActor] GenServer demo")
-  :ok
-end
+**Objective**: Measure typed dispatch overhead and hot-swap latency impact.
 
-```
+**Expected results**:
+- TypedActors `call/3`: 15–30 microseconds
+- GenServer `call/3`: 8–12 microseconds
+- Macro-generated dispatch overhead: 30–80% relative to GenServer
+- Hot update time: < 100 microseconds (dispatch module swap + reply)
+- In-flight message throughput during hot update: > 90% of baseline
 
-Target: 1,000,000 messages/second in a ping-pong loop between two local actors.
+**Test scenarios**:
+1. Baseline: single actor, repeated calls (establish dispatch cost)
+2. Declaration accumulation: 5, 20, 100 declared message types (compile-time macro cost)
+3. Hot update under load: concurrent callers, mid-swap behavior change
+4. Remote ActorRef: local vs remote node dispatch latency
+5. Struct pattern matching: verify no regex-like slowdown
+
+**Measurement methodology**:
+- Warmup: 1,000 ops per benchmark
+- Measure: 100,000 ops per benchmark
+- Report: mean, p50, p99 latency
+- Parallel workers: 1 (baseline), then 10 (contention)
+
+**Interpretation**:
+Macro dispatch uses pattern matching, which is O(n) in the number of declared message types. The baseline overhead should remain < 100 ns per dispatch (2–3 CPU cycles on a 2 GHz BEAM). Hot update should not cause > 10% latency spike — if it does, investigate whether the dispatch module swap blocks the receive loop.
+
+If TypedActors shows > 50% overhead: examine the macro-generated dispatch clauses for inefficient pattern matching or whether the struct type extraction is duplicating work.
 
 ---
 

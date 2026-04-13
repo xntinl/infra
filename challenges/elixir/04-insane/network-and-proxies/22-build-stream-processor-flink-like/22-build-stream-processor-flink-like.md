@@ -631,36 +631,61 @@ Barriers are injected at sources and flow through operators; when an operator se
 ## Benchmark
 
 ```elixir
-# bench/stream_bench.exs
-Benchee.run(%{"pipeline_100k" => fn -> Stream.run(pipeline, 100_000) end}, time: 10)
+# bench/flowex_bench.exs
+job = Flowex.Job.new()
+  |> Flowex.Job.source(:source, Flowex.Sources.Injected, [])
+  |> Flowex.Job.filter(:filter, fn e -> e.value > 0 end)
+  |> Flowex.Job.map(:transform, fn e -> %{e | value: e.value * 2} end)
+  |> Flowex.Job.aggregate(:count, fn _key, acc -> (acc || 0) + 1 end)
+  |> Flowex.Job.sink(:sink, Flowex.Sinks.Noop, [])
+  |> Flowex.Job.edge(:source, :filter)
+  |> Flowex.Job.edge(:filter, :transform)
+  |> Flowex.Job.edge(:transform, :count)
+  |> Flowex.Job.edge(:count, :sink)
+
+{:ok, runtime} = Flowex.Runtime.start_link(job)
+
+Benchee.run(%{
+  "without_checkpoint" => fn ->
+    Enum.each(1..100_000, fn i ->
+      Flowex.Runtime.inject(runtime, :source, %{id: i, value: rem(i, 100), ts: i})
+    end)
+    Flowex.Runtime.flush(runtime)
+  end,
+  "with_checkpoint_every_10k" => fn ->
+    Enum.each(1..100_000, fn i ->
+      Flowex.Runtime.inject(runtime, :source, %{id: i, value: rem(i, 100), ts: i})
+      if rem(i, 10_000) == 0, do: Flowex.Checkpoint.trigger(runtime)
+    end)
+    Flowex.Runtime.flush(runtime)
+  end
+}, time: 10, warmup: 2)
+
 def main do
-  IO.puts("[Flowex.WindowTest] GenServer demo")
+  IO.puts("[Flowex] Exactly-once stream processing engine")
+  IO.puts("Chandy-Lamport barriers enable consistent snapshots across distributed pipelines")
+  IO.puts("Watermarks drive event-time windowed aggregations with late event grace periods")
   :ok
 end
-
 ```
 
-Target: 100,000 events/second through a 3-stage pipeline with 1-second checkpoints; recovery < 500 ms.
+Target: 1M events/second through a 5-operator pipeline with 1-second checkpoints; recovery < 500ms.
 
 ---
 
-## Key Concepts: Load Balancing Under Tail Latency
+## Key Concepts: Streaming Topology and Event-Time Semantics
 
-Load balancers distribute requests across backends. The choice of algorithm affects both latency distribution and fairness.
+Stream processing pipelines handle data in motion. Unlike batch processing, streams are unbounded and events arrive in real time (or out of order). The fundamental challenge is combining events across time windows without knowing when all events for a window have arrived.
 
-**Round-robin**: Request i goes to backend (i % N). Simple and fair on average, but ignores backend state. If one backend is slow (e.g., garbage collection pause), clients hitting that backend wait, skewing the p99 latency.
+**Watermarks**: A watermark is a system assertion: "no event with timestamp earlier than W will arrive." When the watermark advances past a window's end time, the window closes and fires. Watermarks account for late events by maintaining a grace period — a small window after the watermark where late events are still allowed. Events arriving after the grace period are discarded or routed to a side output.
 
-**Least connections**: Track open connections per backend; send the next request to the backend with fewest connections. Better than round-robin, but still ignores request complexity (a short read and a 10-second compute job are both "1 connection").
+**Event-time vs. Processing-time**: Events have two timestamps. Event-time is when the event occurred (from the data source). Processing-time is when the system observed the event. A banking system must window on event-time (transaction happened at 10 AM even if observed at 10:05 AM). A monitoring system may use processing-time. Windowing on the wrong timestamp produces incorrect results.
 
-**Power of two choices**: Pick two random backends and assign the request to the one with fewer connections. With minimal overhead, this reduces tail latency from O(log N) to O(log log N) because load is balanced more evenly without the cost of globally tracking all backends.
+**Exactly-once semantics**: Barriers flow through the DAG with events. When an operator receives barriers on all inputs, it snapshots its state and forwards the barrier downstream. On failure, restarting from the snapshot and replaying source offsets guarantees that each input contributes exactly once to the output — no duplicates, no losses.
 
-**Latency-aware (p99-driven)**: Track recent p99 latency per backend; prefer the backend with lowest p99. Powerful for SLA-driven systems, but can oscillate if multiple backends are competing for shared resources.
+**Credit-based backpressure**: Each operator grants credits (capacity) to its upstream. Upstream sends one event per credit. When downstream is slow, it stops granting credits, throttling the upstream without blocking or dropping events. This is more efficient than buffering unbounded queues.
 
-On a 100-node cluster, round-robin assigns 1% of traffic to each backend. If one is 10x slower, clients hitting it see 10x latency. With 1000 req/sec, that's 10 reqs/sec hitting the slow node, and each sees 10x latency, affecting the fleet's p99. Least connections or power-of-two reduces affected clients to a single one per decision.
-
-The BEAM's `:poolboy` or `:connection_pool` naturally implement least-connections: each pool process tracks queue depth. A dispatcher sends new requests to the pool with the shortest queue. This is "power of two" with full visibility into actual queue depth, making it extremely effective.
-
-**Production insight**: Measuring load balancing on a single machine is misleading. Test against realistic backend variability (e.g., one slow backend, cascading failures) to see how your algorithm's tail latency behaves.
+**Production insight**: Streaming systems are deceptively hard. Test with watermark skew (events from 5 different time ranges arriving simultaneously), operator crashes mid-window, and out-of-order delivery to expose real bugs.
 
 ---
 

@@ -759,19 +759,65 @@ The compiler lowers the AST to a linear sequence of stack-machine opcodes, perfo
 
 ---
 
-## Benchmark
+## Benchmark workload
+
+El benchmark mide compilación (parsing + type checking) y ejecución. El programa es factorial recursivo, que expone:
+1. Call chain depth (parser performance)
+2. Type inference on recursive functions (type checker performance)
+3. Code generation for Core Erlang (codegen performance)
 
 ```elixir
-# bench/compiler_bench.exs
-Benchee.run(%{"compile_100loc" => fn -> MiniLang.compile(source) end, "run" => fn -> VM.run(bc) end}, time: 10)
-def main do
-  IO.puts("[Mlang.TypeChecker.tokenize] demo")
-  :ok
+# bench/mlang_bench.exs
+alias Mlang.{Lexer, Parser, TypeChecker, ClosureConverter, Codegen}
+
+fib_source = """
+fn fib(n: Int) -> Int {
+  if n < 2 { return n; }
+  return fib(n - 1) + fib(n - 2);
+}
+"""
+
+closure_source = """
+fn make_adder(n: Int) -> Fn(Int) -> Int {
+  return fn(x: Int) -> Int { return x + n; };
+}
+fn use_adder() -> Int {
+  let add5 = make_adder(5);
+  return add5(10);
+}
+"""
+
+defp compile_all(source) do
+  {:ok, tokens} = Lexer.tokenize(source)
+  {:ok, ast} = Parser.parse(tokens)
+  {:ok, typed} = TypeChecker.check(ast)
+  {:ok, converted} = ClosureConverter.convert(typed)
+  {:ok, _core} = Codegen.emit(converted)
 end
 
+Benchee.run(
+  %{
+    "parse + type-check fibonacci" => fn -> compile_all(fib_source) end,
+    "parse + type-check with closure" => fn -> compile_all(closure_source) end,
+    "codegen only (pre-typed)" => fn ->
+      {:ok, tokens} = Lexer.tokenize(fib_source)
+      {:ok, ast} = Parser.parse(tokens)
+      {:ok, typed} = TypeChecker.check(ast)
+      {:ok, converted} = ClosureConverter.convert(typed)
+      {:ok, _core} = Codegen.emit(converted)
+    end
+  },
+  time: 5,
+  warmup: 2,
+  formatters: [Benchee.Formatters.Console]
+)
 ```
 
-Target: 100 LOC compile in < 5 ms; bytecode execution ~5x faster than a tree-walking baseline.
+**Targets**:
+- Simple arithmetic parsing: < 50 µs
+- Type inference on fib: < 1 ms
+- Full compilation (lex + parse + check + codegen): < 5 ms for 100 LOC
+- Code generation (post-typed): < 500 µs
 
 ---
 
@@ -801,6 +847,75 @@ pub fn expensive_operation_nif(a: u32) -> u32 { expensive_operation(a) }
 ```
 
 **Production pattern**: Reserve dirty schedulers for truly blocking I/O. Measure scheduler utilization to confirm no starvation under load. Prefer Elixir async processes for I/O when possible; they are more observable and composable.
+
+---
+
+## Key Concepts: Pratt Parsing and Type Unification
+
+**Pratt parser (top-down operator precedence)**: Cada operador tiene un binding power (precedencia). El parser mantiene un precedencia mínima `min_bp`. Cuando se encuentra un operador con binding power `bp > min_bp`, se parsea el lado derecho con `min_bp = bp`. Esto hace que `*` (bp=6) se agrupe más fuerte que `+` (bp=5):
+
+```
+parse_expr("1 + 2 * 3", min_bp=0)
+  → left = nud("1") = IntLit(1)
+  → led_loop(IntLit(1), [+ 2 * 3], 0)
+    → bp(:+) = 5 > 0, recurse right
+    → parse_expr("2 * 3", min_bp=5)
+      → left = IntLit(2)
+      → led_loop(IntLit(2), [* 3], 5)
+        → bp(:*) = 6 > 5, recurse right
+        → parse_expr("3", min_bp=6)
+          → IntLit(3)
+        → BinOp(:*, IntLit(2), IntLit(3))
+      → return BinOp(:*, IntLit(2), IntLit(3))
+    → BinOp(:+, IntLit(1), BinOp(:*, IntLit(2), IntLit(3)))
+```
+
+La clave: cada operador "consume" tokens con precedencia mayor que sí mismo.
+
+**Unification algorithm (Robinson, 1965)**: Dado dos tipos `t1` y `t2`, unificar produce una sustitución `σ` tal que `σ(t1) = σ(t2)`. El algoritmo:
+
+1. Si `t1 = t2`, resultado es la identidad.
+2. Si `t1` es una variable `v` y `v` no aparece en `t2`, resultado es `{v → t2}`.
+3. Si `t1` es concreto (Int, Bool, etc.) y `t2` es variable, resultado es `{variable → t1}`.
+4. Si ambos son tipos de función `Fn(p1) → r1` y `Fn(p2) → r2`, unificar parámetros y retorno recursivamente.
+5. Si `t1` y `t2` son concretos distintos, unificación falla.
+
+En this implementation, the type checker collects all constraints as unification equations and solves them in order. Type inference infers the type of each expression bottom-up:
+
+```elixir
+infer_expr(BinOp(:+, IntLit(1), IntLit(2)))
+  → infer left: :int
+  → infer right: :int
+  → constraint: int + int → int
+  → unify(:+, [:int, :int], result=:int)
+```
+
+**Closure conversion (lambda lifting)**: Core Erlang functions cannot capture variables from enclosing scopes. The converter transforms:
+
+```scheme
+(define (make-adder n)
+  (lambda (x) (+ x n)))
+```
+
+Into a named function with an extra parameter for the captured variable:
+
+```erlang
+make_adder_closure(N, X) -> X + N.
+make_adder(N) -> fun(X) -> make_adder_closure(N, X) end.
+```
+
+The original free variable `n` becomes an explicit parameter. The closure is now a tuple of function pointer and captured values.
+
+**Core Erlang code generation**: The `:cerl` module in OTP provides functions to build Core Erlang AST nodes:
+
+- `:cerl.c_module/3` — module with name, exports, and definitions
+- `:cerl.c_fun/2` — function with parameters and body
+- `:cerl.c_var/1` — variable
+- `:cerl.c_atom/1` — literal atom
+- `:cerl.c_call/3` — function call (e.g., `:erlang.+/2`)
+- `:cerl.c_case/2` — pattern matching (used for if/else)
+
+The emitted Core Erlang AST is then compiled with `:compile.forms/2` to BEAM bytecode.
 
 ---
 

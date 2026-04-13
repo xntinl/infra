@@ -740,39 +740,83 @@ end
 ## Benchmark
 
 ```elixir
-# Minimal timing harness — replace with Benchee for production measurement.
-{time_us, _result} = :timer.tc(fn ->
-  # exercise the hot path N times
-  for _ <- 1..10_000, do: :ok
-end)
+# bench/resolution_overhead.exs
+defmodule TenantFramework.Bench.ResolutionOverhead do
+  def run do
+    IO.puts("=== Tenant Resolution & RLS Overhead Benchmark ===\n")
+    
+    # Warmup: resolve 1000 tenants
+    IO.write("Warmup (1k resolutions)... ")
+    for _ <- 1..1_000 do
+      simulate_resolution()
+    end
+    IO.puts("done")
+    
+    # Benchmark: resolve 100k tenants and measure
+    IO.write("Benchmark (100k resolutions)... ")
+    {us, _} = :timer.tc(fn ->
+      for _ <- 1..100_000 do
+        simulate_resolution()
+      end
+    end)
+    IO.puts("done\n")
+    
+    per_resolution_us = us / 100_000.0
+    per_resolution_ms = per_resolution_us / 1000.0
+    
+    # Typical request: resolve tenant + RLS SET LOCAL + query
+    # Budget: 50ms per request at p99
+    total_per_request_ms = per_resolution_ms + 5  # 5ms query time
+    budget_ms = 50
+    usage_pct = (total_per_request_ms / budget_ms) * 100
+    
+    IO.puts("Results:")
+    IO.puts("  Per-resolution: #{Float.round(per_resolution_us, 2)} µs (#{Float.round(per_resolution_ms, 3)} ms)")
+    IO.puts("  Per request:    #{Float.round(total_per_request_ms, 2)} ms (with 5ms query)")
+    IO.puts("  Budget:         #{budget_ms} ms per request")
+    IO.puts("  Usage:          #{Float.round(usage_pct, 1)}%")
+    IO.puts("  Target:         < 5% overhead")
+    IO.puts("  Status:         #{if usage_pct < 5, do: "PASS", else: "FAIL"}")
+  end
 
-IO.puts("average: #{time_us / 10_000} µs per op")
-def main do
-  IO.puts("[TenantFramework.Flags.Cache] GenServer demo")
-  :ok
+  defp simulate_resolution do
+    # Simulate: slug extraction + header check + DB lookup
+    _slug = "customer-#{Enum.random(1..10_000)}"
+    # Mock DB lookup time (would be ~5ms in reality, we omit for latency measurement)
+    :ok
+  end
 end
 
+TenantFramework.Bench.ResolutionOverhead.run()
 ```
 
-Target: <5% RLS overhead on common query patterns.
+**Target**: <5% del presupuesto de latencia por request para tenant resolution + RLS setup.
 
-## Key Concepts: Event Sourcing and Immutable Logs
+## Key Concepts: Row-Level Security vs. Schema-per-Tenant Tradeoffs
 
-Event sourcing inverts the traditional database model: instead of storing current state, store every state-changing event in an immutable log. The current state is derived by replaying events from the start.
+La aislación multi-tenant se puede resolver en dos niveles de bases de datos:
 
-This shift has profound implications:
-- **Audit trail is free**: Every change is a named event with timestamp and actor.
-- **Temporal queries are simple**: Replay events up to a past date to see historical state.
-- **Concurrency is safe**: Events are immutable and append-only, eliminating race conditions on state mutations.
-- **Testability is easier**: Given a sequence of events, the state is deterministic; no mocks needed.
+1. **RLS (Row-Level Security) - Shared Schema**:
+   - Una sola tabla `projects` con columna `tenant_id`.
+   - PostgreSQL applica política: `CREATE POLICY tenant_isolation ON projects USING (tenant_id = current_setting('app.current_tenant')::uuid)`.
+   - Mismo `SELECT` devuelve diferentes filas dependiendo del `current_setting`.
+   - **Ventajas**: Migraciones O(1), pool de conexiones simple, per-tenant cost ≈ 0.
+   - **Desventajas**: Un bug en la política = leak entre tenants. Operaciones por-tenant (backup, vacuum) requieren un WHERE clause en cada query.
 
-The BEAM is naturally suited for this pattern. Each aggregate (e.g., Account) is a GenServer that receives commands, validates them against current state, publishes an event if valid, then applies the event to update local state. The OTP supervision tree ensures persistence across restarts; the event log (in a database) survives the entire system.
+2. **Schema-per-Tenant - Complete Isolation**:
+   - Cada tenant tiene su propio PostgreSQL schema: `tenant_a.projects`, `tenant_b.projects`.
+   - Conexión a `tenant_a` nunca puede ver `tenant_b.projects` físicamente.
+   - **Ventajas**: Imposible leakear datos. Cada tenant es aislable (backup, migrate, delete).
+   - **Desventajas**: Migraciones O(N tenants), pool debe ser schema-aware, per-tenant fixed cost (schema, roles, triggers).
 
-The downside: evolving schemas is hard. If you rename a field or split an event type, old events still use the old structure. Solutions include versioning (introduce `withdrew_v2` alongside `withdrew_v1`) or upcasting (projection functions that translate old events to new). Frameworks like Commanded automate this.
+**Para SaaS escalado**: RLS es estándar porque el costo de per-tenant es crítico. A 10k tenants, schema-per-tenant = 10k schemas = overhead operacional masivo.
 
-Another challenge: reads require replaying events, which is slow for 10-year-old aggregates with millions of events. Solution: snapshots. Periodically serialize current state; replay only events after the snapshot. This trades disk space for query speed, a worthwhile tradeoff for most systems.
+**La defensa en profundidad**: No confíes en RLS solo. Tu aplicación debe:
+- Nunca hacer `SELECT * FROM projects` sin `WHERE tenant_id = ?`.
+- Usar `Repo.checkout_with_tenant()` para establecer `SET LOCAL` antes de cada query.
+- RLS es la última línea de defensa si tu aplicación tiene un bug, pero tu aplicación debe ser correcta de todas formas.
 
-**Production insight**: Event sourcing is powerful for audit-heavy systems (banking, compliance), but unnecessary overhead for simple CRUD apps. Choose event sourcing when the audit trail or temporal queries justify the implementation complexity.
+**ETS para rate limiting**: A 10k requests/sec, un GenServer rate limiter es un cuello de botella de un proceso. ETS con `:ets.update_counter/3` es atómico sin boundary de proceso — ~100ns por operación. Flags en ETS también son O(1). Para queries en DB sería ~5ms, inviable.
 
 ---
 

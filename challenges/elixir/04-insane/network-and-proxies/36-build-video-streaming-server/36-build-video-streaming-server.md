@@ -582,39 +582,54 @@ The design separates concerns along their real axes: what must be correct (the v
 ## Benchmark
 
 ```elixir
-# Minimal timing harness — replace with Benchee for production measurement.
-{time_us, _result} = :timer.tc(fn ->
-  # exercise the hot path N times
-  for _ <- 1..10_000, do: :ok
-end)
+# bench/hls_bench.exs
+video = :crypto.strong_rand_bytes(100_000_000)  # 100MB simulated video
+seg = HLSServer.Segmenter.load(video, 6, 600)   # 10-min video, 6s segments
 
-IO.puts("average: #{time_us / 10_000} µs per op")
+Benchee.run(%{
+  "segment_extraction_1mb" => fn ->
+    {:ok, _} = HLSServer.Segmenter.get_segment(seg, rem(:rand.uniform(1000), seg.num_segments))
+  end,
+  "range_request_parsing" => fn ->
+    HLSServer.RangeHandler.handle(binary_part(video, 0, 1_000_000), "bytes=0-100000")
+  end,
+  "playlist_rendering_vod" => fn ->
+    segments = for i <- 0..99, do: {i, 6.0, "/segments/720p/#{i}.ts"}
+    playlist = HLSServer.Playlist.Media.new_vod("720p", segments, 6)
+    HLSServer.Playlist.Media.render(playlist)
+  end,
+  "playlist_eviction_live" => fn ->
+    playlist = Enum.reduce(0..99, HLSServer.Playlist.Media.new_live("720p", 6, 10), fn i, p ->
+      HLSServer.Playlist.Media.add_segment(p, 6.0, "/segments/720p/#{i}.ts")
+    end)
+    HLSServer.Playlist.Media.render(playlist)
+  end
+}, time: 10, warmup: 3)
+
 def main do
-  IO.puts("[HLSServer.RangeHandler.load] demo")
+  IO.puts("[HLSServer] Adaptive bitrate video streaming server (HLS)")
+  IO.puts("Segment-based delivery enables CDN caching and resume/seek without re-encoding")
+  IO.puts("Sliding-window playlists for live streams prevent unbounded playlist growth")
+  IO.puts("Range request support enables parallel chunk downloads and resumable transfers")
   :ok
 end
-
 ```
 
 Target: sustained >10 Gbps per node with <100ms segment TTFB.
 
-## Key Concepts: Load Balancing Under Tail Latency
+## Key Concepts: Video Streaming Codecs and HLS Manifests
 
-Load balancers distribute requests across backends. The choice of algorithm affects both latency distribution and fairness.
+Video streaming must adapt to variable bandwidth. HLS (HTTP Live Streaming) segments video into chunks that clients can fetch independently, allowing quality switching mid-stream.
 
-**Round-robin**: Request i goes to backend (i % N). Simple and fair on average, but ignores backend state. If one backend is slow (e.g., garbage collection pause), clients hitting that backend wait, skewing the p99 latency.
+**Segment size and duration**: HLS segments are fixed-duration (typically 6-10 seconds). Longer segments reduce overhead (fewer HTTP requests, smaller manifest) but increase time-to-switch-quality and buffer latency. Shorter segments provide faster adaptation but increase manifest size. The MPEG DASH standard also uses segment duration as a key parameter for player synchronization.
 
-**Least connections**: Track open connections per backend; send the next request to the backend with fewest connections. Better than round-robin, but still ignores request complexity (a short read and a 10-second compute job are both "1 connection").
+**Variant playlists and ABR (Adaptive Bitrate)**: A master.m3u8 lists multiple quality variants (360p, 720p, 1080p). Each variant is a separate media.m3u8. Players measure download throughput and switch to the appropriate variant. All variants have the same timeline — segment N in 360p covers the same time as segment N in 1080p, enabling seamless quality switches.
 
-**Power of two choices**: Pick two random backends and assign the request to the one with fewer connections. With minimal overhead, this reduces tail latency from O(log N) to O(log log N) because load is balanced more evenly without the cost of globally tracking all backends.
+**HTTP Range requests (RFC 7233)**: Clients can request a byte range from a segment to resume interrupted downloads. The server returns 206 (Partial Content) with a Content-Range header. The Content-Range tells the client exactly which bytes arrived, so the client knows what to request next. This enables parallel chunk downloads and seek operations.
 
-**Latency-aware (p99-driven)**: Track recent p99 latency per backend; prefer the backend with lowest p99. Powerful for SLA-driven systems, but can oscillate if multiple backends are competing for shared resources.
+**Sliding window for live playlists**: A live stream generates segments indefinitely. Without windowing, the playlist grows unbounded. HLS specifies that live playlists should contain only the last N segments (typically 3-5). The MEDIA-SEQUENCE tag tells clients which segment number the first entry is, allowing clients to resume without re-requesting earlier segments.
 
-On a 100-node cluster, round-robin assigns 1% of traffic to each backend. If one is 10x slower, clients hitting it see 10x latency. With 1000 req/sec, that's 10 reqs/sec hitting the slow node, and each sees 10x latency, affecting the fleet's p99. Least connections or power-of-two reduces affected clients to a single one per decision.
-
-The BEAM's `:poolboy` or `:connection_pool` naturally implement least-connections: each pool process tracks queue depth. A dispatcher sends new requests to the pool with the shortest queue. This is "power of two" with full visibility into actual queue depth, making it extremely effective.
-
-**Production insight**: Measuring load balancing on a single machine is misleading. Test against realistic backend variability (e.g., one slow backend, cascading failures) to see how your algorithm's tail latency behaves.
+**Production insight**: Video streaming seems simple (segment, list, serve) but is unforgiving. Wrong segment durations break player buffers. Missing or wrong Range headers break resumption. CDN nodes returning stale segments after they're evicted from the live window confuse players. Test with real HLS players (hls.js, VLC, Apple TV) and degraded networks (throttle to 1Mbps, packet loss, latency spikes).
 
 ---
 

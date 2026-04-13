@@ -579,40 +579,86 @@ Hashing the trace-id to decide sampling means every service makes the same decis
 ## Benchmark
 
 ```elixir
-# bench/tracing_bench.exs
-Benchee.run(%{"record_span" => fn -> Tracer.span("work", fn -> :ok end) end}, time: 10)
-def main do
-  IO.puts("[Tracer.Collector] GenServer demo")
-  :ok
+# bench/tracer_bench.exs
+alias Tracer.{Span, Sampling, Collector, Aggregator}
+
+# Setup: warm up the collector
+{:ok, _} = Collector.start_link()
+{:ok, _} = Aggregator.start_link()
+Sampling.configure(:head, rate: 1.0)
+
+# Populate with realistic trace volumes
+setup_traces = fn ->
+  for _ <- 1..1_000 do
+    s = Span.start_span("request")
+    for _ <- 1..3, do: Span.start_span("child")
+    Span.finish_span(s)
+  end
 end
 
+setup_traces.()
+
+Benchee.run(
+  %{
+    "span start + finish (sampled)" => fn ->
+      s = Span.start_span("traced_op")
+      Span.finish_span(s)
+    end,
+    "span start + finish (dropped by sampler)" => fn ->
+      Sampling.configure(:head, rate: 0.0)
+      s = Span.start_span("dropped")
+      Span.finish_span(s)
+    end,
+    "parent-child propagation (3 levels)" => fn ->
+      parent = Span.start_span("root_op")
+      child1 = Span.start_span("child_1")
+      child2 = Span.start_span("child_2")
+      Span.finish_span(child2)
+      Span.finish_span(child1)
+      Span.finish_span(parent)
+    end,
+    "10k spans in sequence" => fn ->
+      for i <- 1..10_000 do
+        s = Span.start_span("seq_#{i}")
+        Span.finish_span(s)
+      end
+    end
+  },
+  parallel: 4,
+  time: 10,
+  warmup: 3,
+  formatters: [Benchee.Formatters.Console]
+)
 ```
 
-Target: 50,000 spans/second ingested on a single node; p99 record overhead < 20 µs.
+Target: 50,000 spans/second ingested on a single node; p99 record overhead < 20 µs (< 100ns for sampled drops).
 
 ---
 
-## Key Concepts: Distributed Tracing and Causal Ordering
+## Key Concepts: Distributed Tracing, Sampling, and Span Propagation
 
-Distributed tracing reconstructs the request flow across services. A request hits service A, which calls B, which calls C. A trace shows this dependency graph and timing at each step.
+**Trace structure**: A trace is a directed acyclic graph (DAG) of spans connected by causality. Each span represents a single operation (RPC, query, handler invocation). A 128-bit trace ID binds all spans in one user request together; parent-child links encode the call graph.
 
-**Trace structure**:
-- **Trace ID**: Unique identifier for the entire user request, propagated in headers from A → B → C.
-- **Span**: A single operation (e.g., "handle POST /users", "query database"). Spans have start time, duration, and metadata (service, endpoint, user ID).
-- **Parent-child**: If A calls B, the B span references the A span's ID as its parent.
+- **Trace ID**: Unique per user request, shared across all services that handle it. Deterministic from a hash of request metadata so retry logic doesn't create phantom traces.
+- **Span ID**: Unique within the trace, identifies one operation. The BEAM's 64-bit span IDs fit comfortably in Erlang integer range.
+- **Parent Span ID**: The span ID of the operation that invoked this one. Nil for root spans.
 
-On a single server, request tracing (e.g., `Logger.metadata(request_id: id)`) shows which logs belong to which request. Across multiple services, distributed tracing shows the entire dependency graph and where time is spent.
+**Causal propagation**: The hardest part of tracing is threading context through asynchronous boundaries. In Elixir:
+- Process dictionary (`Process.put/get`) carries trace context implicitly across synchronous calls.
+- For async or cross-node calls, manually extract context, send as a message header, and restore it in the callee.
+- W3C TraceContext (HTTP header standard) defines the serialization format: `traceparent: 00-{trace-id-32hex}-{span-id-16hex}-{flags-2hex}`.
 
-**Sampling**: Tracing every request is expensive at high traffic. Common strategies:
-- **Always-on for errors**: Every failed request is traced.
-- **Tail-based sampling**: If a request exceeds SLA (e.g., > 1 second), retroactively trace all spans.
-- **Head-based sampling**: At request entry, decide with probability p whether to sample. Risk: you may sample only fast requests if not careful.
+**Sampling strategies and trade-offs**:
+- **Head-based probabilistic**: Decide at trace root (entry point) whether to keep the entire trace. All downstream services see the same decision because it's propagated in the context. O(1) memory, deterministic per trace, but cannot retroactively keep a trace that turned out to be slow.
+- **Tail-based dynamic**: Buffer all spans locally, examine when the root completes, decide retroactively. Guarantees capture of slow/error traces at the cost of unbounded memory during the trace's lifetime.
+- **Hybrid**: Head-based by default (99% keep everything), tail-based override for error conditions (100% keep errors).
 
-**Vector clocks**: Distributed timestamps rely on synchronized clocks, which is fragile. Vector clocks track causality independently: if event A happened before event B, the vector clock at A is ≤ the vector clock at B. Tracing can use vector clocks to detect ordering even if wall-clock times disagree.
+**Why monotonic time for spans**: `System.os_time/1` can jump backward after NTP correction. Span durations must use `System.monotonic_time(:microsecond)` — a clock that never goes backward, only forward. Start and finish timestamps MUST use the same clock source.
 
-The BEAM provides `:trace` and `:redbug` for capturing process message sequences. To integrate with external tracing systems (Jaeger, Datadog), use `:telemetry` to emit events, then forward to external collectors. The challenge is maintaining trace context across process boundaries and RPC calls without manual propagation.
-
-**Production insight**: Tracing is most valuable when latency is unexpected. If you know requests usually take 50 ms, tracing a 5-second request immediately shows if the bottleneck is queuing (high wait time), serialization (high handler time), or RPC latency. Without traces, you just see "5 seconds" and must guess.
+**Observability for observability**: A tracer that fails silently is worse than no tracer. Always emit:
+- Dropped span count per node (overload detection).
+- Aggregator table fill percentage (memory pressure warning).
+- Propagation errors (context corruption detection).
 
 ---
 

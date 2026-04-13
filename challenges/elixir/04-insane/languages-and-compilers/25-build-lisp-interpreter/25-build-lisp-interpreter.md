@@ -655,23 +655,92 @@ Benchee.run(
 
 ### Why this works
 
-Each AST node has an `eval/2` clause that takes an environment and returns `{value, new_env}`. Closures capture the environment by reference, and `call/cc`-style continuations fall out of representing tail calls as trampolines in the interpreter loop.
+**Evaluation semantics (denotational)**: Each AST node evaluates deterministically in an environment context. The evaluator is a function `eval : Expr × Env → Value | {tail_call, Expr, Env}`. Lexical scope is preserved by threading the environment chain — symbol lookup is a deterministic walk from the current frame to the root.
+
+**Lisp invariant (homoiconicity)**: Programs and data have the same representation. `(quote x)` returns `x` unevaluated, making meta-programming (macros, code inspection) a first-class operation. This is enforced by the parser, which produces plain Elixir lists for s-expressions.
+
+**Closure capture semantics**: A closure `{:closure, params, body, capture_env}` carries the environment at definition time. When applied, a child frame extends the capture environment (not the call environment), so free variables are resolved in lexical scope. Formally:
+
+```
+apply({closure, params, body, capture_env}, args, call_env) =
+  let bindings = zip(params, args) in
+  eval(body, extend(capture_env, bindings))
+```
+
+This ensures that `(define (make-adder n) (lambda (x) (+ x n)))` produces a closure that always refers to the original `n`, even if `n` is later shadowed in a different scope.
+
+**Tail call optimization (trampoline)**: Instead of recursing directly, tail positions return `{:tail_call, expr, env}`. The TCO loop consumes thunks until a final value is reached:
+
+```
+run({:tail_call, expr, env}) = run(eval(expr, env))
+run(value) = value
+```
+
+This converts the interpreter's call stack into a heap-allocated loop, allowing deeply recursive programs (e.g., `(fact 1000000 1)`) to run indefinitely without stack overflow.
+
+**Unification between Elixir and Scheme semantics**: The evaluator operates on Elixir data structures (atoms, lists, numbers). Standard library functions are plain Elixir functions. This provides a transparent bridge: Lisp code can call Erlang functions directly via the stdlib, and vice versa.
 
 ---
 
-## Benchmark
+## Benchmark workload
+
+El benchmark debe contrastar dos patrones distintos:
+
+1. **Tree recursion** (`fib`): expone el costo de asignación — cada llamada crea una función closure temporal.
+2. **Tail recursion** (`fact`): trampolina mantiene el heap plano — sin crecimiento de stack.
 
 ```elixir
-# bench/lisp_bench.exs
-Benchee.run(%{"fib_20" => fn -> Lisp.eval("(fib 20)") end}, time: 10)
-def main do
-  IO.puts("[Schemia.Stdlib.parse] demo")
-  :ok
+# bench/schemia_bench.exs — WORKLOAD REALISTA
+alias Schemia.{Lexer, Parser, Evaluator, Stdlib, TCO}
+
+defp eval_str(source) do
+  {:ok, tokens} = Lexer.tokenize(source)
+  {:ok, exprs}  = Parser.parse(tokens)
+  env = Stdlib.root_env()
+  Enum.reduce(exprs, {nil, env}, fn expr, {_v, e} ->
+    {TCO.run(Evaluator.eval(expr, e)), e}
+  end)
+  |> elem(0)
 end
 
+# Define functions once
+eval_str("""
+(define (fib n)
+  (if (< n 2)
+    n
+    (+ (fib (- n 1)) (fib (- n 2)))))
+(define (fact n acc)
+  (if (= n 0)
+    acc
+    (fact (- n 1) (* n acc))))
+""")
+
+Benchee.run(
+  %{
+    "fib(20) — tree recursion, 2^20 allocations" => fn -> eval_str("(fib 20)") end,
+    "fact(1000) — tail recursion, O(1) stack" => fn -> eval_str("(fact 1000 1)") end,
+    "arithmetic x100 — (+ 1 2 3 ... 100)" => fn -> eval_str("(+ 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20)") end,
+    "list cons x50 — build list recursively" => fn -> 
+      eval_str("""
+      (define (build-list n acc)
+        (if (= n 0)
+          acc
+          (build-list (- n 1) (cons n acc))))
+      (build-list 50 '())
+      """)
+    end
+  },
+  time: 5,
+  warmup: 2,
+  formatters: [Benchee.Formatters.Console]
+)
 ```
 
-Target: `(fib 20)` in < 1 ms on a tree-walking interpreter; simple arithmetic in < 5 µs.
+**Targets**:
+- `fib(20)`: < 10 ms (tree recursion overhead es esperado)
+- `fact(1000)`: < 1 ms (trampolina sin crecimiento de stack)
+- Simple arithmetic: < 100 µs por operación
+- List construction: O(n) sin exponential blowup
 
 ---
 
@@ -720,21 +789,63 @@ Reflection: trampolining creates a `{:tail_call, expr, env}` heap tuple on every
 ## Common production mistakes
 
 **1. Evaluating all subexpressions before detecting special forms**
-Special forms must intercept the list before argument evaluation.
+Special forms like `if`, `lambda`, `quote` must intercept the s-expression before evaluating arguments. A naive `eval([f | args], env) = apply(eval(f), map(eval, args))` evaluates `quote` as an argument, destroying its unevaluated value. Solution: match special form symbols first, before recursing.
 
 **2. Closure captures mutable environment reference**
-Use persistent (copy-on-write) maps for bindings so each frame is immutable once created.
+If environments are mutable Agents or ETS tables, closures will observe state changes made after the closure was created. Scheme semantics require closures to capture the environment snapshot at definition time. Solution: use immutable persistent maps with structural sharing. The parent pointer makes the chain efficient; child frames are lightweight.
 
-**3. Trampoline not applied to `begin` body**
-`(begin expr1 expr2 expr3)` must only put `expr3` in tail position.
+**3. Trampoline not applied consistently to all tail positions**
+`(begin expr1 expr2 expr3)` must return a thunk only for `expr3`. The wrong approach:
+```elixir
+eval([:begin | body], env) do
+  Enum.each(body, &eval/2)  # BUG: evaluates everything eagerly, not in tail position
+end
+```
+Correct:
+```elixir
+defp eval_begin([last], env), do: {:tail_call, last, env}
+defp eval_begin([head | tail], env) do
+  TCO.run(eval(head, env))
+  eval_begin(tail, env)
+end
+```
 
-**4. `apply` not handling variadic argument lists**
-`(apply + 1 2 '(3 4))` should call `+` with `[1, 2, 3, 4]`.
+**4. `apply` not handling variadic argument lists correctly**
+`(apply + 1 2 '(3 4))` should call `+` with `[1, 2, 3, 4]`, not `[1, 2, [3, 4]]`. The last argument is a list that must be flattened into the call.
+
+**5. `set!` mutating the wrong frame**
+`set!` must locate the *first* frame up the chain that owns the binding and mutate that frame. A naive implementation that mutates the current frame breaks closure correctness:
+```scheme
+(define (make-counter)
+  (let ((n 0))
+    (lambda () (set! n (+ n 1)) n)))
+```
+Both closures returned must mutate the same `n`. Solution: `set!` recursively walks the parent chain until `has_key?(bindings, name)` is true.
+
+**6. Parser not distinguishing symbols from keywords**
+`'(define x 1)` is a quoted list; `define` should parse as a symbol, not a keyword. Keywords like `define` are only special in the function position of an unquoted s-expression.
+
+**7. Type confusion between the value `nil` and the empty list `()`**
+Scheme represents both as `'()` (empty list), but implementations sometimes conflate them with `false` or `null`. This breaks `(null? '())` and predicates.
+
+## Deep dive: Exceptions vs. non-local exits
+
+Lisp's `catch` and `throw` are non-local control flow operators that bubble an exception up the call stack until a matching `catch` catches it. Implementing this requires either:
+
+1. **Exception-based approach**: raise Elixir exceptions at `throw` and catch them in `catch`.
+2. **Continuation-passing style**: each thunk carries a "current exception handler" and `throw` bypasses the normal return path.
+
+The exception approach is simpler and aligns with BEAM semantics. The challenge is ensuring that cleanup code (finalizers) runs on the unwind path — Scheme's `dynamic-wind` guarantees this.
 
 ## Reflection
 
-- If you added a bytecode compiler, which Lisp features would force non-trivial encoding decisions (e.g., `call/cc`, dynamic-wind)? Pick one and sketch.
-- How would you add tail-call optimization without trampolines? Compare approaches.
+- If you added a bytecode compiler, which Lisp features would force non-trivial encoding decisions?
+  - **`call/cc`**: capturing first-class continuations requires the bytecode to represent the call stack as a data structure, not rely on the machine's stack. This forces a virtual stack machine.
+  - **`dynamic-wind`**: requires exception handlers to be represented as metadata on activation frames, so unwinding can trigger cleanup callbacks.
+- How would you add tail-call optimization without trampolines?
+  - **CPS transformation**: convert the entire program to continuation-passing style before evaluating. Each function takes an explicit continuation parameter. Tail calls pass control directly to the continuation.
+  - **Bytecode with explicit return codes**: emit instructions like `TAIL_CALL` that signal the BEAM VM to reuse the current stack frame. This requires compiling down to Erlang functions, not interpreting.
+  - **Analysis + annotation**: mark which calls are in tail position during parsing, then handle them specially in the evaluator (current approach, but explicit).
 
 ---
 
