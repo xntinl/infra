@@ -1,0 +1,94 @@
+{
+  "total_files_scanned": 554,
+  "files_with_crossrefs": 10,
+  "patterns_found": {
+    "markdown_links_relative": [],
+    "textual_mentions": [
+      {
+        "file": "04-insane/distributed-systems/50-build-distributed-lock-service/50-build-distributed-lock-service.md",
+        "line": 81,
+        "match": "challenge 01"
+      }
+    ],
+    "tier_path_mentions": [
+      {
+        "file": "01-basico/processes-basics/32-receive-and-mailbox/32-receive-and-mailbox.md",
+        "line": 540,
+        "match": "02-intermedio"
+      },
+      {
+        "file": "03-avanzado/resilience-patterns/45-build-api-client-wrapper/45-build-api-client-wrapper.md",
+        "line": 252,
+        "match": "03-avanzado"
+      },
+      {
+        "file": "03-avanzado/resilience-patterns/70-req-finch-http-clients/70-req-finch-http-clients.md",
+        "line": 249,
+        "match": "03-avanzado"
+      },
+      {
+        "file": "03-avanzado/resilience-patterns/36-circuit-breaker-patterns/36-circuit-breaker-patterns.md",
+        "line": 612,
+        "match": "03-avanzado"
+      },
+      {
+        "file": "03-avanzado/phoenix-ecosystem/58-plug-router-api/58-plug-router-api.md",
+        "line": 237,
+        "match": "03-avanzado"
+      },
+      {
+        "file": "03-avanzado/otp-advanced/384-gen-statem-state-functions-vs-handle-event/384-gen-statem-state-functions-vs-handle-event.md",
+        "line": 436,
+        "match": "03-avanzado"
+      },
+      {
+        "file": "03-avanzado/otp-advanced/33-gen-statem-state-machine/33-gen-statem-state-machine.md",
+        "line": 201,
+        "match": "03-avanzado"
+      },
+      {
+        "file": "03-avanzado/otp-advanced/05-genserver-hot-state-migration/05-genserver-hot-state-migration.md",
+        "line": 221,
+        "match": "03-avanzado"
+      }
+    ],
+    "numbered_folder_refs": [
+      {
+        "file": "04-insane/storage-engines/README-v3-AMPLIFICATION.md",
+        "line": 257,
+        "match": "03-build-distributed-cache-redis-like"
+      },
+      {
+        "file": "04-insane/storage-engines/README-v3-AMPLIFICATION.md",
+        "line": 258,
+        "match": "15-build-lsm-tree-storage-engine"
+      },
+      {
+        "file": "04-insane/storage-engines/README-v3-AMPLIFICATION.md",
+        "line": 259,
+        "match": "16-build-in-memory-database"
+      },
+      {
+        "file": "04-insane/storage-engines/README-v3-AMPLIFICATION.md",
+        "line": 260,
+        "match": "17-build-graph-database"
+      },
+      {
+        "file": "04-insane/storage-engines/README-v3-AMPLIFICATION.md",
+        "line": 261,
+        "match": "18-build-time-series-database"
+      },
+      {
+        "file": "04-insane/storage-engines/README-v3-AMPLIFICATION.md",
+        "line": 262,
+        "match": "19-build-search-engine-inverted-index"
+      }
+    ]
+  },
+  "summary_by_pattern": {
+    "markdown_links_relative": 0,
+    "textual_mentions": 1,
+    "tier_path_mentions": 8,
+    "numbered_folder_refs": 6
+  }
+}

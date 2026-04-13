@@ -1,0 +1,446 @@
+# Custom `child_spec/1` — tuning id, restart, and shutdown per child
+
+**Project**: `custom_child_spec` — a worker module that overrides `child_spec/1` to expose per-instance id, restart strategy, and shutdown timeout.
+
+---
+
+## Why child spec custom matters
+
+`use GenServer` auto-generates a `child_spec/1` for you. 95% of the time
+that's fine. The other 5% is when you need multiple instances of the same
+module under one supervisor (and they clash on `:id`), or when one
+instance should be `:permanent` while another should be `:transient`, or
+when an instance needs a longer shutdown window because it's flushing a
+buffer to disk.
+
+The fix is to **override `child_spec/1` in your module** (or build a spec
+manually with `Supervisor.child_spec/2`). This exercise walks through
+both approaches and shows the failure mode when you don't bother.
+
+---
+
+## Project structure
+
+```
+custom_child_spec/
+├── lib/
+│   └── custom_child_spec.ex
+├── script/
+│   └── main.exs
+├── test/
+│   └── custom_child_spec_test.exs
+└── mix.exs
+```
+
+---
+
+## Why X and not Y
+
+- **Why not accept the auto-generated spec?** It works for typical workers but hides `id`, `restart`, and `shutdown` that often need tuning.
+
+## Core concepts
+
+### 1. The anatomy of a child spec
+
+```elixir
+%{
+  id: :worker_1,                     # unique within the supervisor
+  start: {Mod, :start_link, [arg]},  # MFA to start the process
+  restart: :permanent,               # :permanent | :transient | :temporary
+  shutdown: 5_000,                   # ms, or :brutal_kill | :infinity
+  type: :worker,                     # :worker | :supervisor
+  modules: [Mod]                     # for code upgrades (HotSwap)
+}
+```
+
+Every field has a sensible default except `:id` and `:start`.
+
+### 2. Overriding `child_spec/1` in your module
+
+```elixir
+def child_spec(opts) do
+  %{
+    id: Keyword.fetch!(opts, :id),
+    start: {__MODULE__, :start_link, [opts]},
+    restart: Keyword.get(opts, :restart, :permanent),
+    shutdown: Keyword.get(opts, :shutdown, 5_000),
+    type: :worker
+  }
+end
+```
+
+Now a caller can write `{MyWorker, id: :a, shutdown: 30_000}` and the
+supervisor gets a fully-formed spec without you reaching for
+`Supervisor.child_spec/2`.
+
+### 3. `Supervisor.child_spec/2` — the override shortcut
+
+If you don't want to change the module, you can override at the
+supervisor-level:
+
+```elixir
+Supervisor.child_spec({MyWorker, arg}, id: :a, restart: :transient)
+```
+
+This is what you use when dropping third-party modules into your tree
+and you don't control their source.
+
+### 4. Two instances of the same module REQUIRE unique `:id`
+
+```elixir
+children = [
+  {MyWorker, name: :a},
+  {MyWorker, name: :b}  # BOOM: both default to id: MyWorker, supervisor refuses
+]
+```
+
+You'll see `{:already_started, ...}` or a compile-time-ish error about
+duplicate child ids. The fix is `child_spec/2` with distinct `:id`
+values, or a custom `child_spec/1` that derives id from opts.
+
+---
+
+## Design decisions
+
+**Option A — default child_spec from `use GenServer`**
+- Pros: simpler upfront, fewer moving parts.
+- Cons: hides the trade-off that this exercise exists to teach.
+
+**Option B — custom `child_spec/1` (chosen)**
+- Pros: explicit about the semantic that matters in production.
+- Cons: one more concept to internalize.
+
+→ Chose **B** because custom `id`, `restart`, `shutdown`, `type` are needed when defaults don't match the role.
+
+## Implementation
+
+### `mix.exs`
+
+```elixir
+defmodule CustomChildSpec.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :custom_child_spec,
+      version: "0.1.0",
+      elixir: "~> 1.19",
+      start_permanent: Mix.env() == :prod,
+      deps: deps()
+    ]
+  end
+
+  def application do
+    [extra_applications: [:logger]]
+  end
+
+  defp deps do
+    []
+  end
+end
+```
+
+### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
+```bash
+mix new custom_child_spec
+cd custom_child_spec
+```
+
+### `lib/custom_child_spec.ex`
+
+```elixir
+defmodule CustomChildSpec do
+  @moduledoc """
+  Custom `child_spec/1` — tuning id, restart, and shutdown per child.
+
+  `use GenServer` auto-generates a `child_spec/1` for you. 95% of the time.
+  """
+end
+```
+
+### `lib/custom_child_spec/durable_worker.ex`
+
+**Objective**: Implement `durable_worker.ex` — a worker whose crash behavior is the whole point — it exists so the supervisor strategy can be observed.
+
+```elixir
+defmodule CustomChildSpec.DurableWorker do
+  @moduledoc """
+  A worker that represents a durable resource (e.g., a file handle, a
+  network buffer). Exposes a custom `child_spec/1` so callers can
+  configure id, restart strategy, and shutdown timeout per-instance:
+
+      {CustomChildSpec.DurableWorker, id: :log_writer, shutdown: 30_000}
+      {CustomChildSpec.DurableWorker, id: :cache, restart: :transient}
+  """
+
+  use GenServer
+
+  @type opts :: [
+          id: atom(),
+          name: atom(),
+          restart: :permanent | :transient | :temporary,
+          shutdown: non_neg_integer() | :brutal_kill | :infinity
+        ]
+
+  # ── Supervisor contract ─────────────────────────────────────────────
+
+  @doc """
+  Builds a fully-specified child spec from `opts`. Overrides the default
+  generated by `use GenServer` so multiple instances of this module can
+  live under the same supervisor with distinct ids and lifecycles.
+  """
+  @spec child_spec(opts()) :: Supervisor.child_spec()
+  def child_spec(opts) do
+    id = Keyword.fetch!(opts, :id)
+
+    %{
+      id: id,
+      start: {__MODULE__, :start_link, [opts]},
+      restart: Keyword.get(opts, :restart, :permanent),
+      shutdown: Keyword.get(opts, :shutdown, 5_000),
+      type: :worker
+    }
+  end
+
+  # ── Public API ──────────────────────────────────────────────────────
+
+  @spec start_link(opts()) :: GenServer.on_start()
+  def start_link(opts) do
+    name = Keyword.get(opts, :name, Keyword.fetch!(opts, :id))
+    GenServer.start_link(__MODULE__, opts, name: name)
+  end
+
+  @spec get_id(atom()) :: atom()
+  def get_id(server), do: GenServer.call(server, :id)
+
+  # ── Callbacks ───────────────────────────────────────────────────────
+
+  @impl true
+  def init(opts), do: {:ok, %{id: Keyword.fetch!(opts, :id)}}
+
+  @impl true
+  def handle_call(:id, _from, %{id: id} = s), do: {:reply, id, s}
+end
+```
+
+### `lib/custom_child_spec/supervisor.ex`
+
+**Objective**: Encode the restart policy in `supervisor.ex` — the supervisor strategy is the lesson; the children exist to make it observable.
+
+```elixir
+defmodule CustomChildSpec.Supervisor do
+  @moduledoc """
+  Runs two DurableWorker instances with distinct ids, restart strategies,
+  and shutdown timeouts — all specified via the module's custom
+  `child_spec/1`.
+  """
+
+  use Supervisor
+
+  @spec start_link(keyword()) :: Supervisor.on_start()
+  def start_link(opts \\ []), do: Supervisor.start_link(__MODULE__, :ok, opts)
+
+  @impl true
+  def init(:ok) do
+    children = [
+      # Permanent + long shutdown: this one is treated as critical; on
+      # shutdown it gets 30s to flush before the supervisor kills it.
+      {CustomChildSpec.DurableWorker, [id: :log_writer, restart: :permanent, shutdown: 30_000]},
+
+      # Transient + brutal kill: it's expected to exit normally, but if
+      # we must stop it, don't wait — just kill it.
+      {CustomChildSpec.DurableWorker, [id: :scratch, restart: :transient, shutdown: :brutal_kill]}
+    ]
+
+    Supervisor.init(children, strategy: :one_for_one)
+  end
+end
+```
+
+### Step 4: `test/custom_child_spec_test.exs`
+
+**Objective**: Write `custom_child_spec_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+```elixir
+defmodule CustomChildSpecTest do
+  use ExUnit.Case, async: false
+
+  doctest CustomChildSpec
+
+  alias CustomChildSpec.DurableWorker
+
+  describe "core functionality" do
+    test "custom child_spec/1 builds a valid spec with overrides" do
+      spec = DurableWorker.child_spec(id: :x, restart: :transient, shutdown: 10_000)
+
+      assert spec.id == :x
+      assert spec.restart == :transient
+      assert spec.shutdown == 10_000
+      assert spec.type == :worker
+      assert {DurableWorker, :start_link, [_opts]} = spec.start
+    end
+
+    test "two instances of the same module can coexist under one supervisor" do
+      start_supervised!(CustomChildSpec.Supervisor)
+
+      ids =
+        DynamicSupervisor
+        |> Kernel.then(fn _ -> Supervisor.which_children(CustomChildSpec.Supervisor) end)
+        |> Enum.map(&elem(&1, 0))
+        |> Enum.sort()
+
+      assert ids == [:log_writer, :scratch]
+      assert DurableWorker.get_id(:log_writer) == :log_writer
+      assert DurableWorker.get_id(:scratch) == :scratch
+    end
+
+    test "child specs reflect per-instance overrides" do
+      start_supervised!(CustomChildSpec.Supervisor)
+
+      children = Supervisor.which_children(CustomChildSpec.Supervisor)
+      assert is_list(children)
+
+      # Both started and alive.
+      for {_id, pid, _type, _mods} <- children do
+        assert is_pid(pid) and Process.alive?(pid)
+      end
+    end
+
+    test "missing :id crashes child_spec/1 with a clear error" do
+      assert_raise KeyError, fn -> DurableWorker.child_spec([]) end
+    end
+  end
+end
+```
+
+### Step 5: Run
+
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+```bash
+mix test
+```
+
+---
+
+### Why this works
+
+The design leans on OTP primitives that already encode the invariants we care about (supervision, back-pressure, explicit message semantics), so failure modes are visible at the right layer instead of being reinvented ad-hoc. Tests exercise the edges (timeouts, crashes, boundary states), which is where hand-rolled alternatives silently drift over time.
+
+### `script/main.exs`
+
+```elixir
+defmodule Main do
+  def main do
+    IO.puts("=== CustomChildSpec.DurableWorker Demo ===\n")
+
+    result_1 = CustomChildSpec.DurableWorker.get_id(nil)
+    IO.puts("Demo 1 - get_id: #{inspect(result_1)}")
+    result_2 = CustomChildSpec.DurableWorker.handle_call(nil, nil, nil)
+    IO.puts("Demo 2 - handle_call: #{inspect(result_2)}")
+  end
+end
+
+Main.main()
+```
+
+## Benchmark
+
+<!-- benchmark N/A: tema conceptual -->
+
+## Trade-offs and production gotchas
+
+**1. Auto-generated `child_spec/1` uses the module as the id**
+If you forget to override, two children of the same module clash. The
+error surfaces at `start_link`, which makes it look like a runtime bug
+when it's really a spec problem.
+
+**2. Overriding `child_spec/1` vs `Supervisor.child_spec/2`**
+Override in the module when callers routinely need per-instance config.
+Use `Supervisor.child_spec/2` when you're wrapping a foreign module (or
+for a one-off customization in a single supervisor). Pick one convention
+per codebase.
+
+**3. `:shutdown` interacts with `terminate/2`**
+Setting `shutdown: 30_000` only helps if the worker *implements*
+`terminate/2` and actually uses the grace period. A worker that ignores
+shutdown will still be killed after 30s — it just waited longer first.
+
+**4. `:brutal_kill` skips `terminate/2` entirely**
+Don't use `:brutal_kill` on workers that hold OS resources (file
+handles, sockets, NIF state) unless you're sure the VM's cleanup will
+reclaim them. It's a shortcut that can leak.
+
+**5. When NOT to build custom specs**
+For the default case — one instance per module, permanent, 5s shutdown
+— don't write a custom spec. The auto-generated one is correct. Custom
+specs are a tool for the minority of cases that need them; avoid
+ceremony for its own sake.
+
+---
+
+## Reflection
+
+- Un child tarda 60s en arrancar. ¿Qué ajustás en el child_spec y qué NO? Justificá.
+
+## Resources
+
+- [`Supervisor` — child specifications](https://hexdocs.pm/elixir/Supervisor.html#module-child-specification)
+- [`Supervisor.child_spec/2`](https://hexdocs.pm/elixir/Supervisor.html#child_spec/2)
+- [Erlang `supervisor` — child spec](https://www.erlang.org/doc/man/supervisor.html#type-child_spec)
+
+## Advanced Considerations
+
+Supervision trees encode your application's fault tolerance strategy. The tree structure, restart policy, and shutdown semantics directly determine behavior during crashes, dependencies, and graceful shutdown.
+
+**Supervision tree design:**
+A well-designed tree mirrors data/message flow: dependencies point upward. If process A depends on process B, B should be higher in the tree (started first, shut down last). Supervisor strategies (`:one_for_one`, `:one_for_all`, `:rest_for_one`) define the scope of cascading restarts. `:one_for_one` isolates failures (each crash restarts only that child); `:one_for_all` is for tightly-coupled groups (e.g., a reader-writer pair).
+
+**Restart strategies and intensity:**
+`max_restarts: 3, max_seconds: 5` means "if 3+ restarts occur in 5 seconds, kill the supervisor." This circuit-breaker pattern prevents restart loops that consume resources. The key decision: should a crashing child take down the whole app (escalate to parent) or just itself? Transient/temporary children exit "cleanly" and don't trigger restarts — useful for request handlers.
+
+**Error propagation and shutdown ordering:**
+When a supervisor exits, it sends `:shutdown` to children in reverse start order (LIFO). Children have `shutdown: 5000` milliseconds to terminate gracefully before hard killing. Nested supervisors propagate this signal recursively. Understanding this order prevents resource leaks: a child waiting on another child's graceful shutdown will deadlock if not designed carefully.
+
+---
+
+## The business problem
+
+Teams ship software against real constraints: latency budgets, availability targets, memory ceilings, and on-call rotations that punish complexity. The exercise in this document is framed against one of those constraints — not as a toy example, but as a miniature of a shape you will meet in production.
+
+The goal is not to memorize an API. The goal is to recognize the pattern so that when you see it in your own codebase, you reach for the right tool immediately.
+
+### `test/custom_child_spec_test.exs`
+
+```elixir
+defmodule CustomChildSpecTest do
+  use ExUnit.Case, async: true
+
+  doctest CustomChildSpec
+
+  describe "run/1" do
+    test "returns :ok for a no-op input" do
+      assert CustomChildSpec.run(:noop) == :ok
+    end
+  end
+end
+```
+
+---
+
+## Key concepts
+
+### 1. Model the problem with the right primitive
+
+Choose the OTP primitive that matches the failure semantics of the problem: `GenServer` for stateful serialization, `Task` for fire-and-forget async, `Agent` for simple shared state, `Supervisor` for lifecycle management. Reaching for the wrong primitive is the most common source of accidental complexity in Elixir systems.
+
+### 2. Make invariants explicit in code
+
+Guards, pattern matching, and `@spec` annotations turn invariants into enforceable contracts. If a value *must* be a positive integer, write a guard — do not write a comment. The compiler and Dialyzer will catch what documentation cannot.
+
+### 3. Let it crash, but bound the blast radius
+
+"Let it crash" is not permission to ignore failures — it is a directive to design supervision trees that contain them. Every process should be supervised, and every supervisor should have a restart strategy that matches the failure mode it is recovering from.

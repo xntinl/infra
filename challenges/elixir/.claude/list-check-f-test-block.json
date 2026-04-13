@@ -1,0 +1,113 @@
+{
+  "check": "F - test block incomplete",
+  "total_analyzed": 553,
+  "failing_count": 64,
+  "failing_files": [
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/collections/46-mapset-operations/46-mapset-operations.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/collections/47-keyword-dsl-building/47-keyword-dsl-building.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/data-structures/61-protocols-polymorphism/61-protocols-polymorphism.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/data-structures/63-typespecs-dialyzer/63-typespecs-dialyzer.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/error-handling/64-exit-vs-raise-vs-throw/64-exit-vs-raise-vs-throw.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/error-handling/65-trap-exit-linked/65-trap-exit-linked.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/processes-basics/32-receive-and-mailbox/32-receive-and-mailbox.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/processes-basics/33-task-async-await/33-task-async-await.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/processes-basics/34-agent-state-basics/34-agent-state-basics.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/processes-basics/35-registry-and-named-processes/35-registry-and-named-processes.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/text-and-binaries/50-binary-construction/50-binary-construction.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/text-and-binaries/51-base64-url-encoding/51-base64-url-encoding.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/applications-and-releases/06-application-callbacks/06-application-callbacks.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/applications-and-releases/20-configuracion-config-runtime/20-configuracion-config-runtime.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/applications-and-releases/21-releases-mix-basico/21-releases-mix-basico.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/applications-and-releases/66-app-env-runtime/66-app-env-runtime.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/applications-and-releases/67-get-env-vs-compile-env/67-get-env-vs-compile-env.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/applications-and-releases/68-release-config-providers/68-release-config-providers.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/applications-and-releases/69-release-runtime-overlays/69-release-runtime-overlays.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/applications-and-releases/70-release-eval-rpc/70-release-eval-rpc.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/applications-and-releases/72-release-hot-upgrade-intro/72-release-hot-upgrade-intro.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/applications-and-releases/73-release-systemd-packaging/73-release-systemd-packaging.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/integrations-basics/134-finch-pool/134-finch-pool.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/integrations-basics/140-httpoison-migration/140-httpoison-migration.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/otp-genservers/40-handle-info-timers/40-handle-info-timers.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/streams-and-lazy/107-genstage-producer-consumer/107-genstage-producer-consumer.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/streams-and-lazy/108-genstage-buffer-demand/108-genstage-buffer-demand.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/streams-and-lazy/27-genstage-basico/27-genstage-basico.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/supervision-basics/05-supervisor-basico/05-supervisor-basico.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/supervision-basics/26-dynamic-supervisor/26-dynamic-supervisor.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/supervision-basics/56-one-for-one/56-one-for-one.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/supervision-basics/57-one-for-all/57-one-for-all.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/supervision-basics/58-rest-for-one/58-rest-for-one.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/supervision-basics/59-max-restarts-intensity/59-max-restarts-intensity.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/supervision-basics/60-child-spec-custom/60-child-spec-custom.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/supervision-basics/61-dynamic-sup-worker-pool/61-dynamic-sup-worker-pool.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/supervision-basics/62-shutdown-timeouts/62-shutdown-timeouts.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/supervision-basics/63-nested-trees/63-nested-trees.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/tooling-and-ecosystem/120-mix-generator/120-mix-generator.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/tooling-and-ecosystem/121-mix-aliases/121-mix-aliases.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/tooling-and-ecosystem/122-hex-publish-private/122-hex-publish-private.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/tooling-and-ecosystem/123-iex-helpers/123-iex-helpers.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/tooling-and-ecosystem/124-observer-inspection/124-observer-inspection.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/tooling-and-ecosystem/125-recon-intro/125-recon-intro.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/tooling-and-ecosystem/126-credo-rules/126-credo-rules.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/tooling-and-ecosystem/127-formatter-custom/127-formatter-custom.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/tooling-and-ecosystem/18-mix-tasks-personalizadas/18-mix-tasks-personalizadas.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/tooling-and-ecosystem/19-dependencias-hex/19-dependencias-hex.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/tooling-and-ecosystem/22-documentacion-exdoc/22-documentacion-exdoc.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/advanced-testing/291-ecto-sandbox-modes/291-ecto-sandbox-modes.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/advanced-testing/296-phoenix-conn-integration/296-phoenix-conn-integration.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/advanced-testing/297-doctest-side-effects/297-doctest-side-effects.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/advanced-testing/299-ex-machina-factories/299-ex-machina-factories.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/advanced-testing/300-peer-distributed-testing/300-peer-distributed-testing.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/advanced-testing/41-concurrent-testing-exunit/41-concurrent-testing-exunit.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/apis-and-graphql/331-absinthe-dataloader/331-absinthe-dataloader.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/apis-and-graphql/332-absinthe-subscriptions/332-absinthe-subscriptions.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/apis-and-graphql/334-rest-api-versioning/334-rest-api-versioning.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/apis-and-graphql/337-oauth2-assent-flow/337-oauth2-assent-flow.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/apis-and-graphql/340-relay-cursor-pagination/340-relay-cursor-pagination.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/phoenix-ecosystem/51-phoenix-liveview-real-time/51-phoenix-liveview-real-time.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/phoenix-ecosystem/52-phoenix-livecomponent/52-phoenix-livecomponent.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/phoenix-ecosystem/53-phoenix-channels/53-phoenix-channels.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/phoenix-ecosystem/54-phoenix-presence-channels/54-phoenix-presence-channels.md"
+  ],
+  "sample_failures": [
+    {
+      "file": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/collections/46-mapset-operations/46-mapset-operations.md",
+      "reason": "missing: describe"
+    },
+    {
+      "file": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/collections/47-keyword-dsl-building/47-keyword-dsl-building.md",
+      "reason": "missing: describe"
+    },
+    {
+      "file": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/data-structures/61-protocols-polymorphism/61-protocols-polymorphism.md",
+      "reason": "missing: describe"
+    },
+    {
+      "file": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/data-structures/63-typespecs-dialyzer/63-typespecs-dialyzer.md",
+      "reason": "missing: describe"
+    },
+    {
+      "file": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/error-handling/64-exit-vs-raise-vs-throw/64-exit-vs-raise-vs-throw.md",
+      "reason": "missing: describe"
+    },
+    {
+      "file": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/error-handling/65-trap-exit-linked/65-trap-exit-linked.md",
+      "reason": "missing: describe"
+    },
+    {
+      "file": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/processes-basics/32-receive-and-mailbox/32-receive-and-mailbox.md",
+      "reason": "missing: describe"
+    },
+    {
+      "file": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/processes-basics/33-task-async-await/33-task-async-await.md",
+      "reason": "missing: describe"
+    },
+    {
+      "file": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/processes-basics/34-agent-state-basics/34-agent-state-basics.md",
+      "reason": "missing: describe"
+    },
+    {
+      "file": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/processes-basics/35-registry-and-named-processes/35-registry-and-named-processes.md",
+      "reason": "missing: describe"
+    }
+  ]
+}

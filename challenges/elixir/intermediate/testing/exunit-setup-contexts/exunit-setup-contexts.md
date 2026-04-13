@@ -1,0 +1,431 @@
+# ExUnit setup, setup_all and the context map
+
+**Project**: `setup_contexts` — a `UserRepo` backed by an Agent, tested with
+per-test and per-module fixtures via `setup`, `setup_all`, and context tags.
+
+---
+
+## Why exunit setup contexts matters
+
+Anything non-trivial needs fixtures: a started process, a seeded dataset,
+an authenticated user. ExUnit's answer is a layered setup system: `setup_all`
+for module-wide, `setup` for per-test, plus the context map that flows
+through both.
+
+Done right, this eliminates three bad habits at once:
+1. Copy-pasting fixture code across tests.
+2. Relying on global `Application.put_env` mutations.
+3. Using `Process.sleep/1` to wait for a process to be "ready".
+
+## Why ExUnit setup and not X
+
+**Why not module-level `@fixture` attributes?** Module attributes are
+evaluated once at compile time — they can't hold a live pid or a freshly
+seeded process. They're data; fixtures are procedures.
+
+**Why not a macro-based "factories" library?** Most of what ExUnit supports
+via `setup`/`setup_all` + tags needs no DSL. Factories pay off when you
+need graph-shaped object construction; for a pid + seed they're overkill.
+
+**Why not `Process.put` globals?** Because `async: true` tests run in
+parallel processes, and a global write-path destroys test isolation.
+
+---
+
+## Project structure
+
+```
+setup_contexts/
+├── lib/
+│   └── setup_contexts.ex
+├── script/
+│   └── main.exs
+├── test/
+│   └── setup_contexts_test.exs
+└── mix.exs
+```
+
+---
+
+## Core concepts
+
+### 1. `setup_all` vs `setup`
+
+- `setup_all` runs **once** per module, in its own process. Great for
+  expensive setup whose result is immutable (seed data, compiled schemas).
+- `setup` runs **before every test**. Great for per-test state that must
+  be isolated.
+
+Both can return `:ok`, `{:ok, context_map}`, or a plain map. The returned
+map is merged into the test's context.
+
+### 2. The context map
+
+Every test receives a context — a map ExUnit populates with `:test`, `:case`,
+`:file`, `:line`, `:module`, plus anything your setups returned. Destructure
+it in the test signature:
+
+```elixir
+test "creates a user", %{repo: repo} do
+  ...
+end
+```
+
+If you don't need the context, just write `test "name" do ... end`.
+
+### 3. Tag-driven setup with `@tag`
+
+Tags attach metadata to a test. Setups can pattern-match on tags to branch:
+
+```elixir
+@tag seed: 10
+test "with 10 users", %{repo: repo} do ... end
+
+setup context do
+  if n = context[:seed], do: seed(context.repo, n)
+  :ok
+end
+```
+
+This is the idiomatic way to parameterize fixtures without a test factory DSL.
+
+### 4. `on_exit/1` for cleanup
+
+`setup` blocks can register cleanup callbacks with `on_exit/1`. They run
+after the test finishes, regardless of pass/fail — the right place to
+kill processes, delete files, or drop temp tables. For the higher-level
+`start_supervised!/1`, see the supervised-start exercise.
+
+---
+
+## Design decisions
+
+**Option A — Per-test `setup`, fresh state every time**
+- Pros: Full isolation; no test depends on another.
+- Cons: Per-test cost of starting the Agent.
+
+**Option B — `setup_all` once, shared state across the module** (rejected)
+- Pros: Faster overall.
+- Cons: Mutation between tests; breaks under `async: true`.
+
+**Option C — `setup_all` for immutable data + `setup` for mutable pids** (chosen)
+- Pros: Best of both — expensive constants computed once, per-test pids
+  isolated.
+- Cons: Two layers to understand.
+
+→ Chose **C** because it's the idiomatic ExUnit shape. `setup_all` carries
+seed names (immutable), `setup` starts the Agent (mutable).
+
+---
+
+## Implementation
+
+### `mix.exs`
+
+```elixir
+defmodule SetupContexts.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :setup_contexts,
+      version: "0.1.0",
+      elixir: "~> 1.19",
+      start_permanent: Mix.env() == :prod,
+      deps: deps()
+    ]
+  end
+
+  def application do
+    [extra_applications: [:logger]]
+  end
+
+  defp deps do
+    []
+  end
+end
+```
+
+### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
+```bash
+mix new setup_contexts
+cd setup_contexts
+```
+
+### `lib/user_repo.ex`
+
+**Objective**: Implement `user_repo.ex` — the subject under test — shaped specifically to make the testing technique of this lab observable.
+
+```elixir
+defmodule UserRepo do
+  @moduledoc """
+  A trivial in-memory user repository backed by an Agent, used purely to
+  demonstrate ExUnit setup patterns.
+  """
+
+  use Agent
+
+  @type user :: %{id: pos_integer(), name: String.t(), email: String.t()}
+
+  @spec start_link(keyword()) :: Agent.on_start()
+  def start_link(_opts \\ []) do
+    Agent.start_link(fn -> %{} end)
+  end
+
+  @doc "Returns insert result from repo, name and email."
+  @spec insert(pid(), String.t(), String.t()) :: {:ok, user()}
+  def insert(repo, name, email) do
+    Agent.get_and_update(repo, fn state ->
+      id = map_size(state) + 1
+      user = %{id: id, name: name, email: email}
+      {{:ok, user}, Map.put(state, id, user)}
+    end)
+  end
+
+  @doc "Returns result from repo and id."
+  @spec get(pid(), pos_integer()) :: {:ok, user()} | {:error, :not_found}
+  def get(repo, id) do
+    case Agent.get(repo, &Map.get(&1, id)) do
+      nil -> {:error, :not_found}
+      user -> {:ok, user}
+    end
+  end
+
+  @doc "Returns all result from repo."
+  @spec all(pid()) :: [user()]
+  def all(repo), do: Agent.get(repo, &Map.values/1)
+
+  @doc "Counts result from repo."
+  @spec count(pid()) :: non_neg_integer()
+  def count(repo), do: Agent.get(repo, &map_size/1)
+end
+```
+
+### Step 3: `test/user_repo_test.exs`
+
+**Objective**: Write `user_repo_test.exs` exercising the exact ExUnit feature under study — assertions should fail loudly if the technique is misused.
+
+```elixir
+defmodule UserRepoTest do
+  # async: true is safe because each test gets its OWN unregistered Agent pid.
+  use ExUnit.Case, async: true
+
+  doctest UserRepo
+
+  # Runs ONCE for the whole module. Put expensive, read-only setup here.
+  setup_all do
+    # In a real app this might be seed data you compute once.
+    seed_names = ["Ada", "Alan", "Grace", "Linus", "Rob"]
+    {:ok, seed_names: seed_names}
+  end
+
+  # Runs before EVERY test. Starts a fresh repo and registers cleanup.
+  setup context do
+    {:ok, repo} = UserRepo.start_link()
+
+    # Cleanup runs after the test finishes, regardless of outcome.
+    on_exit(fn ->
+      # Agent may already be down if the test stopped it; that's fine.
+      if Process.alive?(repo), do: Agent.stop(repo)
+    end)
+
+    # If a tag like `@tag seed: 3` was applied, pre-populate the repo.
+    if n = context[:seed] do
+      context.seed_names
+      |> Enum.take(n)
+      |> Enum.each(fn name ->
+        UserRepo.insert(repo, name, String.downcase(name) <> "@example.com")
+      end)
+    end
+
+    # Merge the repo pid into the context for tests to use.
+    {:ok, repo: repo}
+  end
+
+  describe "without seeded data" do
+    test "count is zero on a fresh repo", %{repo: repo} do
+      assert UserRepo.count(repo) == 0
+    end
+
+    test "insert assigns sequential ids", %{repo: repo} do
+      {:ok, u1} = UserRepo.insert(repo, "A", "a@x")
+      {:ok, u2} = UserRepo.insert(repo, "B", "b@x")
+
+      assert u1.id == 1
+      assert u2.id == 2
+    end
+  end
+
+  describe "with seeded data" do
+    # Tag-driven setup: the `setup` callback reads `:seed` from context.
+    @describetag :with_seed
+
+    @tag seed: 3
+    test "three users are preloaded", %{repo: repo} do
+      assert UserRepo.count(repo) == 3
+    end
+
+    @tag seed: 5
+    test "five users are preloaded and all have emails", %{repo: repo} do
+      users = UserRepo.all(repo)
+      assert length(users) == 5
+      assert Enum.all?(users, &String.contains?(&1.email, "@"))
+    end
+
+    @tag seed: 1
+    test "can retrieve a seeded user by id", %{repo: repo, seed_names: [first | _]} do
+      assert {:ok, %{name: ^first}} = UserRepo.get(repo, 1)
+    end
+  end
+
+  describe "context merging" do
+    test "setup_all context is visible to tests", %{seed_names: names} do
+      # setup_all's seed_names flowed all the way through.
+      assert is_list(names)
+      assert "Ada" in names
+    end
+  end
+end
+```
+
+### Step 4: Run
+
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+```bash
+mix test
+mix test --only with_seed
+mix test --trace  # see each test name and duration
+```
+
+### Why this works
+
+`setup_all` runs once per module in its own process and merges its return
+value into every test's context. `setup` runs before each test in the test's
+own process, so pids it starts are isolated from other tests — `async: true`
+is safe. Tag-driven branching (`if n = context[:seed]`) keeps fixtures
+parameterized without a DSL; `on_exit/1` guarantees cleanup regardless of
+pass/fail.
+
+---
+
+### `script/main.exs`
+
+```elixir
+defmodule Main do
+  @moduledoc """
+  Runnable demo of `SetupContexts`.
+
+  Exercises the public API end-to-end so behaviour is observable
+  in addition to documented.
+  """
+
+  def main do
+    IO.puts("=== SetupContexts demo ===")
+    run()
+    IO.puts("\nDone — demo finished without errors.")
+  end
+
+  defp run do
+    :ok
+  end
+end
+
+Main.main()
+```
+
+## Key Concepts: Test Setup and Shared Context
+
+ExUnit's `setup` blocks run before each test, preparing fixtures (e.g., creating a GenServer, populating a database table). Return a map (e.g., `%{store: store}`), and the map is passed to the test as an argument.
+
+For async tests, each setup runs independently. For non-async tests, setup runs once before all tests in the module. Use `:ok` or `{:ok, map}` for normal setup; `:skip` to skip the test; `:error` to signal a setup failure that aborts the test. Gotcha: setup runs for every test, so slow setup makes the suite slow. Optimize with tagged tests (`@tag slow: true`) run separately.
+
+## Benchmark
+
+<!-- benchmark N/A: tema conceptual sobre estructura de fixtures; la
+performance relevante es "tests totales / duración del suite" y se mide
+con `mix test --trace`, no con un microbenchmark. -->
+
+---
+
+## Trade-offs and production gotchas
+
+**1. `setup_all` runs in its OWN process**
+Any process started in `setup_all` is linked to that process, not to each
+test. If the process dies between tests, everyone using it fails. Prefer
+`setup` for anything that needs per-test isolation.
+
+**2. `setup_all` and `async: true` can still coexist**
+But only if what `setup_all` produces is truly immutable and read-only.
+Anything writable across tests breaks determinism.
+
+**3. Tag-driven setup can become a DSL**
+It's tempting to grow `setup` into a mini-framework that branches on ten
+different tags. When you notice this, extract a plain module function
+(`TestFixtures.seed/2`) and call it explicitly — easier to read than
+magic tags.
+
+**4. `on_exit/1` runs in a separate process**
+So it cannot affect the test's process state. Use it for external cleanup,
+not to reset a `Process.put/2` value in the test process.
+
+**5. When NOT to use `setup_all`**
+If you're tempted to put a started GenServer in `setup_all`, stop. It
+introduces test-order coupling. Use `setup` + `start_supervised!/1` instead.
+
+---
+
+## Reflection
+
+- Your test suite has 500 tests and a shared Ecto Sandbox setup. A new hire
+  proposes moving sandbox checkout into `setup_all` "for speed". What goes
+  wrong, and how do you explain it with a minimal example?
+- At what point does the branching inside a tag-driven `setup` become bad
+  enough that you should extract it into a `TestFixtures` module? Write
+  the rule you'd enforce on code review.
+
+---
+## Resources
+
+- [`ExUnit.Callbacks`](https://hexdocs.pm/ex_unit/ExUnit.Callbacks.html)
+- [`ExUnit.Case` — context, tags, `@describetag`](https://hexdocs.pm/ex_unit/ExUnit.Case.html)
+- ["Testing in Elixir: Fixtures and Factories" — Dashbit blog](https://dashbit.co/blog) — the Dashbit team's ongoing series on disciplined fixtures
+
+## Key concepts
+ExUnit testing in Elixir balances speed, isolation, and readability. The framework provides fixtures, setup hooks, and async mode to achieve both performance and determinism.
+
+**ExUnit patterns and fixtures:**
+`setup_all` runs once per module (module-scoped state); `setup` runs before each test. Returning `{:ok, map}` injects variables into the test context. For side-effectful setup (e.g., starting supervised processes), use `start_supervised` — it automatically stops the process when the test ends, ensuring cleanup.
+
+**Async safety and isolation:**
+Tests with `async: true` run in parallel, but they must be isolated. Shared resources (database, ETS tables, Registry) require careful locking. A common pattern: `setup :set_myflag` — a private setup that configures a unique state for that test. Avoid global state unless protected by locks.
+
+**Mocking trade-offs:**
+Libraries like `Mox` provide compile-time mock modules that behave like real modules but with controlled behavior. The benefit: you catch missing function implementations at test time. The trade-off: mocks don't catch runtime errors (e.g., a real function that crashes). For critical paths, complement mocks with integration tests against real dependencies. Dependency injection (passing modules as arguments) is more testable than direct calls.
+
+---
+
+## The business problem
+
+Teams ship software against real constraints: latency budgets, availability targets, memory ceilings, and on-call rotations that punish complexity. The exercise in this document is framed against one of those constraints — not as a toy example, but as a miniature of a shape you will meet in production.
+
+The goal is not to memorize an API. The goal is to recognize the pattern so that when you see it in your own codebase, you reach for the right tool immediately.
+
+### `test/setup_contexts_test.exs`
+
+```elixir
+defmodule SetupContextsTest do
+  use ExUnit.Case, async: true
+
+  doctest SetupContexts
+
+  describe "run/1" do
+    test "returns :ok for a no-op input" do
+      assert SetupContexts.run(:noop) == :ok
+    end
+  end
+end
+```

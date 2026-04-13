@@ -1,0 +1,64 @@
+{
+  "check": "D - script/main.exs incomplete",
+  "total_analyzed": 553,
+  "failing_count": 15,
+  "failing_files": [
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/protocols-and-behaviours/32-string-chars-inspect-protocol/32-string-chars-inspect-protocol.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/protocols-and-behaviours/33-access-behaviour/33-access-behaviour.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/protocols-and-behaviours/34-collectable-enumerable/34-collectable-enumerable.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/streams-and-lazy/11-streams-lazy-evaluation/11-streams-lazy-evaluation.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/supervision-basics/60-child-spec-custom/60-child-spec-custom.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/data-pipelines/176-broadway-sqs/176-broadway-sqs.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/data-pipelines/177-broadway-rabbit/177-broadway-rabbit.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/data-pipelines/341-genstage-producer-consumer/341-genstage-producer-consumer.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/data-pipelines/342-flow-parallel-mapreduce/342-flow-parallel-mapreduce.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/data-pipelines/343-broadway-rabbitmq/343-broadway-rabbitmq.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/data-pipelines/346-stream-gzip-composition/346-stream-gzip-composition.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/data-pipelines/347-nimble-csv-huge-files/347-nimble-csv-huge-files.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/data-pipelines/349-checkpointing-resumable/349-checkpointing-resumable.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/data-pipelines/350-etl-http-flow-ecto/350-etl-http-flow-ecto.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/data-pipelines/69-broadway-kafka-pipelines/69-broadway-kafka-pipelines.md"
+  ],
+  "sample_failures": [
+    {
+      "file": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/protocols-and-behaviours/32-string-chars-inspect-protocol/32-string-chars-inspect-protocol.md",
+      "reason": "missing: def main do"
+    },
+    {
+      "file": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/protocols-and-behaviours/33-access-behaviour/33-access-behaviour.md",
+      "reason": "missing: def main do"
+    },
+    {
+      "file": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/protocols-and-behaviours/34-collectable-enumerable/34-collectable-enumerable.md",
+      "reason": "missing: def main do"
+    },
+    {
+      "file": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/streams-and-lazy/11-streams-lazy-evaluation/11-streams-lazy-evaluation.md",
+      "reason": "missing: def main do"
+    },
+    {
+      "file": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/supervision-basics/60-child-spec-custom/60-child-spec-custom.md",
+      "reason": "missing: def main do"
+    },
+    {
+      "file": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/data-pipelines/176-broadway-sqs/176-broadway-sqs.md",
+      "reason": "missing: end"
+    },
+    {
+      "file": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/data-pipelines/177-broadway-rabbit/177-broadway-rabbit.md",
+      "reason": "missing: end"
+    },
+    {
+      "file": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/data-pipelines/341-genstage-producer-consumer/341-genstage-producer-consumer.md",
+      "reason": "missing: end"
+    },
+    {
+      "file": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/data-pipelines/342-flow-parallel-mapreduce/342-flow-parallel-mapreduce.md",
+      "reason": "missing: end"
+    },
+    {
+      "file": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/data-pipelines/343-broadway-rabbitmq/343-broadway-rabbitmq.md",
+      "reason": "missing: end"
+    }
+  ]
+}

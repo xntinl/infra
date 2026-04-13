@@ -1,0 +1,576 @@
+# Debugging with `IO.inspect`, `dbg/2`, and `IEx.pry`
+
+**Project**: `debug_tools` — a tiny pipeline where you practice the three
+everyday Elixir debugging tools without reaching for a debugger.
+
+---
+
+## Why debugging io inspect matters
+
+Before you install `:observer`, before you hook up tracing, before you even
+think about a real debugger — Elixir gives you three tools that solve 90% of
+the "what is this value right now?" problems:
+
+- `IO.inspect/2` — inline printing that is pipeline-friendly because it
+  returns its argument unchanged.
+- `dbg/2` (Elixir 1.14+) — a macro that prints the expression and its value,
+  and in IEx opens an interactive debugger that lets you step through pipes.
+- `IEx.pry/0` — freezes execution at a point in your code and drops you into
+  an IEx prompt bound to the local variables in scope.
+
+This exercise builds a trivial `TextPipeline` module and practices each tool
+on it. You'll understand *when* to use which, and the traps that bite people
+who reach for `IO.puts` and `inspect/1` instead.
+
+---
+
+## Project structure
+
+```
+debug_tools/
+├── lib/
+│   └── debug_tools.ex
+├── script/
+│   └── main.exs
+├── test/
+│   └── debug_tools_test.exs
+└── mix.exs
+```
+
+---
+
+## Core concepts
+
+### 1. `IO.inspect/2` returns its argument — that's the whole point
+
+```elixir
+"hello"
+|> String.upcase()
+|> IO.inspect(label: "after upcase")
+|> String.reverse()
+```
+Because `IO.inspect/2` returns the value it prints, you can drop it anywhere
+in a pipeline without breaking the data flow. Use `label:` to name the
+probe, `limit: :infinity` to defeat the default truncation of long lists,
+and `pretty: true` (the default in most terminals) for readable maps/structs.
+
+### 2. `dbg/2` — inspect the *expression*, not just the value
+
+```elixir
+x = 2
+dbg(x + 3)   # => x + 3 #=> 5
+```
+`dbg/2` is a macro, so it sees the AST. It prints the source expression
+alongside the result, which is wildly more useful than `IO.inspect(x + 3)`
+(which only prints `5`). In **IEx with `--dbg pry`** (Elixir 1.14+), calling
+a function that contains `dbg()` pauses execution and lets you step through
+each stage of the pipe, inspecting intermediate values.
+
+### 3. `IEx.pry/0` — a breakpoint you write in source
+
+```elixir
+require IEx
+IEx.pry()
+```
+When execution hits `IEx.pry()`, if you are running inside `iex -S mix`, the
+VM pauses at that line and gives you an IEx prompt *with the local variables
+in scope*. Type `continue` to resume, `respawn` to restart the shell, or
+just inspect whatever you want.
+
+### 4. None of this is a replacement for tests
+
+Debug prints get committed by accident and pollute production logs. Every
+`IO.inspect`, `dbg`, and `pry` should be temporary. Credo and even the
+compiler (in strict mode) will warn about stray `dbg` calls — lean into that.
+
+---
+
+## Why these three and not `inspect/1` + `IO.puts`
+
+`inspect/1` returns a string, so `x |> inspect() |> foo()` passes a
+string to `foo/1` — almost always wrong. `IO.puts` works on strings only
+and breaks the pipe because it returns `:ok`. `IO.inspect/2` is the
+pipeline-safe primitive: it prints AND returns its argument. `dbg/2`
+adds the expression source to the output (a macro superpower).
+`IEx.pry/0` gives you the full lexical scope, which the other two can't.
+
+---
+
+## Design decisions
+
+**Option A — Always use `IO.inspect/2`**
+- Pros: Works everywhere (IEx, test, production); zero tooling
+  requirements; pipeline-friendly.
+- Cons: Prints a value, not the expression producing it; no stepping;
+  gets committed and pollutes production logs.
+
+**Option B — Tiered approach: `IO.inspect` → `dbg` → `IEx.pry`** (chosen)
+- Pros: Each tool covers a different need — inline probing, expression
+  tracing, full lexical breakpoint. Choosing the least invasive tool
+  for the job keeps debugging cheap.
+- Cons: Requires knowing all three; `dbg/2` needs Elixir 1.14+ and
+  `--dbg pry` for stepping; `IEx.pry/0` requires `iex -S mix`.
+
+→ Chose **B** because each tool has a niche the others can't cover
+  cleanly, and picking the right one turns a 20-minute bug hunt into
+  two minutes.
+
+---
+
+## Implementation
+
+### `mix.exs`
+
+```elixir
+defmodule DebugTools.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :debug_tools,
+      version: "0.1.0",
+      elixir: "~> 1.19",
+      start_permanent: Mix.env() == :prod,
+      deps: deps()
+    ]
+  end
+
+  def application do
+    [extra_applications: [:logger]]
+  end
+
+  defp deps do
+    []
+  end
+end
+```
+### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
+```bash
+mix new debug_tools
+cd debug_tools
+```
+
+### `lib/text_pipeline.ex`
+
+**Objective**: Implement `text_pipeline.ex` — code whose shape is chosen to exercise the tool's capabilities, not to solve a domain problem.
+
+```elixir
+defmodule TextPipeline do
+  @moduledoc """
+  A trivial pipeline used as a target for debugging practice.
+
+  `process_value/1` takes a string, normalizes it, and returns a map of word
+  frequencies. The individual steps are exposed so you can probe each one
+  with `IO.inspect`, `dbg`, or `IEx.pry`.
+  """
+
+  @doc """
+  Normalizes, tokenizes, and counts word frequencies.
+
+  ## Examples
+
+      iex> TextPipeline.process_value("Hello hello world")
+      %{"hello" => 2, "world" => 1}
+  """
+  @spec process_value(String.t()) :: %{String.t() => non_neg_integer()}
+  def process_value(text) when is_binary(text) do
+    text
+    |> normalize()
+    |> tokenize()
+    |> count()
+  end
+
+  @doc "Lowercases and trims extra whitespace."
+  @spec normalize(String.t()) :: String.t()
+  def normalize(text) do
+    text
+    |> String.downcase()
+    |> String.trim()
+  end
+
+  @doc "Splits on whitespace, drops empties."
+  @spec tokenize(String.t()) :: [String.t()]
+  def tokenize(text) do
+    String.split(text, ~r/\s+/, trim: true)
+  end
+
+  @doc "Counts occurrences of each word."
+  @spec count([String.t()]) :: %{String.t() => non_neg_integer()}
+  def count(words), do: Enum.frequencies(words)
+
+  # ── Debugging showcase ──────────────────────────────────────────────────
+
+  @doc """
+  Same as `process_value/1`, but instrumented with `IO.inspect` probes at every
+  stage. Use this to SEE the pipeline values without changing control flow.
+  Each probe returns its argument unchanged, so the final result is identical.
+  """
+  @spec process_with_inspect(String.t()) :: %{String.t() => non_neg_integer()}
+  def process_with_inspect(text) do
+    text
+    |> IO.inspect(label: "input")
+    |> normalize()
+    |> IO.inspect(label: "normalized")
+    |> tokenize()
+    |> IO.inspect(label: "tokens", limit: :infinity)
+    |> count()
+    |> IO.inspect(label: "counts", pretty: true)
+  end
+
+  @doc """
+  Same pipeline wrapped in `dbg/2`. In `iex --dbg pry -S mix`, calling this
+  function PAUSES at each pipe stage and lets you step through interactively.
+  Outside IEx it just prints the expressions and their values.
+  """
+  @spec process_with_dbg(String.t()) :: %{String.t() => non_neg_integer()}
+  def process_with_dbg(text) do
+    text
+    |> normalize()
+    |> tokenize()
+    |> count()
+    |> dbg()
+  end
+
+  @doc """
+  Demonstrates `IEx.pry/0`. Run `iex -S mix` and call
+  `TextPipeline.process_with_pry("hello world")` — execution pauses at the
+  `IEx.pry()` line and you can inspect `normalized`, `tokens`, and `counts`
+  by name from the IEx prompt.
+  """
+  @spec process_with_pry(String.t()) :: %{String.t() => non_neg_integer()}
+  def process_with_pry(text) do
+    require IEx
+
+    normalized = normalize(text)
+    tokens = tokenize(normalized)
+    counts = count(tokens)
+
+    IEx.pry()
+
+    counts
+  end
+end
+```
+### Step 3: `test/text_pipeline_test.exs`
+
+**Objective**: Write `text_pipeline_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+```elixir
+defmodule TextPipelineTest do
+  use ExUnit.Case, async: true
+
+  import ExUnit.CaptureIO
+
+  doctest TextPipeline
+
+  describe "process/1" do
+    test "counts words case-insensitively" do
+      assert TextPipeline.process("Hello HELLO world") == %{"hello" => 2, "world" => 1}
+    end
+
+    test "handles extra whitespace" do
+      assert TextPipeline.process("  a   b  a  ") == %{"a" => 2, "b" => 1}
+    end
+
+    test "empty string yields an empty map" do
+      assert TextPipeline.process("") == %{}
+    end
+  end
+
+  describe "process_with_inspect/1" do
+    test "returns the same result as process/1 and prints the probes" do
+      io =
+        capture_io(fn ->
+          result = TextPipeline.process_with_inspect("Hi hi")
+          assert result == %{"hi" => 2}
+        end)
+
+      # The labels we added with IO.inspect appear in stdout.
+      assert io =~ "input:"
+      assert io =~ "normalized:"
+      assert io =~ "tokens:"
+      assert io =~ "counts:"
+    end
+  end
+end
+```
+### Step 4: Run and explore
+
+**Objective**: Run and explore.
+
+```bash
+mix test
+
+# Inspect everything inline:
+iex -S mix
+iex> TextPipeline.process_with_inspect("Hello world hello")
+
+# Step-through debugging (Elixir 1.14+):
+iex --dbg pry -S mix
+iex> TextPipeline.process_with_dbg("Hello world hello")
+# press Enter / n at each prompt to step through the pipe
+
+# Breakpoint-style:
+iex -S mix
+iex> TextPipeline.process_with_pry("a b a")
+# you drop into a nested IEx prompt; type `normalized`, `tokens`, `counts`
+# then type `continue` to resume.
+```
+
+### Why this works
+
+`IO.inspect/2` returns its argument, which is what lets you insert it
+anywhere in a pipe without changing behavior — a deliberate design
+choice so the debug probe is identity-on-value. `dbg/2` is a macro and
+therefore sees the AST; it can print the expression alongside the
+result and (with `--dbg pry`) pause between pipe stages because it
+rewrites the pipeline at compile time. `IEx.pry/0` hooks into the
+compiled module's debug_info to expose the local scope to the IEx
+shell, which is why it only works when the code is reached from an
+IEx-connected shell.
+
+---
+
+### `script/main.exs`
+
+```elixir
+defmodule Main do
+  defmodule TextPipeline do
+    @moduledoc """
+    A trivial pipeline used as a target for debugging practice.
+
+    `process_value/1` takes a string, normalizes it, and returns a map of word
+    frequencies. The individual steps are exposed so you can probe each one
+    with `IO.inspect`, `dbg`, or `IEx.pry`.
+    """
+
+    @doc """
+    Normalizes, tokenizes, and counts word frequencies.
+
+    ## Examples
+
+        iex> TextPipeline.process_value("Hello hello world")
+        %{"hello" => 2, "world" => 1}
+    """
+    @spec process_value(String.t()) :: %{String.t() => non_neg_integer()}
+    def process_value(text) when is_binary(text) do
+      text
+      |> normalize()
+      |> tokenize()
+      |> count()
+    end
+
+    @doc "Lowercases and trims extra whitespace."
+    @spec normalize(String.t()) :: String.t()
+    def normalize(text) do
+      text
+      |> String.downcase()
+      |> String.trim()
+    end
+
+    @doc "Splits on whitespace, drops empties."
+    @spec tokenize(String.t()) :: [String.t()]
+    def tokenize(text) do
+      String.split(text, ~r/\s+/, trim: true)
+    end
+
+    @doc "Counts occurrences of each word."
+    @spec count([String.t()]) :: %{String.t() => non_neg_integer()}
+    def count(words), do: Enum.frequencies(words)
+
+    # ── Debugging showcase ──────────────────────────────────────────────────
+
+    @doc """
+    Same as `process_value/1`, but instrumented with `IO.inspect` probes at every
+    stage. Use this to SEE the pipeline values without changing control flow.
+    Each probe returns its argument unchanged, so the final result is identical.
+    """
+    @spec process_with_inspect(String.t()) :: %{String.t() => non_neg_integer()}
+    def process_with_inspect(text) do
+      text
+      |> IO.inspect(label: "input")
+      |> normalize()
+      |> IO.inspect(label: "normalized")
+      |> tokenize()
+      |> IO.inspect(label: "tokens", limit: :infinity)
+      |> count()
+      |> IO.inspect(label: "counts", pretty: true)
+    end
+
+    @doc """
+    Same pipeline wrapped in `dbg/2`. In `iex --dbg pry -S mix`, calling this
+    function PAUSES at each pipe stage and lets you step through interactively.
+    Outside IEx it just prints the expressions and their values.
+    """
+    @spec process_with_dbg(String.t()) :: %{String.t() => non_neg_integer()}
+    def process_with_dbg(text) do
+      text
+      |> normalize()
+      |> tokenize()
+      |> count()
+      |> dbg()
+    end
+
+    @doc """
+    Demonstrates `IEx.pry/0`. Run `iex -S mix` and call
+    `TextPipeline.process_with_pry("hello world")` — execution pauses at the
+    `IEx.pry()` line and you can inspect `normalized`, `tokens`, and `counts`
+    by name from the IEx prompt.
+    """
+    @spec process_with_pry(String.t()) :: %{String.t() => non_neg_integer()}
+    def process_with_pry(text) do
+      require IEx
+
+      normalized = normalize(text)
+      tokens = tokenize(normalized)
+      counts = count(tokens)
+
+      IEx.pry()
+
+      counts
+    end
+  end
+
+  def main do
+    IO.puts("=== Debug Demo ===
+  ")
+  
+    # Demo: Debugging with IO.inspect
+  value = %{name: "alice", age: 30}
+  IO.puts("1. Regular IO.inspect:")
+  result = IO.inspect(value)
+  IO.puts("   Returns: #{inspect(result)}")
+
+  IO.puts("2. IO.inspect with label:")
+  IO.inspect(value, label: "User data")
+
+  IO.puts("
+  ✓ IO.inspect debug demo completed!")
+  end
+
+end
+
+Main.main()
+```
+## Benchmark
+
+<!-- benchmark N/A: these are debugging tools; their overhead is
+     intentional (printing, formatting, pausing) and the right metric
+     is "did I find the bug?" not throughput. Roughly, `IO.inspect` on
+     a 1KB term is ~50µs on modern hardware — negligible outside hot
+     loops, pathological inside them. -->
+
+---
+
+## Trade-offs and production gotchas
+
+**1. `IO.inspect` in hot paths is slow and noisy**
+Formatting and printing takes microseconds and synchronizes on `:stdio`. In
+a tight loop, printing once per iteration can dominate runtime. It also
+scrambles log output in concurrent tests. Keep probes scoped and remove
+them before committing.
+
+**2. `inspect/1` vs `IO.inspect/2`** — they are NOT the same
+`inspect/1` returns a string. `IO.inspect/2` prints *and* returns the value.
+If you write `x |> inspect() |> foo()`, you just passed a string to `foo/1`
+— that's almost never what you want.
+
+**3. `dbg/2` leaves pretty output in production logs**
+`dbg` prints colored, formatted output to stderr. If a stray `dbg(x)` ships,
+your logs are noisy AND colored (with ANSI escapes) in environments that
+can't render them. Configure Credo's `Credo.Check.Warning.Dbg` to fail CI.
+
+**4. `IEx.pry` only works when the code is reached from an IEx session**
+If your code runs inside a Task spawned by Phoenix during a request, the
+`pry` prompt opens in the IEx shell *on the BEAM node* — you need to have
+`iex -S mix phx.server` (not `mix phx.server`) for it to be usable.
+
+**5. `IO.inspect` truncates — `:infinity` exists for a reason**
+Default `:limit` is 50 items, default `:printable_limit` is 4096 bytes.
+Missing this leads to "why is the list cut off?" confusion. When in doubt:
+`IO.inspect(x, limit: :infinity, printable_limit: :infinity)`.
+
+**6. When NOT to use these tools**
+If you need to inspect *why* a production node is misbehaving right now,
+you want `:recon`, `:observer`, or `:sys.get_state/1` — not `IO.inspect`.
+If you're debugging concurrency / scheduling, reach for tracing (`:dbg`,
+`:recon_trace`), not print statements.
+
+---
+
+## Reflection
+
+- Your team repeatedly ships PRs with leftover `IO.inspect` calls. Would
+  you fix this socially (code review), mechanically (Credo check
+  blocking CI), or technologically (a compile-time macro that strips
+  them in `:prod`)? What are the tradeoffs of each?
+- You're debugging a Phoenix controller that sometimes returns stale
+  data under load. `IO.inspect` shows correct values in isolation. What
+  tool from this exercise (or beyond it) matches the problem shape, and
+  why do print-based tools fail here?
+
+## Resources
+
+- [`IO.inspect/2` — Elixir stdlib](https://hexdocs.pm/elixir/IO.html#inspect/2)
+- [`Kernel.dbg/2`](https://hexdocs.pm/elixir/Kernel.html#dbg/2) — the macro, including the `--dbg pry` flag
+- [`IEx.pry/0`](https://hexdocs.pm/iex/IEx.html#pry/0) — source-level breakpoints
+- [`Inspect.Opts`](https://hexdocs.pm/elixir/Inspect.Opts.html) — every flag you can pass (`limit`, `printable_limit`, `pretty`, `structs`, `syntax_colors`, etc.)
+- ["Debugging" — the Elixir guide](https://hexdocs.pm/elixir/debugging.html) — official walkthrough of all three tools
+
+## Deep Dive
+
+Elixir's tooling ecosystem extends beyond the language into DevOps, profiling, and observability. Understanding each tool's role prevents misuse and false optimizations.
+
+**Mix tasks and releases:**
+Custom mix tasks (`mix myapp.setup`, `mix myapp.migrate`) encapsulate operational knowledge. Tasks run in the host environment (not the compiled app), so they're ideal for setup, teardown, or scripting. Releases, built with `mix release`, create self-contained OTP applications deployable without Elixir installed. They're immutable: no source code changes after release — all config comes from environment variables or runtime files.
+
+**Debugging and profiling tools:**
+- `:observer` (GUI): real-time process tree, metrics, and port inspection
+- `Recon`: production-safe introspection (stable even under high load)
+- `:eprof`: function-level timing; lower overhead than `:fprof`
+- `:fprof`: detailed trace analysis; use only in staging
+
+**Profiling approaches:**
+Ceiling profiling (e.g., "which modules consume CPU?") is cheap; go there first with `perf` or `eprof`. Floor profiling (e.g., "which lines in this function are slow?") is expensive; reserve for specific functions. In production, prefer metrics (Prometheus, New Relic) over profiling — continuous profiling has overhead. Store profiling data for post-mortem analysis, not real-time dashboards.
+
+---
+
+## The business problem
+
+Teams ship software against real constraints: latency budgets, availability targets, memory ceilings, and on-call rotations that punish complexity. The exercise in this document is framed against one of those constraints — not as a toy example, but as a miniature of a shape you will meet in production.
+
+The goal is not to memorize an API. The goal is to recognize the pattern so that when you see it in your own codebase, you reach for the right tool immediately.
+
+### `test/debug_tools_test.exs`
+
+```elixir
+defmodule DebugToolsTest do
+  use ExUnit.Case, async: true
+
+  doctest DebugTools
+
+  describe "run/1" do
+    test "returns :ok for a no-op input" do
+      assert DebugTools.run(:noop) == :ok
+    end
+  end
+end
+```
+---
+
+## Key concepts
+
+### 1. Model the problem with the right primitive
+
+Choose the OTP primitive that matches the failure semantics of the problem: `GenServer` for stateful serialization, `Task` for fire-and-forget async, `Agent` for simple shared state, `Supervisor` for lifecycle management. Reaching for the wrong primitive is the most common source of accidental complexity in Elixir systems.
+
+### 2. Make invariants explicit in code
+
+Guards, pattern matching, and `@spec` annotations turn invariants into enforceable contracts. If a value *must* be a positive integer, write a guard — do not write a comment. The compiler and Dialyzer will catch what documentation cannot.
+
+### 3. Let it crash, but bound the blast radius
+
+"Let it crash" is not permission to ignore failures — it is a directive to design supervision trees that contain them. Every process should be supervised, and every supervisor should have a restart strategy that matches the failure mode it is recovering from.

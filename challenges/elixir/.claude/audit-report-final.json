@@ -1,0 +1,50 @@
+{
+  "audit_date": "2026-04-13T12:07:27.785020Z",
+  "total_files": 551,
+  "compliance_by_directory": {
+    "01-basico": {
+      "total": 78,
+      "has_project_name": 76,
+      "has_mix_section": 78,
+      "has_script_main": 0,
+      "has_defmodule": 78,
+      "has_h2_executable_example": 63,
+      "coherent": 15
+    },
+    "02-intermedio": {
+      "total": 137,
+      "has_project_name": 137,
+      "has_mix_section": 137,
+      "has_script_main": 0,
+      "has_defmodule": 137,
+      "has_h2_executable_example": 111,
+      "coherent": 26
+    },
+    "03-avanzado": {
+      "total": 280,
+      "has_project_name": 271,
+      "has_mix_section": 238,
+      "has_script_main": 0,
+      "has_defmodule": 280,
+      "has_h2_executable_example": 280,
+      "coherent": 0
+    },
+    "04-insane": {
+      "total": 56,
+      "has_project_name": 55,
+      "has_mix_section": 52,
+      "has_script_main": 0,
+      "has_defmodule": 53,
+      "has_h2_executable_example": 0,
+      "coherent": 53
+    }
+  },
+  "issues": {
+    "missing_project_name": 12,
+    "h2_executable_example": 454,
+    "no_script_main_section": 551
+  },
+  "overall_coherence_score": "17%",
+  "total_coherent_files": 94,
+  "recommendation": "CRITICAL ISSUES"
+}

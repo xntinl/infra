@@ -1,0 +1,374 @@
+# `Access` behaviour — bracket syntax for a `User` struct
+
+**Project**: `user_access` — a `User` struct that supports `user[:profile][:name]` and `put_in/get_in/update_in` by implementing `Access`.
+
+---
+
+## Why access behaviour matters
+
+Elixir's bracket syntax — `user[:profile]` — and the `Kernel.get_in/2`,
+`put_in/2`, and `update_in/2` family are all powered by the `Access`
+behaviour. Maps and keyword lists implement it out of the box. Structs do
+NOT — by default `user[:field]` raises.
+
+This matters the moment your domain model is more than a flat map. A `User`
+that nests a `Profile` is awkward to traverse with pattern matching alone:
+
+```elixir
+%{user | profile: %{user.profile | name: "new"}}  # painful
+put_in(user[:profile][:name], "new")              # with Access
+```
+
+Implementing `Access` on your own struct unlocks the same ergonomics users
+already expect from maps. This exercise does exactly that, with care taken
+around the callbacks' exact semantics — `get_and_update` and `pop` are
+easy to get subtly wrong.
+
+---
+
+## Project structure
+
+```
+user_access/
+├── lib/
+│   └── user_access.ex
+├── script/
+│   └── main.exs
+├── test/
+│   └── user_access_test.exs
+└── mix.exs
+```
+
+---
+
+## Core concepts
+
+### 1. `Access` has three callbacks
+
+```elixir
+@callback fetch(t, key) :: {:ok, value} | :error
+@callback get_and_update(t, key, (value | nil -> {get, value} | :pop)) ::
+            {get, t}
+@callback pop(t, key) :: {value, t}
+```
+
+`fetch/2` drives `user[:k]`. `get_and_update/3` drives `update_in`, `put_in`,
+and `Kernel.update_in`. `pop/2` drives `pop_in`.
+
+### 2. `get_in/2` composes `Access` dispatch
+
+`get_in(user, [:profile, :name])` calls `Access.get(user, :profile)`, then
+`Access.get(result, :name)`. Implementing `Access` once on your struct makes
+it work seamlessly with nested structures.
+
+### 3. Structs do NOT get `Access` for free
+
+This is an intentional design choice. Structs have a fixed shape; throwing
+arbitrary keys at `user[:typo]` should fail loudly. You implement `Access`
+only when you've decided bracket access makes sense for your type.
+
+### 4. `Kernel.get_in/put_in` also accept functions
+
+If your struct shouldn't implement `Access` but you still want nested traversal,
+you can pass an accessor function: `get_in(user, [Access.key(:profile), :name])`.
+See `Access.key/2` and `Access.all/0` for built-in accessors.
+
+---
+
+## Why implement `Access` and not just expose helper functions
+
+**Hand-rolled `User.get_profile_name/1` / `User.put_profile_name/2`.** Readable for one level of nesting; combinatorial explosion at three levels. Every new nested field ships a new helper.
+
+**`Access.key/2` accessor functions in `get_in/2` without implementing `Access` on the struct.** Works, but every call site builds the path with `[Access.key(:profile), :name]`. Verbose and leaks the "this struct doesn't support brackets" detail.
+
+**Implement `Access` on the struct (chosen).** Callers use `user[:profile][:name]`, `put_in`, and `update_in` just like they do with maps. You keep control by restricting `fetch/2` to declared fields, so typos still fail loudly.
+
+---
+
+## Design decisions
+
+**Option A — Do not implement `Access`; callers use `Access.key/2` accessors**
+- Pros: Preserves struct strictness by default.
+- Cons: Every nested traversal is verbose; consumers confuse "does it support brackets?" with "is it a map?".
+
+**Option B — Implement `Access` with a closed `fetch/2` key set and a raising `pop/2`** (chosen)
+- Pros: Bracket ergonomics; typos return `nil` via `get`, but `pop_in` on required fields raises loudly; `get_and_update/3` reroutes `:pop` into a meaningful error.
+- Cons: `user[:typo]` silently returns `nil` (bracket semantics), so external callers need to know the field set.
+
+→ Chose **B** because the ergonomic win is large and the `:pop` raise prevents the silent-corruption class of bugs.
+
+---
+
+## Implementation
+
+### `mix.exs`
+
+```elixir
+defmodule UserAccess.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :user_access,
+      version: "0.1.0",
+      elixir: "~> 1.19",
+      start_permanent: Mix.env() == :prod,
+      deps: deps()
+    ]
+  end
+
+  def application do
+    [extra_applications: [:logger]]
+  end
+
+  defp deps do
+    []
+  end
+end
+```
+
+### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
+```bash
+mix new user_access
+cd user_access
+```
+
+### `lib/user.ex`
+
+**Objective**: Implement `user.ex` — polymorphism via dispatch on the data's type (protocol) or via an explicit contract (behaviour).
+
+```elixir
+defmodule User do
+  @moduledoc """
+  A small user struct that supports bracket-access (`user[:profile]`) and
+  works with `get_in`, `put_in`, and `update_in`. Implements the `Access`
+  behaviour.
+  """
+
+  @behaviour Access
+
+  @enforce_keys [:id, :profile]
+  defstruct [:id, :profile]
+
+  @type t :: %__MODULE__{id: term(), profile: map()}
+
+  @doc "Build a new user with id and a profile map."
+  @spec new(term(), map()) :: t
+  def new(id, profile) when is_map(profile), do: %__MODULE__{id: id, profile: profile}
+
+  # ── Access callbacks ───────────────────────────────────────────────────
+  #
+  # We delegate to the underlying map for storage, but restrict which keys
+  # are accessible — only declared struct fields. Attempting to fetch an
+  # unknown key returns :error, which is the documented "not present" signal.
+
+  @impl Access
+  def fetch(%__MODULE__{} = user, key) when key in [:id, :profile] do
+    {:ok, Map.fetch!(user, key)}
+  end
+
+  def fetch(%__MODULE__{}, _key), do: :error
+
+  @impl Access
+  def get_and_update(%__MODULE__{} = user, key, fun)
+      when key in [:id, :profile] and is_function(fun, 1) do
+    current = Map.fetch!(user, key)
+
+    case fun.(current) do
+      {get, new_value} ->
+        {get, Map.put(user, key, new_value)}
+
+      :pop ->
+        # Pop is allowed only for optional fields; id/profile are enforced.
+        raise ArgumentError, "cannot pop required key #{inspect(key)} from User"
+    end
+  end
+
+  @impl Access
+  def pop(%__MODULE__{}, key) do
+    raise ArgumentError, "cannot pop key #{inspect(key)} from User (all keys required)"
+  end
+end
+```
+
+### Step 3: `test/user_test.exs`
+
+**Objective**: Write `user_test.exs` — tests pin the behaviour so future refactors cannot silently regress the invariants established above.
+
+```elixir
+defmodule UserTest do
+  use ExUnit.Case, async: true
+
+  doctest User
+
+  setup do
+    %{user: User.new(1, %{name: "Jane", email: "j@x.io"})}
+  end
+
+  describe "bracket access" do
+    test "top-level field via brackets", %{user: user} do
+      assert user[:id] == 1
+      assert user[:profile] == %{name: "Jane", email: "j@x.io"}
+    end
+
+    test "unknown struct key returns nil (Access.get default)", %{user: user} do
+      # fetch/2 returns :error → get/2 returns nil, matching Map semantics.
+      assert user[:nope] == nil
+    end
+
+    test "nested access via brackets", %{user: user} do
+      # profile is a plain map; Map already implements Access, so this chains.
+      assert user[:profile][:name] == "Jane"
+    end
+  end
+
+  describe "get_in / put_in / update_in" do
+    test "get_in/2 traverses into the profile map", %{user: user} do
+      assert get_in(user, [:profile, :name]) == "Jane"
+    end
+
+    test "put_in/2 replaces a nested value", %{user: user} do
+      updated = put_in(user, [:profile, :name], "Janet")
+      assert updated.profile.name == "Janet"
+      # Original is untouched — immutable, as always.
+      assert user.profile.name == "Jane"
+    end
+
+    test "update_in/2 transforms a nested value", %{user: user} do
+      updated = update_in(user, [:profile, :name], &String.upcase/1)
+      assert updated.profile.name == "JANE"
+    end
+  end
+
+  describe "pop semantics" do
+    test "pop on a required key raises", %{user: user} do
+      assert_raise ArgumentError, fn -> pop_in(user, [:profile]) end
+    end
+  end
+end
+```
+
+### Step 4: Run
+
+**Objective**: Execute the suite (or IEx session) so the invariants we just encoded are proven by observation, not just by reading the code.
+
+```bash
+mix test
+```
+
+### Why this works
+
+`fetch/2` restricts bracket access to the declared struct fields — unknown keys return `:error`, which `Access.get/2` turns into `nil`, matching map semantics without bypassing struct strictness. `get_and_update/3` routes a `:pop` return into an explicit `ArgumentError`, so `pop_in` on required fields fails loudly instead of silently corrupting state. Because `profile` is a plain map, `user[:profile][:name]` chains through two `Access` impls (yours + `Map`'s) without extra code.
+
+---
+
+### `script/main.exs`
+
+```elixir
+defmodule Main do
+  def main do
+    IO.puts("=== User Demo ===\n")
+
+    result_1 = User.new(nil, nil)
+    IO.puts("Demo 1 - new: #{inspect(result_1)}")
+    result_2 = User.fetch(nil, nil)
+    IO.puts("Demo 2 - fetch: #{inspect(result_2)}")
+    result_3 = User.get_and_update(nil, nil, nil)
+    IO.puts("Demo 3 - get_and_update: #{inspect(result_3)}")
+  end
+end
+
+Main.main()
+```
+
+## Key Concepts: The Access Behaviour and Bracket Notation
+
+The `Access` behaviour lets custom data structures support bracket notation (`struct[key]`, `struct[key] = value`). Normally only maps and keyword lists support this. Implement `get/3` and `get_and_update/4` to enable bracket access on your struct.
+
+Example: a custom `Spreadsheet` struct can implement `Access` to support `sheet["A1"]` and `sheet["A1"] = value`, making it transparent in code that expects map-like behavior. The gotcha: `Access` requires explicit opt-in; naive bracket access on a custom struct raises an error.
+
+## Benchmark
+
+<!-- benchmark N/A: bracket access vs function access is a few nanoseconds; the interesting complexity is the API ergonomics, not the cost. -->
+
+---
+
+## Trade-offs and production gotchas
+
+**1. Implementing `Access` is a public API decision**
+Once callers use `user[:field]`, renaming a field is a breaking change — the
+bracket form happily returns `nil` for the old key without any warning. Pin
+field names via `@enforce_keys` and restrict `fetch/2` to the known set to
+fail loudly on typos at the server boundary.
+
+**2. `get_and_update/3` must handle `:pop` correctly**
+`update_in` callbacks may return `:pop` to remove the key. If your struct
+can't represent "key absent", you must either raise (as above) or coerce to
+a default. Silently ignoring `:pop` corrupts state.
+
+**3. `Kernel.put_in/3` is NOT the same as `Map.put/3`**
+`put_in(user, [:profile, :name], "x")` requires `Access` on `user`. If you
+forget to implement it, the error message is about the struct, not the key —
+expect confused issue reports.
+
+**4. Bracket access is `nil`-lenient; dot access is strict**
+`user[:missing]` returns `nil`. `user.missing` raises `KeyError`. Don't let
+code drift between the two styles — pick one per abstraction layer.
+
+**5. When NOT to implement `Access`**
+If the struct's shape is opaque (an encoded blob, an internal cache), don't.
+Force callers to go through functions you control. `Access` is for value
+objects, not for stateful or invariant-heavy types.
+
+---
+
+## Reflection
+
+- You add an optional `:preferences` field. Should `pop_in(user, [:preferences])` succeed (field becomes `nil` or absent)? How does the answer change `get_and_update/3` and `pop/2`, and what invariant does each choice preserve?
+- A consumer calls `user[:profil]` (typo). Bracket access returns `nil`; dot access (`user.profil`) raises `KeyError`. In a codebase where both styles coexist, which one would you ban in code review for struct fields, and why?
+
+## Resources
+
+- [`Access` behaviour — Elixir stdlib](https://hexdocs.pm/elixir/Access.html)
+- [`Kernel.get_in/2`, `put_in/3`, `update_in/3`](https://hexdocs.pm/elixir/Kernel.html#get_in/2)
+- [`Access.key/2` — accessor for missing-or-present fields](https://hexdocs.pm/elixir/Access.html#key/2)
+- ["The Access behaviour and you" — ElixirSchool](https://elixirschool.com/en/lessons/advanced/protocols/)
+
+## Key concepts
+Protocols and behaviors are Elixir's mechanism for ad-hoc and static polymorphism. They solve different problems and are often confused.
+
+**Protocols:**
+Dispatch based on the type/struct of the first argument at runtime. A protocol defines a contract (e.g., `Enumerable`); any type can implement it by adding a corresponding implementation block. Protocols excel when you control neither the type nor the caller — e.g., a library that needs to iterate any collection. The fallback is `:any` — if no specific implementation exists, the `:any` handler is tried. This enables "optional" protocol implementations.
+
+**Behaviours:**
+Static polymorphism enforced at compile time. A module implements a behavior by defining callbacks (functions). Behaviors are about contracts between modules, not types. Use when you need multiple implementations of the same interface and the caller chooses which to use (e.g., different database adapters, different strategies). Callbacks are checked at compile time — missing a required callback is a compiler error.
+
+**Architectural patterns:**
+Behaviors excel in plugin systems (user defines modules conforming to the behavior). Protocols excel in type-driven dispatch (any type can conform). Mix both: a behavior can require that its callbacks operate on types that implement a protocol. Example: `MyAdapter` behavior requiring callbacks that work with `Enumerable` types.
+
+---
+
+## The business problem
+
+Teams ship software against real constraints: latency budgets, availability targets, memory ceilings, and on-call rotations that punish complexity. The exercise in this document is framed against one of those constraints — not as a toy example, but as a miniature of a shape you will meet in production.
+
+The goal is not to memorize an API. The goal is to recognize the pattern so that when you see it in your own codebase, you reach for the right tool immediately.
+
+### `test/user_access_test.exs`
+
+```elixir
+defmodule UserAccessTest do
+  use ExUnit.Case, async: true
+
+  doctest UserAccess
+
+  describe "run/1" do
+    test "returns :ok for a no-op input" do
+      assert UserAccess.run(:noop) == :ok
+    end
+  end
+end
+```

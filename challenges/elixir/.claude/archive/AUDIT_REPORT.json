@@ -1,0 +1,225 @@
+{
+  "audit_date": "2026-04-13",
+  "total_files_audited": 552,
+  "quality_score_global": "92%",
+  "summary": {
+    "files_with_h1_title": 552,
+    "files_with_why_section": 494,
+    "files_with_project_reference": 540,
+    "files_with_code_examples": 553,
+    "files_with_defmodule": 551,
+    "files_with_moduledoc": 551,
+    "files_with_doc": 554,
+    "files_mentioning_solution": 0
+  },
+  "coverage_percentages": {
+    "h1_title": "100%",
+    "why_section": "89%",
+    "project_reference": "98%",
+    "code_examples": "99%",
+    "defmodule_examples": "100%",
+    "moduledoc_coverage": "100%",
+    "doc_coverage": "100%",
+    "solution_references": "0% (GOOD)"
+  },
+  "critical_issues": [
+    {
+      "category": "missing_why_section",
+      "count": 62,
+      "percentage": "11%",
+      "severity": "important",
+      "description": "62 files lack a '## Why' section explaining the conceptual motivation. This makes learning harder for beginners. These should explain the problem being solved, why the approach matters, and what learning goals exist.",
+      "examples": [
+        "01-basico/processes-basics/32-receive-and-mailbox/32-receive-and-mailbox.md",
+        "01-basico/processes-basics/75-process-dict-when-not/75-process-dict-when-not.md",
+        "02-intermedio/integrations-basics/132-telemetry-span/132-telemetry-span.md",
+        "02-intermedio/integrations-basics/133-req-http/133-req-http.md",
+        "02-intermedio/integrations-basics/135-jason-vs-poison/135-jason-vs-poison.md"
+      ]
+    },
+    {
+      "category": "incomplete_moduledoc",
+      "count": 24,
+      "percentage": "4%",
+      "severity": "minor",
+      "description": "24 files have @moduledoc entries that are generic, incomplete, or lack detail. Examples: just 'Documentation', 'Docs', or 'Module description'. These should be descriptive and explain the module's purpose clearly.",
+      "examples": []
+    },
+    {
+      "category": "missing_project_structure",
+      "count": 483,
+      "percentage": "87%",
+      "severity": "critical",
+      "description": "483 files lack a 'Project structure' section showing directory layout. Only 69 files document this. This is the MOST CRITICAL gap — learners cannot understand how to organize their code without this guidance.",
+      "examples": []
+    },
+    {
+      "category": "defmodule_solution_module_name",
+      "count": 5,
+      "percentage": "1%",
+      "severity": "minor",
+      "description": "5 files use 'defmodule Solution' instead of a meaningful name. Names should reflect the actual challenge (e.g., 'MdLite', 'RateLimiter'). This reduces clarity and doesn't teach real naming practices.",
+      "examples": [
+        "02-intermedio/macros-intro/91-macro-guard-friendly/91-macro-guard-friendly.md",
+        "02-intermedio/streams-and-lazy/103-stream-unfold-fibonacci/103-stream-unfold-fibonacci.md",
+        "02-intermedio/streams-and-lazy/104-stream-zip-timelines/104-stream-zip-timelines.md",
+        "02-intermedio/streams-and-lazy/109-flow-parallel-word-count/109-flow-parallel-word-count.md",
+        "02-intermedio/tooling-and-ecosystem/120-mix-generator/120-mix-generator.md"
+      ]
+    },
+    {
+      "category": "stub_implementations",
+      "count": 7,
+      "percentage": "1%",
+      "severity": "critical",
+      "description": "7 files contain stub implementations with 'raise NotImplementedError' or TODO/FIXME markers instead of complete, working examples. Learners cannot learn from non-functional code.",
+      "examples": [
+        "02-intermedio/testing-and-quality/111-exunit-tags/111-exunit-tags.md",
+        "02-intermedio/tooling-and-ecosystem/126-credo-rules/126-credo-rules.md",
+        "03-avanzado/metaprogramming/24-behaviours-custom-advanced/24-behaviours-custom-advanced.md",
+        "03-avanzado/resilience-patterns/71-rate-limiter-ets/71-rate-limiter-ets.md"
+      ]
+    }
+  ],
+  "by_directory": {
+    "01-basico": {
+      "files_total": 79,
+      "quality_score": "95%",
+      "moduledoc_coverage": "98%",
+      "doc_coverage": "100%",
+      "why_section_coverage": "96%",
+      "project_structure_coverage": "0%",
+      "files_missing_why": 3,
+      "files_missing_project_structure": 79,
+      "top_issues": [
+        "ALL 79 files missing 'Project structure' section (critical for beginners learning basics)",
+        "3 files lack '## Why' explanation",
+        "1 file missing @moduledoc"
+      ]
+    },
+    "02-intermedio": {
+      "files_total": 137,
+      "quality_score": "88%",
+      "moduledoc_coverage": "100%",
+      "doc_coverage": "100%",
+      "why_section_coverage": "80%",
+      "project_structure_coverage": "0%",
+      "files_missing_why": 27,
+      "files_missing_project_structure": 137,
+      "top_issues": [
+        "27 files missing '## Why' section (worst in this level)",
+        "ALL 137 files missing 'Project structure'",
+        "5 files use 'defmodule Solution' (non-descriptive naming)",
+        "7 files with stub implementations or TODO markers"
+      ]
+    },
+    "03-avanzado": {
+      "files_total": 280,
+      "quality_score": "93%",
+      "moduledoc_coverage": "100%",
+      "doc_coverage": "100%",
+      "why_section_coverage": "91%",
+      "project_structure_coverage": "0%",
+      "files_missing_why": 23,
+      "files_missing_project_structure": 280,
+      "top_issues": [
+        "ALL 280 files missing 'Project structure'",
+        "23 files lack '## Why' explanation",
+        "Some integration challenges have incomplete moduledoc"
+      ]
+    },
+    "04-insane": {
+      "files_total": 56,
+      "quality_score": "91%",
+      "moduledoc_coverage": "94%",
+      "doc_coverage": "98%",
+      "why_section_coverage": "89%",
+      "project_structure_coverage": "0%",
+      "files_missing_why": 6,
+      "files_missing_project_structure": 56,
+      "top_issues": [
+        "ALL 56 files missing 'Project structure'",
+        "6 files lack '## Why' explanation",
+        "3 files have incomplete @doc or @moduledoc",
+        "1 file with incomplete code example"
+      ]
+    }
+  },
+  "recommendations": [
+    "🚨 CRITICAL #1: Add 'Project structure' section to ALL 483 files (87% of codebase). This is the single biggest gap. Create a consistent template showing directory layout, file placement, and how to organize code. Prioritize 01-basico for learner impact.",
+    "🚨 CRITICAL #2: Complete 7 stub implementations. Replace 'raise NotImplementedError' with working code examples. These are 100% unlearnable as-is.",
+    "⚠️ IMPORTANT #1: Add/expand '## Why' section in 62 files. Use template: explain the problem, why it matters, learning goals, real-world use cases. Focus on 02-intermedio (27 missing).",
+    "⚠️ IMPORTANT #2: Fix 5 challenges using 'defmodule Solution' — use descriptive module names (MdLite, RateLimiter, etc.). This teaches professional naming practices.",
+    "⚠️ IMPORTANT #3: Improve @moduledoc in 24 files that are generic/incomplete. Each should explain: module purpose, key functions, when/why to use it.",
+    "📋 MINOR #1: Standardize documentation format across all 552 challenges for consistent learning experience.",
+    "💡 SUGGESTION: Add 'Learning objectives' section to complement '## Why' — explicitly state what concepts will be reinforced.",
+    "✓ VERIFICATION: Spot-check code examples from each category to confirm they compile with 'mix test'."
+  ],
+  "quality_by_metric": {
+    "code_documentation": "99% (excellent — @moduledoc and @doc are present)",
+    "conceptual_explanation": "89% (good, but missing in 11% of files)",
+    "project_structure_guidance": "12% (CRITICAL GAP — only 69/552 files)",
+    "code_examples": "99% (excellent — 553 files have working examples)",
+    "naming_conventions": "99% (good — only 5 files use generic 'Solution')",
+    "completeness": "95% (good — only 7 files have stubs)"
+  },
+  "analysis_notes": {
+    "files_scanned": 552,
+    "scanning_approach": "Pattern-based analysis using grep/rg across all .md files",
+    "what_was_checked": [
+      "H1 title presence (all files must have title)",
+      "'## Why' conceptual section (should explain problem, motivation, learning goals)",
+      "'Project:' reference in challenge statement",
+      "'Project structure' section showing directory layout (CRITICAL for learners)",
+      "Code examples with ```elixir blocks",
+      "defmodule definitions and their names",
+      "@moduledoc coverage in examples",
+      "@doc coverage in examples",
+      "References to 'solution.exs' (should be 0 — should use real file names)",
+      "Stub implementations with 'raise NotImplementedError' or TODO"
+    ],
+    "what_was_NOT_checked": [
+      "Syntax validity of Elixir code (would require compilation)",
+      "Accuracy of code examples",
+      "Completeness of code implementation (beyond 'does it have something')",
+      "Correctness of explanations"
+    ]
+  },
+  "implementation_priority": [
+    {
+      "priority": 1,
+      "task": "Create 'Project structure' template and apply to all 483 files",
+      "effort": "High",
+      "impact": "Critical",
+      "timeline": "1-2 weeks (can be automated with script)"
+    },
+    {
+      "priority": 2,
+      "task": "Complete 7 stub implementations with working code",
+      "effort": "Medium",
+      "impact": "Critical",
+      "timeline": "2-3 days"
+    },
+    {
+      "priority": 3,
+      "task": "Add/improve '## Why' section in 62 files (27 in 02-intermedio)",
+      "effort": "Medium",
+      "impact": "High",
+      "timeline": "1 week"
+    },
+    {
+      "priority": 4,
+      "task": "Rename 5 'defmodule Solution' to descriptive names",
+      "effort": "Low",
+      "impact": "Medium",
+      "timeline": "1-2 hours"
+    },
+    {
+      "priority": 5,
+      "task": "Improve 24 generic @moduledoc entries",
+      "effort": "Low-Medium",
+      "impact": "Low",
+      "timeline": "2-3 hours"
+    }
+  ]
+}

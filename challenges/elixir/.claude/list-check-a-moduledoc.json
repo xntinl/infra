@@ -1,0 +1,102 @@
+{
+  "check": "A - @moduledoc",
+  "total_analyzed": 553,
+  "failing_count": 53,
+  "failing_files": [
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/integrations-basics/130-ecto-repo-transactions/130-ecto-repo-transactions.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/integrations-basics/29-ecto-basico/29-ecto-basico.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/advanced-testing/291-ecto-sandbox-modes/291-ecto-sandbox-modes.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/advanced-testing/294-supervisor-restart-testing/294-supervisor-restart-testing.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/advanced-testing/299-ex-machina-factories/299-ex-machina-factories.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/advanced-testing/300-peer-distributed-testing/300-peer-distributed-testing.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/apis-and-graphql/245-subscriptions-pubsub/245-subscriptions-pubsub.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/apis-and-graphql/251-openapi-gen/251-openapi-gen.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/apis-and-graphql/331-absinthe-dataloader/331-absinthe-dataloader.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/apis-and-graphql/332-absinthe-subscriptions/332-absinthe-subscriptions.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/apis-and-graphql/333-persisted-queries-complexity/333-persisted-queries-complexity.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/apis-and-graphql/334-rest-api-versioning/334-rest-api-versioning.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/apis-and-graphql/335-openapi-spex-generation/335-openapi-spex-generation.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/apis-and-graphql/337-oauth2-assent-flow/337-oauth2-assent-flow.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/beam-internals-and-perf/363-gc-tuning-per-process/363-gc-tuning-per-process.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/beam-internals-and-perf/364-binary-refc-leaks/364-binary-refc-leaks.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/data-pipelines/341-genstage-producer-consumer/341-genstage-producer-consumer.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/data-pipelines/344-broadway-sqs-batchers/344-broadway-sqs-batchers.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/distribution-and-clustering/368-horde-registry-dynamic-supervisor/368-horde-registry-dynamic-supervisor.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/distribution-and-clustering/369-phoenix-pubsub-distributed/369-phoenix-pubsub-distributed.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/domain-frameworks/380-ash-resource-actions/380-ash-resource-actions.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/domain-frameworks/381-commanded-aggregate-events-projections/381-commanded-aggregate-events-projections.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/domain-frameworks/382-cqrs-commanded-eventstore/382-cqrs-commanded-eventstore.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/domain-frameworks/383-event-sourcing-from-scratch-snapshots/383-event-sourcing-from-scratch-snapshots.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/domain-frameworks/66-commanded-projections-read-models/66-commanded-projections-read-models.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/domain-frameworks/67-ash-framework-resources/67-ash-framework-resources.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/domain-frameworks/68-ash-extensions-api/68-ash-extensions-api.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ecto-advanced/273-ecto-multi-transactions/273-ecto-multi-transactions.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ecto-advanced/276-polymorphic-associations/276-polymorphic-associations.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ecto-advanced/279-ctes-recursive-queries/279-ctes-recursive-queries.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ecto-advanced/280-subqueries-advanced/280-subqueries-advanced.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ecto-advanced/282-zero-downtime-migrations/282-zero-downtime-migrations.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ecto-advanced/283-row-level-locking/283-row-level-locking.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ecto-advanced/286-embedded-schemas-nested-changesets/286-embedded-schemas-nested-changesets.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/interop-and-native/161-rustler-binary/161-rustler-binary.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/interop-and-native/31-ports-external-processes/31-ports-external-processes.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/interop-and-native/319-dirty-nif-cpu-bound/319-dirty-nif-cpu-bound.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/interop-and-native/326-ets-shared-nif-readers/326-ets-shared-nif-readers.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/metaprogramming/139-optional-callbacks/139-optional-callbacks.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/resilience-patterns/307-fallback-chains-with/307-fallback-chains-with.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/resilience-patterns/308-bounded-queue-genstage-backpressure/308-bounded-queue-genstage-backpressure.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/resilience-patterns/310-graceful-degradation-feature-flags/310-graceful-degradation-feature-flags.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/resilience-patterns/311-deadline-propagation-processes/311-deadline-propagation-processes.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/resilience-patterns/312-chaos-engineering-suspend-kill/312-chaos-engineering-suspend-kill.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/resilience-patterns/313-idempotency-keys-ets-ttl/313-idempotency-keys-ets-ttl.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/resilience-patterns/314-dead-letter-queue/314-dead-letter-queue.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/resilience-patterns/315-saga-compensating-actions/315-saga-compensating-actions.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/resilience-patterns/316-hedged-requests/316-hedged-requests.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/frameworks-and-engines/32-build-web-framework-phoenix-like/32-build-web-framework-phoenix-like.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/network-and-proxies/34-build-api-gateway/34-build-api-gateway.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/network-and-proxies/39-build-service-mesh-proxy/39-build-service-mesh-proxy.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/observability/29-build-metrics-collector-prometheus-like/29-build-metrics-collector-prometheus-like.md",
+    "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/observability/30-build-profiler-performance-analyzer/30-build-profiler-performance-analyzer.md"
+  ],
+  "sample_failures": [
+    {
+      "file": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/integrations-basics/130-ecto-repo-transactions/130-ecto-repo-transactions.md",
+      "reason": "no @moduledoc"
+    },
+    {
+      "file": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/integrations-basics/29-ecto-basico/29-ecto-basico.md",
+      "reason": "no @moduledoc"
+    },
+    {
+      "file": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/advanced-testing/291-ecto-sandbox-modes/291-ecto-sandbox-modes.md",
+      "reason": "no @moduledoc"
+    },
+    {
+      "file": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/advanced-testing/294-supervisor-restart-testing/294-supervisor-restart-testing.md",
+      "reason": "no @moduledoc"
+    },
+    {
+      "file": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/advanced-testing/299-ex-machina-factories/299-ex-machina-factories.md",
+      "reason": "no @moduledoc"
+    },
+    {
+      "file": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/advanced-testing/300-peer-distributed-testing/300-peer-distributed-testing.md",
+      "reason": "no @moduledoc"
+    },
+    {
+      "file": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/apis-and-graphql/245-subscriptions-pubsub/245-subscriptions-pubsub.md",
+      "reason": "no @moduledoc"
+    },
+    {
+      "file": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/apis-and-graphql/251-openapi-gen/251-openapi-gen.md",
+      "reason": "no @moduledoc"
+    },
+    {
+      "file": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/apis-and-graphql/331-absinthe-dataloader/331-absinthe-dataloader.md",
+      "reason": "no @moduledoc"
+    },
+    {
+      "file": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/apis-and-graphql/332-absinthe-subscriptions/332-absinthe-subscriptions.md",
+      "reason": "no @moduledoc"
+    }
+  ]
+}

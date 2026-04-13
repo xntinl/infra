@@ -1,0 +1,605 @@
+# Generating documentation with ExDoc
+
+**Project**: `docs_demo` — a library with rich docs, doctests, cross-module
+links, and an `extras/` guide, rendered by ExDoc to the same HTML you see
+on hexdocs.pm.
+
+---
+
+## Why documentacion exdoc matters
+
+ExDoc is the tool that renders Elixir's module docs into the site you've
+been reading for the last 20 exercises. If you publish to Hex, ExDoc runs
+on their build server and the output becomes your `hexdocs.pm/<pkg>` page.
+If you don't publish, running `mix docs` locally gives you an identical
+site in `doc/`.
+
+This exercise shows the full documentation pipeline:
+
+1. `@moduledoc` + `@doc` with Markdown, typespecs, and examples.
+2. Doctests so examples in docs are TESTED on every CI run.
+3. Cross-module links with the backtick notation.
+4. Extras: free-form guides (a `GUIDE.md`) rendered alongside module docs.
+5. `mix docs` configured with `source_url`, logo, groups, and extras.
+
+---
+
+## Project structure
+
+```
+docs_demo/
+├── lib/
+│   └── docs_demo.ex
+├── script/
+│   └── main.exs
+├── test/
+│   └── docs_demo_test.exs
+└── mix.exs
+```
+
+---
+
+## Core concepts
+
+### 1. `@moduledoc` and `@doc` are just Markdown
+
+```elixir
+defmodule MathUtils do
+  @moduledoc """
+  Numeric helpers.
+
+  ## Quick start
+
+      iex> MathUtils.square(3)
+      9
+  """
+end
+```
+
+Two rules you'll forget:
+
+- The docstring must be `"""`-delimited — single-line `@doc "foo"` works
+  but can't contain Markdown sections.
+- `@moduledoc false` hides a module from docs entirely. Use it for internal
+  helpers so your public surface stays clean.
+
+### 2. Doctests: examples that run on CI
+
+Any block indented under `## Examples` that looks like `iex>` prompts is
+executed as a test when the test file calls `doctest ModuleName`.
+
+```elixir
+@doc """
+## Examples
+
+    iex> MathUtils.square(3)
+    9
+"""
+```
+
+**If the example is wrong, `mix test` fails.** Your docs cannot drift from
+reality. This is the single highest-ROI habit in the Elixir ecosystem.
+
+### 3. Cross-module references
+
+Inside a docstring, backticks with a `Module.function/arity` shape become
+hyperlinks:
+
+| Markdown                   | Rendered link            |
+|----------------------------|--------------------------|
+| `` `String.upcase/1` ``    | → the stdlib doc         |
+| `` `MathUtils` ``          | → your own module        |
+| `` `t:Enumerable.t/0` ``   | → a type                 |
+| `` `c:GenServer.init/1` ``| → a callback             |
+
+Prefixes: `t:` for types, `c:` for callbacks, `mfa` (bare) for functions.
+
+### 4. Extras — long-form guides
+
+Add `extras: ["guides/getting_started.md"]` to `mix docs` config and ExDoc
+renders Markdown files as sibling pages to the API reference. Use extras
+for tutorials, migration guides, and design rationale that don't belong on
+any one module.
+
+---
+
+## Why ExDoc + doctests and not external docs (Sphinx, MkDocs)
+
+External doc generators treat code and docs as separate artifacts that
+drift independently. ExDoc reads `@moduledoc` and `@doc` directly from
+source, and doctests execute examples as part of `mix test` — docs that
+lie fail CI. External tools replicate the first half (source-extracted
+API reference) but never the second, so they become outdated the moment
+an example becomes aspirational.
+
+---
+
+## Design decisions
+
+**Option A — Keep all narrative docs in `README.md` only**
+- Pros: One file; familiar to every developer; renders on GitHub.
+- Cons: Becomes a wall of text; no navigation between topics; can't
+  cross-link to API reference.
+
+**Option B — `@moduledoc` + `@doc` + `extras/` guides via ExDoc** (chosen)
+- Pros: API docs live next to the code; guides live in Markdown;
+  doctests prevent drift; the output matches what Hex users see.
+- Cons: Two places for different kinds of content (module vs guide);
+  `extras:` requires ordering and titling; CI cost of running doctests.
+
+→ Chose **B** because the "next to the code" part is load-bearing:
+  docs that live in a separate repo or file are the ones that rot.
+
+---
+
+## Implementation
+
+### `mix.exs`
+
+```elixir
+defmodule DocsDemo.MixProject do
+  use Mix.Project
+
+  def project do
+    [
+      app: :docs_demo,
+      version: "0.1.0",
+      elixir: "~> 1.19",
+      start_permanent: Mix.env() == :prod,
+      deps: deps()
+    ]
+  end
+
+  def application do
+    [extra_applications: [:logger]]
+  end
+
+  defp deps do
+    []
+  end
+end
+```
+
+### Step 1: Create the project
+
+**Objective**: Bootstrap a clean Mix project so the lab runs in isolation — this ensures every environment starts with a fresh state.
+
+```bash
+mix new docs_demo
+cd docs_demo
+```
+
+### Step 2: Add ExDoc to `mix.exs`
+
+**Objective**: Add ExDoc to `mix.exs`.
+
+```elixir
+defmodule DocsDemo.MixProject do
+  use Mix.Project
+
+  @source_url "https://github.com/example/docs_demo"
+  @version "0.1.0"
+
+  def project do
+    [
+      app: :docs_demo,
+      version: @version,
+      elixir: "~> 1.19",
+      start_permanent: Mix.env() == :prod,
+      deps: deps(),
+
+      # --- ExDoc-specific configuration ---
+      name: "DocsDemo",
+      source_url: @source_url,
+      homepage_url: @source_url,
+      docs: docs()
+    ]
+  end
+
+  def application, do: [extra_applications: [:logger]]
+
+  defp deps do
+    [
+      {:ex_doc, "~> 0.31", only: :dev, runtime: false}
+    ]
+  end
+
+  defp docs do
+    [
+      main: "readme",
+      source_url: @source_url,
+      source_ref: "v#{@version}",
+      extras: [
+        "README.md",
+        "guides/getting_started.md": [title: "Getting Started"]
+      ],
+      groups_for_modules: [
+        "Utilities": [
+          DocsDemo.StringUtils,
+          DocsDemo.MathUtils
+        ]
+      ],
+      groups_for_docs: [
+        "Math": &(&1[:section] == :math),
+        "Strings": &(&1[:section] == :strings)
+      ]
+    ]
+  end
+end
+```
+
+### `lib/docs_demo.ex`
+
+**Objective**: Edit `docs_demo.ex` — the entry-point module, exposing code whose shape is chosen to exercise the tool's capabilities, not to solve a domain problem.
+
+```elixir
+defmodule DocsDemo do
+  @moduledoc """
+  Entry point for `DocsDemo`.
+
+  This library is a demo of the ExDoc pipeline. See:
+
+    * `DocsDemo.StringUtils` — text helpers.
+    * `DocsDemo.MathUtils` — numeric helpers.
+
+  It also ships with the ["Getting Started"](getting_started.html) guide.
+  """
+
+  @doc """
+  Returns the library version.
+
+  ## Examples
+
+      iex> is_binary(DocsDemo.version())
+      true
+  """
+  @spec version() :: String.t()
+  def version, do: Application.spec(:docs_demo, :vsn) |> to_string()
+end
+```
+
+### `lib/docs_demo/string_utils.ex`
+
+**Objective**: Implement `string_utils.ex` — code whose shape is chosen to exercise the tool's capabilities, not to solve a domain problem.
+
+```elixir
+defmodule DocsDemo.StringUtils do
+  @moduledoc """
+  Small string helpers, used to demonstrate `@doc`, `@spec`, and doctests.
+
+  See also `DocsDemo.MathUtils` for the numeric counterpart.
+  """
+
+  @doc section: :strings
+  @doc """
+  Shouts a string by uppercasing and appending an exclamation mark.
+
+  Delegates the uppercase step to `String.upcase/1`.
+
+  ## Examples
+
+      iex> DocsDemo.StringUtils.shout("hello")
+      "HELLO!"
+
+      iex> DocsDemo.StringUtils.shout("")
+      "!"
+  """
+  @spec shout(String.t()) :: String.t()
+  def shout(text) when is_binary(text), do: String.upcase(text) <> "!"
+
+  @doc section: :strings
+  @doc """
+  Reverses a string.
+
+  ## Examples
+
+      iex> DocsDemo.StringUtils.reverse("abc")
+      "cba"
+  """
+  @spec reverse(String.t()) :: String.t()
+  def reverse(text) when is_binary(text), do: String.reverse(text)
+
+  # Internal helper; @doc false hides it from ExDoc output.
+  @doc false
+  def __private_helper__, do: :ok
+end
+```
+
+### `lib/docs_demo/math_utils.ex`
+
+**Objective**: Implement `math_utils.ex` — code whose shape is chosen to exercise the tool's capabilities, not to solve a domain problem.
+
+```elixir
+defmodule DocsDemo.MathUtils do
+  @moduledoc """
+  Numeric helpers.
+
+  Use with `DocsDemo.StringUtils` for the full "hello world" experience.
+  """
+
+  @typedoc "A non-negative integer used as a count or size."
+  @type non_neg :: non_neg_integer()
+
+  @doc section: :math
+  @doc """
+  Returns the square of a number.
+
+  ## Examples
+
+      iex> DocsDemo.MathUtils.square(3)
+      9
+
+      iex> DocsDemo.MathUtils.square(-4)
+      16
+  """
+  @spec square(number()) :: number()
+  def square(n) when is_number(n), do: n * n
+
+  @doc section: :math
+  @doc """
+  Clamps `n` to the range `[min, max]`.
+
+  Raises `ArgumentError` if `min > max`.
+
+  ## Examples
+
+      iex> DocsDemo.MathUtils.clamp(5, 0, 10)
+      5
+
+      iex> DocsDemo.MathUtils.clamp(-1, 0, 10)
+      0
+
+      iex> DocsDemo.MathUtils.clamp(99, 0, 10)
+      10
+  """
+  @spec clamp(number(), number(), number()) :: number()
+  def clamp(_n, min, max) when min > max, do: raise(ArgumentError, "min > max")
+  def clamp(n, min, _max) when n < min, do: min
+  def clamp(n, _min, max) when n > max, do: max
+  def clamp(n, _min, _max), do: n
+end
+```
+
+### Step 6: `guides/getting_started.md`
+
+**Objective**: Implement `getting_started.md` — code whose shape is chosen to exercise the tool's capabilities, not to solve a domain problem.
+
+```markdown
+# Getting Started
+
+`DocsDemo` is a demo library for learning ExDoc. Install by adding
+`{:docs_demo, "~> 0.1"}` to your deps, then use `DocsDemo.MathUtils.square/1`
+or `DocsDemo.StringUtils.shout/1` from anywhere in your code.
+```
+
+### `test/docs_demo_test.exs`
+
+**Objective**: Tests (with doctests enabled).
+
+`test/math_utils_test.exs`:
+
+```elixir
+defmodule DocsDemo.MathUtilsTest do
+  use ExUnit.Case, async: true
+
+  doctest DocsDemo.MathUtils
+
+  describe "core functionality" do
+    test "clamp/3 raises when min > max" do
+      assert_raise ArgumentError, fn -> DocsDemo.MathUtils.clamp(1, 10, 0) end
+    end
+  end
+end
+```
+
+`test/string_utils_test.exs`:
+
+```elixir
+defmodule DocsDemo.StringUtilsTest do
+  use ExUnit.Case, async: true
+
+  doctest DocsDemo.StringUtils
+end
+```
+
+### Step 8: Build the docs
+
+**Objective**: Build the docs.
+
+```bash
+mix deps.get
+mix test        # doctests + normal tests
+mix docs        # generates doc/index.html
+open doc/index.html
+```
+
+You get the full hexdocs.pm UX locally: sidebar with extras, module groups,
+search, "source" links pointing back at GitHub.
+
+### Why this works
+
+ExDoc extracts `@moduledoc` / `@doc` attributes from compiled beam
+files, so docs live next to the code they describe — no drift, no
+duplication. Doctests use the same docstrings as source for ExUnit's
+`doctest` macro, which lexes the `iex>` blocks and asserts each
+expression matches. Grouping (`groups_for_modules`, `groups_for_docs`)
+plus `extras:` let you shape the generated site without leaving `mix.exs`.
+
+---
+
+### `script/main.exs`
+
+```elixir
+defmodule Main do
+  defmodule DocsDemo.MathUtils do
+    @moduledoc """
+    Numeric helpers.
+
+    Use with `DocsDemo.StringUtils` for the full "hello world" experience.
+    """
+
+    @typedoc "A non-negative integer used as a count or size."
+    @type non_neg :: non_neg_integer()
+
+    @doc section: :math
+    @doc """
+    Returns the square of a number.
+
+    ## Examples
+
+        iex> DocsDemo.MathUtils.square(3)
+        9
+
+        iex> DocsDemo.MathUtils.square(-4)
+        16
+    """
+    @spec square(number()) :: number()
+    def square(n) when is_number(n), do: n * n
+
+    @doc section: :math
+    @doc """
+    Clamps `n` to the range `[min, max]`.
+
+    Raises `ArgumentError` if `min > max`.
+
+    ## Examples
+
+        iex> DocsDemo.MathUtils.clamp(5, 0, 10)
+        5
+
+        iex> DocsDemo.MathUtils.clamp(-1, 0, 10)
+        0
+
+        iex> DocsDemo.MathUtils.clamp(99, 0, 10)
+        10
+    """
+    @spec clamp(number(), number(), number()) :: number()
+    def clamp(_n, min, max) when min > max, do: raise(ArgumentError, "min > max")
+    def clamp(n, min, _max) when n < min, do: min
+    def clamp(n, _min, max) when n > max, do: max
+    def clamp(n, _min, _max), do: n
+  end
+
+  def main do
+    IO.puts("=== Docs Demo ===
+  ")
+  
+    # Demo: ExDoc documentation
+  IO.puts("1. mix docs - generate HTML docs")
+  IO.puts("2. @doc and @moduledoc strings")
+  IO.puts("3. Code examples in docs")
+
+  IO.puts("
+  ✓ ExDoc demo completed!")
+  end
+
+end
+
+Main.main()
+```
+
+## Benchmark
+
+<!-- benchmark N/A: `mix docs` on a medium library (50 modules, 20
+     guides) typically completes in under 10 seconds — CPU bound on
+     Markdown parsing. Doctests add roughly 1 ms per example to the
+     test suite. The useful metric is "docs match reality", enforced
+     by the test suite, not throughput. -->
+
+---
+
+## Trade-offs and production gotchas
+
+**1. Doctests are tests — they fail the build**
+This is a feature, not a bug. If you change behavior without updating
+docs, CI fails. But it means you can't put speculative/aspirational
+examples in docs — only things that work right now. Use `## Examples` for
+real examples and plain prose for everything else.
+
+**2. `@moduledoc false` vs omitting it**
+Omitting `@moduledoc` emits a compiler warning (in `--warnings-as-errors`
+it breaks CI). Modules that are genuinely internal should have explicit
+`@moduledoc false` — it tells both the compiler and the reader this is
+intentional.
+
+**3. `source_ref:` matters for Hex**
+Without `source_ref: "v#{@version}"`, the "Source" links in docs point to
+the default branch — which will drift. For a published package, `source_ref`
+pins links to the exact tag.
+
+**4. Extras order matters**
+The `extras:` list order is the sidebar order. Put your "Getting Started"
+first, migration guides next, reference last.
+
+**5. Doctests are slow if you have many**
+Each doctest is a separate ExUnit test with its own setup. Thousands of
+doctests can noticeably slow the suite. Keep doctests for API illustration;
+use `describe`-grouped unit tests for edge cases.
+
+**6. When NOT to add a doctest**
+- The example depends on wall-clock time, randomness, or environment (fails
+  on CI).
+- The output is a huge map/list (the doctest becomes unreadable).
+- The behavior is platform-specific.
+
+For those, describe the behavior in prose and test it in the test file.
+
+---
+
+## Reflection
+
+- Your library has 400 doctests. CI is now slower because of them and a
+  teammate proposes replacing 80% with plain unit tests. What's the
+  argument for keeping them as doctests (beyond "testing")? When is the
+  speed tradeoff worth it, and when isn't it?
+- A customer reports the docs on hexdocs.pm differ from what they see
+  when cloning the repo and running `mix docs` locally. What's the
+  likely root cause — given `source_ref`, `@version`, and `mix.lock` as
+  candidate culprits — and what's your debugging sequence?
+
+## Resources
+
+- [ExDoc](https://hexdocs.pm/ex_doc/) — main docs, configuration options
+- [Writing documentation — the Elixir guide](https://hexdocs.pm/elixir/writing-documentation.html) — idioms for `@moduledoc`, `@doc`, `@typedoc`
+- [ExUnit.DocTest](https://hexdocs.pm/ex_unit/ExUnit.DocTest.html) — doctest mechanics and escape hatches
+- [Hex.pm — "Publishing docs"](https://hex.pm/docs/publish#publishing-docs) — how `mix hex.publish` uploads to hexdocs.pm
+
+## Deep Dive
+
+Elixir's tooling ecosystem extends beyond the language into DevOps, profiling, and observability. Understanding each tool's role prevents misuse and false optimizations.
+
+**Mix tasks and releases:**
+Custom mix tasks (`mix myapp.setup`, `mix myapp.migrate`) encapsulate operational knowledge. Tasks run in the host environment (not the compiled app), so they're ideal for setup, teardown, or scripting. Releases, built with `mix release`, create self-contained OTP applications deployable without Elixir installed. They're immutable: no source code changes after release — all config comes from environment variables or runtime files.
+
+**Debugging and profiling tools:**
+- `:observer` (GUI): real-time process tree, metrics, and port inspection
+- `Recon`: production-safe introspection (stable even under high load)
+- `:eprof`: function-level timing; lower overhead than `:fprof`
+- `:fprof`: detailed trace analysis; use only in staging
+
+**Profiling approaches:**
+Ceiling profiling (e.g., "which modules consume CPU?") is cheap; go there first with `perf` or `eprof`. Floor profiling (e.g., "which lines in this function are slow?") is expensive; reserve for specific functions. In production, prefer metrics (Prometheus, New Relic) over profiling — continuous profiling has overhead. Store profiling data for post-mortem analysis, not real-time dashboards.
+
+---
+
+## The business problem
+
+Teams ship software against real constraints: latency budgets, availability targets, memory ceilings, and on-call rotations that punish complexity. The exercise in this document is framed against one of those constraints — not as a toy example, but as a miniature of a shape you will meet in production.
+
+The goal is not to memorize an API. The goal is to recognize the pattern so that when you see it in your own codebase, you reach for the right tool immediately.
+
+---
+
+## Key concepts
+
+### 1. Model the problem with the right primitive
+
+Choose the OTP primitive that matches the failure semantics of the problem: `GenServer` for stateful serialization, `Task` for fire-and-forget async, `Agent` for simple shared state, `Supervisor` for lifecycle management. Reaching for the wrong primitive is the most common source of accidental complexity in Elixir systems.
+
+### 2. Make invariants explicit in code
+
+Guards, pattern matching, and `@spec` annotations turn invariants into enforceable contracts. If a value *must* be a positive integer, write a guard — do not write a comment. The compiler and Dialyzer will catch what documentation cannot.
+
+### 3. Let it crash, but bound the blast radius
+
+"Let it crash" is not permission to ignore failures — it is a directive to design supervision trees that contain them. Every process should be supervised, and every supervisor should have a restart strategy that matches the failure mode it is recovering from.

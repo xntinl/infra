@@ -1,0 +1,4489 @@
+[
+  {
+    "level": "01-basico",
+    "category": "collections",
+    "current_number": "06",
+    "current_slug": "lists-and-head-tail-pattern",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/collections/06-lists-and-head-tail-pattern/06-lists-and-head-tail-pattern.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "collections",
+    "current_number": "11",
+    "current_slug": "enum-module-and-immutability",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/collections/11-enum-module-and-immutability/11-enum-module-and-immutability.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "collections",
+    "current_number": "12",
+    "current_slug": "pipe-operator-and-composition",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/collections/12-pipe-operator-and-composition/12-pipe-operator-and-composition.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "collections",
+    "current_number": "17",
+    "current_slug": "ranges-and-streams",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/collections/17-ranges-and-streams/17-ranges-and-streams.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "collections",
+    "current_number": "19",
+    "current_slug": "comprehensions-for",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/collections/19-comprehensions-for/19-comprehensions-for.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "collections",
+    "current_number": "44",
+    "current_slug": "enum-reduce-patterns",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/collections/44-enum-reduce-patterns/44-enum-reduce-patterns.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "collections",
+    "current_number": "45",
+    "current_slug": "stream-resource-infinite",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/collections/45-stream-resource-infinite/45-stream-resource-infinite.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "collections",
+    "current_number": "46",
+    "current_slug": "mapset-operations",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/collections/46-mapset-operations/46-mapset-operations.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "collections",
+    "current_number": "47",
+    "current_slug": "keyword-dsl-building",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/collections/47-keyword-dsl-building/47-keyword-dsl-building.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "control-flow",
+    "current_number": "09",
+    "current_slug": "control-flow-if-case-cond",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/control-flow/09-control-flow-if-case-cond/09-control-flow-if-case-cond.md",
+    "issues": [
+      "duplicate-number-in-level"
+    ]
+  },
+  {
+    "level": "01-basico",
+    "category": "control-flow",
+    "current_number": "10",
+    "current_slug": "recursion-and-tail-call-optimization",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/control-flow/10-recursion-and-tail-call-optimization/10-recursion-and-tail-call-optimization.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "control-flow",
+    "current_number": "20",
+    "current_slug": "guards-and-custom-guards",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/control-flow/20-guards-and-custom-guards/20-guards-and-custom-guards.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "control-flow",
+    "current_number": "21",
+    "current_slug": "with-keyword-flow",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/control-flow/21-with-keyword-flow/21-with-keyword-flow.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "control-flow",
+    "current_number": "56",
+    "current_slug": "case-deep-patterns",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/control-flow/56-case-deep-patterns/56-case-deep-patterns.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "control-flow",
+    "current_number": "57",
+    "current_slug": "cond-vs-if-choices",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/control-flow/57-cond-vs-if-choices/57-cond-vs-if-choices.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "control-flow",
+    "current_number": "58",
+    "current_slug": "unless-else-guards",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/control-flow/58-unless-else-guards/58-unless-else-guards.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "control-flow",
+    "current_number": "59",
+    "current_slug": "try-catch-after-cleanup",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/control-flow/59-try-catch-after-cleanup/59-try-catch-after-cleanup.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "data-structures",
+    "current_number": "15",
+    "current_slug": "structs-and-basic-validation",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/data-structures/15-structs-and-basic-validation/15-structs-and-basic-validation.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "data-structures",
+    "current_number": "60",
+    "current_slug": "enforce-keys-structs",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/data-structures/60-enforce-keys-structs/60-enforce-keys-structs.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "data-structures",
+    "current_number": "61",
+    "current_slug": "protocols-polymorphism",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/data-structures/61-protocols-polymorphism/61-protocols-polymorphism.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "data-structures",
+    "current_number": "62",
+    "current_slug": "behaviours-contracts",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/data-structures/62-behaviours-contracts/62-behaviours-contracts.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "data-structures",
+    "current_number": "63",
+    "current_slug": "typespecs-dialyzer",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/data-structures/63-typespecs-dialyzer/63-typespecs-dialyzer.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "error-handling",
+    "current_number": "25",
+    "current_slug": "error-handling-try-rescue",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/error-handling/25-error-handling-try-rescue/25-error-handling-try-rescue.md",
+    "issues": [
+      "spanish-slug",
+      "duplicate-number-in-level"
+    ]
+  },
+  {
+    "level": "01-basico",
+    "category": "error-handling",
+    "current_number": "29",
+    "current_slug": "exceptions-try-rescue",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/error-handling/29-exceptions-try-rescue/29-exceptions-try-rescue.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "error-handling",
+    "current_number": "30",
+    "current_slug": "error-tuples-vs-raise",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/error-handling/30-error-tuples-vs-raise/30-error-tuples-vs-raise.md",
+    "issues": [
+      "spanish-slug"
+    ]
+  },
+  {
+    "level": "01-basico",
+    "category": "error-handling",
+    "current_number": "64",
+    "current_slug": "exit-vs-raise-vs-throw",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/error-handling/64-exit-vs-raise-vs-throw/64-exit-vs-raise-vs-throw.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "error-handling",
+    "current_number": "65",
+    "current_slug": "trap-exit-linked",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/error-handling/65-trap-exit-linked/65-trap-exit-linked.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "error-handling",
+    "current_number": "66",
+    "current_slug": "custom-exception-modules",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/error-handling/66-custom-exception-modules/66-custom-exception-modules.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "error-handling",
+    "current_number": "67",
+    "current_slug": "bang-vs-safe-apis",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/error-handling/67-bang-vs-safe-apis/67-bang-vs-safe-apis.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "functions-and-modules",
+    "current_number": "08",
+    "current_slug": "functions-and-arity",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/functions-and-modules/08-functions-and-arity/08-functions-and-arity.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "functions-and-modules",
+    "current_number": "13",
+    "current_slug": "anonymous-functions-and-closures",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/functions-and-modules/13-anonymous-functions-and-closures/13-anonymous-functions-and-closures.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "functions-and-modules",
+    "current_number": "14",
+    "current_slug": "modules-and-function-visibility",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/functions-and-modules/14-modules-and-function-visibility/14-modules-and-function-visibility.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "functions-and-modules",
+    "current_number": "52",
+    "current_slug": "function-capture-ampersand",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/functions-and-modules/52-function-capture-ampersand/52-function-capture-ampersand.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "functions-and-modules",
+    "current_number": "53",
+    "current_slug": "default-arguments-patterns",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/functions-and-modules/53-default-arguments-patterns/53-default-arguments-patterns.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "functions-and-modules",
+    "current_number": "54",
+    "current_slug": "multi-clause-functions",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/functions-and-modules/54-multi-clause-functions/54-multi-clause-functions.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "functions-and-modules",
+    "current_number": "55",
+    "current_slug": "module-import-alias-require",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/functions-and-modules/55-module-import-alias-require/55-module-import-alias-require.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "fundamentals",
+    "current_number": "01",
+    "current_slug": "setup-and-mix",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/fundamentals/01-setup-and-mix/01-setup-and-mix.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "fundamentals",
+    "current_number": "02",
+    "current_slug": "atoms-and-symbols",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/fundamentals/02-atoms-and-symbols/02-atoms-and-symbols.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "fundamentals",
+    "current_number": "03",
+    "current_slug": "numbers-and-arithmetic",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/fundamentals/03-numbers-and-arithmetic/03-numbers-and-arithmetic.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "fundamentals",
+    "current_number": "07",
+    "current_slug": "maps-and-keyword-lists",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/fundamentals/07-maps-and-keyword-lists/07-maps-and-keyword-lists.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "fundamentals",
+    "current_number": "36",
+    "current_slug": "booleans-nil-truthiness",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/fundamentals/36-booleans-nil-truthiness/36-booleans-nil-truthiness.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "fundamentals",
+    "current_number": "37",
+    "current_slug": "variable-rebinding-and-scope",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/fundamentals/37-variable-rebinding-and-scope/37-variable-rebinding-and-scope.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "fundamentals",
+    "current_number": "38",
+    "current_slug": "integer-float-precision",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/fundamentals/38-integer-float-precision/38-integer-float-precision.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "fundamentals",
+    "current_number": "39",
+    "current_slug": "module-attributes-constants",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/fundamentals/39-module-attributes-constants/39-module-attributes-constants.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "pattern-matching",
+    "current_number": "05",
+    "current_slug": "tuples-and-pattern-matching-intro",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/pattern-matching/05-tuples-and-pattern-matching-intro/05-tuples-and-pattern-matching-intro.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "pattern-matching",
+    "current_number": "09",
+    "current_slug": "pattern-matching-avanzado",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/pattern-matching/09-pattern-matching-avanzado/09-pattern-matching-avanzado.md",
+    "issues": [
+      "spanish-slug",
+      "duplicate-number-in-level"
+    ]
+  },
+  {
+    "level": "01-basico",
+    "category": "pattern-matching",
+    "current_number": "40",
+    "current_slug": "pin-operator-deep",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/pattern-matching/40-pin-operator-deep/40-pin-operator-deep.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "pattern-matching",
+    "current_number": "41",
+    "current_slug": "map-pattern-matching",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/pattern-matching/41-map-pattern-matching/41-map-pattern-matching.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "pattern-matching",
+    "current_number": "42",
+    "current_slug": "nested-destructuring",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/pattern-matching/42-nested-destructuring/42-nested-destructuring.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "pattern-matching",
+    "current_number": "43",
+    "current_slug": "case-with-guards",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/pattern-matching/43-case-with-guards/43-case-with-guards.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "processes-basics",
+    "current_number": "31",
+    "current_slug": "process-spawn-and-send",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/processes-basics/31-process-spawn-and-send/31-process-spawn-and-send.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "processes-basics",
+    "current_number": "32",
+    "current_slug": "receive-and-mailbox",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/processes-basics/32-receive-and-mailbox/32-receive-and-mailbox.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "processes-basics",
+    "current_number": "33",
+    "current_slug": "task-async-await",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/processes-basics/33-task-async-await/33-task-async-await.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "processes-basics",
+    "current_number": "34",
+    "current_slug": "agent-state-basics",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/processes-basics/34-agent-state-basics/34-agent-state-basics.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "processes-basics",
+    "current_number": "35",
+    "current_slug": "registry-and-named-processes",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/processes-basics/35-registry-and-named-processes/35-registry-and-named-processes.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "processes-basics",
+    "current_number": "72",
+    "current_slug": "process-link-exit",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/processes-basics/72-process-link-exit/72-process-link-exit.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "processes-basics",
+    "current_number": "73",
+    "current_slug": "process-monitor",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/processes-basics/73-process-monitor/73-process-monitor.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "processes-basics",
+    "current_number": "74",
+    "current_slug": "process-send-after",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/processes-basics/74-process-send-after/74-process-send-after.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "processes-basics",
+    "current_number": "75",
+    "current_slug": "process-dict-when-not",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/processes-basics/75-process-dict-when-not/75-process-dict-when-not.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "stdlib-essentials",
+    "current_number": "23",
+    "current_slug": "io-and-stdio",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/stdlib-essentials/23-io-and-stdio/23-io-and-stdio.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "stdlib-essentials",
+    "current_number": "24",
+    "current_slug": "file-io-and-streams",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/stdlib-essentials/24-file-io-and-streams/24-file-io-and-streams.md",
+    "issues": [
+      "duplicate-number-in-level"
+    ]
+  },
+  {
+    "level": "01-basico",
+    "category": "stdlib-essentials",
+    "current_number": "25",
+    "current_slug": "path-and-filesystem",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/stdlib-essentials/25-path-and-filesystem/25-path-and-filesystem.md",
+    "issues": [
+      "duplicate-number-in-level"
+    ]
+  },
+  {
+    "level": "01-basico",
+    "category": "stdlib-essentials",
+    "current_number": "26",
+    "current_slug": "datetime-naivedatetime",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/stdlib-essentials/26-datetime-naivedatetime/26-datetime-naivedatetime.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "stdlib-essentials",
+    "current_number": "27",
+    "current_slug": "keyword-vs-map-opts",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/stdlib-essentials/27-keyword-vs-map-opts/27-keyword-vs-map-opts.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "stdlib-essentials",
+    "current_number": "68",
+    "current_slug": "uri-parsing",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/stdlib-essentials/68-uri-parsing/68-uri-parsing.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "stdlib-essentials",
+    "current_number": "69",
+    "current_slug": "base-encoding",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/stdlib-essentials/69-base-encoding/69-base-encoding.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "stdlib-essentials",
+    "current_number": "70",
+    "current_slug": "system-env-vars",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/stdlib-essentials/70-system-env-vars/70-system-env-vars.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "stdlib-essentials",
+    "current_number": "71",
+    "current_slug": "code-eval-sandboxed",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/stdlib-essentials/71-code-eval-sandboxed/71-code-eval-sandboxed.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "text-and-binaries",
+    "current_number": "04",
+    "current_slug": "strings-and-binaries-basics",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/text-and-binaries/04-strings-and-binaries-basics/04-strings-and-binaries-basics.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "text-and-binaries",
+    "current_number": "16",
+    "current_slug": "sigils-and-regex",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/text-and-binaries/16-sigils-and-regex/16-sigils-and-regex.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "text-and-binaries",
+    "current_number": "18",
+    "current_slug": "charlists-vs-strings",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/text-and-binaries/18-charlists-vs-strings/18-charlists-vs-strings.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "text-and-binaries",
+    "current_number": "22",
+    "current_slug": "string-chars-protocol",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/text-and-binaries/22-string-chars-protocol/22-string-chars-protocol.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "text-and-binaries",
+    "current_number": "24",
+    "current_slug": "bitstrings-binarios-avanzados",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/text-and-binaries/24-bitstrings-binarios-avanzados/24-bitstrings-binarios-avanzados.md",
+    "issues": [
+      "spanish-slug",
+      "duplicate-number-in-level"
+    ]
+  },
+  {
+    "level": "01-basico",
+    "category": "text-and-binaries",
+    "current_number": "28",
+    "current_slug": "binaries-bit-syntax",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/text-and-binaries/28-binaries-bit-syntax/28-binaries-bit-syntax.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "text-and-binaries",
+    "current_number": "48",
+    "current_slug": "unicode-normalization",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/text-and-binaries/48-unicode-normalization/48-unicode-normalization.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "text-and-binaries",
+    "current_number": "49",
+    "current_slug": "string-split-trim-edge",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/text-and-binaries/49-string-split-trim-edge/49-string-split-trim-edge.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "text-and-binaries",
+    "current_number": "50",
+    "current_slug": "binary-construction",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/text-and-binaries/50-binary-construction/50-binary-construction.md",
+    "issues": []
+  },
+  {
+    "level": "01-basico",
+    "category": "text-and-binaries",
+    "current_number": "51",
+    "current_slug": "base64-url-encoding",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/01-basico/text-and-binaries/51-base64-url-encoding/51-base64-url-encoding.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "applications-and-releases",
+    "current_number": "06",
+    "current_slug": "application-callbacks",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/applications-and-releases/06-application-callbacks/06-application-callbacks.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "applications-and-releases",
+    "current_number": "20",
+    "current_slug": "configuracion-config-runtime",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/applications-and-releases/20-configuracion-config-runtime/20-configuracion-config-runtime.md",
+    "issues": [
+      "spanish-slug"
+    ]
+  },
+  {
+    "level": "02-intermedio",
+    "category": "applications-and-releases",
+    "current_number": "21",
+    "current_slug": "releases-mix-basico",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/applications-and-releases/21-releases-mix-basico/21-releases-mix-basico.md",
+    "issues": [
+      "spanish-slug"
+    ]
+  },
+  {
+    "level": "02-intermedio",
+    "category": "applications-and-releases",
+    "current_number": "66",
+    "current_slug": "app-env-runtime",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/applications-and-releases/66-app-env-runtime/66-app-env-runtime.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "applications-and-releases",
+    "current_number": "67",
+    "current_slug": "get-env-vs-compile-env",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/applications-and-releases/67-get-env-vs-compile-env/67-get-env-vs-compile-env.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "applications-and-releases",
+    "current_number": "68",
+    "current_slug": "release-config-providers",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/applications-and-releases/68-release-config-providers/68-release-config-providers.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "applications-and-releases",
+    "current_number": "69",
+    "current_slug": "release-runtime-overlays",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/applications-and-releases/69-release-runtime-overlays/69-release-runtime-overlays.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "applications-and-releases",
+    "current_number": "70",
+    "current_slug": "release-eval-rpc",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/applications-and-releases/70-release-eval-rpc/70-release-eval-rpc.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "applications-and-releases",
+    "current_number": "71",
+    "current_slug": "umbrella-intro",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/applications-and-releases/71-umbrella-intro/71-umbrella-intro.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "applications-and-releases",
+    "current_number": "72",
+    "current_slug": "release-hot-upgrade-intro",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/applications-and-releases/72-release-hot-upgrade-intro/72-release-hot-upgrade-intro.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "applications-and-releases",
+    "current_number": "73",
+    "current_slug": "release-systemd-packaging",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/applications-and-releases/73-release-systemd-packaging/73-release-systemd-packaging.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "ets-basics",
+    "current_number": "100",
+    "current_slug": "named-public-private",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/ets-basics/100-named-public-private/100-named-public-private.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "ets-basics",
+    "current_number": "101",
+    "current_slug": "lookup-benchmark",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/ets-basics/101-lookup-benchmark/101-lookup-benchmark.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "ets-basics",
+    "current_number": "13",
+    "current_slug": "ets-basico",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/ets-basics/13-ets-basico/13-ets-basico.md",
+    "issues": [
+      "spanish-slug"
+    ]
+  },
+  {
+    "level": "02-intermedio",
+    "category": "ets-basics",
+    "current_number": "95",
+    "current_slug": "set-vs-bag",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/ets-basics/95-set-vs-bag/95-set-vs-bag.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "ets-basics",
+    "current_number": "96",
+    "current_slug": "ordered-set-range",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/ets-basics/96-ordered-set-range/96-ordered-set-range.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "ets-basics",
+    "current_number": "97",
+    "current_slug": "match-object",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/ets-basics/97-match-object/97-match-object.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "ets-basics",
+    "current_number": "98",
+    "current_slug": "select-match-spec",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/ets-basics/98-select-match-spec/98-select-match-spec.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "ets-basics",
+    "current_number": "99",
+    "current_slug": "ets-counters",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/ets-basics/99-ets-counters/99-ets-counters.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "integrations-basics",
+    "current_number": "128",
+    "current_slug": "ecto-changesets",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/integrations-basics/128-ecto-changesets/128-ecto-changesets.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "integrations-basics",
+    "current_number": "129",
+    "current_slug": "ecto-migrations",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/integrations-basics/129-ecto-migrations/129-ecto-migrations.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "integrations-basics",
+    "current_number": "130",
+    "current_slug": "ecto-repo-transactions",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/integrations-basics/130-ecto-repo-transactions/130-ecto-repo-transactions.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "integrations-basics",
+    "current_number": "131",
+    "current_slug": "telemetry-metrics-prom",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/integrations-basics/131-telemetry-metrics-prom/131-telemetry-metrics-prom.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "integrations-basics",
+    "current_number": "132",
+    "current_slug": "telemetry-span",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/integrations-basics/132-telemetry-span/132-telemetry-span.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "integrations-basics",
+    "current_number": "133",
+    "current_slug": "req-http",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/integrations-basics/133-req-http/133-req-http.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "integrations-basics",
+    "current_number": "134",
+    "current_slug": "finch-pool",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/integrations-basics/134-finch-pool/134-finch-pool.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "integrations-basics",
+    "current_number": "135",
+    "current_slug": "jason-vs-poison",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/integrations-basics/135-jason-vs-poison/135-jason-vs-poison.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "integrations-basics",
+    "current_number": "136",
+    "current_slug": "nimble-json-lite",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/integrations-basics/136-nimble-json-lite/136-nimble-json-lite.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "integrations-basics",
+    "current_number": "137",
+    "current_slug": "nimble-options",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/integrations-basics/137-nimble-options/137-nimble-options.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "integrations-basics",
+    "current_number": "138",
+    "current_slug": "csv-streaming",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/integrations-basics/138-csv-streaming/138-csv-streaming.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "integrations-basics",
+    "current_number": "139",
+    "current_slug": "broadway-rabbit-basic",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/integrations-basics/139-broadway-rabbit-basic/139-broadway-rabbit-basic.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "integrations-basics",
+    "current_number": "140",
+    "current_slug": "httpoison-migration",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/integrations-basics/140-httpoison-migration/140-httpoison-migration.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "integrations-basics",
+    "current_number": "28",
+    "current_slug": "telemetry-basico",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/integrations-basics/28-telemetry-basico/28-telemetry-basico.md",
+    "issues": [
+      "spanish-slug"
+    ]
+  },
+  {
+    "level": "02-intermedio",
+    "category": "integrations-basics",
+    "current_number": "29",
+    "current_slug": "ecto-basico",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/integrations-basics/29-ecto-basico/29-ecto-basico.md",
+    "issues": [
+      "spanish-slug"
+    ]
+  },
+  {
+    "level": "02-intermedio",
+    "category": "integrations-basics",
+    "current_number": "35",
+    "current_slug": "nimbleparsec-csv-basico",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/integrations-basics/35-nimbleparsec-csv-basico/35-nimbleparsec-csv-basico.md",
+    "issues": [
+      "spanish-slug"
+    ]
+  },
+  {
+    "level": "02-intermedio",
+    "category": "macros-intro",
+    "current_number": "12",
+    "current_slug": "macros-y-quote-unquote",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/macros-intro/12-macros-y-quote-unquote/12-macros-y-quote-unquote.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "macros-intro",
+    "current_number": "23",
+    "current_slug": "kernel-y-builtins-avanzados",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/macros-intro/23-kernel-y-builtins-avanzados/23-kernel-y-builtins-avanzados.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "macros-intro",
+    "current_number": "87",
+    "current_slug": "macro-unless",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/macros-intro/87-macro-unless/87-macro-unless.md",
+    "issues": [
+      "duplicate-number-in-level"
+    ]
+  },
+  {
+    "level": "02-intermedio",
+    "category": "macros-intro",
+    "current_number": "88",
+    "current_slug": "macro-trace-function",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/macros-intro/88-macro-trace-function/88-macro-trace-function.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "macros-intro",
+    "current_number": "89",
+    "current_slug": "macro-compile-time-config",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/macros-intro/89-macro-compile-time-config/89-macro-compile-time-config.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "macros-intro",
+    "current_number": "90",
+    "current_slug": "macro-pipeline-ops",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/macros-intro/90-macro-pipeline-ops/90-macro-pipeline-ops.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "macros-intro",
+    "current_number": "91",
+    "current_slug": "macro-guard-friendly",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/macros-intro/91-macro-guard-friendly/91-macro-guard-friendly.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "macros-intro",
+    "current_number": "92",
+    "current_slug": "macro-safe-injection",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/macros-intro/92-macro-safe-injection/92-macro-safe-injection.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "macros-intro",
+    "current_number": "93",
+    "current_slug": "quote-bind-quoted",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/macros-intro/93-quote-bind-quoted/93-quote-bind-quoted.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "macros-intro",
+    "current_number": "94",
+    "current_slug": "macro-hygiene-pitfalls",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/macros-intro/94-macro-hygiene-pitfalls/94-macro-hygiene-pitfalls.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "otp-agents-and-tasks",
+    "current_number": "02",
+    "current_slug": "agent-basico",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/otp-agents-and-tasks/02-agent-basico/02-agent-basico.md",
+    "issues": [
+      "spanish-slug"
+    ]
+  },
+  {
+    "level": "02-intermedio",
+    "category": "otp-agents-and-tasks",
+    "current_number": "03",
+    "current_slug": "task-y-concurrencia",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/otp-agents-and-tasks/03-task-y-concurrencia/03-task-y-concurrencia.md",
+    "issues": [
+      "spanish-slug"
+    ]
+  },
+  {
+    "level": "02-intermedio",
+    "category": "otp-agents-and-tasks",
+    "current_number": "31",
+    "current_slug": "concurrency-patterns-fan-out",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/otp-agents-and-tasks/31-concurrency-patterns-fan-out/31-concurrency-patterns-fan-out.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "otp-agents-and-tasks",
+    "current_number": "48",
+    "current_slug": "agent-ttl-cache",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/otp-agents-and-tasks/48-agent-ttl-cache/48-agent-ttl-cache.md",
+    "issues": [
+      "duplicate-number-in-level"
+    ]
+  },
+  {
+    "level": "02-intermedio",
+    "category": "otp-agents-and-tasks",
+    "current_number": "49",
+    "current_slug": "agent-vs-genserver-tradeoff",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/otp-agents-and-tasks/49-agent-vs-genserver-tradeoff/49-agent-vs-genserver-tradeoff.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "otp-agents-and-tasks",
+    "current_number": "50",
+    "current_slug": "task-await-many",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/otp-agents-and-tasks/50-task-await-many/50-task-await-many.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "otp-agents-and-tasks",
+    "current_number": "51",
+    "current_slug": "task-async-stream-images",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/otp-agents-and-tasks/51-task-async-stream-images/51-task-async-stream-images.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "otp-agents-and-tasks",
+    "current_number": "52",
+    "current_slug": "task-sup-fire-forget",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/otp-agents-and-tasks/52-task-sup-fire-forget/52-task-sup-fire-forget.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "otp-agents-and-tasks",
+    "current_number": "53",
+    "current_slug": "task-yield-many-timeouts",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/otp-agents-and-tasks/53-task-yield-many-timeouts/53-task-yield-many-timeouts.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "otp-agents-and-tasks",
+    "current_number": "54",
+    "current_slug": "task-shutdown-semantics",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/otp-agents-and-tasks/54-task-shutdown-semantics/54-task-shutdown-semantics.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "otp-agents-and-tasks",
+    "current_number": "55",
+    "current_slug": "bounded-concurrency-pool",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/otp-agents-and-tasks/55-bounded-concurrency-pool/55-bounded-concurrency-pool.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "otp-genservers",
+    "current_number": "01",
+    "current_slug": "procesos-spawn-send-receive",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/otp-genservers/01-procesos-spawn-send-receive/01-procesos-spawn-send-receive.md",
+    "issues": [
+      "spanish-slug"
+    ]
+  },
+  {
+    "level": "02-intermedio",
+    "category": "otp-genservers",
+    "current_number": "04",
+    "current_slug": "genserver-basico",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/otp-genservers/04-genserver-basico/04-genserver-basico.md",
+    "issues": [
+      "spanish-slug"
+    ]
+  },
+  {
+    "level": "02-intermedio",
+    "category": "otp-genservers",
+    "current_number": "30",
+    "current_slug": "process-dictionary-erlang",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/otp-genservers/30-process-dictionary-erlang/30-process-dictionary-erlang.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "otp-genservers",
+    "current_number": "36",
+    "current_slug": "genserver-counter-reset",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/otp-genservers/36-genserver-counter-reset/36-genserver-counter-reset.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "otp-genservers",
+    "current_number": "37",
+    "current_slug": "genserver-bounded-buffer",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/otp-genservers/37-genserver-bounded-buffer/37-genserver-bounded-buffer.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "otp-genservers",
+    "current_number": "38",
+    "current_slug": "genserver-rate-counter",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/otp-genservers/38-genserver-rate-counter/38-genserver-rate-counter.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "otp-genservers",
+    "current_number": "39",
+    "current_slug": "call-vs-cast-tradeoffs",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/otp-genservers/39-call-vs-cast-tradeoffs/39-call-vs-cast-tradeoffs.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "otp-genservers",
+    "current_number": "40",
+    "current_slug": "handle-info-timers",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/otp-genservers/40-handle-info-timers/40-handle-info-timers.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "otp-genservers",
+    "current_number": "41",
+    "current_slug": "monitor-external-process",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/otp-genservers/41-monitor-external-process/41-monitor-external-process.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "otp-genservers",
+    "current_number": "42",
+    "current_slug": "terminate-cleanup",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/otp-genservers/42-terminate-cleanup/42-terminate-cleanup.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "otp-genservers",
+    "current_number": "43",
+    "current_slug": "state-validation",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/otp-genservers/43-state-validation/43-state-validation.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "otp-genservers",
+    "current_number": "44",
+    "current_slug": "stop-reasons",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/otp-genservers/44-stop-reasons/44-stop-reasons.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "otp-genservers",
+    "current_number": "45",
+    "current_slug": "format-status-debug",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/otp-genservers/45-format-status-debug/45-format-status-debug.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "otp-genservers",
+    "current_number": "46",
+    "current_slug": "proxy-delegator",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/otp-genservers/46-proxy-delegator/46-proxy-delegator.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "otp-genservers",
+    "current_number": "47",
+    "current_slug": "testing-with-mox",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/otp-genservers/47-testing-with-mox/47-testing-with-mox.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "otp-genservers",
+    "current_number": "48",
+    "current_slug": "hibernation-memory",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/otp-genservers/48-hibernation-memory/48-hibernation-memory.md",
+    "issues": [
+      "duplicate-number-in-level"
+    ]
+  },
+  {
+    "level": "02-intermedio",
+    "category": "protocols-and-behaviours",
+    "current_number": "07",
+    "current_slug": "behaviours-y-callbacks",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/protocols-and-behaviours/07-behaviours-y-callbacks/07-behaviours-y-callbacks.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "protocols-and-behaviours",
+    "current_number": "08",
+    "current_slug": "protocols",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/protocols-and-behaviours/08-protocols/08-protocols.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "protocols-and-behaviours",
+    "current_number": "32",
+    "current_slug": "string-chars-inspect-protocol",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/protocols-and-behaviours/32-string-chars-inspect-protocol/32-string-chars-inspect-protocol.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "protocols-and-behaviours",
+    "current_number": "33",
+    "current_slug": "access-behaviour",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/protocols-and-behaviours/33-access-behaviour/33-access-behaviour.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "protocols-and-behaviours",
+    "current_number": "34",
+    "current_slug": "collectable-enumerable",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/protocols-and-behaviours/34-collectable-enumerable/34-collectable-enumerable.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "protocols-and-behaviours",
+    "current_number": "74",
+    "current_slug": "protocol-jsonable",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/protocols-and-behaviours/74-protocol-jsonable/74-protocol-jsonable.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "protocols-and-behaviours",
+    "current_number": "75",
+    "current_slug": "protocol-fallback-any",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/protocols-and-behaviours/75-protocol-fallback-any/75-protocol-fallback-any.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "protocols-and-behaviours",
+    "current_number": "76",
+    "current_slug": "behaviour-adapter",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/protocols-and-behaviours/76-behaviour-adapter/76-behaviour-adapter.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "protocols-and-behaviours",
+    "current_number": "77",
+    "current_slug": "behaviour-strategy",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/protocols-and-behaviours/77-behaviour-strategy/77-behaviour-strategy.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "protocols-and-behaviours",
+    "current_number": "78",
+    "current_slug": "protocol-vs-behaviour",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/protocols-and-behaviours/78-protocol-vs-behaviour/78-protocol-vs-behaviour.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "protocols-and-behaviours",
+    "current_number": "79",
+    "current_slug": "enumerable-custom-tree",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/protocols-and-behaviours/79-enumerable-custom-tree/79-enumerable-custom-tree.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "protocols-and-behaviours",
+    "current_number": "80",
+    "current_slug": "inspect-algebra-custom",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/protocols-and-behaviours/80-inspect-algebra-custom/80-inspect-algebra-custom.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "registries-and-naming",
+    "current_number": "14",
+    "current_slug": "registry-dinamico",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/registries-and-naming/14-registry-dinamico/14-registry-dinamico.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "registries-and-naming",
+    "current_number": "81",
+    "current_slug": "registry-pubsub",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/registries-and-naming/81-registry-pubsub/81-registry-pubsub.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "registries-and-naming",
+    "current_number": "82",
+    "current_slug": "registry-partitioned",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/registries-and-naming/82-registry-partitioned/82-registry-partitioned.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "registries-and-naming",
+    "current_number": "83",
+    "current_slug": "registry-vs-global",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/registries-and-naming/83-registry-vs-global/83-registry-vs-global.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "registries-and-naming",
+    "current_number": "84",
+    "current_slug": "via-tuple-patterns",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/registries-and-naming/84-via-tuple-patterns/84-via-tuple-patterns.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "registries-and-naming",
+    "current_number": "85",
+    "current_slug": "process-groups-pg",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/registries-and-naming/85-process-groups-pg/85-process-groups-pg.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "registries-and-naming",
+    "current_number": "86",
+    "current_slug": "naming-strategies-review",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/registries-and-naming/86-naming-strategies-review/86-naming-strategies-review.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "registries-and-naming",
+    "current_number": "87",
+    "current_slug": "via-hibernation-error-handling",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/registries-and-naming/87-via-hibernation-error-handling/87-via-hibernation-error-handling.md",
+    "issues": [
+      "spanish-slug",
+      "duplicate-number-in-level"
+    ]
+  },
+  {
+    "level": "02-intermedio",
+    "category": "streams-and-lazy",
+    "current_number": "10",
+    "current_slug": "comprehensions-avanzadas",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/streams-and-lazy/10-comprehensions-avanzadas/10-comprehensions-avanzadas.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "streams-and-lazy",
+    "current_number": "102",
+    "current_slug": "stream-resource-file",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/streams-and-lazy/102-stream-resource-file/102-stream-resource-file.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "streams-and-lazy",
+    "current_number": "103",
+    "current_slug": "stream-unfold-fibonacci",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/streams-and-lazy/103-stream-unfold-fibonacci/103-stream-unfold-fibonacci.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "streams-and-lazy",
+    "current_number": "104",
+    "current_slug": "stream-zip-timelines",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/streams-and-lazy/104-stream-zip-timelines/104-stream-zip-timelines.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "streams-and-lazy",
+    "current_number": "105",
+    "current_slug": "stream-chunk-every",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/streams-and-lazy/105-stream-chunk-every/105-stream-chunk-every.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "streams-and-lazy",
+    "current_number": "106",
+    "current_slug": "stream-transform-stateful",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/streams-and-lazy/106-stream-transform-stateful/106-stream-transform-stateful.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "streams-and-lazy",
+    "current_number": "107",
+    "current_slug": "genstage-producer-consumer",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/streams-and-lazy/107-genstage-producer-consumer/107-genstage-producer-consumer.md",
+    "issues": [
+      "duplicate-slug"
+    ]
+  },
+  {
+    "level": "02-intermedio",
+    "category": "streams-and-lazy",
+    "current_number": "108",
+    "current_slug": "genstage-buffer-demand",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/streams-and-lazy/108-genstage-buffer-demand/108-genstage-buffer-demand.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "streams-and-lazy",
+    "current_number": "109",
+    "current_slug": "flow-parallel-word-count",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/streams-and-lazy/109-flow-parallel-word-count/109-flow-parallel-word-count.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "streams-and-lazy",
+    "current_number": "11",
+    "current_slug": "streams-lazy-evaluation",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/streams-and-lazy/11-streams-lazy-evaluation/11-streams-lazy-evaluation.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "streams-and-lazy",
+    "current_number": "27",
+    "current_slug": "genstage-basico",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/streams-and-lazy/27-genstage-basico/27-genstage-basico.md",
+    "issues": [
+      "spanish-slug"
+    ]
+  },
+  {
+    "level": "02-intermedio",
+    "category": "supervision-basics",
+    "current_number": "05",
+    "current_slug": "supervisor-basico",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/supervision-basics/05-supervisor-basico/05-supervisor-basico.md",
+    "issues": [
+      "spanish-slug"
+    ]
+  },
+  {
+    "level": "02-intermedio",
+    "category": "supervision-basics",
+    "current_number": "26",
+    "current_slug": "dynamic-supervisor",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/supervision-basics/26-dynamic-supervisor/26-dynamic-supervisor.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "supervision-basics",
+    "current_number": "56",
+    "current_slug": "one-for-one",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/supervision-basics/56-one-for-one/56-one-for-one.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "supervision-basics",
+    "current_number": "57",
+    "current_slug": "one-for-all",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/supervision-basics/57-one-for-all/57-one-for-all.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "supervision-basics",
+    "current_number": "58",
+    "current_slug": "rest-for-one",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/supervision-basics/58-rest-for-one/58-rest-for-one.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "supervision-basics",
+    "current_number": "59",
+    "current_slug": "max-restarts-intensity",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/supervision-basics/59-max-restarts-intensity/59-max-restarts-intensity.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "supervision-basics",
+    "current_number": "60",
+    "current_slug": "child-spec-custom",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/supervision-basics/60-child-spec-custom/60-child-spec-custom.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "supervision-basics",
+    "current_number": "61",
+    "current_slug": "dynamic-sup-worker-pool",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/supervision-basics/61-dynamic-sup-worker-pool/61-dynamic-sup-worker-pool.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "supervision-basics",
+    "current_number": "62",
+    "current_slug": "shutdown-timeouts",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/supervision-basics/62-shutdown-timeouts/62-shutdown-timeouts.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "supervision-basics",
+    "current_number": "63",
+    "current_slug": "nested-trees",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/supervision-basics/63-nested-trees/63-nested-trees.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "supervision-basics",
+    "current_number": "64",
+    "current_slug": "transient-temporary-permanent",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/supervision-basics/64-transient-temporary-permanent/64-transient-temporary-permanent.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "supervision-basics",
+    "current_number": "65",
+    "current_slug": "testing-restarts",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/supervision-basics/65-testing-restarts/65-testing-restarts.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "testing-and-quality",
+    "current_number": "110",
+    "current_slug": "exunit-setup-contexts",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/testing-and-quality/110-exunit-setup-contexts/110-exunit-setup-contexts.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "testing-and-quality",
+    "current_number": "111",
+    "current_slug": "exunit-tags",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/testing-and-quality/111-exunit-tags/111-exunit-tags.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "testing-and-quality",
+    "current_number": "112",
+    "current_slug": "capture-log",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/testing-and-quality/112-capture-log/112-capture-log.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "testing-and-quality",
+    "current_number": "113",
+    "current_slug": "start-supervised",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/testing-and-quality/113-start-supervised/113-start-supervised.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "testing-and-quality",
+    "current_number": "114",
+    "current_slug": "doctests-with-assertions",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/testing-and-quality/114-doctests-with-assertions/114-doctests-with-assertions.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "testing-and-quality",
+    "current_number": "115",
+    "current_slug": "typespecs-opaque",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/testing-and-quality/115-typespecs-opaque/115-typespecs-opaque.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "testing-and-quality",
+    "current_number": "116",
+    "current_slug": "dialyzer-success-typing",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/testing-and-quality/116-dialyzer-success-typing/116-dialyzer-success-typing.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "testing-and-quality",
+    "current_number": "117",
+    "current_slug": "stream-data-basics",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/testing-and-quality/117-stream-data-basics/117-stream-data-basics.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "testing-and-quality",
+    "current_number": "118",
+    "current_slug": "mox-verify-on-exit",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/testing-and-quality/118-mox-verify-on-exit/118-mox-verify-on-exit.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "testing-and-quality",
+    "current_number": "119",
+    "current_slug": "coverage-ci",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/testing-and-quality/119-coverage-ci/119-coverage-ci.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "testing-and-quality",
+    "current_number": "15",
+    "current_slug": "spec-y-tipado",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/testing-and-quality/15-spec-y-tipado/15-spec-y-tipado.md",
+    "issues": [
+      "spanish-slug"
+    ]
+  },
+  {
+    "level": "02-intermedio",
+    "category": "testing-and-quality",
+    "current_number": "16",
+    "current_slug": "testing-exunit",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/testing-and-quality/16-testing-exunit/16-testing-exunit.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "tooling-and-ecosystem",
+    "current_number": "120",
+    "current_slug": "mix-generator",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/tooling-and-ecosystem/120-mix-generator/120-mix-generator.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "tooling-and-ecosystem",
+    "current_number": "121",
+    "current_slug": "mix-aliases",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/tooling-and-ecosystem/121-mix-aliases/121-mix-aliases.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "tooling-and-ecosystem",
+    "current_number": "122",
+    "current_slug": "hex-publish-private",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/tooling-and-ecosystem/122-hex-publish-private/122-hex-publish-private.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "tooling-and-ecosystem",
+    "current_number": "123",
+    "current_slug": "iex-helpers",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/tooling-and-ecosystem/123-iex-helpers/123-iex-helpers.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "tooling-and-ecosystem",
+    "current_number": "124",
+    "current_slug": "observer-inspection",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/tooling-and-ecosystem/124-observer-inspection/124-observer-inspection.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "tooling-and-ecosystem",
+    "current_number": "125",
+    "current_slug": "recon-intro",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/tooling-and-ecosystem/125-recon-intro/125-recon-intro.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "tooling-and-ecosystem",
+    "current_number": "126",
+    "current_slug": "credo-rules",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/tooling-and-ecosystem/126-credo-rules/126-credo-rules.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "tooling-and-ecosystem",
+    "current_number": "127",
+    "current_slug": "formatter-custom",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/tooling-and-ecosystem/127-formatter-custom/127-formatter-custom.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "tooling-and-ecosystem",
+    "current_number": "17",
+    "current_slug": "debugging-io-inspect",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/tooling-and-ecosystem/17-debugging-io-inspect/17-debugging-io-inspect.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "tooling-and-ecosystem",
+    "current_number": "18",
+    "current_slug": "mix-tasks-personalizadas",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/tooling-and-ecosystem/18-mix-tasks-personalizadas/18-mix-tasks-personalizadas.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "tooling-and-ecosystem",
+    "current_number": "19",
+    "current_slug": "dependencias-hex",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/tooling-and-ecosystem/19-dependencias-hex/19-dependencias-hex.md",
+    "issues": []
+  },
+  {
+    "level": "02-intermedio",
+    "category": "tooling-and-ecosystem",
+    "current_number": "22",
+    "current_slug": "documentacion-exdoc",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/02-intermedio/tooling-and-ecosystem/22-documentacion-exdoc/22-documentacion-exdoc.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "advanced-testing",
+    "current_number": "200",
+    "current_slug": "mox-stub-many",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/advanced-testing/200-mox-stub-many/200-mox-stub-many.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "advanced-testing",
+    "current_number": "288",
+    "current_slug": "stream-data-generators",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/advanced-testing/288-stream-data-generators/288-stream-data-generators.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "advanced-testing",
+    "current_number": "289",
+    "current_slug": "mox-contracts-behaviours",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/advanced-testing/289-mox-contracts-behaviours/289-mox-contracts-behaviours.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "advanced-testing",
+    "current_number": "290",
+    "current_slug": "bypass-http-tests",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/advanced-testing/290-bypass-http-tests/290-bypass-http-tests.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "advanced-testing",
+    "current_number": "291",
+    "current_slug": "ecto-sandbox-modes",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/advanced-testing/291-ecto-sandbox-modes/291-ecto-sandbox-modes.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "advanced-testing",
+    "current_number": "292",
+    "current_slug": "genserver-telemetry-testing",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/advanced-testing/292-genserver-telemetry-testing/292-genserver-telemetry-testing.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "advanced-testing",
+    "current_number": "293",
+    "current_slug": "capture-log-assert-raise",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/advanced-testing/293-capture-log-assert-raise/293-capture-log-assert-raise.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "advanced-testing",
+    "current_number": "294",
+    "current_slug": "supervisor-restart-testing",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/advanced-testing/294-supervisor-restart-testing/294-supervisor-restart-testing.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "advanced-testing",
+    "current_number": "295",
+    "current_slug": "async-tests-isolation",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/advanced-testing/295-async-tests-isolation/295-async-tests-isolation.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "advanced-testing",
+    "current_number": "296",
+    "current_slug": "phoenix-conn-integration",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/advanced-testing/296-phoenix-conn-integration/296-phoenix-conn-integration.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "advanced-testing",
+    "current_number": "297",
+    "current_slug": "doctest-side-effects",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/advanced-testing/297-doctest-side-effects/297-doctest-side-effects.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "advanced-testing",
+    "current_number": "298",
+    "current_slug": "benchmark-regression",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/advanced-testing/298-benchmark-regression/298-benchmark-regression.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "advanced-testing",
+    "current_number": "299",
+    "current_slug": "ex-machina-factories",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/advanced-testing/299-ex-machina-factories/299-ex-machina-factories.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "advanced-testing",
+    "current_number": "300",
+    "current_slug": "peer-distributed-testing",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/advanced-testing/300-peer-distributed-testing/300-peer-distributed-testing.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "advanced-testing",
+    "current_number": "301",
+    "current_slug": "mutation-testing-elixir",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/advanced-testing/301-mutation-testing-elixir/301-mutation-testing-elixir.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "advanced-testing",
+    "current_number": "302",
+    "current_slug": "contract-testing-pact",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/advanced-testing/302-contract-testing-pact/302-contract-testing-pact.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "advanced-testing",
+    "current_number": "38",
+    "current_slug": "mox-testing",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/advanced-testing/38-mox-testing/38-mox-testing.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "advanced-testing",
+    "current_number": "39",
+    "current_slug": "property-based-testing",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/advanced-testing/39-property-based-testing/39-property-based-testing.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "advanced-testing",
+    "current_number": "40",
+    "current_slug": "bypass-http-testing",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/advanced-testing/40-bypass-http-testing/40-bypass-http-testing.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "advanced-testing",
+    "current_number": "41",
+    "current_slug": "concurrent-testing-exunit",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/advanced-testing/41-concurrent-testing-exunit/41-concurrent-testing-exunit.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "apis-and-graphql",
+    "current_number": "245",
+    "current_slug": "subscriptions-pubsub",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/apis-and-graphql/245-subscriptions-pubsub/245-subscriptions-pubsub.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "apis-and-graphql",
+    "current_number": "246",
+    "current_slug": "batching-n-plus-1",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/apis-and-graphql/246-batching-n-plus-1/246-batching-n-plus-1.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "apis-and-graphql",
+    "current_number": "247",
+    "current_slug": "dataloader-ecto",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/apis-and-graphql/247-dataloader-ecto/247-dataloader-ecto.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "apis-and-graphql",
+    "current_number": "248",
+    "current_slug": "middleware-auth",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/apis-and-graphql/248-middleware-auth/248-middleware-auth.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "apis-and-graphql",
+    "current_number": "249",
+    "current_slug": "complexity-analysis",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/apis-and-graphql/249-complexity-analysis/249-complexity-analysis.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "apis-and-graphql",
+    "current_number": "250",
+    "current_slug": "file-uploads",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/apis-and-graphql/250-file-uploads/250-file-uploads.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "apis-and-graphql",
+    "current_number": "251",
+    "current_slug": "openapi-gen",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/apis-and-graphql/251-openapi-gen/251-openapi-gen.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "apis-and-graphql",
+    "current_number": "252",
+    "current_slug": "pagination-cursor",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/apis-and-graphql/252-pagination-cursor/252-pagination-cursor.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "apis-and-graphql",
+    "current_number": "331",
+    "current_slug": "absinthe-dataloader",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/apis-and-graphql/331-absinthe-dataloader/331-absinthe-dataloader.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "apis-and-graphql",
+    "current_number": "332",
+    "current_slug": "absinthe-subscriptions",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/apis-and-graphql/332-absinthe-subscriptions/332-absinthe-subscriptions.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "apis-and-graphql",
+    "current_number": "333",
+    "current_slug": "persisted-queries-complexity",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/apis-and-graphql/333-persisted-queries-complexity/333-persisted-queries-complexity.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "apis-and-graphql",
+    "current_number": "334",
+    "current_slug": "rest-api-versioning",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/apis-and-graphql/334-rest-api-versioning/334-rest-api-versioning.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "apis-and-graphql",
+    "current_number": "335",
+    "current_slug": "openapi-spex-generation",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/apis-and-graphql/335-openapi-spex-generation/335-openapi-spex-generation.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "apis-and-graphql",
+    "current_number": "336",
+    "current_slug": "jwt-joken-refresh",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/apis-and-graphql/336-jwt-joken-refresh/336-jwt-joken-refresh.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "apis-and-graphql",
+    "current_number": "337",
+    "current_slug": "oauth2-assent-flow",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/apis-and-graphql/337-oauth2-assent-flow/337-oauth2-assent-flow.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "apis-and-graphql",
+    "current_number": "338",
+    "current_slug": "webhooks-hmac-signed",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/apis-and-graphql/338-webhooks-hmac-signed/338-webhooks-hmac-signed.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "apis-and-graphql",
+    "current_number": "339",
+    "current_slug": "rate-limit-api-key-ets",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/apis-and-graphql/339-rate-limit-api-key-ets/339-rate-limit-api-key-ets.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "apis-and-graphql",
+    "current_number": "340",
+    "current_slug": "relay-cursor-pagination",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/apis-and-graphql/340-relay-cursor-pagination/340-relay-cursor-pagination.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "apis-and-graphql",
+    "current_number": "59",
+    "current_slug": "absinthe-graphql-schema",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/apis-and-graphql/59-absinthe-graphql-schema/59-absinthe-graphql-schema.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "apis-and-graphql",
+    "current_number": "60",
+    "current_slug": "absinthe-dataloader-auth",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/apis-and-graphql/60-absinthe-dataloader-auth/60-absinthe-dataloader-auth.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "beam-internals-and-perf",
+    "current_number": "152",
+    "current_slug": "recon-trace-prod",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/beam-internals-and-perf/152-recon-trace-prod/152-recon-trace-prod.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "beam-internals-and-perf",
+    "current_number": "153",
+    "current_slug": "recon-info-top",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/beam-internals-and-perf/153-recon-info-top/153-recon-info-top.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "beam-internals-and-perf",
+    "current_number": "154",
+    "current_slug": "dbg-tpl",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/beam-internals-and-perf/154-dbg-tpl/154-dbg-tpl.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "beam-internals-and-perf",
+    "current_number": "155",
+    "current_slug": "flame-graph-eflame",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/beam-internals-and-perf/155-flame-graph-eflame/155-flame-graph-eflame.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "beam-internals-and-perf",
+    "current_number": "156",
+    "current_slug": "benchee-parallel",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/beam-internals-and-perf/156-benchee-parallel/156-benchee-parallel.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "beam-internals-and-perf",
+    "current_number": "157",
+    "current_slug": "benchee-memory",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/beam-internals-and-perf/157-benchee-memory/157-benchee-memory.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "beam-internals-and-perf",
+    "current_number": "25",
+    "current_slug": "beam-schedulers-reductions",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/beam-internals-and-perf/25-beam-schedulers-reductions/25-beam-schedulers-reductions.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "beam-internals-and-perf",
+    "current_number": "26",
+    "current_slug": "memory-profiling-recon",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/beam-internals-and-perf/26-memory-profiling-recon/26-memory-profiling-recon.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "beam-internals-and-perf",
+    "current_number": "27",
+    "current_slug": "tracing-sys-dbg",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/beam-internals-and-perf/27-tracing-sys-dbg/27-tracing-sys-dbg.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "beam-internals-and-perf",
+    "current_number": "28",
+    "current_slug": "benchmarking-benchee",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/beam-internals-and-perf/28-benchmarking-benchee/28-benchmarking-benchee.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "beam-internals-and-perf",
+    "current_number": "29",
+    "current_slug": "binary-matching-performance",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/beam-internals-and-perf/29-binary-matching-performance/29-binary-matching-performance.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "beam-internals-and-perf",
+    "current_number": "360",
+    "current_slug": "scheduler-observation",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/beam-internals-and-perf/360-scheduler-observation/360-scheduler-observation.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "beam-internals-and-perf",
+    "current_number": "361",
+    "current_slug": "reductions-budget-bump",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/beam-internals-and-perf/361-reductions-budget-bump/361-reductions-budget-bump.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "beam-internals-and-perf",
+    "current_number": "362",
+    "current_slug": "process-heap-tuning",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/beam-internals-and-perf/362-process-heap-tuning/362-process-heap-tuning.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "beam-internals-and-perf",
+    "current_number": "363",
+    "current_slug": "gc-tuning-per-process",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/beam-internals-and-perf/363-gc-tuning-per-process/363-gc-tuning-per-process.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "beam-internals-and-perf",
+    "current_number": "364",
+    "current_slug": "binary-refc-leaks",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/beam-internals-and-perf/364-binary-refc-leaks/364-binary-refc-leaks.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "beam-internals-and-perf",
+    "current_number": "365",
+    "current_slug": "jit-beamasm-considerations",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/beam-internals-and-perf/365-jit-beamasm-considerations/365-jit-beamasm-considerations.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "beam-internals-and-perf",
+    "current_number": "366",
+    "current_slug": "recon-production-diagnosis",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/beam-internals-and-perf/366-recon-production-diagnosis/366-recon-production-diagnosis.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "beam-internals-and-perf",
+    "current_number": "48",
+    "current_slug": "mix-release-advanced",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/beam-internals-and-perf/48-mix-release-advanced/48-mix-release-advanced.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "beam-internals-and-perf",
+    "current_number": "50",
+    "current_slug": "competitive-programming-graphs",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/beam-internals-and-perf/50-competitive-programming-graphs/50-competitive-programming-graphs.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "data-pipelines",
+    "current_number": "173",
+    "current_slug": "dispatcher-broadcast",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/data-pipelines/173-dispatcher-broadcast/173-dispatcher-broadcast.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "data-pipelines",
+    "current_number": "174",
+    "current_slug": "dispatcher-partition",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/data-pipelines/174-dispatcher-partition/174-dispatcher-partition.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "data-pipelines",
+    "current_number": "175",
+    "current_slug": "dispatcher-demand",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/data-pipelines/175-dispatcher-demand/175-dispatcher-demand.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "data-pipelines",
+    "current_number": "176",
+    "current_slug": "broadway-sqs",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/data-pipelines/176-broadway-sqs/176-broadway-sqs.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "data-pipelines",
+    "current_number": "177",
+    "current_slug": "broadway-rabbit",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/data-pipelines/177-broadway-rabbit/177-broadway-rabbit.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "data-pipelines",
+    "current_number": "178",
+    "current_slug": "broadway-batcher",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/data-pipelines/178-broadway-batcher/178-broadway-batcher.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "data-pipelines",
+    "current_number": "179",
+    "current_slug": "broadway-ack-custom",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/data-pipelines/179-broadway-ack-custom/179-broadway-ack-custom.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "data-pipelines",
+    "current_number": "34",
+    "current_slug": "genstage-advanced",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/data-pipelines/34-genstage-advanced/34-genstage-advanced.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "data-pipelines",
+    "current_number": "341",
+    "current_slug": "genstage-producer-consumer",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/data-pipelines/341-genstage-producer-consumer/341-genstage-producer-consumer.md",
+    "issues": [
+      "duplicate-slug"
+    ]
+  },
+  {
+    "level": "03-avanzado",
+    "category": "data-pipelines",
+    "current_number": "342",
+    "current_slug": "flow-parallel-mapreduce",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/data-pipelines/342-flow-parallel-mapreduce/342-flow-parallel-mapreduce.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "data-pipelines",
+    "current_number": "343",
+    "current_slug": "broadway-rabbitmq",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/data-pipelines/343-broadway-rabbitmq/343-broadway-rabbitmq.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "data-pipelines",
+    "current_number": "344",
+    "current_slug": "broadway-sqs-batchers",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/data-pipelines/344-broadway-sqs-batchers/344-broadway-sqs-batchers.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "data-pipelines",
+    "current_number": "345",
+    "current_slug": "broadway-kafka-partition",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/data-pipelines/345-broadway-kafka-partition/345-broadway-kafka-partition.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "data-pipelines",
+    "current_number": "346",
+    "current_slug": "stream-gzip-composition",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/data-pipelines/346-stream-gzip-composition/346-stream-gzip-composition.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "data-pipelines",
+    "current_number": "347",
+    "current_slug": "nimble-csv-huge-files",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/data-pipelines/347-nimble-csv-huge-files/347-nimble-csv-huge-files.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "data-pipelines",
+    "current_number": "348",
+    "current_slug": "exactly-once-idempotency",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/data-pipelines/348-exactly-once-idempotency/348-exactly-once-idempotency.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "data-pipelines",
+    "current_number": "349",
+    "current_slug": "checkpointing-resumable",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/data-pipelines/349-checkpointing-resumable/349-checkpointing-resumable.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "data-pipelines",
+    "current_number": "35",
+    "current_slug": "broadway-data-pipelines",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/data-pipelines/35-broadway-data-pipelines/35-broadway-data-pipelines.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "data-pipelines",
+    "current_number": "350",
+    "current_slug": "etl-http-flow-ecto",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/data-pipelines/350-etl-http-flow-ecto/350-etl-http-flow-ecto.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "data-pipelines",
+    "current_number": "69",
+    "current_slug": "broadway-kafka-pipelines",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/data-pipelines/69-broadway-kafka-pipelines/69-broadway-kafka-pipelines.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "distribution-and-clustering",
+    "current_number": "101",
+    "current_slug": "libcluster-epmd",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/distribution-and-clustering/101-libcluster-epmd/101-libcluster-epmd.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "distribution-and-clustering",
+    "current_number": "106",
+    "current_slug": "pg2-to-pg",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/distribution-and-clustering/106-pg2-to-pg/106-pg2-to-pg.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "distribution-and-clustering",
+    "current_number": "107",
+    "current_slug": "pubsub-redis",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/distribution-and-clustering/107-pubsub-redis/107-pubsub-redis.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "distribution-and-clustering",
+    "current_number": "108",
+    "current_slug": "erpc-vs-rpc",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/distribution-and-clustering/108-erpc-vs-rpc/108-erpc-vs-rpc.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "distribution-and-clustering",
+    "current_number": "109",
+    "current_slug": "net-kernel-tick",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/distribution-and-clustering/109-net-kernel-tick/109-net-kernel-tick.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "distribution-and-clustering",
+    "current_number": "11",
+    "current_slug": "distributed-erlang-clustering",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/distribution-and-clustering/11-distributed-erlang-clustering/11-distributed-erlang-clustering.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "distribution-and-clustering",
+    "current_number": "110",
+    "current_slug": "ping-monitoring",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/distribution-and-clustering/110-ping-monitoring/110-ping-monitoring.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "distribution-and-clustering",
+    "current_number": "111",
+    "current_slug": "split-brain-handling",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/distribution-and-clustering/111-split-brain-handling/111-split-brain-handling.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "distribution-and-clustering",
+    "current_number": "112",
+    "current_slug": "horde-locks",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/distribution-and-clustering/112-horde-locks/112-horde-locks.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "distribution-and-clustering",
+    "current_number": "12",
+    "current_slug": "global-process-registry",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/distribution-and-clustering/12-global-process-registry/12-global-process-registry.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "distribution-and-clustering",
+    "current_number": "13",
+    "current_slug": "horde-distributed-registry",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/distribution-and-clustering/13-horde-distributed-registry/13-horde-distributed-registry.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "distribution-and-clustering",
+    "current_number": "14",
+    "current_slug": "phoenix-pubsub-advanced",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/distribution-and-clustering/14-phoenix-pubsub-advanced/14-phoenix-pubsub-advanced.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "distribution-and-clustering",
+    "current_number": "15",
+    "current_slug": "rpc-and-remote-calls",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/distribution-and-clustering/15-rpc-and-remote-calls/15-rpc-and-remote-calls.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "distribution-and-clustering",
+    "current_number": "367",
+    "current_slug": "libcluster-epmd-dns",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/distribution-and-clustering/367-libcluster-epmd-dns/367-libcluster-epmd-dns.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "distribution-and-clustering",
+    "current_number": "368",
+    "current_slug": "horde-registry-dynamic-supervisor",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/distribution-and-clustering/368-horde-registry-dynamic-supervisor/368-horde-registry-dynamic-supervisor.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "distribution-and-clustering",
+    "current_number": "369",
+    "current_slug": "phoenix-pubsub-distributed",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/distribution-and-clustering/369-phoenix-pubsub-distributed/369-phoenix-pubsub-distributed.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "distribution-and-clustering",
+    "current_number": "370",
+    "current_slug": "node-monitoring",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/distribution-and-clustering/370-node-monitoring/370-node-monitoring.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "distribution-and-clustering",
+    "current_number": "371",
+    "current_slug": "global-locks",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/distribution-and-clustering/371-global-locks/371-global-locks.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "distribution-and-clustering",
+    "current_number": "372",
+    "current_slug": "distributed-rate-limiter-consistent-hashing",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/distribution-and-clustering/372-distributed-rate-limiter-consistent-hashing/372-distributed-rate-limiter-consistent-hashing.md",
+    "issues": [
+      "long-slug"
+    ]
+  },
+  {
+    "level": "03-avanzado",
+    "category": "distribution-and-clustering",
+    "current_number": "373",
+    "current_slug": "split-brain-detection",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/distribution-and-clustering/373-split-brain-detection/373-split-brain-detection.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "domain-frameworks",
+    "current_number": "268",
+    "current_slug": "nerves-ota",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/domain-frameworks/268-nerves-ota/268-nerves-ota.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "domain-frameworks",
+    "current_number": "269",
+    "current_slug": "nx-defn-autograd",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/domain-frameworks/269-nx-defn-autograd/269-nx-defn-autograd.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "domain-frameworks",
+    "current_number": "270",
+    "current_slug": "axon-training-loop",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/domain-frameworks/270-axon-training-loop/270-axon-training-loop.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "domain-frameworks",
+    "current_number": "271",
+    "current_slug": "axon-inference-server",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/domain-frameworks/271-axon-inference-server/271-axon-inference-server.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "domain-frameworks",
+    "current_number": "380",
+    "current_slug": "ash-resource-actions",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/domain-frameworks/380-ash-resource-actions/380-ash-resource-actions.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "domain-frameworks",
+    "current_number": "381",
+    "current_slug": "commanded-aggregate-events-projections",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/domain-frameworks/381-commanded-aggregate-events-projections/381-commanded-aggregate-events-projections.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "domain-frameworks",
+    "current_number": "382",
+    "current_slug": "cqrs-commanded-eventstore",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/domain-frameworks/382-cqrs-commanded-eventstore/382-cqrs-commanded-eventstore.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "domain-frameworks",
+    "current_number": "383",
+    "current_slug": "event-sourcing-from-scratch-snapshots",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/domain-frameworks/383-event-sourcing-from-scratch-snapshots/383-event-sourcing-from-scratch-snapshots.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "domain-frameworks",
+    "current_number": "42",
+    "current_slug": "build-event-bus",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/domain-frameworks/42-build-event-bus/42-build-event-bus.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "domain-frameworks",
+    "current_number": "44",
+    "current_slug": "build-job-scheduler",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/domain-frameworks/44-build-job-scheduler/44-build-job-scheduler.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "domain-frameworks",
+    "current_number": "46",
+    "current_slug": "oban-background-jobs",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/domain-frameworks/46-oban-background-jobs/46-oban-background-jobs.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "domain-frameworks",
+    "current_number": "49",
+    "current_slug": "livebook-integration",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/domain-frameworks/49-livebook-integration/49-livebook-integration.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "domain-frameworks",
+    "current_number": "61",
+    "current_slug": "nx-numerical-elixir",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/domain-frameworks/61-nx-numerical-elixir/61-nx-numerical-elixir.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "domain-frameworks",
+    "current_number": "62",
+    "current_slug": "axon-neural-networks",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/domain-frameworks/62-axon-neural-networks/62-axon-neural-networks.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "domain-frameworks",
+    "current_number": "63",
+    "current_slug": "nerves-iot-embedded",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/domain-frameworks/63-nerves-iot-embedded/63-nerves-iot-embedded.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "domain-frameworks",
+    "current_number": "64",
+    "current_slug": "nerves-networking-cloud",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/domain-frameworks/64-nerves-networking-cloud/64-nerves-networking-cloud.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "domain-frameworks",
+    "current_number": "65",
+    "current_slug": "commanded-aggregates-commands",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/domain-frameworks/65-commanded-aggregates-commands/65-commanded-aggregates-commands.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "domain-frameworks",
+    "current_number": "66",
+    "current_slug": "commanded-projections-read-models",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/domain-frameworks/66-commanded-projections-read-models/66-commanded-projections-read-models.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "domain-frameworks",
+    "current_number": "67",
+    "current_slug": "ash-framework-resources",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/domain-frameworks/67-ash-framework-resources/67-ash-framework-resources.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "domain-frameworks",
+    "current_number": "68",
+    "current_slug": "ash-extensions-api",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/domain-frameworks/68-ash-extensions-api/68-ash-extensions-api.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "ecto-advanced",
+    "current_number": "230",
+    "current_slug": "ecto-multi",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ecto-advanced/230-ecto-multi/230-ecto-multi.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "ecto-advanced",
+    "current_number": "231",
+    "current_slug": "preload-nested",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ecto-advanced/231-preload-nested/231-preload-nested.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "ecto-advanced",
+    "current_number": "272",
+    "current_slug": "multi-tenancy-prefix",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ecto-advanced/272-multi-tenancy-prefix/272-multi-tenancy-prefix.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "ecto-advanced",
+    "current_number": "273",
+    "current_slug": "ecto-multi-transactions",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ecto-advanced/273-ecto-multi-transactions/273-ecto-multi-transactions.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "ecto-advanced",
+    "current_number": "274",
+    "current_slug": "upsert-on-conflict",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ecto-advanced/274-upsert-on-conflict/274-upsert-on-conflict.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "ecto-advanced",
+    "current_number": "275",
+    "current_slug": "custom-ecto-type-money",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ecto-advanced/275-custom-ecto-type-money/275-custom-ecto-type-money.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "ecto-advanced",
+    "current_number": "276",
+    "current_slug": "polymorphic-associations",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ecto-advanced/276-polymorphic-associations/276-polymorphic-associations.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "ecto-advanced",
+    "current_number": "277",
+    "current_slug": "preload-optimization",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ecto-advanced/277-preload-optimization/277-preload-optimization.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "ecto-advanced",
+    "current_number": "278",
+    "current_slug": "window-functions-select-merge",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ecto-advanced/278-window-functions-select-merge/278-window-functions-select-merge.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "ecto-advanced",
+    "current_number": "279",
+    "current_slug": "ctes-recursive-queries",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ecto-advanced/279-ctes-recursive-queries/279-ctes-recursive-queries.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "ecto-advanced",
+    "current_number": "280",
+    "current_slug": "subqueries-advanced",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ecto-advanced/280-subqueries-advanced/280-subqueries-advanced.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "ecto-advanced",
+    "current_number": "281",
+    "current_slug": "schemaless-queries-etl",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ecto-advanced/281-schemaless-queries-etl/281-schemaless-queries-etl.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "ecto-advanced",
+    "current_number": "282",
+    "current_slug": "zero-downtime-migrations",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ecto-advanced/282-zero-downtime-migrations/282-zero-downtime-migrations.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "ecto-advanced",
+    "current_number": "283",
+    "current_slug": "row-level-locking",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ecto-advanced/283-row-level-locking/283-row-level-locking.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "ecto-advanced",
+    "current_number": "284",
+    "current_slug": "soft-delete-global-filter",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ecto-advanced/284-soft-delete-global-filter/284-soft-delete-global-filter.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "ecto-advanced",
+    "current_number": "285",
+    "current_slug": "full-text-search-tsvector",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ecto-advanced/285-full-text-search-tsvector/285-full-text-search-tsvector.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "ecto-advanced",
+    "current_number": "286",
+    "current_slug": "embedded-schemas-nested-changesets",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ecto-advanced/286-embedded-schemas-nested-changesets/286-embedded-schemas-nested-changesets.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "ecto-advanced",
+    "current_number": "287",
+    "current_slug": "custom-query-macros",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ecto-advanced/287-custom-query-macros/287-custom-query-macros.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "ecto-advanced",
+    "current_number": "55",
+    "current_slug": "ecto-queries-avanzadas",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ecto-advanced/55-ecto-queries-avanzadas/55-ecto-queries-avanzadas.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "ecto-advanced",
+    "current_number": "56",
+    "current_slug": "ecto-schemas-avanzados",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ecto-advanced/56-ecto-schemas-avanzados/56-ecto-schemas-avanzados.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "ets-dets-mnesia",
+    "current_number": "116",
+    "current_slug": "ets-sharding",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ets-dets-mnesia/116-ets-sharding/116-ets-sharding.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "ets-dets-mnesia",
+    "current_number": "121",
+    "current_slug": "mnesia-ram",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ets-dets-mnesia/121-mnesia-ram/121-mnesia-ram.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "ets-dets-mnesia",
+    "current_number": "122",
+    "current_slug": "mnesia-disc-transactions",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ets-dets-mnesia/122-mnesia-disc-transactions/122-mnesia-disc-transactions.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "ets-dets-mnesia",
+    "current_number": "123",
+    "current_slug": "mnesia-dirty-ops",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ets-dets-mnesia/123-mnesia-dirty-ops/123-mnesia-dirty-ops.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "ets-dets-mnesia",
+    "current_number": "124",
+    "current_slug": "mnesia-fragmented",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ets-dets-mnesia/124-mnesia-fragmented/124-mnesia-fragmented.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "ets-dets-mnesia",
+    "current_number": "125",
+    "current_slug": "mnesia-vs-postgres",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ets-dets-mnesia/125-mnesia-vs-postgres/125-mnesia-vs-postgres.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "ets-dets-mnesia",
+    "current_number": "126",
+    "current_slug": "dets-vs-ets",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ets-dets-mnesia/126-dets-vs-ets/126-dets-vs-ets.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "ets-dets-mnesia",
+    "current_number": "127",
+    "current_slug": "cache-lru",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ets-dets-mnesia/127-cache-lru/127-cache-lru.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "ets-dets-mnesia",
+    "current_number": "16",
+    "current_slug": "ets-advanced-concurrent",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ets-dets-mnesia/16-ets-advanced-concurrent/16-ets-advanced-concurrent.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "ets-dets-mnesia",
+    "current_number": "17",
+    "current_slug": "dets-persistent-storage",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ets-dets-mnesia/17-dets-persistent-storage/17-dets-persistent-storage.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "ets-dets-mnesia",
+    "current_number": "18",
+    "current_slug": "mnesia-basics",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ets-dets-mnesia/18-mnesia-basics/18-mnesia-basics.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "ets-dets-mnesia",
+    "current_number": "19",
+    "current_slug": "cache-patterns-ets",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ets-dets-mnesia/19-cache-patterns-ets/19-cache-patterns-ets.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "ets-dets-mnesia",
+    "current_number": "20",
+    "current_slug": "ets-counter-and-atomics",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ets-dets-mnesia/20-ets-counter-and-atomics/20-ets-counter-and-atomics.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "ets-dets-mnesia",
+    "current_number": "374",
+    "current_slug": "ets-match-specs",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ets-dets-mnesia/374-ets-match-specs/374-ets-match-specs.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "ets-dets-mnesia",
+    "current_number": "375",
+    "current_slug": "ordered-set-range-queries",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ets-dets-mnesia/375-ordered-set-range-queries/375-ordered-set-range-queries.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "ets-dets-mnesia",
+    "current_number": "376",
+    "current_slug": "dets-persistence",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ets-dets-mnesia/376-dets-persistence/376-dets-persistence.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "ets-dets-mnesia",
+    "current_number": "377",
+    "current_slug": "mnesia-transactions-indices",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ets-dets-mnesia/377-mnesia-transactions-indices/377-mnesia-transactions-indices.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "ets-dets-mnesia",
+    "current_number": "378",
+    "current_slug": "mnesia-distributed-replicas",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ets-dets-mnesia/378-mnesia-distributed-replicas/378-mnesia-distributed-replicas.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "ets-dets-mnesia",
+    "current_number": "379",
+    "current_slug": "ets-shard-pattern",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ets-dets-mnesia/379-ets-shard-pattern/379-ets-shard-pattern.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "ets-dets-mnesia",
+    "current_number": "43",
+    "current_slug": "build-cache-server",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ets-dets-mnesia/43-build-cache-server/43-build-cache-server.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "interop-and-native",
+    "current_number": "161",
+    "current_slug": "rustler-binary",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/interop-and-native/161-rustler-binary/161-rustler-binary.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "interop-and-native",
+    "current_number": "162",
+    "current_slug": "rustler-dirty",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/interop-and-native/162-rustler-dirty/162-rustler-dirty.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "interop-and-native",
+    "current_number": "163",
+    "current_slug": "nif-resources",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/interop-and-native/163-nif-resources/163-nif-resources.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "interop-and-native",
+    "current_number": "164",
+    "current_slug": "port-driver",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/interop-and-native/164-port-driver/164-port-driver.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "interop-and-native",
+    "current_number": "30",
+    "current_slug": "erlang-interop-advanced",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/interop-and-native/30-erlang-interop-advanced/30-erlang-interop-advanced.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "interop-and-native",
+    "current_number": "31",
+    "current_slug": "ports-external-processes",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/interop-and-native/31-ports-external-processes/31-ports-external-processes.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "interop-and-native",
+    "current_number": "318",
+    "current_slug": "rustler-nif-typed",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/interop-and-native/318-rustler-nif-typed/318-rustler-nif-typed.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "interop-and-native",
+    "current_number": "319",
+    "current_slug": "dirty-nif-cpu-bound",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/interop-and-native/319-dirty-nif-cpu-bound/319-dirty-nif-cpu-bound.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "interop-and-native",
+    "current_number": "32",
+    "current_slug": "nifs-basics-rustler",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/interop-and-native/32-nifs-basics-rustler/32-nifs-basics-rustler.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "interop-and-native",
+    "current_number": "320",
+    "current_slug": "port-driver-streaming",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/interop-and-native/320-port-driver-streaming/320-port-driver-streaming.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "interop-and-native",
+    "current_number": "321",
+    "current_slug": "port-open-subprocess",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/interop-and-native/321-port-open-subprocess/321-port-open-subprocess.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "interop-and-native",
+    "current_number": "322",
+    "current_slug": "erlexec-resource-limits",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/interop-and-native/322-erlexec-resource-limits/322-erlexec-resource-limits.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "interop-and-native",
+    "current_number": "323",
+    "current_slug": "zigler-nif-basics",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/interop-and-native/323-zigler-nif-basics/323-zigler-nif-basics.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "interop-and-native",
+    "current_number": "324",
+    "current_slug": "cnode-integration",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/interop-and-native/324-cnode-integration/324-cnode-integration.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "interop-and-native",
+    "current_number": "325",
+    "current_slug": "nif-resource-env",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/interop-and-native/325-nif-resource-env/325-nif-resource-env.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "interop-and-native",
+    "current_number": "326",
+    "current_slug": "ets-shared-nif-readers",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/interop-and-native/326-ets-shared-nif-readers/326-ets-shared-nif-readers.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "interop-and-native",
+    "current_number": "327",
+    "current_slug": "erlport-python-bridge",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/interop-and-native/327-erlport-python-bridge/327-erlport-python-bridge.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "interop-and-native",
+    "current_number": "328",
+    "current_slug": "port-nodejs-json-framing",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/interop-and-native/328-port-nodejs-json-framing/328-port-nodejs-json-framing.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "interop-and-native",
+    "current_number": "329",
+    "current_slug": "embed-binary-resources",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/interop-and-native/329-embed-binary-resources/329-embed-binary-resources.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "interop-and-native",
+    "current_number": "330",
+    "current_slug": "system-cmd-timeout-wrapper",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/interop-and-native/330-system-cmd-timeout-wrapper/330-system-cmd-timeout-wrapper.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "metaprogramming",
+    "current_number": "131",
+    "current_slug": "unquote-fragment",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/metaprogramming/131-unquote-fragment/131-unquote-fragment.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "metaprogramming",
+    "current_number": "132",
+    "current_slug": "compile-tracer",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/metaprogramming/132-compile-tracer/132-compile-tracer.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "metaprogramming",
+    "current_number": "133",
+    "current_slug": "attr-accumulate",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/metaprogramming/133-attr-accumulate/133-attr-accumulate.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "metaprogramming",
+    "current_number": "134",
+    "current_slug": "defdelegate-custom",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/metaprogramming/134-defdelegate-custom/134-defdelegate-custom.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "metaprogramming",
+    "current_number": "135",
+    "current_slug": "use-with-opts",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/metaprogramming/135-use-with-opts/135-use-with-opts.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "metaprogramming",
+    "current_number": "136",
+    "current_slug": "quoted-as-literal",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/metaprogramming/136-quoted-as-literal/136-quoted-as-literal.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "metaprogramming",
+    "current_number": "137",
+    "current_slug": "protocol-derive",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/metaprogramming/137-protocol-derive/137-protocol-derive.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "metaprogramming",
+    "current_number": "138",
+    "current_slug": "fallback-any",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/metaprogramming/138-fallback-any/138-fallback-any.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "metaprogramming",
+    "current_number": "139",
+    "current_slug": "optional-callbacks",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/metaprogramming/139-optional-callbacks/139-optional-callbacks.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "metaprogramming",
+    "current_number": "140",
+    "current_slug": "ast-walker",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/metaprogramming/140-ast-walker/140-ast-walker.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "metaprogramming",
+    "current_number": "141",
+    "current_slug": "macro-expand-debug",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/metaprogramming/141-macro-expand-debug/141-macro-expand-debug.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "metaprogramming",
+    "current_number": "142",
+    "current_slug": "dsl-schema-builder",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/metaprogramming/142-dsl-schema-builder/142-dsl-schema-builder.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "metaprogramming",
+    "current_number": "143",
+    "current_slug": "dsl-router-builder",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/metaprogramming/143-dsl-router-builder/143-dsl-router-builder.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "metaprogramming",
+    "current_number": "144",
+    "current_slug": "spec-gen",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/metaprogramming/144-spec-gen/144-spec-gen.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "metaprogramming",
+    "current_number": "21",
+    "current_slug": "advanced-macros-ast",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/metaprogramming/21-advanced-macros-ast/21-advanced-macros-ast.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "metaprogramming",
+    "current_number": "22",
+    "current_slug": "custom-dsl-with-macros",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/metaprogramming/22-custom-dsl-with-macros/22-custom-dsl-with-macros.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "metaprogramming",
+    "current_number": "23",
+    "current_slug": "protocol-consolidation",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/metaprogramming/23-protocol-consolidation/23-protocol-consolidation.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "metaprogramming",
+    "current_number": "24",
+    "current_slug": "behaviours-custom-advanced",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/metaprogramming/24-behaviours-custom-advanced/24-behaviours-custom-advanced.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "metaprogramming",
+    "current_number": "388",
+    "current_slug": "compile-time-config-validation-on-load",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/metaprogramming/388-compile-time-config-validation-on-load/388-compile-time-config-validation-on-load.md",
+    "issues": [
+      "too-many-words"
+    ]
+  },
+  {
+    "level": "03-avanzado",
+    "category": "metaprogramming",
+    "current_number": "389",
+    "current_slug": "dsl-macro-prewalk-special-forms",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/metaprogramming/389-dsl-macro-prewalk-special-forms/389-dsl-macro-prewalk-special-forms.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "otp-advanced",
+    "current_number": "01",
+    "current_slug": "genserver-hibernation-state-compaction",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/otp-advanced/01-genserver-hibernation-state-compaction/01-genserver-hibernation-state-compaction.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "otp-advanced",
+    "current_number": "02",
+    "current_slug": "genserver-handle-continue-recovery",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/otp-advanced/02-genserver-handle-continue-recovery/02-genserver-handle-continue-recovery.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "otp-advanced",
+    "current_number": "03",
+    "current_slug": "genserver-timeouts-and-heartbeats",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/otp-advanced/03-genserver-timeouts-and-heartbeats/03-genserver-timeouts-and-heartbeats.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "otp-advanced",
+    "current_number": "04",
+    "current_slug": "genserver-back-pressure-queue",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/otp-advanced/04-genserver-back-pressure-queue/04-genserver-back-pressure-queue.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "otp-advanced",
+    "current_number": "05",
+    "current_slug": "genserver-hot-state-migration",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/otp-advanced/05-genserver-hot-state-migration/05-genserver-hot-state-migration.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "otp-advanced",
+    "current_number": "33",
+    "current_slug": "gen-statem-state-machine",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/otp-advanced/33-gen-statem-state-machine/33-gen-statem-state-machine.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "otp-advanced",
+    "current_number": "384",
+    "current_slug": "gen-statem-state-functions-vs-handle-event",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/otp-advanced/384-gen-statem-state-functions-vs-handle-event/384-gen-statem-state-functions-vs-handle-event.md",
+    "issues": [
+      "long-slug",
+      "too-many-words"
+    ]
+  },
+  {
+    "level": "03-avanzado",
+    "category": "otp-advanced",
+    "current_number": "385",
+    "current_slug": "proc-lib-sys-handrolled-behaviour",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/otp-advanced/385-proc-lib-sys-handrolled-behaviour/385-proc-lib-sys-handrolled-behaviour.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "otp-advanced",
+    "current_number": "386",
+    "current_slug": "hot-code-upgrades-release-handler",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/otp-advanced/386-hot-code-upgrades-release-handler/386-hot-code-upgrades-release-handler.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "otp-advanced",
+    "current_number": "387",
+    "current_slug": "genserver-hibernation-idle-memory",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/otp-advanced/387-genserver-hibernation-idle-memory/387-genserver-hibernation-idle-memory.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "otp-advanced",
+    "current_number": "72",
+    "current_slug": "gen-statem-retry",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/otp-advanced/72-gen-statem-retry/72-gen-statem-retry.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "otp-advanced",
+    "current_number": "73",
+    "current_slug": "selective-receive",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/otp-advanced/73-selective-receive/73-selective-receive.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "otp-advanced",
+    "current_number": "77",
+    "current_slug": "sys-replace-state-live",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/otp-advanced/77-sys-replace-state-live/77-sys-replace-state-live.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "otp-advanced",
+    "current_number": "78",
+    "current_slug": "sys-suspend-resume",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/otp-advanced/78-sys-suspend-resume/78-sys-suspend-resume.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "otp-advanced",
+    "current_number": "79",
+    "current_slug": "proc-lib-start-link",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/otp-advanced/79-proc-lib-start-link/79-proc-lib-start-link.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "otp-advanced",
+    "current_number": "80",
+    "current_slug": "special-process-impl",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/otp-advanced/80-special-process-impl/80-special-process-impl.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "otp-advanced",
+    "current_number": "81",
+    "current_slug": "call-from-self-deadlock",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/otp-advanced/81-call-from-self-deadlock/81-call-from-self-deadlock.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "otp-advanced",
+    "current_number": "82",
+    "current_slug": "reply-async",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/otp-advanced/82-reply-async/82-reply-async.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "otp-advanced",
+    "current_number": "83",
+    "current_slug": "timers-send-after-vs-schedule",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/otp-advanced/83-timers-send-after-vs-schedule/83-timers-send-after-vs-schedule.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "otp-advanced",
+    "current_number": "84",
+    "current_slug": "trap-exit-semantics",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/otp-advanced/84-trap-exit-semantics/84-trap-exit-semantics.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "phoenix-ecosystem",
+    "current_number": "218",
+    "current_slug": "channels-binary",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/phoenix-ecosystem/218-channels-binary/218-channels-binary.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "phoenix-ecosystem",
+    "current_number": "219",
+    "current_slug": "channels-auth",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/phoenix-ecosystem/219-channels-auth/219-channels-auth.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "phoenix-ecosystem",
+    "current_number": "220",
+    "current_slug": "channels-intercept",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/phoenix-ecosystem/220-channels-intercept/220-channels-intercept.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "phoenix-ecosystem",
+    "current_number": "221",
+    "current_slug": "presence-metas",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/phoenix-ecosystem/221-presence-metas/221-presence-metas.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "phoenix-ecosystem",
+    "current_number": "222",
+    "current_slug": "plug-auth-custom",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/phoenix-ecosystem/222-plug-auth-custom/222-plug-auth-custom.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "phoenix-ecosystem",
+    "current_number": "351",
+    "current_slug": "liveview-stateful-streams",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/phoenix-ecosystem/351-liveview-stateful-streams/351-liveview-stateful-streams.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "phoenix-ecosystem",
+    "current_number": "352",
+    "current_slug": "liveview-uploads-progress",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/phoenix-ecosystem/352-liveview-uploads-progress/352-liveview-uploads-progress.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "phoenix-ecosystem",
+    "current_number": "353",
+    "current_slug": "liveview-js-interactions",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/phoenix-ecosystem/353-liveview-js-interactions/353-liveview-js-interactions.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "phoenix-ecosystem",
+    "current_number": "354",
+    "current_slug": "channels-presence",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/phoenix-ecosystem/354-channels-presence/354-channels-presence.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "phoenix-ecosystem",
+    "current_number": "355",
+    "current_slug": "pubsub-local-vs-distributed",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/phoenix-ecosystem/355-pubsub-local-vs-distributed/355-pubsub-local-vs-distributed.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "phoenix-ecosystem",
+    "current_number": "356",
+    "current_slug": "phoenix-token-signing",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/phoenix-ecosystem/356-phoenix-token-signing/356-phoenix-token-signing.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "phoenix-ecosystem",
+    "current_number": "357",
+    "current_slug": "livedashboard-custom-metrics",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/phoenix-ecosystem/357-livedashboard-custom-metrics/357-livedashboard-custom-metrics.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "phoenix-ecosystem",
+    "current_number": "358",
+    "current_slug": "tailwind-esbuild-pipeline",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/phoenix-ecosystem/358-tailwind-esbuild-pipeline/358-tailwind-esbuild-pipeline.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "phoenix-ecosystem",
+    "current_number": "359",
+    "current_slug": "endpoint-custom-plug-pipeline",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/phoenix-ecosystem/359-endpoint-custom-plug-pipeline/359-endpoint-custom-plug-pipeline.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "phoenix-ecosystem",
+    "current_number": "51",
+    "current_slug": "phoenix-liveview-real-time",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/phoenix-ecosystem/51-phoenix-liveview-real-time/51-phoenix-liveview-real-time.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "phoenix-ecosystem",
+    "current_number": "52",
+    "current_slug": "phoenix-livecomponent",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/phoenix-ecosystem/52-phoenix-livecomponent/52-phoenix-livecomponent.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "phoenix-ecosystem",
+    "current_number": "53",
+    "current_slug": "phoenix-channels",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/phoenix-ecosystem/53-phoenix-channels/53-phoenix-channels.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "phoenix-ecosystem",
+    "current_number": "54",
+    "current_slug": "phoenix-presence-channels",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/phoenix-ecosystem/54-phoenix-presence-channels/54-phoenix-presence-channels.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "phoenix-ecosystem",
+    "current_number": "57",
+    "current_slug": "plug-pipeline-middleware",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/phoenix-ecosystem/57-plug-pipeline-middleware/57-plug-pipeline-middleware.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "phoenix-ecosystem",
+    "current_number": "58",
+    "current_slug": "plug-router-api",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/phoenix-ecosystem/58-plug-router-api/58-plug-router-api.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "resilience-patterns",
+    "current_number": "303",
+    "current_slug": "circuit-breaker-states-ets",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/resilience-patterns/303-circuit-breaker-states-ets/303-circuit-breaker-states-ets.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "resilience-patterns",
+    "current_number": "304",
+    "current_slug": "bulkhead-process-pools",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/resilience-patterns/304-bulkhead-process-pools/304-bulkhead-process-pools.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "resilience-patterns",
+    "current_number": "305",
+    "current_slug": "retry-exponential-backoff-jitter",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/resilience-patterns/305-retry-exponential-backoff-jitter/305-retry-exponential-backoff-jitter.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "resilience-patterns",
+    "current_number": "306",
+    "current_slug": "timeout-hierarchies",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/resilience-patterns/306-timeout-hierarchies/306-timeout-hierarchies.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "resilience-patterns",
+    "current_number": "307",
+    "current_slug": "fallback-chains-with",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/resilience-patterns/307-fallback-chains-with/307-fallback-chains-with.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "resilience-patterns",
+    "current_number": "308",
+    "current_slug": "bounded-queue-genstage-backpressure",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/resilience-patterns/308-bounded-queue-genstage-backpressure/308-bounded-queue-genstage-backpressure.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "resilience-patterns",
+    "current_number": "309",
+    "current_slug": "load-shedding-token-bucket",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/resilience-patterns/309-load-shedding-token-bucket/309-load-shedding-token-bucket.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "resilience-patterns",
+    "current_number": "310",
+    "current_slug": "graceful-degradation-feature-flags",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/resilience-patterns/310-graceful-degradation-feature-flags/310-graceful-degradation-feature-flags.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "resilience-patterns",
+    "current_number": "311",
+    "current_slug": "deadline-propagation-processes",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/resilience-patterns/311-deadline-propagation-processes/311-deadline-propagation-processes.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "resilience-patterns",
+    "current_number": "312",
+    "current_slug": "chaos-engineering-suspend-kill",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/resilience-patterns/312-chaos-engineering-suspend-kill/312-chaos-engineering-suspend-kill.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "resilience-patterns",
+    "current_number": "313",
+    "current_slug": "idempotency-keys-ets-ttl",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/resilience-patterns/313-idempotency-keys-ets-ttl/313-idempotency-keys-ets-ttl.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "resilience-patterns",
+    "current_number": "314",
+    "current_slug": "dead-letter-queue",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/resilience-patterns/314-dead-letter-queue/314-dead-letter-queue.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "resilience-patterns",
+    "current_number": "315",
+    "current_slug": "saga-compensating-actions",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/resilience-patterns/315-saga-compensating-actions/315-saga-compensating-actions.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "resilience-patterns",
+    "current_number": "316",
+    "current_slug": "hedged-requests",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/resilience-patterns/316-hedged-requests/316-hedged-requests.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "resilience-patterns",
+    "current_number": "317",
+    "current_slug": "adaptive-concurrency-limits",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/resilience-patterns/317-adaptive-concurrency-limits/317-adaptive-concurrency-limits.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "resilience-patterns",
+    "current_number": "36",
+    "current_slug": "circuit-breaker-patterns",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/resilience-patterns/36-circuit-breaker-patterns/36-circuit-breaker-patterns.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "resilience-patterns",
+    "current_number": "37",
+    "current_slug": "rate-limiting-patterns",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/resilience-patterns/37-rate-limiting-patterns/37-rate-limiting-patterns.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "resilience-patterns",
+    "current_number": "45",
+    "current_slug": "build-api-client-wrapper",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/resilience-patterns/45-build-api-client-wrapper/45-build-api-client-wrapper.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "resilience-patterns",
+    "current_number": "70",
+    "current_slug": "req-finch-http-clients",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/resilience-patterns/70-req-finch-http-clients/70-req-finch-http-clients.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "resilience-patterns",
+    "current_number": "71",
+    "current_slug": "rate-limiter-ets",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/resilience-patterns/71-rate-limiter-ets/71-rate-limiter-ets.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "supervision-advanced",
+    "current_number": "06",
+    "current_slug": "supervision-strategies-advanced",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/supervision-advanced/06-supervision-strategies-advanced/06-supervision-strategies-advanced.md",
+    "issues": [
+      "spanish-slug"
+    ]
+  },
+  {
+    "level": "03-avanzado",
+    "category": "supervision-advanced",
+    "current_number": "07",
+    "current_slug": "partition-supervisor",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/supervision-advanced/07-partition-supervisor/07-partition-supervisor.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "supervision-advanced",
+    "current_number": "08",
+    "current_slug": "task-supervisor-dynamic",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/supervision-advanced/08-task-supervisor-dynamic/08-task-supervisor-dynamic.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "supervision-advanced",
+    "current_number": "09",
+    "current_slug": "supervision-tree-design",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/supervision-advanced/09-supervision-tree-design/09-supervision-tree-design.md",
+    "issues": [
+      "spanish-slug"
+    ]
+  },
+  {
+    "level": "03-avanzado",
+    "category": "supervision-advanced",
+    "current_number": "10",
+    "current_slug": "graceful-shutdown-drain",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/supervision-advanced/10-graceful-shutdown-drain/10-graceful-shutdown-drain.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "supervision-advanced",
+    "current_number": "390",
+    "current_slug": "rest-for-one-custom-restart-intensity",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/supervision-advanced/390-rest-for-one-custom-restart-intensity/390-rest-for-one-custom-restart-intensity.md",
+    "issues": [
+      "too-many-words"
+    ]
+  },
+  {
+    "level": "03-avanzado",
+    "category": "supervision-advanced",
+    "current_number": "391",
+    "current_slug": "partition-supervisor-lock-contention",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/supervision-advanced/391-partition-supervisor-lock-contention/391-partition-supervisor-lock-contention.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "supervision-advanced",
+    "current_number": "47",
+    "current_slug": "umbrella-application",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/supervision-advanced/47-umbrella-application/47-umbrella-application.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "supervision-advanced",
+    "current_number": "87",
+    "current_slug": "partition-sup-sharded",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/supervision-advanced/87-partition-sup-sharded/87-partition-sup-sharded.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "supervision-advanced",
+    "current_number": "88",
+    "current_slug": "drain-on-deploy",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/supervision-advanced/88-drain-on-deploy/88-drain-on-deploy.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "supervision-advanced",
+    "current_number": "89",
+    "current_slug": "significant-child",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/supervision-advanced/89-significant-child/89-significant-child.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "supervision-advanced",
+    "current_number": "90",
+    "current_slug": "bulkhead-supervisors",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/supervision-advanced/90-bulkhead-supervisors/90-bulkhead-supervisors.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "supervision-advanced",
+    "current_number": "91",
+    "current_slug": "umbrella-boot-order",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/supervision-advanced/91-umbrella-boot-order/91-umbrella-boot-order.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "supervision-advanced",
+    "current_number": "92",
+    "current_slug": "overlays-assemble",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/supervision-advanced/92-overlays-assemble/92-overlays-assemble.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "supervision-advanced",
+    "current_number": "93",
+    "current_slug": "dynamic-sup-autoscale",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/supervision-advanced/93-dynamic-sup-autoscale/93-dynamic-sup-autoscale.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "supervision-advanced",
+    "current_number": "94",
+    "current_slug": "failure-isolation",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/supervision-advanced/94-failure-isolation/94-failure-isolation.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "supervision-advanced",
+    "current_number": "95",
+    "current_slug": "task-sup-rate-limited",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/supervision-advanced/95-task-sup-rate-limited/95-task-sup-rate-limited.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "supervision-advanced",
+    "current_number": "96",
+    "current_slug": "sup-metrics-telemetry",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/supervision-advanced/96-sup-metrics-telemetry/96-sup-metrics-telemetry.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "supervision-advanced",
+    "current_number": "97",
+    "current_slug": "adoption-patterns",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/supervision-advanced/97-adoption-patterns/97-adoption-patterns.md",
+    "issues": []
+  },
+  {
+    "level": "03-avanzado",
+    "category": "supervision-advanced",
+    "current_number": "98",
+    "current_slug": "app-start-phases",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/supervision-advanced/98-app-start-phases/98-app-start-phases.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "concurrency-primitives",
+    "current_number": "10",
+    "current_slug": "build-custom-genserver-supervisor",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/concurrency-primitives/10-build-custom-genserver-supervisor/10-build-custom-genserver-supervisor.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "concurrency-primitives",
+    "current_number": "11",
+    "current_slug": "build-custom-event-bus-registry",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/concurrency-primitives/11-build-custom-event-bus-registry/11-build-custom-event-bus-registry.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "concurrency-primitives",
+    "current_number": "12",
+    "current_slug": "build-custom-process-pool",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/concurrency-primitives/12-build-custom-process-pool/12-build-custom-process-pool.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "concurrency-primitives",
+    "current_number": "13",
+    "current_slug": "build-actor-framework-alternative",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/concurrency-primitives/13-build-actor-framework-alternative/13-build-actor-framework-alternative.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "concurrency-primitives",
+    "current_number": "14",
+    "current_slug": "build-behaviour-callback-validator",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/concurrency-primitives/14-build-behaviour-callback-validator/14-build-behaviour-callback-validator.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "data-and-integrations",
+    "current_number": "20",
+    "current_slug": "build-crdt-data-structures",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/data-and-integrations/20-build-crdt-data-structures/20-build-crdt-data-structures.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "data-and-integrations",
+    "current_number": "37",
+    "current_slug": "build-blockchain-simulation",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/data-and-integrations/37-build-blockchain-simulation/37-build-blockchain-simulation.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "data-and-integrations",
+    "current_number": "43",
+    "current_slug": "build-ai-inference-engine",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/data-and-integrations/43-build-ai-inference-engine/43-build-ai-inference-engine.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "data-and-integrations",
+    "current_number": "47",
+    "current_slug": "build-workflow-engine-temporal-like",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/data-and-integrations/47-build-workflow-engine-temporal-like/47-build-workflow-engine-temporal-like.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "distributed-systems",
+    "current_number": "01",
+    "current_slug": "build-distributed-raft-consensus",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/distributed-systems/01-build-distributed-raft-consensus/01-build-distributed-raft-consensus.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "distributed-systems",
+    "current_number": "02",
+    "current_slug": "build-distributed-transaction-coordinator",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/distributed-systems/02-build-distributed-transaction-coordinator/02-build-distributed-transaction-coordinator.md",
+    "issues": [
+      "long-slug"
+    ]
+  },
+  {
+    "level": "04-insane",
+    "category": "distributed-systems",
+    "current_number": "04",
+    "current_slug": "build-distributed-scheduler",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/distributed-systems/04-build-distributed-scheduler/04-build-distributed-scheduler.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "distributed-systems",
+    "current_number": "05",
+    "current_slug": "build-gossip-membership-protocol",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/distributed-systems/05-build-gossip-membership-protocol/05-build-gossip-membership-protocol.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "distributed-systems",
+    "current_number": "07",
+    "current_slug": "build-distributed-event-log",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/distributed-systems/07-build-distributed-event-log/07-build-distributed-event-log.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "distributed-systems",
+    "current_number": "08",
+    "current_slug": "build-viewstamped-replication",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/distributed-systems/08-build-viewstamped-replication/08-build-viewstamped-replication.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "distributed-systems",
+    "current_number": "09",
+    "current_slug": "build-consistent-hashing-rebalancer",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/distributed-systems/09-build-consistent-hashing-rebalancer/09-build-consistent-hashing-rebalancer.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "distributed-systems",
+    "current_number": "24",
+    "current_slug": "build-distributed-rate-limiter",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/distributed-systems/24-build-distributed-rate-limiter/24-build-distributed-rate-limiter.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "distributed-systems",
+    "current_number": "44",
+    "current_slug": "build-full-stack-distributed-system",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/distributed-systems/44-build-full-stack-distributed-system/44-build-full-stack-distributed-system.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "distributed-systems",
+    "current_number": "50",
+    "current_slug": "build-distributed-lock-service",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/distributed-systems/50-build-distributed-lock-service/50-build-distributed-lock-service.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "distributed-systems",
+    "current_number": "55",
+    "current_slug": "build-distributed-saga-orchestrator",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/distributed-systems/55-build-distributed-saga-orchestrator/55-build-distributed-saga-orchestrator.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "frameworks-and-engines",
+    "current_number": "23",
+    "current_slug": "build-job-queue-with-retry",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/frameworks-and-engines/23-build-job-queue-with-retry/23-build-job-queue-with-retry.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "frameworks-and-engines",
+    "current_number": "31",
+    "current_slug": "build-test-framework",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/frameworks-and-engines/31-build-test-framework/31-build-test-framework.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "frameworks-and-engines",
+    "current_number": "32",
+    "current_slug": "build-web-framework-phoenix-like",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/frameworks-and-engines/32-build-web-framework-phoenix-like/32-build-web-framework-phoenix-like.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "frameworks-and-engines",
+    "current_number": "33",
+    "current_slug": "build-rest-api-framework",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/frameworks-and-engines/33-build-rest-api-framework/33-build-rest-api-framework.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "frameworks-and-engines",
+    "current_number": "41",
+    "current_slug": "build-event-sourcing-cqrs-framework",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/frameworks-and-engines/41-build-event-sourcing-cqrs-framework/41-build-event-sourcing-cqrs-framework.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "frameworks-and-engines",
+    "current_number": "42",
+    "current_slug": "build-custom-macro-dsl-system",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/frameworks-and-engines/42-build-custom-macro-dsl-system/42-build-custom-macro-dsl-system.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "frameworks-and-engines",
+    "current_number": "45",
+    "current_slug": "build-game-engine-ecs",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/frameworks-and-engines/45-build-game-engine-ecs/45-build-game-engine-ecs.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "frameworks-and-engines",
+    "current_number": "46",
+    "current_slug": "build-liveview-clone",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/frameworks-and-engines/46-build-liveview-clone/46-build-liveview-clone.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "frameworks-and-engines",
+    "current_number": "48",
+    "current_slug": "build-compile-time-type-system",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/frameworks-and-engines/48-build-compile-time-type-system/48-build-compile-time-type-system.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "frameworks-and-engines",
+    "current_number": "49",
+    "current_slug": "build-reactive-streams",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/frameworks-and-engines/49-build-reactive-streams/49-build-reactive-streams.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "frameworks-and-engines",
+    "current_number": "51",
+    "current_slug": "build-production-job-queue",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/frameworks-and-engines/51-build-production-job-queue/51-build-production-job-queue.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "frameworks-and-engines",
+    "current_number": "52",
+    "current_slug": "build-multi-tenant-saas-framework",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/frameworks-and-engines/52-build-multi-tenant-saas-framework/52-build-multi-tenant-saas-framework.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "frameworks-and-engines",
+    "current_number": "53",
+    "current_slug": "build-real-time-collaboration-engine",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/frameworks-and-engines/53-build-real-time-collaboration-engine/53-build-real-time-collaboration-engine.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "frameworks-and-engines",
+    "current_number": "54",
+    "current_slug": "build-ai-agents-framework",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/frameworks-and-engines/54-build-ai-agents-framework/54-build-ai-agents-framework.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "languages-and-compilers",
+    "current_number": "25",
+    "current_slug": "build-lisp-interpreter",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/languages-and-compilers/25-build-lisp-interpreter/25-build-lisp-interpreter.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "languages-and-compilers",
+    "current_number": "26",
+    "current_slug": "build-mini-language-compiler",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/languages-and-compilers/26-build-mini-language-compiler/26-build-mini-language-compiler.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "languages-and-compilers",
+    "current_number": "27",
+    "current_slug": "build-regex-engine",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/languages-and-compilers/27-build-regex-engine/27-build-regex-engine.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "languages-and-compilers",
+    "current_number": "40",
+    "current_slug": "build-wasm-interpreter",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/languages-and-compilers/40-build-wasm-interpreter/40-build-wasm-interpreter.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "network-and-proxies",
+    "current_number": "21",
+    "current_slug": "build-message-broker-amqp-like",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/network-and-proxies/21-build-message-broker-amqp-like/21-build-message-broker-amqp-like.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "network-and-proxies",
+    "current_number": "22",
+    "current_slug": "build-stream-processor-flink-like",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/network-and-proxies/22-build-stream-processor-flink-like/22-build-stream-processor-flink-like.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "network-and-proxies",
+    "current_number": "34",
+    "current_slug": "build-api-gateway",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/network-and-proxies/34-build-api-gateway/34-build-api-gateway.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "network-and-proxies",
+    "current_number": "35",
+    "current_slug": "build-load-balancer",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/network-and-proxies/35-build-load-balancer/35-build-load-balancer.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "network-and-proxies",
+    "current_number": "36",
+    "current_slug": "build-video-streaming-server",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/network-and-proxies/36-build-video-streaming-server/36-build-video-streaming-server.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "network-and-proxies",
+    "current_number": "38",
+    "current_slug": "build-p2p-file-sharing",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/network-and-proxies/38-build-p2p-file-sharing/38-build-p2p-file-sharing.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "network-and-proxies",
+    "current_number": "39",
+    "current_slug": "build-service-mesh-proxy",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/network-and-proxies/39-build-service-mesh-proxy/39-build-service-mesh-proxy.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "observability",
+    "current_number": "06",
+    "current_slug": "build-distributed-tracing-system",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/observability/06-build-distributed-tracing-system/06-build-distributed-tracing-system.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "observability",
+    "current_number": "28",
+    "current_slug": "build-log-aggregation-system",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/observability/28-build-log-aggregation-system/28-build-log-aggregation-system.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "observability",
+    "current_number": "29",
+    "current_slug": "build-metrics-collector-prometheus-like",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/observability/29-build-metrics-collector-prometheus-like/29-build-metrics-collector-prometheus-like.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "observability",
+    "current_number": "30",
+    "current_slug": "build-profiler-performance-analyzer",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/observability/30-build-profiler-performance-analyzer/30-build-profiler-performance-analyzer.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "storage-engines",
+    "current_number": "03",
+    "current_slug": "build-distributed-cache-redis-like",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/storage-engines/03-build-distributed-cache-redis-like/03-build-distributed-cache-redis-like.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "storage-engines",
+    "current_number": "15",
+    "current_slug": "build-lsm-tree-storage-engine",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/storage-engines/15-build-lsm-tree-storage-engine/15-build-lsm-tree-storage-engine.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "storage-engines",
+    "current_number": "16",
+    "current_slug": "build-in-memory-database",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/storage-engines/16-build-in-memory-database/16-build-in-memory-database.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "storage-engines",
+    "current_number": "17",
+    "current_slug": "build-graph-database",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/storage-engines/17-build-graph-database/17-build-graph-database.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "storage-engines",
+    "current_number": "18",
+    "current_slug": "build-time-series-database",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/storage-engines/18-build-time-series-database/18-build-time-series-database.md",
+    "issues": []
+  },
+  {
+    "level": "04-insane",
+    "category": "storage-engines",
+    "current_number": "19",
+    "current_slug": "build-search-engine-inverted-index",
+    "path": "/Users/consulting/Documents/consulting/infra/challenges/elixir/04-insane/storage-engines/19-build-search-engine-inverted-index/19-build-search-engine-inverted-index.md",
+    "issues": []
+  }
+]

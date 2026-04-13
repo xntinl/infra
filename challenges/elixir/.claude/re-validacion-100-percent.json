@@ -1,0 +1,231 @@
+{
+  "total_files": 559,
+  "gold": 0,
+  "gold_pct": 0.0,
+  "ge95": 4,
+  "ge90": 316,
+  "ge80": 542,
+  "avg_score_pct": 86.84,
+  "item_fails": {
+    "10": 559,
+    "12": 499,
+    "20": 212,
+    "17": 55,
+    "11": 34,
+    "9": 27,
+    "5": 17,
+    "8": 15,
+    "19": 13,
+    "2": 7,
+    "4": 7,
+    "7": 7,
+    "14": 7,
+    "3": 4,
+    "6": 3,
+    "15": 2,
+    "18": 2,
+    "1": 1
+  },
+  "per_dir": {
+    "01-basico": {
+      "count": 84,
+      "gold": 0,
+      "avg": 86.13
+    },
+    "02-intermedio": {
+      "count": 139,
+      "gold": 0,
+      "avg": 87.66
+    },
+    "03-avanzado": {
+      "count": 280,
+      "gold": 0,
+      "avg": 86.27
+    },
+    "04-insane": {
+      "count": 56,
+      "gold": 0,
+      "avg": 88.75
+    }
+  },
+  "top_problems": [
+    {
+      "file": "01-basico/fundamentals/01-setup-and-mix/json_validator/deps/excoveralls/CHANGELOG.md",
+      "score": 7,
+      "pct": 35.0,
+      "failing": [
+        1,
+        2,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        14,
+        19
+      ]
+    },
+    {
+      "file": "01-basico/fundamentals/01-setup-and-mix/json_validator/deps/jason/CHANGELOG.md",
+      "score": 7,
+      "pct": 35.0,
+      "failing": [
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        14,
+        19
+      ]
+    },
+    {
+      "file": "01-basico/fundamentals/01-setup-and-mix/json_validator/deps/json/README.md",
+      "score": 7,
+      "pct": 35.0,
+      "failing": [
+        2,
+        3,
+        4,
+        5,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        14,
+        15,
+        19
+      ]
+    },
+    {
+      "file": "01-basico/fundamentals/01-setup-and-mix/json_validator/README.md",
+      "score": 8,
+      "pct": 40.0,
+      "failing": [
+        2,
+        3,
+        4,
+        5,
+        7,
+        8,
+        9,
+        10,
+        11,
+        14,
+        19,
+        20
+      ]
+    },
+    {
+      "file": "01-basico/fundamentals/01-setup-and-mix/json_validator/deps/jason/README.md",
+      "score": 8,
+      "pct": 40.0,
+      "failing": [
+        2,
+        3,
+        4,
+        5,
+        7,
+        8,
+        9,
+        10,
+        11,
+        14,
+        19,
+        20
+      ]
+    },
+    {
+      "file": "01-basico/fundamentals/01-setup-and-mix/json_validator/deps/excoveralls/README.md",
+      "score": 9,
+      "pct": 45.0,
+      "failing": [
+        2,
+        4,
+        5,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        14,
+        20
+      ]
+    },
+    {
+      "file": "04-insane/storage-engines/README-v3-AMPLIFICATION.md",
+      "score": 9,
+      "pct": 45.0,
+      "failing": [
+        2,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        14,
+        19
+      ]
+    },
+    {
+      "file": "03-avanzado/advanced-testing/291-ecto-sandbox-modes/291-ecto-sandbox-modes.md",
+      "score": 12,
+      "pct": 60.0,
+      "failing": [
+        5,
+        8,
+        9,
+        10,
+        11,
+        12,
+        18,
+        19
+      ]
+    },
+    {
+      "file": "03-avanzado/advanced-testing/299-ex-machina-factories/299-ex-machina-factories.md",
+      "score": 12,
+      "pct": 60.0,
+      "failing": [
+        5,
+        8,
+        9,
+        10,
+        11,
+        12,
+        18,
+        19
+      ]
+    },
+    {
+      "file": "03-avanzado/advanced-testing/300-peer-distributed-testing/300-peer-distributed-testing.md",
+      "score": 13,
+      "pct": 65.0,
+      "failing": [
+        5,
+        8,
+        9,
+        10,
+        11,
+        12,
+        19
+      ]
+    }
+  ]
+}

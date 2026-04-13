@@ -1,0 +1,3631 @@
+{
+  "summary": {
+    "total_files": 552,
+    "gold_20_20": 246,
+    "gold_pct": 44.57,
+    "ge_95_pct": 472,
+    "ge_90_pct": 546,
+    "ge_80_pct": 549,
+    "avg_score_pct": 96.29,
+    "per_dir": {
+      "01-basico": {
+        "files": 78,
+        "gold": 42,
+        "avg_pct": 97.63
+      },
+      "02-intermedio": {
+        "files": 139,
+        "gold": 84,
+        "avg_pct": 97.37
+      },
+      "03-avanzado": {
+        "files": 280,
+        "gold": 85,
+        "avg_pct": 95.05
+      },
+      "04-insane": {
+        "files": 55,
+        "gold": 35,
+        "avg_pct": 97.91
+      }
+    },
+    "fails_per_item": {
+      "9": 129,
+      "20": 128,
+      "10": 112,
+      "19": 9,
+      "8": 8,
+      "5": 7,
+      "11": 5,
+      "3": 3,
+      "4": 3,
+      "16": 3,
+      "12": 2,
+      "14": 1
+    },
+    "worst_10": [
+      {
+        "file": "02-intermedio/macros-intro/23-kernel-y-builtins-avanzados/23-kernel-y-builtins-avanzados.md",
+        "passed": 10,
+        "failed_items": [
+          3,
+          4,
+          5,
+          8,
+          9,
+          10,
+          11,
+          12,
+          14,
+          16
+        ]
+      },
+      {
+        "file": "03-avanzado/distribution-and-clustering/106-pg2-to-pg/106-pg2-to-pg.md",
+        "passed": 11,
+        "failed_items": [
+          3,
+          4,
+          5,
+          8,
+          9,
+          10,
+          11,
+          12,
+          16
+        ]
+      },
+      {
+        "file": "02-intermedio/protocols-and-behaviours/34-collectable-enumerable/34-collectable-enumerable.md",
+        "passed": 12,
+        "failed_items": [
+          3,
+          4,
+          5,
+          8,
+          9,
+          10,
+          11,
+          16
+        ]
+      },
+      {
+        "file": "02-intermedio/integrations-basics/129-ecto-migrations/129-ecto-migrations.md",
+        "passed": 17,
+        "failed_items": [
+          9,
+          19,
+          20
+        ]
+      },
+      {
+        "file": "03-avanzado/interop-and-native/161-rustler-binary/161-rustler-binary.md",
+        "passed": 17,
+        "failed_items": [
+          8,
+          9,
+          11
+        ]
+      },
+      {
+        "file": "03-avanzado/interop-and-native/162-rustler-dirty/162-rustler-dirty.md",
+        "passed": 17,
+        "failed_items": [
+          8,
+          9,
+          11
+        ]
+      },
+      {
+        "file": "01-basico/processes-basics/35-registry-and-named-processes/35-registry-and-named-processes.md",
+        "passed": 18,
+        "failed_items": [
+          9,
+          10
+        ]
+      },
+      {
+        "file": "03-avanzado/advanced-testing/294-supervisor-restart-testing/294-supervisor-restart-testing.md",
+        "passed": 18,
+        "failed_items": [
+          10,
+          20
+        ]
+      },
+      {
+        "file": "03-avanzado/advanced-testing/296-phoenix-conn-integration/296-phoenix-conn-integration.md",
+        "passed": 18,
+        "failed_items": [
+          10,
+          20
+        ]
+      },
+      {
+        "file": "03-avanzado/advanced-testing/298-benchmark-regression/298-benchmark-regression.md",
+        "passed": 18,
+        "failed_items": [
+          10,
+          20
+        ]
+      }
+    ]
+  },
+  "results": [
+    {
+      "file": "01-basico/collections/06-lists-and-head-tail-pattern/06-lists-and-head-tail-pattern.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "01-basico/collections/11-enum-module-and-immutability/11-enum-module-and-immutability.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "01-basico/collections/12-pipe-operator-and-composition/12-pipe-operator-and-composition.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "01-basico/collections/17-ranges-and-streams/17-ranges-and-streams.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "01-basico/collections/19-comprehensions-for/19-comprehensions-for.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "01-basico/collections/44-enum-reduce-patterns/44-enum-reduce-patterns.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "01-basico/collections/45-stream-resource-infinite/45-stream-resource-infinite.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "01-basico/collections/46-mapset-operations/46-mapset-operations.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "01-basico/collections/47-keyword-dsl-building/47-keyword-dsl-building.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "01-basico/control-flow/09-control-flow-if-case-cond/09-control-flow-if-case-cond.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "01-basico/control-flow/10-recursion-and-tail-call-optimization/10-recursion-and-tail-call-optimization.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "01-basico/control-flow/20-guards-and-custom-guards/20-guards-and-custom-guards.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "01-basico/control-flow/21-with-keyword-flow/21-with-keyword-flow.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "01-basico/control-flow/56-case-deep-patterns/56-case-deep-patterns.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "01-basico/control-flow/57-cond-vs-if-choices/57-cond-vs-if-choices.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "01-basico/control-flow/58-unless-else-guards/58-unless-else-guards.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "01-basico/control-flow/59-try-catch-after-cleanup/59-try-catch-after-cleanup.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "01-basico/data-structures/15-structs-and-basic-validation/15-structs-and-basic-validation.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "01-basico/data-structures/60-enforce-keys-structs/60-enforce-keys-structs.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "01-basico/data-structures/61-protocols-polymorphism/61-protocols-polymorphism.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "01-basico/data-structures/62-behaviours-contracts/62-behaviours-contracts.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "01-basico/data-structures/63-typespecs-dialyzer/63-typespecs-dialyzer.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "01-basico/error-handling/25-error-handling-try-rescue/25-error-handling-try-rescue.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "01-basico/error-handling/29-exceptions-try-rescue/29-exceptions-try-rescue.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "01-basico/error-handling/30-error-tuples-vs-raise/30-error-tuples-vs-raise.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "01-basico/error-handling/64-exit-vs-raise-vs-throw/64-exit-vs-raise-vs-throw.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "01-basico/error-handling/65-trap-exit-linked/65-trap-exit-linked.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "01-basico/error-handling/66-custom-exception-modules/66-custom-exception-modules.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "01-basico/error-handling/67-bang-vs-safe-apis/67-bang-vs-safe-apis.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "01-basico/functions-and-modules/08-functions-and-arity/08-functions-and-arity.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "01-basico/functions-and-modules/13-anonymous-functions-and-closures/13-anonymous-functions-and-closures.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "01-basico/functions-and-modules/14-modules-and-function-visibility/14-modules-and-function-visibility.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "01-basico/functions-and-modules/52-function-capture-ampersand/52-function-capture-ampersand.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "01-basico/functions-and-modules/53-default-arguments-patterns/53-default-arguments-patterns.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "01-basico/functions-and-modules/54-multi-clause-functions/54-multi-clause-functions.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "01-basico/functions-and-modules/55-module-import-alias-require/55-module-import-alias-require.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "01-basico/fundamentals/01-setup-and-mix/01-setup-and-mix.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "01-basico/fundamentals/02-atoms-and-symbols/02-atoms-and-symbols.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "01-basico/fundamentals/03-numbers-and-arithmetic/03-numbers-and-arithmetic.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "01-basico/fundamentals/07-maps-and-keyword-lists/07-maps-and-keyword-lists.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "01-basico/fundamentals/36-booleans-nil-truthiness/36-booleans-nil-truthiness.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "01-basico/fundamentals/37-variable-rebinding-and-scope/37-variable-rebinding-and-scope.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "01-basico/fundamentals/38-integer-float-precision/38-integer-float-precision.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "01-basico/fundamentals/39-module-attributes-constants/39-module-attributes-constants.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "01-basico/pattern-matching/05-tuples-and-pattern-matching-intro/05-tuples-and-pattern-matching-intro.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "01-basico/pattern-matching/09-pattern-matching-avanzado/09-pattern-matching-avanzado.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "01-basico/pattern-matching/40-pin-operator-deep/40-pin-operator-deep.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "01-basico/pattern-matching/41-map-pattern-matching/41-map-pattern-matching.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "01-basico/pattern-matching/42-nested-destructuring/42-nested-destructuring.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "01-basico/pattern-matching/43-case-with-guards/43-case-with-guards.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "01-basico/processes-basics/31-process-spawn-and-send/31-process-spawn-and-send.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "01-basico/processes-basics/32-receive-and-mailbox/32-receive-and-mailbox.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "01-basico/processes-basics/33-task-async-await/33-task-async-await.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "01-basico/processes-basics/34-agent-state-basics/34-agent-state-basics.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "01-basico/processes-basics/35-registry-and-named-processes/35-registry-and-named-processes.md",
+      "passed": 18,
+      "failed_items": [
+        9,
+        10
+      ]
+    },
+    {
+      "file": "01-basico/processes-basics/72-process-link-exit/72-process-link-exit.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "01-basico/processes-basics/73-process-monitor/73-process-monitor.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "01-basico/processes-basics/74-process-send-after/74-process-send-after.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "01-basico/processes-basics/75-process-dict-when-not/75-process-dict-when-not.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "01-basico/stdlib-essentials/23-io-and-stdio/23-io-and-stdio.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "01-basico/stdlib-essentials/24-file-io-and-streams/24-file-io-and-streams.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "01-basico/stdlib-essentials/25-path-and-filesystem/25-path-and-filesystem.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "01-basico/stdlib-essentials/26-datetime-naivedatetime/26-datetime-naivedatetime.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "01-basico/stdlib-essentials/27-keyword-vs-map-opts/27-keyword-vs-map-opts.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "01-basico/stdlib-essentials/68-uri-parsing/68-uri-parsing.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "01-basico/stdlib-essentials/69-base-encoding/69-base-encoding.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "01-basico/stdlib-essentials/70-system-env-vars/70-system-env-vars.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "01-basico/stdlib-essentials/71-code-eval-sandboxed/71-code-eval-sandboxed.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "01-basico/text-and-binaries/04-strings-and-binaries-basics/04-strings-and-binaries-basics.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "01-basico/text-and-binaries/16-sigils-and-regex/16-sigils-and-regex.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "01-basico/text-and-binaries/18-charlists-vs-strings/18-charlists-vs-strings.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "01-basico/text-and-binaries/22-string-chars-protocol/22-string-chars-protocol.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "01-basico/text-and-binaries/24-bitstrings-binarios-avanzados/24-bitstrings-binarios-avanzados.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "01-basico/text-and-binaries/28-binaries-bit-syntax/28-binaries-bit-syntax.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "01-basico/text-and-binaries/48-unicode-normalization/48-unicode-normalization.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "01-basico/text-and-binaries/49-string-split-trim-edge/49-string-split-trim-edge.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "01-basico/text-and-binaries/50-binary-construction/50-binary-construction.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "01-basico/text-and-binaries/51-base64-url-encoding/51-base64-url-encoding.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/applications-and-releases/06-application-callbacks/06-application-callbacks.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "02-intermedio/applications-and-releases/20-configuracion-config-runtime/20-configuracion-config-runtime.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "02-intermedio/applications-and-releases/21-releases-mix-basico/21-releases-mix-basico.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "02-intermedio/applications-and-releases/66-app-env-runtime/66-app-env-runtime.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "02-intermedio/applications-and-releases/67-get-env-vs-compile-env/67-get-env-vs-compile-env.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/applications-and-releases/68-release-config-providers/68-release-config-providers.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "02-intermedio/applications-and-releases/69-release-runtime-overlays/69-release-runtime-overlays.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "02-intermedio/applications-and-releases/70-release-eval-rpc/70-release-eval-rpc.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "02-intermedio/applications-and-releases/71-umbrella-intro/71-umbrella-intro.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/applications-and-releases/72-release-hot-upgrade-intro/72-release-hot-upgrade-intro.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "02-intermedio/applications-and-releases/73-release-systemd-packaging/73-release-systemd-packaging.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "02-intermedio/ets-basics/100-named-public-private/100-named-public-private.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/ets-basics/101-lookup-benchmark/101-lookup-benchmark.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/ets-basics/13-ets-basico/13-ets-basico.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/ets-basics/95-set-vs-bag/95-set-vs-bag.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/ets-basics/96-ordered-set-range/96-ordered-set-range.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/ets-basics/97-match-object/97-match-object.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/ets-basics/98-select-match-spec/98-select-match-spec.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/ets-basics/99-ets-counters/99-ets-counters.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/integrations-basics/128-ecto-changesets/128-ecto-changesets.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/integrations-basics/129-ecto-migrations/129-ecto-migrations.md",
+      "passed": 17,
+      "failed_items": [
+        9,
+        19,
+        20
+      ]
+    },
+    {
+      "file": "02-intermedio/integrations-basics/130-ecto-repo-transactions/130-ecto-repo-transactions.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/integrations-basics/131-telemetry-metrics-prom/131-telemetry-metrics-prom.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/integrations-basics/132-telemetry-span/132-telemetry-span.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/integrations-basics/133-req-http/133-req-http.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "02-intermedio/integrations-basics/134-finch-pool/134-finch-pool.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "02-intermedio/integrations-basics/135-jason-vs-poison/135-jason-vs-poison.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/integrations-basics/136-nimble-json-lite/136-nimble-json-lite.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "02-intermedio/integrations-basics/137-nimble-options/137-nimble-options.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "02-intermedio/integrations-basics/138-csv-streaming/138-csv-streaming.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/integrations-basics/139-broadway-rabbit-basic/139-broadway-rabbit-basic.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "02-intermedio/integrations-basics/140-httpoison-migration/140-httpoison-migration.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "02-intermedio/integrations-basics/28-telemetry-basico/28-telemetry-basico.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/integrations-basics/29-ecto-basico/29-ecto-basico.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "02-intermedio/integrations-basics/35-nimbleparsec-csv-basico/35-nimbleparsec-csv-basico.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/macros-intro/12-macros-y-quote-unquote/12-macros-y-quote-unquote.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/macros-intro/23-kernel-y-builtins-avanzados/23-kernel-y-builtins-avanzados.md",
+      "passed": 10,
+      "failed_items": [
+        3,
+        4,
+        5,
+        8,
+        9,
+        10,
+        11,
+        12,
+        14,
+        16
+      ]
+    },
+    {
+      "file": "02-intermedio/macros-intro/87-macro-unless/87-macro-unless.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/macros-intro/88-macro-trace-function/88-macro-trace-function.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/macros-intro/89-macro-compile-time-config/89-macro-compile-time-config.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/macros-intro/90-macro-pipeline-ops/90-macro-pipeline-ops.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/macros-intro/91-macro-guard-friendly/91-macro-guard-friendly.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/macros-intro/92-macro-safe-injection/92-macro-safe-injection.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/macros-intro/93-quote-bind-quoted/93-quote-bind-quoted.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/macros-intro/94-macro-hygiene-pitfalls/94-macro-hygiene-pitfalls.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/otp-agents-and-tasks/02-agent-basico/02-agent-basico.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/otp-agents-and-tasks/03-task-y-concurrencia/03-task-y-concurrencia.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/otp-agents-and-tasks/31-concurrency-patterns-fan-out/31-concurrency-patterns-fan-out.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/otp-agents-and-tasks/48-agent-ttl-cache/48-agent-ttl-cache.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/otp-agents-and-tasks/49-agent-vs-genserver-tradeoff/49-agent-vs-genserver-tradeoff.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "02-intermedio/otp-agents-and-tasks/50-task-await-many/50-task-await-many.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/otp-agents-and-tasks/51-task-async-stream-images/51-task-async-stream-images.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/otp-agents-and-tasks/52-task-sup-fire-forget/52-task-sup-fire-forget.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "02-intermedio/otp-agents-and-tasks/53-task-yield-many-timeouts/53-task-yield-many-timeouts.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/otp-agents-and-tasks/54-task-shutdown-semantics/54-task-shutdown-semantics.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/otp-agents-and-tasks/55-bounded-concurrency-pool/55-bounded-concurrency-pool.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/otp-genservers/01-procesos-spawn-send-receive/01-procesos-spawn-send-receive.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/otp-genservers/04-genserver-basico/04-genserver-basico.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/otp-genservers/30-process-dictionary-erlang/30-process-dictionary-erlang.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/otp-genservers/36-genserver-counter-reset/36-genserver-counter-reset.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/otp-genservers/37-genserver-bounded-buffer/37-genserver-bounded-buffer.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/otp-genservers/38-genserver-rate-counter/38-genserver-rate-counter.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/otp-genservers/39-call-vs-cast-tradeoffs/39-call-vs-cast-tradeoffs.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/otp-genservers/40-handle-info-timers/40-handle-info-timers.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "02-intermedio/otp-genservers/41-monitor-external-process/41-monitor-external-process.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/otp-genservers/42-terminate-cleanup/42-terminate-cleanup.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/otp-genservers/43-state-validation/43-state-validation.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/otp-genservers/44-stop-reasons/44-stop-reasons.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/otp-genservers/45-format-status-debug/45-format-status-debug.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/otp-genservers/46-proxy-delegator/46-proxy-delegator.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "02-intermedio/otp-genservers/47-testing-with-mox/47-testing-with-mox.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/otp-genservers/48-hibernation-memory/48-hibernation-memory.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/protocols-and-behaviours/07-behaviours-y-callbacks/07-behaviours-y-callbacks.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/protocols-and-behaviours/08-protocols/08-protocols.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/protocols-and-behaviours/32-string-chars-inspect-protocol/32-string-chars-inspect-protocol.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/protocols-and-behaviours/33-access-behaviour/33-access-behaviour.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/protocols-and-behaviours/34-collectable-enumerable/34-collectable-enumerable.md",
+      "passed": 12,
+      "failed_items": [
+        3,
+        4,
+        5,
+        8,
+        9,
+        10,
+        11,
+        16
+      ]
+    },
+    {
+      "file": "02-intermedio/protocols-and-behaviours/74-protocol-jsonable/74-protocol-jsonable.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "02-intermedio/protocols-and-behaviours/75-protocol-fallback-any/75-protocol-fallback-any.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/protocols-and-behaviours/76-behaviour-adapter/76-behaviour-adapter.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/protocols-and-behaviours/77-behaviour-strategy/77-behaviour-strategy.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/protocols-and-behaviours/78-protocol-vs-behaviour/78-protocol-vs-behaviour.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "02-intermedio/protocols-and-behaviours/79-enumerable-custom-tree/79-enumerable-custom-tree.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/protocols-and-behaviours/80-inspect-algebra-custom/80-inspect-algebra-custom.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "02-intermedio/registries-and-naming/14-registry-dinamico/14-registry-dinamico.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "02-intermedio/registries-and-naming/81-registry-pubsub/81-registry-pubsub.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/registries-and-naming/82-registry-partitioned/82-registry-partitioned.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/registries-and-naming/83-registry-vs-global/83-registry-vs-global.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/registries-and-naming/84-via-tuple-patterns/84-via-tuple-patterns.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/registries-and-naming/85-process-groups-pg/85-process-groups-pg.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/registries-and-naming/86-naming-strategies-review/86-naming-strategies-review.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "02-intermedio/registries-and-naming/87-via-hibernation-error-handling/87-via-hibernation-error-handling.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/streams-and-lazy/10-comprehensions-avanzadas/10-comprehensions-avanzadas.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/streams-and-lazy/102-stream-resource-file/102-stream-resource-file.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/streams-and-lazy/103-stream-unfold-fibonacci/103-stream-unfold-fibonacci.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/streams-and-lazy/104-stream-zip-timelines/104-stream-zip-timelines.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/streams-and-lazy/105-stream-chunk-every/105-stream-chunk-every.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/streams-and-lazy/106-stream-transform-stateful/106-stream-transform-stateful.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/streams-and-lazy/107-genstage-producer-consumer/107-genstage-producer-consumer.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "02-intermedio/streams-and-lazy/108-genstage-buffer-demand/108-genstage-buffer-demand.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "02-intermedio/streams-and-lazy/109-flow-parallel-word-count/109-flow-parallel-word-count.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/streams-and-lazy/11-streams-lazy-evaluation/11-streams-lazy-evaluation.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/streams-and-lazy/27-genstage-basico/27-genstage-basico.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "02-intermedio/supervision-basics/05-supervisor-basico/05-supervisor-basico.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "02-intermedio/supervision-basics/26-dynamic-supervisor/26-dynamic-supervisor.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "02-intermedio/supervision-basics/56-one-for-one/56-one-for-one.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "02-intermedio/supervision-basics/57-one-for-all/57-one-for-all.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "02-intermedio/supervision-basics/58-rest-for-one/58-rest-for-one.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "02-intermedio/supervision-basics/59-max-restarts-intensity/59-max-restarts-intensity.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "02-intermedio/supervision-basics/60-child-spec-custom/60-child-spec-custom.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "02-intermedio/supervision-basics/61-dynamic-sup-worker-pool/61-dynamic-sup-worker-pool.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "02-intermedio/supervision-basics/62-shutdown-timeouts/62-shutdown-timeouts.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "02-intermedio/supervision-basics/63-nested-trees/63-nested-trees.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "02-intermedio/supervision-basics/64-transient-temporary-permanent/64-transient-temporary-permanent.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "02-intermedio/supervision-basics/65-testing-restarts/65-testing-restarts.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "02-intermedio/testing-and-quality/110-exunit-setup-contexts/110-exunit-setup-contexts.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "02-intermedio/testing-and-quality/111-exunit-tags/111-exunit-tags.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "02-intermedio/testing-and-quality/112-capture-log/112-capture-log.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "02-intermedio/testing-and-quality/113-start-supervised/113-start-supervised.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "02-intermedio/testing-and-quality/114-doctests-with-assertions/114-doctests-with-assertions.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "02-intermedio/testing-and-quality/115-typespecs-opaque/115-typespecs-opaque.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/testing-and-quality/116-dialyzer-success-typing/116-dialyzer-success-typing.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "02-intermedio/testing-and-quality/117-stream-data-basics/117-stream-data-basics.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "02-intermedio/testing-and-quality/118-mox-verify-on-exit/118-mox-verify-on-exit.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/testing-and-quality/119-coverage-ci/119-coverage-ci.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "02-intermedio/testing-and-quality/15-spec-y-tipado/15-spec-y-tipado.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/testing-and-quality/16-testing-exunit/16-testing-exunit.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "02-intermedio/tooling-and-ecosystem/120-mix-generator/120-mix-generator.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "02-intermedio/tooling-and-ecosystem/121-mix-aliases/121-mix-aliases.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/tooling-and-ecosystem/122-hex-publish-private/122-hex-publish-private.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/tooling-and-ecosystem/123-iex-helpers/123-iex-helpers.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/tooling-and-ecosystem/124-observer-inspection/124-observer-inspection.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "02-intermedio/tooling-and-ecosystem/125-recon-intro/125-recon-intro.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/tooling-and-ecosystem/126-credo-rules/126-credo-rules.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/tooling-and-ecosystem/127-formatter-custom/127-formatter-custom.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/tooling-and-ecosystem/17-debugging-io-inspect/17-debugging-io-inspect.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/tooling-and-ecosystem/18-mix-tasks-personalizadas/18-mix-tasks-personalizadas.md",
+      "passed": 19,
+      "failed_items": [
+        19
+      ]
+    },
+    {
+      "file": "02-intermedio/tooling-and-ecosystem/19-dependencias-hex/19-dependencias-hex.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "02-intermedio/tooling-and-ecosystem/22-documentacion-exdoc/22-documentacion-exdoc.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/advanced-testing/200-mox-stub-many/200-mox-stub-many.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/advanced-testing/288-stream-data-generators/288-stream-data-generators.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/advanced-testing/289-mox-contracts-behaviours/289-mox-contracts-behaviours.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/advanced-testing/290-bypass-http-tests/290-bypass-http-tests.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/advanced-testing/291-ecto-sandbox-modes/291-ecto-sandbox-modes.md",
+      "passed": 19,
+      "failed_items": [
+        10
+      ]
+    },
+    {
+      "file": "03-avanzado/advanced-testing/292-genserver-telemetry-testing/292-genserver-telemetry-testing.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/advanced-testing/293-capture-log-assert-raise/293-capture-log-assert-raise.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/advanced-testing/294-supervisor-restart-testing/294-supervisor-restart-testing.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/advanced-testing/295-async-tests-isolation/295-async-tests-isolation.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/advanced-testing/296-phoenix-conn-integration/296-phoenix-conn-integration.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/advanced-testing/297-doctest-side-effects/297-doctest-side-effects.md",
+      "passed": 19,
+      "failed_items": [
+        10
+      ]
+    },
+    {
+      "file": "03-avanzado/advanced-testing/298-benchmark-regression/298-benchmark-regression.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/advanced-testing/299-ex-machina-factories/299-ex-machina-factories.md",
+      "passed": 19,
+      "failed_items": [
+        10
+      ]
+    },
+    {
+      "file": "03-avanzado/advanced-testing/300-peer-distributed-testing/300-peer-distributed-testing.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/advanced-testing/301-mutation-testing-elixir/301-mutation-testing-elixir.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/advanced-testing/302-contract-testing-pact/302-contract-testing-pact.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/advanced-testing/38-mox-testing/38-mox-testing.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/advanced-testing/39-property-based-testing/39-property-based-testing.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/advanced-testing/40-bypass-http-testing/40-bypass-http-testing.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/advanced-testing/41-concurrent-testing-exunit/41-concurrent-testing-exunit.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/apis-and-graphql/245-subscriptions-pubsub/245-subscriptions-pubsub.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/apis-and-graphql/246-batching-n-plus-1/246-batching-n-plus-1.md",
+      "passed": 19,
+      "failed_items": [
+        19
+      ]
+    },
+    {
+      "file": "03-avanzado/apis-and-graphql/247-dataloader-ecto/247-dataloader-ecto.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/apis-and-graphql/248-middleware-auth/248-middleware-auth.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/apis-and-graphql/249-complexity-analysis/249-complexity-analysis.md",
+      "passed": 19,
+      "failed_items": [
+        19
+      ]
+    },
+    {
+      "file": "03-avanzado/apis-and-graphql/250-file-uploads/250-file-uploads.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/apis-and-graphql/251-openapi-gen/251-openapi-gen.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/apis-and-graphql/252-pagination-cursor/252-pagination-cursor.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/apis-and-graphql/331-absinthe-dataloader/331-absinthe-dataloader.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/apis-and-graphql/332-absinthe-subscriptions/332-absinthe-subscriptions.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/apis-and-graphql/333-persisted-queries-complexity/333-persisted-queries-complexity.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/apis-and-graphql/334-rest-api-versioning/334-rest-api-versioning.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/apis-and-graphql/335-openapi-spex-generation/335-openapi-spex-generation.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/apis-and-graphql/336-jwt-joken-refresh/336-jwt-joken-refresh.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/apis-and-graphql/337-oauth2-assent-flow/337-oauth2-assent-flow.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/apis-and-graphql/338-webhooks-hmac-signed/338-webhooks-hmac-signed.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/apis-and-graphql/339-rate-limit-api-key-ets/339-rate-limit-api-key-ets.md",
+      "passed": 19,
+      "failed_items": [
+        10
+      ]
+    },
+    {
+      "file": "03-avanzado/apis-and-graphql/340-relay-cursor-pagination/340-relay-cursor-pagination.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/apis-and-graphql/59-absinthe-graphql-schema/59-absinthe-graphql-schema.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/apis-and-graphql/60-absinthe-dataloader-auth/60-absinthe-dataloader-auth.md",
+      "passed": 19,
+      "failed_items": [
+        10
+      ]
+    },
+    {
+      "file": "03-avanzado/beam-internals-and-perf/152-recon-trace-prod/152-recon-trace-prod.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/beam-internals-and-perf/153-recon-info-top/153-recon-info-top.md",
+      "passed": 19,
+      "failed_items": [
+        10
+      ]
+    },
+    {
+      "file": "03-avanzado/beam-internals-and-perf/154-dbg-tpl/154-dbg-tpl.md",
+      "passed": 19,
+      "failed_items": [
+        10
+      ]
+    },
+    {
+      "file": "03-avanzado/beam-internals-and-perf/155-flame-graph-eflame/155-flame-graph-eflame.md",
+      "passed": 19,
+      "failed_items": [
+        10
+      ]
+    },
+    {
+      "file": "03-avanzado/beam-internals-and-perf/156-benchee-parallel/156-benchee-parallel.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/beam-internals-and-perf/157-benchee-memory/157-benchee-memory.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/beam-internals-and-perf/25-beam-schedulers-reductions/25-beam-schedulers-reductions.md",
+      "passed": 19,
+      "failed_items": [
+        10
+      ]
+    },
+    {
+      "file": "03-avanzado/beam-internals-and-perf/26-memory-profiling-recon/26-memory-profiling-recon.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/beam-internals-and-perf/27-tracing-sys-dbg/27-tracing-sys-dbg.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/beam-internals-and-perf/28-benchmarking-benchee/28-benchmarking-benchee.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/beam-internals-and-perf/29-binary-matching-performance/29-binary-matching-performance.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/beam-internals-and-perf/360-scheduler-observation/360-scheduler-observation.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/beam-internals-and-perf/361-reductions-budget-bump/361-reductions-budget-bump.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/beam-internals-and-perf/362-process-heap-tuning/362-process-heap-tuning.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/beam-internals-and-perf/363-gc-tuning-per-process/363-gc-tuning-per-process.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/beam-internals-and-perf/364-binary-refc-leaks/364-binary-refc-leaks.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/beam-internals-and-perf/365-jit-beamasm-considerations/365-jit-beamasm-considerations.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/beam-internals-and-perf/366-recon-production-diagnosis/366-recon-production-diagnosis.md",
+      "passed": 19,
+      "failed_items": [
+        10
+      ]
+    },
+    {
+      "file": "03-avanzado/beam-internals-and-perf/48-mix-release-advanced/48-mix-release-advanced.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/beam-internals-and-perf/50-competitive-programming-graphs/50-competitive-programming-graphs.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/data-pipelines/173-dispatcher-broadcast/173-dispatcher-broadcast.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/data-pipelines/174-dispatcher-partition/174-dispatcher-partition.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/data-pipelines/175-dispatcher-demand/175-dispatcher-demand.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/data-pipelines/176-broadway-sqs/176-broadway-sqs.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/data-pipelines/177-broadway-rabbit/177-broadway-rabbit.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/data-pipelines/178-broadway-batcher/178-broadway-batcher.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/data-pipelines/179-broadway-ack-custom/179-broadway-ack-custom.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/data-pipelines/34-genstage-advanced/34-genstage-advanced.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/data-pipelines/341-genstage-producer-consumer/341-genstage-producer-consumer.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/data-pipelines/342-flow-parallel-mapreduce/342-flow-parallel-mapreduce.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/data-pipelines/343-broadway-rabbitmq/343-broadway-rabbitmq.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/data-pipelines/344-broadway-sqs-batchers/344-broadway-sqs-batchers.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/data-pipelines/345-broadway-kafka-partition/345-broadway-kafka-partition.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/data-pipelines/346-stream-gzip-composition/346-stream-gzip-composition.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/data-pipelines/347-nimble-csv-huge-files/347-nimble-csv-huge-files.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/data-pipelines/348-exactly-once-idempotency/348-exactly-once-idempotency.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/data-pipelines/349-checkpointing-resumable/349-checkpointing-resumable.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/data-pipelines/35-broadway-data-pipelines/35-broadway-data-pipelines.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/data-pipelines/350-etl-http-flow-ecto/350-etl-http-flow-ecto.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/data-pipelines/69-broadway-kafka-pipelines/69-broadway-kafka-pipelines.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/distribution-and-clustering/101-libcluster-epmd/101-libcluster-epmd.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/distribution-and-clustering/106-pg2-to-pg/106-pg2-to-pg.md",
+      "passed": 11,
+      "failed_items": [
+        3,
+        4,
+        5,
+        8,
+        9,
+        10,
+        11,
+        12,
+        16
+      ]
+    },
+    {
+      "file": "03-avanzado/distribution-and-clustering/107-pubsub-redis/107-pubsub-redis.md",
+      "passed": 19,
+      "failed_items": [
+        10
+      ]
+    },
+    {
+      "file": "03-avanzado/distribution-and-clustering/108-erpc-vs-rpc/108-erpc-vs-rpc.md",
+      "passed": 19,
+      "failed_items": [
+        10
+      ]
+    },
+    {
+      "file": "03-avanzado/distribution-and-clustering/109-net-kernel-tick/109-net-kernel-tick.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/distribution-and-clustering/11-distributed-erlang-clustering/11-distributed-erlang-clustering.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/distribution-and-clustering/110-ping-monitoring/110-ping-monitoring.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/distribution-and-clustering/111-split-brain-handling/111-split-brain-handling.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/distribution-and-clustering/112-horde-locks/112-horde-locks.md",
+      "passed": 19,
+      "failed_items": [
+        10
+      ]
+    },
+    {
+      "file": "03-avanzado/distribution-and-clustering/12-global-process-registry/12-global-process-registry.md",
+      "passed": 19,
+      "failed_items": [
+        10
+      ]
+    },
+    {
+      "file": "03-avanzado/distribution-and-clustering/13-horde-distributed-registry/13-horde-distributed-registry.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/distribution-and-clustering/14-phoenix-pubsub-advanced/14-phoenix-pubsub-advanced.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/distribution-and-clustering/15-rpc-and-remote-calls/15-rpc-and-remote-calls.md",
+      "passed": 19,
+      "failed_items": [
+        10
+      ]
+    },
+    {
+      "file": "03-avanzado/distribution-and-clustering/367-libcluster-epmd-dns/367-libcluster-epmd-dns.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/distribution-and-clustering/368-horde-registry-dynamic-supervisor/368-horde-registry-dynamic-supervisor.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/distribution-and-clustering/369-phoenix-pubsub-distributed/369-phoenix-pubsub-distributed.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/distribution-and-clustering/370-node-monitoring/370-node-monitoring.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/distribution-and-clustering/371-global-locks/371-global-locks.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/distribution-and-clustering/372-distributed-rate-limiter-consistent-hashing/372-distributed-rate-limiter-consistent-hashing.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/distribution-and-clustering/373-split-brain-detection/373-split-brain-detection.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/domain-frameworks/268-nerves-ota/268-nerves-ota.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/domain-frameworks/269-nx-defn-autograd/269-nx-defn-autograd.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/domain-frameworks/270-axon-training-loop/270-axon-training-loop.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/domain-frameworks/271-axon-inference-server/271-axon-inference-server.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/domain-frameworks/380-ash-resource-actions/380-ash-resource-actions.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/domain-frameworks/381-commanded-aggregate-events-projections/381-commanded-aggregate-events-projections.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/domain-frameworks/382-cqrs-commanded-eventstore/382-cqrs-commanded-eventstore.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/domain-frameworks/383-event-sourcing-from-scratch-snapshots/383-event-sourcing-from-scratch-snapshots.md",
+      "passed": 19,
+      "failed_items": [
+        10
+      ]
+    },
+    {
+      "file": "03-avanzado/domain-frameworks/42-build-event-bus/42-build-event-bus.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/domain-frameworks/44-build-job-scheduler/44-build-job-scheduler.md",
+      "passed": 18,
+      "failed_items": [
+        19,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/domain-frameworks/46-oban-background-jobs/46-oban-background-jobs.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/domain-frameworks/49-livebook-integration/49-livebook-integration.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/domain-frameworks/61-nx-numerical-elixir/61-nx-numerical-elixir.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/domain-frameworks/62-axon-neural-networks/62-axon-neural-networks.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/domain-frameworks/63-nerves-iot-embedded/63-nerves-iot-embedded.md",
+      "passed": 19,
+      "failed_items": [
+        10
+      ]
+    },
+    {
+      "file": "03-avanzado/domain-frameworks/64-nerves-networking-cloud/64-nerves-networking-cloud.md",
+      "passed": 19,
+      "failed_items": [
+        10
+      ]
+    },
+    {
+      "file": "03-avanzado/domain-frameworks/65-commanded-aggregates-commands/65-commanded-aggregates-commands.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/domain-frameworks/66-commanded-projections-read-models/66-commanded-projections-read-models.md",
+      "passed": 19,
+      "failed_items": [
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/domain-frameworks/67-ash-framework-resources/67-ash-framework-resources.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/domain-frameworks/68-ash-extensions-api/68-ash-extensions-api.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/ecto-advanced/230-ecto-multi/230-ecto-multi.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/ecto-advanced/231-preload-nested/231-preload-nested.md",
+      "passed": 19,
+      "failed_items": [
+        10
+      ]
+    },
+    {
+      "file": "03-avanzado/ecto-advanced/272-multi-tenancy-prefix/272-multi-tenancy-prefix.md",
+      "passed": 19,
+      "failed_items": [
+        10
+      ]
+    },
+    {
+      "file": "03-avanzado/ecto-advanced/273-ecto-multi-transactions/273-ecto-multi-transactions.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/ecto-advanced/274-upsert-on-conflict/274-upsert-on-conflict.md",
+      "passed": 19,
+      "failed_items": [
+        10
+      ]
+    },
+    {
+      "file": "03-avanzado/ecto-advanced/275-custom-ecto-type-money/275-custom-ecto-type-money.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/ecto-advanced/276-polymorphic-associations/276-polymorphic-associations.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/ecto-advanced/277-preload-optimization/277-preload-optimization.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/ecto-advanced/278-window-functions-select-merge/278-window-functions-select-merge.md",
+      "passed": 19,
+      "failed_items": [
+        10
+      ]
+    },
+    {
+      "file": "03-avanzado/ecto-advanced/279-ctes-recursive-queries/279-ctes-recursive-queries.md",
+      "passed": 19,
+      "failed_items": [
+        10
+      ]
+    },
+    {
+      "file": "03-avanzado/ecto-advanced/280-subqueries-advanced/280-subqueries-advanced.md",
+      "passed": 19,
+      "failed_items": [
+        10
+      ]
+    },
+    {
+      "file": "03-avanzado/ecto-advanced/281-schemaless-queries-etl/281-schemaless-queries-etl.md",
+      "passed": 19,
+      "failed_items": [
+        10
+      ]
+    },
+    {
+      "file": "03-avanzado/ecto-advanced/282-zero-downtime-migrations/282-zero-downtime-migrations.md",
+      "passed": 19,
+      "failed_items": [
+        10
+      ]
+    },
+    {
+      "file": "03-avanzado/ecto-advanced/283-row-level-locking/283-row-level-locking.md",
+      "passed": 19,
+      "failed_items": [
+        10
+      ]
+    },
+    {
+      "file": "03-avanzado/ecto-advanced/284-soft-delete-global-filter/284-soft-delete-global-filter.md",
+      "passed": 19,
+      "failed_items": [
+        10
+      ]
+    },
+    {
+      "file": "03-avanzado/ecto-advanced/285-full-text-search-tsvector/285-full-text-search-tsvector.md",
+      "passed": 19,
+      "failed_items": [
+        10
+      ]
+    },
+    {
+      "file": "03-avanzado/ecto-advanced/286-embedded-schemas-nested-changesets/286-embedded-schemas-nested-changesets.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/ecto-advanced/287-custom-query-macros/287-custom-query-macros.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "03-avanzado/ecto-advanced/55-ecto-queries-avanzadas/55-ecto-queries-avanzadas.md",
+      "passed": 19,
+      "failed_items": [
+        10
+      ]
+    },
+    {
+      "file": "03-avanzado/ecto-advanced/56-ecto-schemas-avanzados/56-ecto-schemas-avanzados.md",
+      "passed": 19,
+      "failed_items": [
+        10
+      ]
+    },
+    {
+      "file": "03-avanzado/ets-dets-mnesia/116-ets-sharding/116-ets-sharding.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "03-avanzado/ets-dets-mnesia/121-mnesia-ram/121-mnesia-ram.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/ets-dets-mnesia/122-mnesia-disc-transactions/122-mnesia-disc-transactions.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/ets-dets-mnesia/123-mnesia-dirty-ops/123-mnesia-dirty-ops.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "03-avanzado/ets-dets-mnesia/124-mnesia-fragmented/124-mnesia-fragmented.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "03-avanzado/ets-dets-mnesia/125-mnesia-vs-postgres/125-mnesia-vs-postgres.md",
+      "passed": 18,
+      "failed_items": [
+        9,
+        10
+      ]
+    },
+    {
+      "file": "03-avanzado/ets-dets-mnesia/126-dets-vs-ets/126-dets-vs-ets.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "03-avanzado/ets-dets-mnesia/127-cache-lru/127-cache-lru.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "03-avanzado/ets-dets-mnesia/16-ets-advanced-concurrent/16-ets-advanced-concurrent.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "03-avanzado/ets-dets-mnesia/17-dets-persistent-storage/17-dets-persistent-storage.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "03-avanzado/ets-dets-mnesia/18-mnesia-basics/18-mnesia-basics.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "03-avanzado/ets-dets-mnesia/19-cache-patterns-ets/19-cache-patterns-ets.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "03-avanzado/ets-dets-mnesia/20-ets-counter-and-atomics/20-ets-counter-and-atomics.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "03-avanzado/ets-dets-mnesia/374-ets-match-specs/374-ets-match-specs.md",
+      "passed": 19,
+      "failed_items": [
+        8
+      ]
+    },
+    {
+      "file": "03-avanzado/ets-dets-mnesia/375-ordered-set-range-queries/375-ordered-set-range-queries.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/ets-dets-mnesia/376-dets-persistence/376-dets-persistence.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/ets-dets-mnesia/377-mnesia-transactions-indices/377-mnesia-transactions-indices.md",
+      "passed": 19,
+      "failed_items": [
+        8
+      ]
+    },
+    {
+      "file": "03-avanzado/ets-dets-mnesia/378-mnesia-distributed-replicas/378-mnesia-distributed-replicas.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/ets-dets-mnesia/379-ets-shard-pattern/379-ets-shard-pattern.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/ets-dets-mnesia/43-build-cache-server/43-build-cache-server.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/interop-and-native/161-rustler-binary/161-rustler-binary.md",
+      "passed": 17,
+      "failed_items": [
+        8,
+        9,
+        11
+      ]
+    },
+    {
+      "file": "03-avanzado/interop-and-native/162-rustler-dirty/162-rustler-dirty.md",
+      "passed": 17,
+      "failed_items": [
+        8,
+        9,
+        11
+      ]
+    },
+    {
+      "file": "03-avanzado/interop-and-native/163-nif-resources/163-nif-resources.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "03-avanzado/interop-and-native/164-port-driver/164-port-driver.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "03-avanzado/interop-and-native/30-erlang-interop-advanced/30-erlang-interop-advanced.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "03-avanzado/interop-and-native/31-ports-external-processes/31-ports-external-processes.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "03-avanzado/interop-and-native/318-rustler-nif-typed/318-rustler-nif-typed.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/interop-and-native/319-dirty-nif-cpu-bound/319-dirty-nif-cpu-bound.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/interop-and-native/32-nifs-basics-rustler/32-nifs-basics-rustler.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/interop-and-native/320-port-driver-streaming/320-port-driver-streaming.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/interop-and-native/321-port-open-subprocess/321-port-open-subprocess.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/interop-and-native/322-erlexec-resource-limits/322-erlexec-resource-limits.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/interop-and-native/323-zigler-nif-basics/323-zigler-nif-basics.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/interop-and-native/324-cnode-integration/324-cnode-integration.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/interop-and-native/325-nif-resource-env/325-nif-resource-env.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/interop-and-native/326-ets-shared-nif-readers/326-ets-shared-nif-readers.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/interop-and-native/327-erlport-python-bridge/327-erlport-python-bridge.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/interop-and-native/328-port-nodejs-json-framing/328-port-nodejs-json-framing.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/interop-and-native/329-embed-binary-resources/329-embed-binary-resources.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/interop-and-native/330-system-cmd-timeout-wrapper/330-system-cmd-timeout-wrapper.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/metaprogramming/131-unquote-fragment/131-unquote-fragment.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "03-avanzado/metaprogramming/132-compile-tracer/132-compile-tracer.md",
+      "passed": 18,
+      "failed_items": [
+        9,
+        10
+      ]
+    },
+    {
+      "file": "03-avanzado/metaprogramming/133-attr-accumulate/133-attr-accumulate.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "03-avanzado/metaprogramming/134-defdelegate-custom/134-defdelegate-custom.md",
+      "passed": 18,
+      "failed_items": [
+        9,
+        10
+      ]
+    },
+    {
+      "file": "03-avanzado/metaprogramming/135-use-with-opts/135-use-with-opts.md",
+      "passed": 18,
+      "failed_items": [
+        9,
+        10
+      ]
+    },
+    {
+      "file": "03-avanzado/metaprogramming/136-quoted-as-literal/136-quoted-as-literal.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "03-avanzado/metaprogramming/137-protocol-derive/137-protocol-derive.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "03-avanzado/metaprogramming/138-fallback-any/138-fallback-any.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "03-avanzado/metaprogramming/139-optional-callbacks/139-optional-callbacks.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "03-avanzado/metaprogramming/140-ast-walker/140-ast-walker.md",
+      "passed": 18,
+      "failed_items": [
+        9,
+        19
+      ]
+    },
+    {
+      "file": "03-avanzado/metaprogramming/141-macro-expand-debug/141-macro-expand-debug.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "03-avanzado/metaprogramming/142-dsl-schema-builder/142-dsl-schema-builder.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "03-avanzado/metaprogramming/143-dsl-router-builder/143-dsl-router-builder.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "03-avanzado/metaprogramming/144-spec-gen/144-spec-gen.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "03-avanzado/metaprogramming/21-advanced-macros-ast/21-advanced-macros-ast.md",
+      "passed": 18,
+      "failed_items": [
+        9,
+        10
+      ]
+    },
+    {
+      "file": "03-avanzado/metaprogramming/22-custom-dsl-with-macros/22-custom-dsl-with-macros.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "03-avanzado/metaprogramming/23-protocol-consolidation/23-protocol-consolidation.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "03-avanzado/metaprogramming/24-behaviours-custom-advanced/24-behaviours-custom-advanced.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "03-avanzado/metaprogramming/388-compile-time-config-validation-on-load/388-compile-time-config-validation-on-load.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/metaprogramming/389-dsl-macro-prewalk-special-forms/389-dsl-macro-prewalk-special-forms.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/otp-advanced/01-genserver-hibernation-state-compaction/01-genserver-hibernation-state-compaction.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/otp-advanced/02-genserver-handle-continue-recovery/02-genserver-handle-continue-recovery.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "03-avanzado/otp-advanced/03-genserver-timeouts-and-heartbeats/03-genserver-timeouts-and-heartbeats.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/otp-advanced/04-genserver-back-pressure-queue/04-genserver-back-pressure-queue.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "03-avanzado/otp-advanced/05-genserver-hot-state-migration/05-genserver-hot-state-migration.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/otp-advanced/33-gen-statem-state-machine/33-gen-statem-state-machine.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/otp-advanced/384-gen-statem-state-functions-vs-handle-event/384-gen-statem-state-functions-vs-handle-event.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/otp-advanced/385-proc-lib-sys-handrolled-behaviour/385-proc-lib-sys-handrolled-behaviour.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/otp-advanced/386-hot-code-upgrades-release-handler/386-hot-code-upgrades-release-handler.md",
+      "passed": 19,
+      "failed_items": [
+        19
+      ]
+    },
+    {
+      "file": "03-avanzado/otp-advanced/387-genserver-hibernation-idle-memory/387-genserver-hibernation-idle-memory.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/otp-advanced/72-gen-statem-retry/72-gen-statem-retry.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "03-avanzado/otp-advanced/73-selective-receive/73-selective-receive.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "03-avanzado/otp-advanced/77-sys-replace-state-live/77-sys-replace-state-live.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "03-avanzado/otp-advanced/78-sys-suspend-resume/78-sys-suspend-resume.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "03-avanzado/otp-advanced/79-proc-lib-start-link/79-proc-lib-start-link.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "03-avanzado/otp-advanced/80-special-process-impl/80-special-process-impl.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "03-avanzado/otp-advanced/81-call-from-self-deadlock/81-call-from-self-deadlock.md",
+      "passed": 18,
+      "failed_items": [
+        9,
+        19
+      ]
+    },
+    {
+      "file": "03-avanzado/otp-advanced/82-reply-async/82-reply-async.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "03-avanzado/otp-advanced/83-timers-send-after-vs-schedule/83-timers-send-after-vs-schedule.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "03-avanzado/otp-advanced/84-trap-exit-semantics/84-trap-exit-semantics.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "03-avanzado/phoenix-ecosystem/218-channels-binary/218-channels-binary.md",
+      "passed": 18,
+      "failed_items": [
+        9,
+        10
+      ]
+    },
+    {
+      "file": "03-avanzado/phoenix-ecosystem/219-channels-auth/219-channels-auth.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/phoenix-ecosystem/220-channels-intercept/220-channels-intercept.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/phoenix-ecosystem/221-presence-metas/221-presence-metas.md",
+      "passed": 18,
+      "failed_items": [
+        9,
+        10
+      ]
+    },
+    {
+      "file": "03-avanzado/phoenix-ecosystem/222-plug-auth-custom/222-plug-auth-custom.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/phoenix-ecosystem/351-liveview-stateful-streams/351-liveview-stateful-streams.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/phoenix-ecosystem/352-liveview-uploads-progress/352-liveview-uploads-progress.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/phoenix-ecosystem/353-liveview-js-interactions/353-liveview-js-interactions.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/phoenix-ecosystem/354-channels-presence/354-channels-presence.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/phoenix-ecosystem/355-pubsub-local-vs-distributed/355-pubsub-local-vs-distributed.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/phoenix-ecosystem/356-phoenix-token-signing/356-phoenix-token-signing.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/phoenix-ecosystem/357-livedashboard-custom-metrics/357-livedashboard-custom-metrics.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/phoenix-ecosystem/358-tailwind-esbuild-pipeline/358-tailwind-esbuild-pipeline.md",
+      "passed": 19,
+      "failed_items": [
+        8
+      ]
+    },
+    {
+      "file": "03-avanzado/phoenix-ecosystem/359-endpoint-custom-plug-pipeline/359-endpoint-custom-plug-pipeline.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/phoenix-ecosystem/51-phoenix-liveview-real-time/51-phoenix-liveview-real-time.md",
+      "passed": 19,
+      "failed_items": [
+        10
+      ]
+    },
+    {
+      "file": "03-avanzado/phoenix-ecosystem/52-phoenix-livecomponent/52-phoenix-livecomponent.md",
+      "passed": 19,
+      "failed_items": [
+        10
+      ]
+    },
+    {
+      "file": "03-avanzado/phoenix-ecosystem/53-phoenix-channels/53-phoenix-channels.md",
+      "passed": 19,
+      "failed_items": [
+        10
+      ]
+    },
+    {
+      "file": "03-avanzado/phoenix-ecosystem/54-phoenix-presence-channels/54-phoenix-presence-channels.md",
+      "passed": 19,
+      "failed_items": [
+        10
+      ]
+    },
+    {
+      "file": "03-avanzado/phoenix-ecosystem/57-plug-pipeline-middleware/57-plug-pipeline-middleware.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/phoenix-ecosystem/58-plug-router-api/58-plug-router-api.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/resilience-patterns/303-circuit-breaker-states-ets/303-circuit-breaker-states-ets.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/resilience-patterns/304-bulkhead-process-pools/304-bulkhead-process-pools.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/resilience-patterns/305-retry-exponential-backoff-jitter/305-retry-exponential-backoff-jitter.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/resilience-patterns/306-timeout-hierarchies/306-timeout-hierarchies.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/resilience-patterns/307-fallback-chains-with/307-fallback-chains-with.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/resilience-patterns/308-bounded-queue-genstage-backpressure/308-bounded-queue-genstage-backpressure.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/resilience-patterns/309-load-shedding-token-bucket/309-load-shedding-token-bucket.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/resilience-patterns/310-graceful-degradation-feature-flags/310-graceful-degradation-feature-flags.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/resilience-patterns/311-deadline-propagation-processes/311-deadline-propagation-processes.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/resilience-patterns/312-chaos-engineering-suspend-kill/312-chaos-engineering-suspend-kill.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/resilience-patterns/313-idempotency-keys-ets-ttl/313-idempotency-keys-ets-ttl.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/resilience-patterns/314-dead-letter-queue/314-dead-letter-queue.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/resilience-patterns/315-saga-compensating-actions/315-saga-compensating-actions.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/resilience-patterns/316-hedged-requests/316-hedged-requests.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/resilience-patterns/317-adaptive-concurrency-limits/317-adaptive-concurrency-limits.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/resilience-patterns/36-circuit-breaker-patterns/36-circuit-breaker-patterns.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "03-avanzado/resilience-patterns/37-rate-limiting-patterns/37-rate-limiting-patterns.md",
+      "passed": 19,
+      "failed_items": [
+        10
+      ]
+    },
+    {
+      "file": "03-avanzado/resilience-patterns/45-build-api-client-wrapper/45-build-api-client-wrapper.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/resilience-patterns/70-req-finch-http-clients/70-req-finch-http-clients.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/resilience-patterns/71-rate-limiter-ets/71-rate-limiter-ets.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "03-avanzado/supervision-advanced/06-supervision-strategies-advanced/06-supervision-strategies-advanced.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/supervision-advanced/07-partition-supervisor/07-partition-supervisor.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/supervision-advanced/08-task-supervisor-dynamic/08-task-supervisor-dynamic.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/supervision-advanced/09-supervision-tree-design/09-supervision-tree-design.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/supervision-advanced/10-graceful-shutdown-drain/10-graceful-shutdown-drain.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/supervision-advanced/390-rest-for-one-custom-restart-intensity/390-rest-for-one-custom-restart-intensity.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/supervision-advanced/391-partition-supervisor-lock-contention/391-partition-supervisor-lock-contention.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/supervision-advanced/47-umbrella-application/47-umbrella-application.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/supervision-advanced/87-partition-sup-sharded/87-partition-sup-sharded.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/supervision-advanced/88-drain-on-deploy/88-drain-on-deploy.md",
+      "passed": 19,
+      "failed_items": [
+        10
+      ]
+    },
+    {
+      "file": "03-avanzado/supervision-advanced/89-significant-child/89-significant-child.md",
+      "passed": 19,
+      "failed_items": [
+        10
+      ]
+    },
+    {
+      "file": "03-avanzado/supervision-advanced/90-bulkhead-supervisors/90-bulkhead-supervisors.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/supervision-advanced/91-umbrella-boot-order/91-umbrella-boot-order.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "03-avanzado/supervision-advanced/92-overlays-assemble/92-overlays-assemble.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "03-avanzado/supervision-advanced/93-dynamic-sup-autoscale/93-dynamic-sup-autoscale.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "03-avanzado/supervision-advanced/94-failure-isolation/94-failure-isolation.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "03-avanzado/supervision-advanced/95-task-sup-rate-limited/95-task-sup-rate-limited.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "03-avanzado/supervision-advanced/96-sup-metrics-telemetry/96-sup-metrics-telemetry.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "03-avanzado/supervision-advanced/97-adoption-patterns/97-adoption-patterns.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "03-avanzado/supervision-advanced/98-app-start-phases/98-app-start-phases.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "04-insane/concurrency-primitives/10-build-custom-genserver-supervisor/10-build-custom-genserver-supervisor.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "04-insane/concurrency-primitives/11-build-custom-event-bus-registry/11-build-custom-event-bus-registry.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "04-insane/concurrency-primitives/12-build-custom-process-pool/12-build-custom-process-pool.md",
+      "passed": 19,
+      "failed_items": [
+        10
+      ]
+    },
+    {
+      "file": "04-insane/concurrency-primitives/13-build-actor-framework-alternative/13-build-actor-framework-alternative.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "04-insane/concurrency-primitives/14-build-behaviour-callback-validator/14-build-behaviour-callback-validator.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "04-insane/data-and-integrations/20-build-crdt-data-structures/20-build-crdt-data-structures.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "04-insane/data-and-integrations/37-build-blockchain-simulation/37-build-blockchain-simulation.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "04-insane/data-and-integrations/43-build-ai-inference-engine/43-build-ai-inference-engine.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "04-insane/data-and-integrations/47-build-workflow-engine-temporal-like/47-build-workflow-engine-temporal-like.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "04-insane/distributed-systems/01-build-distributed-raft-consensus/01-build-distributed-raft-consensus.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "04-insane/distributed-systems/02-build-distributed-transaction-coordinator/02-build-distributed-transaction-coordinator.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "04-insane/distributed-systems/04-build-distributed-scheduler/04-build-distributed-scheduler.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "04-insane/distributed-systems/05-build-gossip-membership-protocol/05-build-gossip-membership-protocol.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "04-insane/distributed-systems/07-build-distributed-event-log/07-build-distributed-event-log.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "04-insane/distributed-systems/08-build-viewstamped-replication/08-build-viewstamped-replication.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "04-insane/distributed-systems/09-build-consistent-hashing-rebalancer/09-build-consistent-hashing-rebalancer.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "04-insane/distributed-systems/24-build-distributed-rate-limiter/24-build-distributed-rate-limiter.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "04-insane/distributed-systems/44-build-full-stack-distributed-system/44-build-full-stack-distributed-system.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "04-insane/distributed-systems/50-build-distributed-lock-service/50-build-distributed-lock-service.md",
+      "passed": 19,
+      "failed_items": [
+        10
+      ]
+    },
+    {
+      "file": "04-insane/distributed-systems/55-build-distributed-saga-orchestrator/55-build-distributed-saga-orchestrator.md",
+      "passed": 18,
+      "failed_items": [
+        10,
+        20
+      ]
+    },
+    {
+      "file": "04-insane/frameworks-and-engines/23-build-job-queue-with-retry/23-build-job-queue-with-retry.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "04-insane/frameworks-and-engines/31-build-test-framework/31-build-test-framework.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "04-insane/frameworks-and-engines/32-build-web-framework-phoenix-like/32-build-web-framework-phoenix-like.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "04-insane/frameworks-and-engines/33-build-rest-api-framework/33-build-rest-api-framework.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "04-insane/frameworks-and-engines/41-build-event-sourcing-cqrs-framework/41-build-event-sourcing-cqrs-framework.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "04-insane/frameworks-and-engines/42-build-custom-macro-dsl-system/42-build-custom-macro-dsl-system.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "04-insane/frameworks-and-engines/45-build-game-engine-ecs/45-build-game-engine-ecs.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "04-insane/frameworks-and-engines/46-build-liveview-clone/46-build-liveview-clone.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "04-insane/frameworks-and-engines/48-build-compile-time-type-system/48-build-compile-time-type-system.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "04-insane/frameworks-and-engines/49-build-reactive-streams/49-build-reactive-streams.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "04-insane/frameworks-and-engines/51-build-production-job-queue/51-build-production-job-queue.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "04-insane/frameworks-and-engines/52-build-multi-tenant-saas-framework/52-build-multi-tenant-saas-framework.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "04-insane/frameworks-and-engines/53-build-real-time-collaboration-engine/53-build-real-time-collaboration-engine.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "04-insane/frameworks-and-engines/54-build-ai-agents-framework/54-build-ai-agents-framework.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "04-insane/languages-and-compilers/25-build-lisp-interpreter/25-build-lisp-interpreter.md",
+      "passed": 19,
+      "failed_items": [
+        5
+      ]
+    },
+    {
+      "file": "04-insane/languages-and-compilers/26-build-mini-language-compiler/26-build-mini-language-compiler.md",
+      "passed": 19,
+      "failed_items": [
+        5
+      ]
+    },
+    {
+      "file": "04-insane/languages-and-compilers/27-build-regex-engine/27-build-regex-engine.md",
+      "passed": 18,
+      "failed_items": [
+        5,
+        19
+      ]
+    },
+    {
+      "file": "04-insane/languages-and-compilers/40-build-wasm-interpreter/40-build-wasm-interpreter.md",
+      "passed": 18,
+      "failed_items": [
+        5,
+        9
+      ]
+    },
+    {
+      "file": "04-insane/network-and-proxies/21-build-message-broker-amqp-like/21-build-message-broker-amqp-like.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "04-insane/network-and-proxies/22-build-stream-processor-flink-like/22-build-stream-processor-flink-like.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "04-insane/network-and-proxies/34-build-api-gateway/34-build-api-gateway.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "04-insane/network-and-proxies/35-build-load-balancer/35-build-load-balancer.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "04-insane/network-and-proxies/36-build-video-streaming-server/36-build-video-streaming-server.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "04-insane/network-and-proxies/38-build-p2p-file-sharing/38-build-p2p-file-sharing.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "04-insane/network-and-proxies/39-build-service-mesh-proxy/39-build-service-mesh-proxy.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "04-insane/observability/06-build-distributed-tracing-system/06-build-distributed-tracing-system.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "04-insane/observability/28-build-log-aggregation-system/28-build-log-aggregation-system.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "04-insane/observability/29-build-metrics-collector-prometheus-like/29-build-metrics-collector-prometheus-like.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "04-insane/observability/30-build-profiler-performance-analyzer/30-build-profiler-performance-analyzer.md",
+      "passed": 19,
+      "failed_items": [
+        9
+      ]
+    },
+    {
+      "file": "04-insane/storage-engines/03-build-distributed-cache-redis-like/03-build-distributed-cache-redis-like.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "04-insane/storage-engines/15-build-lsm-tree-storage-engine/15-build-lsm-tree-storage-engine.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "04-insane/storage-engines/16-build-in-memory-database/16-build-in-memory-database.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "04-insane/storage-engines/17-build-graph-database/17-build-graph-database.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "04-insane/storage-engines/18-build-time-series-database/18-build-time-series-database.md",
+      "passed": 20,
+      "failed_items": []
+    },
+    {
+      "file": "04-insane/storage-engines/19-build-search-engine-inverted-index/19-build-search-engine-inverted-index.md",
+      "passed": 20,
+      "failed_items": []
+    }
+  ]
+}

@@ -1,0 +1,208 @@
+{
+  "total": 554,
+  "files_complete": 349,
+  "files_with_block": 470,
+  "files_without_heading": 82,
+  "files_heading_no_code": 2,
+  "check_failures": {
+    "has_defmodule": 110,
+    "has_use_mix_project": 110,
+    "has_def_project": 115,
+    "project_has_app": 115,
+    "project_has_version": 115,
+    "project_has_elixir": 115,
+    "project_has_start_permanent": 132,
+    "project_has_deps_ref": 116,
+    "has_def_application": 118,
+    "app_has_extra_apps_logger": 118,
+    "has_defp_deps": 17,
+    "defp_deps_returns_list": 17,
+    "has_closing_end": 14,
+    "anti_orphan_defp_deps": 95,
+    "anti_no_do": 0,
+    "anti_brackets_ok": 0,
+    "anti_no_duplicate_funcs": 0
+  },
+  "top10_worst": [
+    {
+      "file": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ets-dets-mnesia/374-ets-match-specs/374-ets-match-specs.md",
+      "score": 4,
+      "issues": [
+        "Falta defmodule X.MixProject do",
+        "Falta use Mix.Project",
+        "Falta def project do",
+        "project sin app:",
+        "project sin version:",
+        "project sin elixir: ~>",
+        "project sin deps: deps()",
+        "Falta def application do",
+        "application sin extra_applications: [:logger]",
+        "Falta defp deps do",
+        "defp deps no devuelve lista",
+        "No termina con end"
+      ]
+    },
+    {
+      "file": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/ets-dets-mnesia/377-mnesia-transactions-indices/377-mnesia-transactions-indices.md",
+      "score": 4,
+      "issues": [
+        "Falta defmodule X.MixProject do",
+        "Falta use Mix.Project",
+        "Falta def project do",
+        "project sin app:",
+        "project sin version:",
+        "project sin elixir: ~>",
+        "project sin deps: deps()",
+        "Falta def application do",
+        "application sin extra_applications: [:logger]",
+        "Falta defp deps do",
+        "defp deps no devuelve lista",
+        "No termina con end"
+      ]
+    },
+    {
+      "file": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/otp-advanced/33-gen-statem-state-machine/33-gen-statem-state-machine.md",
+      "score": 4,
+      "issues": [
+        "Falta defmodule X.MixProject do",
+        "Falta use Mix.Project",
+        "Falta def project do",
+        "project sin app:",
+        "project sin version:",
+        "project sin elixir: ~>",
+        "project sin deps: deps()",
+        "Falta def application do",
+        "application sin extra_applications: [:logger]",
+        "Falta defp deps do",
+        "defp deps no devuelve lista",
+        "No termina con end"
+      ]
+    },
+    {
+      "file": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/phoenix-ecosystem/353-liveview-js-interactions/353-liveview-js-interactions.md",
+      "score": 4,
+      "issues": [
+        "Falta defmodule X.MixProject do",
+        "Falta use Mix.Project",
+        "Falta def project do",
+        "project sin app:",
+        "project sin version:",
+        "project sin elixir: ~>",
+        "project sin deps: deps()",
+        "Falta def application do",
+        "application sin extra_applications: [:logger]",
+        "Falta defp deps do",
+        "defp deps no devuelve lista",
+        "No termina con end"
+      ]
+    },
+    {
+      "file": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/phoenix-ecosystem/358-tailwind-esbuild-pipeline/358-tailwind-esbuild-pipeline.md",
+      "score": 4,
+      "issues": [
+        "Falta defmodule X.MixProject do",
+        "Falta use Mix.Project",
+        "Falta def project do",
+        "project sin app:",
+        "project sin version:",
+        "project sin elixir: ~>",
+        "project sin deps: deps()",
+        "Falta def application do",
+        "application sin extra_applications: [:logger]",
+        "Falta defp deps do",
+        "defp deps no devuelve lista",
+        "No termina con end"
+      ]
+    },
+    {
+      "file": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/phoenix-ecosystem/359-endpoint-custom-plug-pipeline/359-endpoint-custom-plug-pipeline.md",
+      "score": 4,
+      "issues": [
+        "Falta defmodule X.MixProject do",
+        "Falta use Mix.Project",
+        "Falta def project do",
+        "project sin app:",
+        "project sin version:",
+        "project sin elixir: ~>",
+        "project sin deps: deps()",
+        "Falta def application do",
+        "application sin extra_applications: [:logger]",
+        "Falta defp deps do",
+        "defp deps no devuelve lista",
+        "No termina con end"
+      ]
+    },
+    {
+      "file": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/phoenix-ecosystem/57-plug-pipeline-middleware/57-plug-pipeline-middleware.md",
+      "score": 4,
+      "issues": [
+        "Falta defmodule X.MixProject do",
+        "Falta use Mix.Project",
+        "Falta def project do",
+        "project sin app:",
+        "project sin version:",
+        "project sin elixir: ~>",
+        "project sin deps: deps()",
+        "Falta def application do",
+        "application sin extra_applications: [:logger]",
+        "Falta defp deps do",
+        "defp deps no devuelve lista",
+        "No termina con end"
+      ]
+    },
+    {
+      "file": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/phoenix-ecosystem/58-plug-router-api/58-plug-router-api.md",
+      "score": 4,
+      "issues": [
+        "Falta defmodule X.MixProject do",
+        "Falta use Mix.Project",
+        "Falta def project do",
+        "project sin app:",
+        "project sin version:",
+        "project sin elixir: ~>",
+        "project sin deps: deps()",
+        "Falta def application do",
+        "application sin extra_applications: [:logger]",
+        "Falta defp deps do",
+        "defp deps no devuelve lista",
+        "No termina con end"
+      ]
+    },
+    {
+      "file": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/resilience-patterns/45-build-api-client-wrapper/45-build-api-client-wrapper.md",
+      "score": 4,
+      "issues": [
+        "Falta defmodule X.MixProject do",
+        "Falta use Mix.Project",
+        "Falta def project do",
+        "project sin app:",
+        "project sin version:",
+        "project sin elixir: ~>",
+        "project sin deps: deps()",
+        "Falta def application do",
+        "application sin extra_applications: [:logger]",
+        "Falta defp deps do",
+        "defp deps no devuelve lista",
+        "No termina con end"
+      ]
+    },
+    {
+      "file": "/Users/consulting/Documents/consulting/infra/challenges/elixir/03-avanzado/resilience-patterns/70-req-finch-http-clients/70-req-finch-http-clients.md",
+      "score": 4,
+      "issues": [
+        "Falta defmodule X.MixProject do",
+        "Falta use Mix.Project",
+        "Falta def project do",
+        "project sin app:",
+        "project sin version:",
+        "project sin elixir: ~>",
+        "project sin deps: deps()",
+        "Falta def application do",
+        "application sin extra_applications: [:logger]",
+        "Falta defp deps do",
+        "defp deps no devuelve lista",
+        "No termina con end"
+      ]
+    }
+  ]
+}
